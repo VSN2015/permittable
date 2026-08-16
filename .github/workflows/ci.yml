@@ -55,3 +55,21 @@ jobs:
         bundler: latest
         bundler-cache: true
     - uses: rubygems/release-gem@v1
+
+    # release-gem only pushes to RubyGems. It leaves the built gem in pkg/,
+    # which is what gets attached here.
+    - name: Create GitHub release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        version="${GITHUB_REF_NAME#v}"
+        awk -v h="## ${version} (" 'index($0, h) == 1 { f = 1; next } f && /^## / { exit } f' \
+          CHANGELOG.md > notes.md
+        if [ ! -s notes.md ]; then
+          echo "::error::CHANGELOG.md has no '## ${version} (...)' section to release from"
+          exit 1
+        fi
+        gh release create "$GITHUB_REF_NAME" pkg/*.gem \
+          --title "$GITHUB_REF_NAME" \
+          --notes-file notes.md \
+          --verify-tag
