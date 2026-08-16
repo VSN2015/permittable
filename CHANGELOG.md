@@ -1,5 +1,17 @@
 <!-- CHANGELOG.md -->
 
+## 0.1.1 (2026-08-16)
+
+Maintenance release. The public API and every documented behaviour are identical to 0.1.0; upgrading is a no-op.
+
+### Changed
+- Internal style pass to satisfy the RuboCop config added in this release (hash alignment, guard clauses, anonymous block forwarding).
+- `cast_datetime` folds `DateTime` into the `Time` branch whose body it already shared. Dispatch order is unchanged, so `DateTime` still matches ahead of `Date`, which it subclasses.
+- Dropped `require "set"` from the filter parameter registry: `Set` has been autoloaded since Ruby 3.1 and the gemspec already floors at 3.2.
+
+### Added
+- CI on Ruby 3.2 (RuboCop + RSpec) and tag-driven publishing to RubyGems via trusted publishing. Repository tooling only — not part of the packaged gem.
+
 ## 0.1.0 (2026-08-16)
 
 Initial extraction from [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails) (developed there on `feature/permittable` as `ConcernsOnRails::Controllers::Permittable`; concerns_on_rails now depends on this gem and aliases that constant to `::Permittable`).

@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    permittable (0.1.0)
+    permittable (0.1.1)
       activesupport (>= 5.0, < 9)
 
 GEM
