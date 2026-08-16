@@ -1,5 +1,17 @@
 <!-- CHANGELOG.md -->
 
+## 0.1.2 (2026-08-16)
+<!-- title: gem metadata -->
+
+Metadata-only release. `lib/` is byte-for-byte identical to 0.1.1, so upgrading changes nothing at runtime — it exists to publish the rewritten gem description, which RubyGems only refreshes on a new version.
+
+### Changed
+- Rewrote the gem summary and description. Both now open with the comparison the README already draws — strong parameters say which keys may pass, a contract says what each field should be — rather than with implementation vocabulary. The schema-drift guard is presented as a consequence of contracts being class-level data instead of as one more bullet.
+
+### Internal
+- The publish job creates the GitHub release itself, taking the title from this file's `<!-- title: ... -->` marker and the body from the matching section.
+- Development dependencies: simplecov 0.22 → 1.1, `actions/checkout` 6 → 7.
+
 ## 0.1.1 (2026-08-16)
 <!-- title: maintenance release -->
 
