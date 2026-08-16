@@ -1,6 +1,7 @@
 <!-- CHANGELOG.md -->
 
 ## 0.1.1 (2026-08-16)
+<!-- title: maintenance release -->
 
 Maintenance release. The public API and every documented behaviour are identical to 0.1.0; upgrading is a no-op.
 
@@ -13,6 +14,7 @@ Maintenance release. The public API and every documented behaviour are identical
 - CI on Ruby 3.2 (RuboCop + RSpec) and tag-driven publishing to RubyGems via trusted publishing. Repository tooling only — not part of the packaged gem.
 
 ## 0.1.0 (2026-08-16)
+<!-- title: initial release -->
 
 Initial extraction from [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails) (developed there on `feature/permittable` as `ConcernsOnRails::Controllers::Permittable`; concerns_on_rails now depends on this gem and aliases that constant to `::Permittable`).
 

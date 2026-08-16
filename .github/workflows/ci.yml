@@ -63,13 +63,36 @@ jobs:
         GH_TOKEN: ${{ github.token }}
       run: |
         version="${GITHUB_REF_NAME#v}"
-        awk -v h="## ${version} (" 'index($0, h) == 1 { f = 1; next } f && /^## / { exit } f' \
-          CHANGELOG.md > notes.md
+
+        # Body: this version's CHANGELOG section, minus the title marker.
+        awk -v h="## ${version} (" '
+          index($0, h) == 1 { f = 1; next }
+          f && /^## / { exit }
+          f && /^<!-- title:/ { next }
+          f
+        ' CHANGELOG.md > notes.md
         if [ ! -s notes.md ]; then
           echo "::error::CHANGELOG.md has no '## ${version} (...)' section to release from"
           exit 1
         fi
+
+        # Title: "<tag> — <descriptor>" from the section's title marker. The
+        # version comes from the tag, so it cannot drift from what was released.
+        # A missing marker is cosmetic and must not fail the release.
+        descriptor=$(awk -v h="## ${version} (" '
+          index($0, h) == 1 { f = 1; next }
+          f && /^## / { exit }
+          f && sub(/^<!-- title:[[:space:]]*/, "") {
+            sub(/[[:space:]]*-->[[:space:]]*$/, ""); print; exit
+          }
+        ' CHANGELOG.md)
+        if [ -n "$descriptor" ]; then
+          title="$GITHUB_REF_NAME — $descriptor"
+        else
+          title="$GITHUB_REF_NAME"
+        fi
+
         gh release create "$GITHUB_REF_NAME" pkg/*.gem \
-          --title "$GITHUB_REF_NAME" \
+          --title "$title" \
           --notes-file notes.md \
           --verify-tag
