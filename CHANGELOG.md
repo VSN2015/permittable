@@ -1,6 +1,6 @@
 <!-- CHANGELOG.md -->
 
-## 0.1.0 (unreleased)
+## 0.1.0 (2026-08-16)
 
 Initial extraction from [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails) (developed there on `feature/permittable` as `ConcernsOnRails::Controllers::Permittable`; concerns_on_rails now depends on this gem and aliases that constant to `::Permittable`).
 
