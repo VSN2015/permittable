@@ -6,11 +6,14 @@ Gem::Specification.new do |spec|
   spec.authors       = ["Ethan Nguyen"]
   spec.email         = ["doctorit@gmail.com"]
 
-  spec.summary       = "Typed, validated params contracts for Rails controllers + schema-drift guard"
-  spec.description   = "Declarative per-action params contracts: strict typing/coercion, validation, " \
-                       "defaults, machine-readable 422s, output reshaping (transform/finalize), and a " \
-                       "boot-time schema-drift guard that fails the deploy when a permitted field's " \
-                       "column was dropped. Strong parameters with types, validation, and drift detection."
+  spec.summary       = "Strong parameters for Rails that also know types, bounds, and defaults"
+  spec.description   = "Strong parameters answer only which keys may pass. A Permittable contract also " \
+                       "says what each field should be: it casts the value to a declared type, validates " \
+                       "bounds and formats, applies defaults, and renders every failure as a 422 that " \
+                       "names the offending parameter. Because a contract is class-level data rather than " \
+                       "code inside the action, it can also be checked against the database when the " \
+                       "controller loads, so a column dropped by a migration fails the deploy instead of " \
+                       "the request. activesupport is the only runtime dependency."
   spec.homepage      = "https://github.com/VSN2015/permittable"
   spec.license       = "MIT"
 
