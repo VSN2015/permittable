@@ -115,11 +115,11 @@ module Permittable
   ROUTING_KEYS = %w[controller action format].freeze
 
   NORMALIZERS = {
-    squish:   ->(v) { v.squish },
-    strip:    ->(v) { v.strip },
+    squish: ->(v) { v.squish },
+    strip: ->(v) { v.strip },
     downcase: ->(v) { v.downcase },
-    upcase:   ->(v) { v.upcase },
-    email:    ->(v) { v.strip.downcase },
+    upcase: ->(v) { v.upcase },
+    email: ->(v) { v.strip.downcase }
   }.freeze
 
   @registry_mutex = Mutex.new
@@ -271,8 +271,8 @@ module Permittable
     # (deterministic); explicit offsets are honoured and normalised to UTC.
     def cast_datetime(value)
       case value
-      when ActiveSupport::TimeWithZone, Time then [:ok, value.to_time.utc]
-      when DateTime then [:ok, value.to_time.utc]
+      # DateTime is listed here, ahead of Date, because it subclasses Date.
+      when ActiveSupport::TimeWithZone, Time, DateTime then [:ok, value.to_time.utc]
       when Date then [:ok, Time.utc(value.year, value.month, value.day)]
       when String then [:ok, DateTime.parse(value).to_time.utc]
       else [:error, "invalid_type"]
@@ -315,8 +315,8 @@ module Permittable
       @finalizer = nil
     end
 
-    def build(&block)
-      instance_eval(&block)
+    def build(&)
+      instance_eval(&)
       @fields.map(&:freeze).freeze
     end
 
@@ -331,12 +331,12 @@ module Permittable
 
     # `required :name` defaults the type to :string. A block instead of a
     # type declares a nested hash of sub-fields.
-    def required(name, type = nil, **opts, &block)
-      add_field(name, type, required: true, opts: opts, &block)
+    def required(name, type = nil, **opts, &)
+      add_field(name, type, required: true, opts: opts, &)
     end
 
-    def optional(name, type = nil, **opts, &block)
-      add_field(name, type, required: false, opts: opts, &block)
+    def optional(name, type = nil, **opts, &)
+      add_field(name, type, required: false, opts: opts, &)
     end
 
     # Array of scalars (`of:`, default :string) or, with a block, an array
@@ -384,9 +384,7 @@ module Permittable
 
     def field_name!(name)
       name = name.to_sym
-      if @fields.any? { |f| f[:name] == name }
-        raise ArgumentError, "#{LABEL}: field :#{name} is declared twice in the same contract"
-      end
+      raise ArgumentError, "#{LABEL}: field :#{name} is declared twice in the same contract" if @fields.any? { |f| f[:name] == name }
 
       name
     end
@@ -408,9 +406,9 @@ module Permittable
                            "(supported: #{SCALAR_TYPES.join(', ')})"
     end
 
-    def nested_fields!(name, &block)
+    def nested_fields!(name, &)
       builder = ContractBuilder.new
-      fields = builder.build(&block)
+      fields = builder.build(&)
       raise ArgumentError, "#{LABEL}: nested field :#{name} declares no sub-fields" if fields.empty?
       if builder.finalizer
         raise ArgumentError, "#{LABEL}: finalize is only available at the top level of a contract (found inside :#{name})"
@@ -638,7 +636,7 @@ module Permittable
   def render_invalid_parameters(error)
     ErrorEnvelope.render(
       self, message: error.message, status: error.status,
-      code: "invalid_parameters", details: error.details
+            code: "invalid_parameters", details: error.details
     )
   end
 
@@ -650,12 +648,10 @@ module Permittable
     result = ActiveSupport::HashWithIndifferentAccess.new
     if source
       result = permittable_check_hash(rule[:fields], source, path: rule[:root] ? rule[:root].to_s : nil,
-                                      unknown: rule[:unknown], top_level: !rule[:root], violations: violations)
+                                                             unknown: rule[:unknown], top_level: !rule[:root], violations: violations)
     end
     # finalize only sees a hash every field vouched for — never garbage.
-    if violations.empty? && rule[:finalize]
-      result = permittable_run_finalize(rule[:finalize], result, violations)
-    end
+    result = permittable_run_finalize(rule[:finalize], result, violations) if violations.empty? && rule[:finalize]
     return result if violations.empty?
 
     raise_invalid_parameters!(violations, status: source ? :unprocessable_entity : :bad_request)
@@ -757,9 +753,7 @@ module Permittable
 
   def permittable_check_array(field, value, path:, unknown:, violations:)
     before = violations.length
-    if field[:length] && !Coercion.length_ok?(field[:length], value.length)
-      violations << { param: path, code: "length" }
-    end
+    violations << { param: path, code: "length" } if field[:length] && !Coercion.length_ok?(field[:length], value.length)
     out = value.each_with_index.map do |element, index|
       permittable_check_element(field, element, "#{path}[#{index}]", unknown: unknown, violations: violations)
     end

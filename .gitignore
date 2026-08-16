@@ -3,4 +3,3 @@
 /pkg/
 /tmp/
 *.gem
-Gemfile.lock

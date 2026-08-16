@@ -1,5 +1,3 @@
-require "set"
-
 module Permittable
   # Registry of sensitive parameter names (populated by `sensitive: true`
   # contract fields) surfaced to Rails' log filtering. Appending plain symbols

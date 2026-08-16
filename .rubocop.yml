@@ -1,0 +1,112 @@
+AllCops:
+  TargetRubyVersion: 3.2
+  NewCops: enable
+  SuggestExtensions: false
+  Exclude:
+    - 'bin/**/*'
+    - 'coverage/**/*'
+    - 'vendor/**/*'
+    - 'tmp/**/*'
+    - '*.gemspec'
+
+# Documentation isn't required for every class/module in a small gem.
+Style/Documentation:
+  Enabled: false
+
+# Allow both single- and double-quoted strings; codebase mixes them.
+Style/StringLiterals:
+  Enabled: false
+
+Style/StringLiteralsInInterpolation:
+  Enabled: false
+
+# Frozen string literal magic comment isn't required.
+Style/FrozenStringLiteralComment:
+  Enabled: false
+
+# Metric cops produce noise on the contract compiler, which legitimately
+# branches over every supported type and option.
+Metrics/MethodLength:
+  Enabled: false
+
+Metrics/AbcSize:
+  Enabled: false
+
+Metrics/ClassLength:
+  Enabled: false
+
+Metrics/ModuleLength:
+  Enabled: false
+
+Metrics/BlockLength:
+  Exclude:
+    - 'spec/**/*'
+    # class_methods do ... end holds the whole permit_params macro.
+    - 'lib/**/*'
+
+# The contract compiler dispatches over every supported type and option, so
+# branch counts track the feature list rather than any tangle worth splitting.
+Metrics/CyclomaticComplexity:
+  Enabled: false
+
+Metrics/PerceivedComplexity:
+  Enabled: false
+
+# The permits macro exposes many self-documenting keyword options; counting
+# them adds noise without the positional-arg risk.
+Metrics/ParameterLists:
+  CountKeywordArgs: false
+
+Layout/LineLength:
+  Max: 140
+
+# Specs use describe/context blocks with long bodies.
+Lint/AmbiguousBlockAssociation:
+  Exclude:
+    - 'spec/**/*'
+
+# Specs intentionally define test controller/model constants inside blocks.
+Lint/ConstantDefinitionInBlock:
+  Exclude:
+    - 'spec/**/*'
+
+# The built-in transform table reads as a lookup of ->(v) { v.squish } entries;
+# lambda(&:squish) would obscure that and change the resulting arity.
+Style/SymbolProc:
+  Enabled: false
+
+# `enforce: !!enforce` normalises the stored flag. RuboCop's suggested
+# `!enforce.nil?` is not equivalent — it would turn `enforce: false` into true.
+Style/DoubleNegation:
+  Enabled: false
+
+# False positive inside this ActiveSupport::Concern's module body: the cop reads
+# the `private` before validate_params_contract! as dead, but removing it makes
+# the whole check pipeline public on every including controller.
+Lint/UselessAccessModifier:
+  Enabled: false
+
+# `root:` defaults to false, not nil, so `rule[:root] ? ... : nil` cannot become
+# `rule[:root]&.to_s` — &. short-circuits only on nil, and false&.to_s is "false",
+# which would prefix every violation path on top-level contracts.
+Style/SafeNavigation:
+  Enabled: false
+
+# ensure_columns_on! is a bang command that returns a success boolean, matching
+# the gem's convention; it is not a predicate.
+Naming/PredicateMethod:
+  AllowBangMethods: true
+
+# Specs stub controller actions with empty blocks, nest `def create` inside
+# anonymous test controllers, and chain describe/let blocks.
+Lint/EmptyBlock:
+  Exclude:
+    - 'spec/**/*'
+
+Lint/NestedMethodDefinition:
+  Exclude:
+    - 'spec/**/*'
+
+Style/MultilineBlockChain:
+  Exclude:
+    - 'spec/**/*'

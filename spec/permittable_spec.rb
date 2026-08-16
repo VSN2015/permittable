@@ -1,6 +1,3 @@
-
-
-
 RSpec.describe Permittable do
   # FakeController responds to neither before_action nor rescue_from, so the
   # concern's guarded included-block installs nothing — specs drive
@@ -82,7 +79,14 @@ RSpec.describe Permittable do
     end
 
     it "rejects a duplicate field in the same contract" do
-      expect { permittable_class { permit_params(:create) { required :a; optional :a } } }
+      expect do
+        permittable_class do
+          permit_params(:create) do
+            required :a
+            optional :a
+          end
+        end
+      end
         .to raise_error(ArgumentError, /:a is declared twice/)
     end
 
@@ -171,8 +175,16 @@ RSpec.describe Permittable do
     end
 
     it "rejects unparseable dates and datetimes" do
-      expect(violations_for({ day: "not-a-day" }) { permit_params(:create) { required :day, :date } }.details.first[:code]).to eq("invalid_type")
-      expect(violations_for({ at: "not-a-time" }) { permit_params(:create) { required :at, :datetime } }.details.first[:code]).to eq("invalid_type")
+      expect(violations_for({ day: "not-a-day" }) do
+        permit_params(:create) do
+          required :day, :date
+        end
+      end.details.first[:code]).to eq("invalid_type")
+      expect(violations_for({ at: "not-a-time" }) do
+        permit_params(:create) do
+          required :at, :datetime
+        end
+      end.details.first[:code]).to eq("invalid_type")
     end
 
     it "stringifies numbers and booleans for :string (JSON bodies)" do
@@ -588,7 +600,7 @@ RSpec.describe Permittable do
         permit_params(:create) { optional :ids, :string, default: "authored", transform: ->(v) { v.split(",") } }
       end
       expect(permit({}, &decl)[:ids]).to eq("authored")
-      expect(permit({}) { permit_params(:create) { optional :ids, :string, transform: ->(v) { raise "must not run" } } }
+      expect(permit({}) { permit_params(:create) { optional :ids, :string, transform: ->(_v) { raise "must not run" } } }
         .key?("ids")).to be(false)
     end
 
@@ -604,11 +616,35 @@ RSpec.describe Permittable do
 
   describe "finalize" do
     it "requires a block, rejects a second declaration, and rejects nesting" do
-      expect { permittable_class { permit_params(:create) { required :a; finalize } } }
+      expect do
+        permittable_class do
+          permit_params(:create) do
+            required :a
+            finalize
+          end
+        end
+      end
         .to raise_error(ArgumentError, /finalize requires a block/)
-      expect { permittable_class { permit_params(:create) { required :a; finalize { |p| p }; finalize { |p| p } } } }
+      expect do
+        permittable_class do
+          permit_params(:create) do
+            required :a
+            finalize { |p| p }
+            finalize { |p| p }
+          end
+        end
+      end
         .to raise_error(ArgumentError, /finalize may only be declared once/)
-      expect { permittable_class { permit_params(:create) { required(:a) { required :b; finalize { |p| p } } } } }
+      expect do
+        permittable_class do
+          permit_params(:create) do
+            required(:a) do
+              required :b
+              finalize { |p| p }
+            end
+          end
+        end
+      end
         .to raise_error(ArgumentError, /finalize is only available at the top level.*inside :a/)
     end
 
@@ -629,8 +665,8 @@ RSpec.describe Permittable do
             end
 
             p[:resident_signatures] = p[:resident_signatures]
-              .zip(p[:signer_names], p[:signer_ids])
-              .map { |image, name, id| signature.new(image, name, id) }
+                                      .zip(p[:signer_names], p[:signer_ids])
+                                      .map { |image, name, id| signature.new(image, name, id) }
             p.except(:signer_names, :signer_ids)
           end
         end
@@ -667,7 +703,10 @@ RSpec.describe Permittable do
       e = violations_for({}) do
         permit_params(:create) do
           required :a, :string
-          finalize { |p| ran = true; p }
+          finalize do |p|
+            ran = true
+            p
+          end
         end
       end
       expect(e.details).to eq([{ param: "a", code: "missing" }])
@@ -697,7 +736,10 @@ RSpec.describe Permittable do
       klass = permittable_class do
         permit_params(:create) do
           required :a, :string
-          finalize { |p| params; p }
+          finalize do |p|
+            params
+            p
+          end
         end
       end
       expect { controller(klass, params: { a: "x" }).permitted_params }
@@ -806,14 +848,14 @@ RSpec.describe Permittable do
         end
       end
 
-      ok = IntegrationHarness.dispatch(controller, :create, method: "POST",
-                                       params: { lease_addendum_form: { resident_signatures: "i1<<delimiter>>i2", signer_names: "An,Binh" } })
+      both = { lease_addendum_form: { resident_signatures: "i1<<delimiter>>i2", signer_names: "An,Binh" } }
+      ok = IntegrationHarness.dispatch(controller, :create, method: "POST", params: both)
       expect(ok.status).to eq(200)
       expect(JSON.parse(ok.body)).to eq("signatures" => [{ "image" => "i1", "full_name" => "An" },
                                                          { "image" => "i2", "full_name" => "Binh" }])
 
-      mismatch = IntegrationHarness.dispatch(controller, :create, method: "POST",
-                                             params: { lease_addendum_form: { resident_signatures: "i1<<delimiter>>i2", signer_names: "An" } })
+      short = { lease_addendum_form: { resident_signatures: "i1<<delimiter>>i2", signer_names: "An" } }
+      mismatch = IntegrationHarness.dispatch(controller, :create, method: "POST", params: short)
       expect(mismatch.status).to eq(422)
       expect(JSON.parse(mismatch.body)["error"]["details"])
         .to eq([{ "param" => "lease_addendum_form.signer_names", "code" => "length_mismatch" }])
