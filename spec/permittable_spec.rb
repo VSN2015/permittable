@@ -242,6 +242,104 @@ RSpec.describe Permittable do
     end
   end
 
+  describe "message: (custom error messages)" do
+    it "rejects a message that is neither a String nor a code => String Hash" do
+      expect { permittable_class { permit_params(:create) { required :a, :string, message: :nope } } }
+        .to raise_error(ArgumentError, /:message for field :a must be a String or a Hash of violation code => String/)
+      expect { permittable_class { permit_params(:create) { required :a, :string, message: { format: :nope } } } }
+        .to raise_error(ArgumentError, /:message for field :a/)
+      expect { permittable_class { permit_params(:create) { required :a, :string, message: {} } } }
+        .to raise_error(ArgumentError, /:message for field :a/)
+    end
+
+    it "a String message covers every violation code on the field, and replaces (code) in the summary" do
+      decl = proc { permit_params(:create) { required :email, :string, format: /@/, message: "must be a valid email" } }
+
+      e = violations_for({ email: "nope" }, &decl)
+      expect(e.details).to eq([{ param: "email", code: "format", message: "must be a valid email" }])
+      expect(e.message).to eq("Invalid parameters: email must be a valid email")
+
+      expect(violations_for({}, &decl).details)
+        .to eq([{ param: "email", code: "missing", message: "must be a valid email" }])
+    end
+
+    it "a Hash message resolves per code — codes without an entry keep the bare shape" do
+      decl = proc do
+        permit_params(:create) do
+          required :email, :string, format: /@/, message: { missing: "is required", format: "must be a valid email" }
+        end
+      end
+      expect(violations_for({}, &decl).details).to eq([{ param: "email", code: "missing", message: "is required" }])
+      expect(violations_for({ email: "nope" }, &decl).details)
+        .to eq([{ param: "email", code: "format", message: "must be a valid email" }])
+
+      e = violations_for({ email: ["x@y"] }, &decl) # invalid_type has no entry
+      expect(e.details).to eq([{ param: "email", code: "invalid_type" }])
+      expect(e.message).to eq("Invalid parameters: email (invalid_type)")
+
+      string_keys = proc { permit_params(:create) { required :a, :string, message: { "missing" => "is required" } } }
+      expect(violations_for({}, &string_keys).details).to eq([{ param: "a", code: "missing", message: "is required" }])
+    end
+
+    it "matches a Symbol code returned by a custom validate:" do
+      decl = proc do
+        permit_params(:create) do
+          required :n, :integer, validate: ->(v) { v.even? || :must_be_even }, message: { must_be_even: "must be an even number" }
+        end
+      end
+      expect(violations_for({ n: "3" }, &decl).details)
+        .to eq([{ param: "n", code: "must_be_even", message: "must be an even number" }])
+    end
+
+    it "applies an array's message to violations on the array and on its elements" do
+      decl = proc { permit_params(:create) { array :ages, of: :integer, length: 1..2, message: "must be one or two whole numbers" } }
+      expect(violations_for({ ages: [] }, &decl).details)
+        .to eq([{ param: "ages", code: "length", message: "must be one or two whole numbers" }])
+      expect(violations_for({ ages: ["x"] }, &decl).details)
+        .to eq([{ param: "ages[0]", code: "invalid_type", message: "must be one or two whole numbers" }])
+    end
+
+    it "nested fields resolve their own message, independent of the parent's" do
+      decl = proc do
+        permit_params(:create) do
+          required :address, message: "must be an object" do
+            required :zip, :string, format: /\A\d{5}\z/, message: { format: "must be five digits" }
+          end
+        end
+      end
+      expect(violations_for({ address: "nope" }, &decl).details)
+        .to eq([{ param: "address", code: "invalid_type", message: "must be an object" }])
+      expect(violations_for({ address: { zip: "abc" } }, &decl).details)
+        .to eq([{ param: "address.zip", code: "format", message: "must be five digits" }])
+    end
+
+    it "violate! carries an optional message: into the detail" do
+      e = violations_for({ a: "x" }) do
+        permit_params(:create) do
+          required :a, :string
+          finalize do |p|
+            violate!("a", :conflict, message: "cannot be combined with b")
+            p
+          end
+        end
+      end
+      expect(e.details).to eq([{ param: "a", code: "conflict", message: "cannot be combined with b" }])
+      expect(e.message).to eq("Invalid parameters: a cannot be combined with b")
+    end
+
+    it "flows into the rendered error envelope" do
+      klass = permittable_class { permit_params(:create) { required :name, :string, message: { missing: "is required" } } }
+      c = controller(klass, params: {})
+      begin
+        c.permitted_params
+      rescue described_class::InvalidParameters => e
+        c.render_invalid_parameters(e)
+      end
+      expect(c.rendered[:json][:error][:message]).to eq("Invalid parameters: name is required")
+      expect(c.rendered[:json][:error][:details]).to eq([{ param: "name", code: "missing", message: "is required" }])
+    end
+  end
+
   describe "absence, defaults, and required" do
     let(:decl) do
       proc do

@@ -1,5 +1,14 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+<!-- title: custom error messages -->
+
+### Added
+- `message:` field option for customizing violation messages, on every field kind (scalar, array, nested). A String covers every violation code on the field; a Hash of code → String targets specific codes — including Symbol codes returned by `validate:` — while unmatched codes keep the default rendering. A resolved message is carried in the violation detail as `message:` and replaces the `(code)` part of the `InvalidParameters` summary, so it flows into the error envelope and the `invalid_parameters.permittable` instrumentation payload unchanged. An array's message also covers its elements' violations; a malformed `message:` raises at class load like every other contract mistake.
+- `violate!(param, code, message: nil)` — finalize's violation verb accepts the same optional human-readable message.
+
+Contracts that don't opt in are byte-for-byte unaffected: details keep the bare `{ param:, code: }` shape and the summary keeps its `param (code)` rendering.
+
 ## 0.1.2 (2026-08-16)
 <!-- title: gem metadata -->
 
