@@ -12,5 +12,9 @@ module Permittable
       filter = ::Permittable.filter_parameter_registry.to_proc
       app.config.filter_parameters << filter unless app.config.filter_parameters.include?(filter)
     end
+
+    rake_tasks do
+      load File.expand_path("tasks/openapi.rake", __dir__)
+    end
   end
 end

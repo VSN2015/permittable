@@ -1,0 +1,279 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Golden API",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/users": {
+      "post": {
+        "operationId": "users_create",
+        "description": "Create or update a user",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "user": {
+                    "type": "object",
+                    "properties": {
+                      "name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 80,
+                        "description": "Display name"
+                      },
+                      "email": {
+                        "type": "string",
+                        "minLength": 1,
+                        "pattern": "^[^@\\s]+@[^@\\s]+$",
+                        "examples": [
+                          "jo@example.com"
+                        ]
+                      },
+                      "age": {
+                        "type": "integer",
+                        "minimum": 18,
+                        "maximum": 120
+                      },
+                      "ssn": {
+                        "type": "string",
+                        "writeOnly": true,
+                        "x-permittable-sensitive": true
+                      },
+                      "plan": {
+                        "type": "string",
+                        "enum": [
+                          "free",
+                          "pro"
+                        ],
+                        "default": "free"
+                      },
+                      "tag_names": {
+                        "type": "array",
+                        "minItems": 0,
+                        "maxItems": 10,
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "address": {
+                        "type": "object",
+                        "properties": {
+                          "city": {
+                            "type": "string",
+                            "minLength": 1
+                          },
+                          "zip": {
+                            "type": "string",
+                            "pattern": "^\\d{5}$"
+                          }
+                        },
+                        "required": [
+                          "city"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "required": [
+                      "name",
+                      "email"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "user"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "400": {
+            "$ref": "#/components/responses/PermittableBadRequest"
+          },
+          "422": {
+            "$ref": "#/components/responses/PermittableUnprocessableEntity"
+          }
+        }
+      }
+    },
+    "/users/{id}": {
+      "patch": {
+        "operationId": "users_update",
+        "description": "Create or update a user",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "user": {
+                    "type": "object",
+                    "properties": {
+                      "name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 80,
+                        "description": "Display name"
+                      },
+                      "email": {
+                        "type": "string",
+                        "minLength": 1,
+                        "pattern": "^[^@\\s]+@[^@\\s]+$",
+                        "examples": [
+                          "jo@example.com"
+                        ]
+                      },
+                      "age": {
+                        "type": "integer",
+                        "minimum": 18,
+                        "maximum": 120
+                      },
+                      "ssn": {
+                        "type": "string",
+                        "writeOnly": true,
+                        "x-permittable-sensitive": true
+                      },
+                      "plan": {
+                        "type": "string",
+                        "enum": [
+                          "free",
+                          "pro"
+                        ],
+                        "default": "free"
+                      },
+                      "tag_names": {
+                        "type": "array",
+                        "minItems": 0,
+                        "maxItems": 10,
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "address": {
+                        "type": "object",
+                        "properties": {
+                          "city": {
+                            "type": "string",
+                            "minLength": 1
+                          },
+                          "zip": {
+                            "type": "string",
+                            "pattern": "^\\d{5}$"
+                          }
+                        },
+                        "required": [
+                          "city"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "required": [
+                      "name",
+                      "email"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "user"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "400": {
+            "$ref": "#/components/responses/PermittableBadRequest"
+          },
+          "422": {
+            "$ref": "#/components/responses/PermittableUnprocessableEntity"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "PermittableInvalidParameters": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "code": {
+                "type": "string",
+                "enum": [
+                  "invalid_parameters"
+                ]
+              },
+              "details": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "param": {
+                      "type": "string",
+                      "description": "Fully-qualified parameter path, e.g. user.address.zip or line_items[1].sku"
+                    },
+                    "code": {
+                      "type": "string",
+                      "description": "missing / invalid_type / inclusion / format / length / unknown / invalid, or a contract-specific symbol"
+                    }
+                  },
+                  "required": [
+                    "param",
+                    "code"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "message"
+            ]
+          }
+        },
+        "required": [
+          "success",
+          "error"
+        ]
+      }
+    },
+    "responses": {
+      "PermittableBadRequest": {
+        "description": "The root: key is missing or not an object — the request envelope itself is malformed.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/PermittableInvalidParameters"
+            }
+          }
+        }
+      },
+      "PermittableUnprocessableEntity": {
+        "description": "One or more parameters violated the action's contract; details names each offender.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/PermittableInvalidParameters"
+            }
+          }
+        }
+      }
+    }
+  }
+}

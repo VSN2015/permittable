@@ -121,6 +121,29 @@ RSpec.describe Permittable do
       expect { permittable_class { permit_params(:create) { optional :a, :string, normalize: :shout } } }
         .to raise_error(ArgumentError, /unknown :normalize preset :shout.*squish, strip, downcase, upcase, email/)
     end
+
+    it "carries desc:/example: as documentation-only data the runtime never reads" do
+      klass = permittable_class do
+        permit_params(:create, desc: "Create a user") do
+          required :name, :string, desc: "Display name", example: "Jo"
+          array :tags, of: :string, example: %w[a b]
+          optional(:address, desc: "Postal address") { required :city, :string }
+        end
+      end
+      rule = klass.permit_rule_for(:create)
+      expect(rule[:desc]).to eq("Create a user")
+      expect(rule[:fields].first).to include(desc: "Display name", example: "Jo")
+      expect(controller(klass, params: { name: "Jo" }).permitted_params.to_h).to eq("name" => "Jo")
+    end
+
+    it "rejects an example: that violates its own field's contract, like a default" do
+      expect { permittable_class { permit_params(:create) { optional :plan, :string, in: %w[free pro], example: "gold" } } }
+        .to raise_error(ArgumentError, /:example for field :plan violates its own contract \(inclusion\)/)
+      expect { permittable_class { permit_params(:create) { array :ids, of: :integer, example: ["x"] } } }
+        .to raise_error(ArgumentError, /:example for array :ids contains an element violating of: :integer/)
+      expect { permittable_class { permit_params(:create) { required(:a, example: {}) { required :b } } } }
+        .to raise_error(ArgumentError, /unknown option\(s\) :example for field :a/)
+    end
   end
 
   describe "type casting" do
