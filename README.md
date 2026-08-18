@@ -51,7 +51,7 @@ A violating request never reaches your action:
 - [Why](#why) · [Installation](#installation) · [How a request flows](#how-a-request-flows)
 - [Declaring a contract](#declaring-a-contract) · [The field DSL](#the-field-dsl) · [Field options](#field-options)
 - [Types and strict coercion](#types-and-strict-coercion) · [Absence, defaults, and partial updates](#absence-defaults-and-partial-updates)
-- [Violations and error responses](#violations-and-error-responses) · [Unknown parameters](#unknown-parameters)
+- [Violations and error responses](#violations-and-error-responses) · [Custom error messages](#custom-error-messages-message) · [Unknown parameters](#unknown-parameters)
 - [Output reshaping](#output-reshaping-transform-and-finalize) · [The schema-drift guard](#the-schema-drift-guard)
 - [Sensitive parameters](#sensitive-parameters-and-log-redaction) · [Instrumentation](#instrumentation)
 - [API reference](#api-reference) · [Errors caught at class load](#errors-caught-at-class-load) · [Compatibility](#compatibility)
@@ -183,6 +183,7 @@ Which options are legal depends on the field kind — anything else raises at cl
 | `transform:` | ✅ | ✅ | — | Callable applied **after** cast and validation — see [output reshaping](#output-reshaping-transform-and-finalize) |
 | `virtual:` | ✅ | ✅ | ✅ | Exempt this field from the schema-drift guard |
 | `sensitive:` | ✅ | ✅ | ✅ | Register the field name for [log redaction](#sensitive-parameters-and-log-redaction) |
+| `message:` | ✅ | ✅ | ✅ | Human-readable copy for violations on this field — a String, or a Hash of code → String. See [custom messages](#custom-error-messages-message) |
 | `of:` | — | ✅ | — | Element type for an array of scalars (default `:string`) |
 | `required:` | — | ✅ | — | Arrays are optional unless this is `true` |
 
@@ -229,7 +230,7 @@ Defaults are checked against the field's own contract when the class loads, so `
 
 ## Violations and error responses
 
-Every failure raises `Permittable::InvalidParameters`, carrying `details` (an array of `{ param:, code: }`) and a `status`. On a real controller it is auto-rescued into the error envelope.
+Every failure raises `Permittable::InvalidParameters`, carrying `details` (an array of `{ param:, code: }`, plus a `message:` when the field [declares one](#custom-error-messages-message)) and a `status`. On a real controller it is auto-rescued into the error envelope.
 
 | Code | Raised when |
 |---|---|
@@ -247,6 +248,39 @@ Paths are fully qualified: `user.address.zip`, `line_items[1].sku`.
 **Status codes:** a missing root key renders **400** (the request is malformed — the envelope you asked for isn't there); field-level violations render **422** (well-formed, semantically wrong).
 
 **Custom rendering:** if your controller defines `render_error`, the envelope delegates to it as `render_error(message:, code:, status:, errors:)` — the `errors:` key is passed only when details exist, so hosts documenting a three-keyword contract keep working. Otherwise the inline JSON shape shown at the top of this README is rendered. Either way, `render_invalid_parameters` is a normal method you can override.
+
+## Custom error messages (`message:`)
+
+Violations stay machine-first — the `code` is the contract — but any field can attach human-readable copy with `message:`. A **String** covers every code on the field; a **Hash of code → String** targets specific codes, and codes without an entry keep the default rendering:
+
+```ruby
+permit_params :create, root: :user do
+  required :email, :string, format: URI::MailTo::EMAIL_REGEXP,
+                            message: { missing: "is required", format: "must be a valid email address" }
+  optional :age,   :integer, in: 18..120, message: "must be between 18 and 120"
+  array    :tags,  of: :string, length: 0..10, message: "must be at most ten tags"
+end
+```
+
+A resolved message rides into the violation detail and replaces the `(code)` part of the exception's summary line, so both the envelope's `message` and its `details` read naturally:
+
+```json
+{ "success": false,
+  "error": { "message": "Invalid parameters: user.email must be a valid email address",
+             "code": "invalid_parameters",
+             "details": [{ "param": "user.email", "code": "format",
+                           "message": "must be a valid email address" }] } }
+```
+
+The rules:
+
+- Messages are written to read after the param name: `"is required"`, not `"Email is required"`.
+- A Hash key matches the violation code, **including Symbol codes returned by `validate:`** — `validate: ->(v) { v.even? || :must_be_even }, message: { must_be_even: "must be an even number" }`.
+- An array's message covers the array's own violations (`length`, `invalid_type`, `missing`) **and** its elements' (`tags[3]`); sub-fields of a nested block resolve their own `message:` declarations.
+- `violate!` in `finalize` takes the same idea as a keyword: `violate!("user.ends_at", :before_start, message: "must be after starts_at")`.
+- A `message:` that is neither a String nor a code → String Hash raises at class load, like every other contract mistake.
+
+Fields without a `message:` are untouched — their details keep the bare `{ param:, code: }` shape. For full control over the response body itself (localization, RFC 9457, a different envelope), override `render_invalid_parameters` or define `render_error` as described above; `error.details` gives you the structured violations to build from.
 
 ## Unknown parameters
 
@@ -278,7 +312,7 @@ It runs only on request-supplied values. Absent fields stay absent, `default:` v
 
 Declared once, at the top level only. It runs after every field has validated cleanly, receives the result hash, and must return the final `Hash`. Use it to combine parallel fields, build value objects, or drop scaffolding keys.
 
-It executes on a **bare runner, not the controller**, so contracts stay pure data plus pure functions and can never grow a dependency on request state. Its one extra verb is `violate!(param, code)`, which records a violation and **halts the block immediately** — so the code after a `violate!` may assume the invariant it just checked. That makes `finalize` the natural home for cross-field validation (`ends_at` after `starts_at`, matching array lengths).
+It executes on a **bare runner, not the controller**, so contracts stay pure data plus pure functions and can never grow a dependency on request state. Its one extra verb is `violate!(param, code, message: nil)`, which records a violation (the optional [`message:`](#custom-error-messages-message) rides into the detail) and **halts the block immediately** — so the code after a `violate!` may assume the invariant it just checked. That makes `finalize` the natural home for cross-field validation (`ends_at` after `starts_at`, matching array lengths).
 
 ```ruby
 permit_params :create, root: :lease_addendum_form do

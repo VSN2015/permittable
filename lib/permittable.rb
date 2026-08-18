@@ -79,6 +79,15 @@ require "permittable/filter_parameter_registry"
 # renders 400, field violations 422. Every violation also instruments
 # "invalid_parameters.permittable" so failures can be dashboarded.
 #
+# Violation MESSAGES stay machine-first (the code is the contract), but a
+# field can attach human-readable copy with `message:` — one String for every
+# code (`message: "must be a valid email"`) or a Hash per code
+# (`message: { missing: "is required", format: "must be a valid email" }`).
+# A resolved message rides into the detail entry as `message:` and replaces
+# the "(code)" rendering in the exception's summary line; codes without a
+# message keep the bare shape, so nothing changes for contracts that don't
+# opt in. `violate!` in finalize accepts the same via `message:`.
+#
 # `sensitive: true` registers the field name with
 # Permittable.filter_parameter_registry (swappable — a host gem can point it
 # at its own registry), consulted at filter time by the proc
@@ -304,9 +313,9 @@ module Permittable
   # declaration is validated eagerly: a bad contract is a programmer error and
   # should fail at class load, not at request time.
   class ContractBuilder
-    SCALAR_OPTS = %i[in format length default normalize validate virtual sensitive transform].freeze
-    NESTED_OPTS = %i[virtual sensitive].freeze
-    ARRAY_OPTS  = %i[of length default validate virtual sensitive required transform].freeze
+    SCALAR_OPTS = %i[in format length default normalize validate virtual sensitive transform message].freeze
+    NESTED_OPTS = %i[virtual sensitive message].freeze
+    ARRAY_OPTS  = %i[of length default validate virtual sensitive required transform message].freeze
 
     attr_reader :finalizer
 
@@ -360,6 +369,7 @@ module Permittable
       validate_callable!(name, :validate, field[:validate]) if field.key?(:validate)
       validate_callable!(name, :transform, field[:transform]) if field.key?(:transform)
       validate_array_default!(field) if field.key?(:default)
+      validate_message!(field)
       @fields << field
     end
 
@@ -371,15 +381,16 @@ module Permittable
         raise ArgumentError, "#{LABEL}: :#{name} takes a type OR a nested block, not both" if type
 
         assert_opts!(name, opts, NESTED_OPTS)
-        @fields << { name: name, kind: :nested, required: required,
-                     fields: nested_fields!(name, &block), **opts }
+        field = { name: name, kind: :nested, required: required,
+                  fields: nested_fields!(name, &block), **opts }
+        validate_message!(field)
       else
         assert_opts!(name, opts, SCALAR_OPTS)
         field = { name: name, kind: :scalar, required: required,
                   type: scalar_type!(name, type || :string), **opts }
         validate_scalar_opts!(field)
-        @fields << field
       end
+      @fields << field
     end
 
     def field_name!(name)
@@ -432,6 +443,7 @@ module Permittable
       validate_callable!(name, :transform, field[:transform]) if field.key?(:transform)
       resolve_normalizer!(field)
       validate_default!(field)
+      validate_message!(field)
     end
 
     # format / length / normalize reason about characters; on any other
@@ -492,6 +504,26 @@ module Permittable
         raise ArgumentError, "#{LABEL}: :default for array :#{field[:name]} contains an element violating of: :#{field[:of]} (#{code})"
       end
     end
+
+    # `message:` customizes what the client reads for a violation on this
+    # field: one String covering every code, or a Hash of code => String
+    # (codes without an entry keep the default rendering). Keys are
+    # normalized to Symbols here so request-time resolution is a plain
+    # lookup.
+    def validate_message!(field)
+      spec = field[:message]
+      return if spec.nil?
+      return if spec.is_a?(String)
+
+      valid_hash = spec.is_a?(Hash) && !spec.empty? &&
+                   spec.all? { |code, text| (code.is_a?(Symbol) || code.is_a?(String)) && text.is_a?(String) }
+      unless valid_hash
+        raise ArgumentError, "#{LABEL}: :message for field :#{field[:name]} must be a String " \
+                             "or a Hash of violation code => String (e.g. { missing: \"is required\" })"
+      end
+
+      field[:message] = spec.transform_keys(&:to_sym).freeze
+    end
   end
 
   # The `self` a finalize block runs on. Deliberately bare — no controller
@@ -504,9 +536,13 @@ module Permittable
 
     # Records ONE violation and halts the finalize block immediately (the
     # code after a violate! call never runs, so it can assume the checked
-    # invariant). The contract then fails as a normal 422.
-    def violate!(param, code)
-      @violations << { param: param.to_s, code: code.to_s }
+    # invariant). The contract then fails as a normal 422. An optional
+    # message: rides along into the violation detail, same as a field's
+    # `message:` option.
+    def violate!(param, code, message: nil)
+      entry = { param: param.to_s, code: code.to_s }
+      entry[:message] = message.to_s if message
+      @violations << entry
       throw :permittable_finalize_halt
     end
   end
@@ -663,8 +699,25 @@ module Permittable
       "invalid_parameters.permittable",
       controller: permittable_controller_name, action: permittable_action_name, details: violations
     )
-    summary = violations.map { |v| "#{v[:param]} (#{v[:code]})" }.join(", ")
+    summary = violations.map { |v| v[:message] ? "#{v[:param]} #{v[:message]}" : "#{v[:param]} (#{v[:code]})" }.join(", ")
     raise InvalidParameters.new("Invalid parameters: #{summary}", details: violations, status: status)
+  end
+
+  # One violation detail entry. A field's `message:` (String, or Hash keyed
+  # by code) attaches a human-readable message; entries without one keep
+  # the bare { param:, code: } shape, so existing consumers see no change.
+  def permittable_violation(field, param, code)
+    entry = { param: param, code: code.to_s }
+    message = permittable_message_for(field, code)
+    entry[:message] = message if message
+    entry
+  end
+
+  def permittable_message_for(field, code)
+    spec = field[:message]
+    return spec if spec.nil? || spec.is_a?(String)
+
+    spec[code.to_sym]
   end
 
   def permittable_run_finalize(finalizer, result, violations)
@@ -713,7 +766,7 @@ module Permittable
         if field.key?(:default)
           result[key] = field[:default]
         elsif field[:required]
-          violations << { param: full, code: "missing" }
+          violations << permittable_violation(field, full, "missing")
         end
         next
       end
@@ -733,33 +786,33 @@ module Permittable
         out = field[:transform].call(out) if field[:transform]
         result[key] = out
       else
-        violations << { param: full, code: out }
+        violations << permittable_violation(field, full, out)
       end
     when :nested
       if value.is_a?(Hash)
         result[key] = permittable_check_hash(field[:fields], ActiveSupport::HashWithIndifferentAccess.new(value),
                                              path: full, unknown: unknown, top_level: false, violations: violations)
       else
-        violations << { param: full, code: "invalid_type" }
+        violations << permittable_violation(field, full, "invalid_type")
       end
     when :array
       if value.is_a?(Array)
         result[key] = permittable_check_array(field, value, path: full, unknown: unknown, violations: violations)
       else
-        violations << { param: full, code: "invalid_type" }
+        violations << permittable_violation(field, full, "invalid_type")
       end
     end
   end
 
   def permittable_check_array(field, value, path:, unknown:, violations:)
     before = violations.length
-    violations << { param: path, code: "length" } if field[:length] && !Coercion.length_ok?(field[:length], value.length)
+    violations << permittable_violation(field, path, "length") if field[:length] && !Coercion.length_ok?(field[:length], value.length)
     out = value.each_with_index.map do |element, index|
       permittable_check_element(field, element, "#{path}[#{index}]", unknown: unknown, violations: violations)
     end
     if field[:validate]
       status, code = Coercion.check_custom(field[:validate], out)
-      violations << { param: path, code: code } unless status == :ok
+      violations << permittable_violation(field, path, code) unless status == :ok
     end
     # Transform only a fully-valid array — a partially-nil one (element
     # violations) would hand user code garbage it never agreed to see.
@@ -770,7 +823,7 @@ module Permittable
   def permittable_check_element(field, element, path, unknown:, violations:)
     if field[:fields]
       unless element.is_a?(Hash)
-        violations << { param: path, code: "invalid_type" }
+        violations << permittable_violation(field, path, "invalid_type")
         return nil
       end
       return permittable_check_hash(field[:fields], ActiveSupport::HashWithIndifferentAccess.new(element),
@@ -780,7 +833,7 @@ module Permittable
     status, out = Coercion.cast(field[:of], element)
     return out if status == :ok
 
-    violations << { param: path, code: out }
+    violations << permittable_violation(field, path, out)
     nil
   end
 
