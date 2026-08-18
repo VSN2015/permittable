@@ -54,6 +54,7 @@ A violating request never reaches your action:
 - [Violations and error responses](#violations-and-error-responses) · [Unknown parameters](#unknown-parameters)
 - [Output reshaping](#output-reshaping-transform-and-finalize) · [The schema-drift guard](#the-schema-drift-guard)
 - [Sensitive parameters](#sensitive-parameters-and-log-redaction) · [Instrumentation](#instrumentation)
+- [Exporting OpenAPI](#exporting-openapi-docs-that-cannot-drift)
 - [API reference](#api-reference) · [Errors caught at class load](#errors-caught-at-class-load) · [Compatibility](#compatibility)
 
 ---
@@ -70,6 +71,7 @@ A violating request never reaches your action:
 | Machine-readable error details | ❌ | ❌ | ✅ |
 | Reshapes output | ❌ | ❌ | ✅ |
 | Checked against your schema at boot | ❌ | ❌ | ✅ |
+| Exports OpenAPI / JSON Schema | ❌ | ❌ | ✅ |
 
 The design rests on one idea: **a contract is data, not code.** It is declared once at the class level, frozen, inheritable, and introspectable. Everything else here follows from that — the drift guard can read it at boot, `finalize` can run on a bare object with no controller state, and the whole contract can be printed or tested without a request.
 
@@ -109,7 +111,7 @@ Validation is **lazy by default**: it runs on the first `permitted_params` call,
 ## Declaring a contract
 
 ```ruby
-permit_params(*actions, root: false, model: nil, unknown: :ignore, enforce: false, &contract)
+permit_params(*actions, root: false, model: nil, unknown: :ignore, enforce: false, desc: nil, &contract)
 ```
 
 | Option | Default | Meaning |
@@ -119,6 +121,7 @@ permit_params(*actions, root: false, model: nil, unknown: :ignore, enforce: fals
 | `model:` | `nil` | Model class, or `true` to infer from `controller_name`, enabling the [drift guard](#the-schema-drift-guard) |
 | `unknown:` | `:ignore` | `:ignore` / `:log` / `:error` — how to treat undeclared keys |
 | `enforce:` | `false` | `false` validates lazily on first use; `true` validates in a `before_action` |
+| `desc:` | `nil` | Documentation only — becomes the operation description in [exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) |
 
 `permit_params` is **repeatable**, and **the last matching rule wins**. Contracts behave like configuration: a base controller declares a catch-all, and a subclass overrides it for specific actions.
 
@@ -185,6 +188,8 @@ Which options are legal depends on the field kind — anything else raises at cl
 | `sensitive:` | ✅ | ✅ | ✅ | Register the field name for [log redaction](#sensitive-parameters-and-log-redaction) |
 | `of:` | — | ✅ | — | Element type for an array of scalars (default `:string`) |
 | `required:` | — | ✅ | — | Arrays are optional unless this is `true` |
+| `desc:` | ✅ | ✅ | ✅ | Documentation only — the field's `description` in [exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) |
+| `example:` | ✅ | ✅ | — | Documentation only, but **validated against the field's own contract at class load**, like `default:` |
 
 ¹ `format:`, `length:`, and `normalize:` reason about characters and are **only valid on `:string` fields**. On any other type they would silently apply to an already-cast value, so declaring them raises at class load.
 
@@ -344,6 +349,49 @@ ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, 
 end
 ```
 
+## Exporting OpenAPI (docs that cannot drift)
+
+Because a contract is data, it has a third reader beyond the validator and the drift guard: an exporter that emits **OpenAPI 3.1** (whose request bodies are plain JSON Schema). The schema is generated from the same frozen data the server enforces, so — like the drift guard, pointed outward — the docs cannot lie:
+
+```sh
+bin/rails permittable:openapi                       # JSON to stdout
+bin/rails "permittable:openapi[openapi/api.json]"   # write to a file
+```
+
+The task eager-loads the app (also exercising the drift guard), collects every controller with contracts, and maps documented actions onto `paths` via the route set. `OPENAPI_TITLE` / `OPENAPI_VERSION` override the `info` block. Pipe the output through Swagger UI, Redoc, Postman, or [`openapi-typescript`](https://github.com/openapi-ts/openapi-typescript) and your frontend gets compile-time types for every request body.
+
+Or build fragments programmatically — no Rails required:
+
+```ruby
+Permittable::JsonSchema.rule(UsersController.permit_rule_for(:create))  # request-body schema
+Permittable::OpenAPI.request_body_for(UsersController, :create)         # OpenAPI requestBody object
+Permittable::OpenAPI.operations_for(UsersController)                    # { action => operation }
+Permittable::OpenAPI.document(controllers: [...], info: { "title" => "My API" })
+```
+
+How contracts map:
+
+| Contract | Emitted schema |
+|---|---|
+| `required` / `optional` | the object's `required:` array; required strings also get `minLength: 1` (`""` is absent) |
+| `:string` `:integer` `:float` `:boolean` | `string` / `integer` / `number` / `boolean` |
+| `:date` / `:datetime` | `string` + `format: date` / `date-time` |
+| `:decimal` | `type: ["string", "number"]` + `format: decimal` (string is the precision-safe encoding) |
+| `in:` Array / numeric Range | `enum` / `minimum` + `maximum` (exclusive ends honoured) |
+| `length:` | `minLength`/`maxLength` on strings, `minItems`/`maxItems` on arrays |
+| `format:` | `pattern`, with `\A`/`\z` translated to `^`/`$` |
+| `default:` / `desc:` / `example:` | `default` / `description` / `examples` |
+| nested block / `array` | `object` + `properties` / `array` + `items` |
+| `unknown: :error` | `additionalProperties: false`, at every nesting level |
+| `root:` | the wrapping object, itself required |
+| `sensitive: true` | `writeOnly: true` (never echoed in responses) |
+
+Every operation references shared components for the [error envelope](#violations-and-error-responses): a `422` response always, plus a `400` when the contract declares a `root:`. So consumers get typed *errors*, not just typed inputs.
+
+**What is honestly unrepresentable stays visible instead of guessed.** A `format:` regexp using a Ruby-only construct (or flags) is exported as `x-permittable-pattern` rather than a mistranslated `pattern`; `validate:`/`transform:` are flagged `x-permittable-custom-validation`/`x-permittable-transformed`; actions covered only by a catch-all rule on a plain-Ruby host appear under `"*"` with `x-permittable-catch-all`; operations with no matching route land in `x-permittable-controllers` instead of being dropped. The schema documents the canonical JSON encoding — the runtime additionally accepts string-encoded scalars (`"42"`, `"true"`) for form/query payloads.
+
+Output is deterministic (fixed key order, declaration-order properties), so the generated file can be committed and reviewed as a diff — a contract change shows up in the same PR as its documentation change.
+
 ## API reference
 
 ### Instance methods
@@ -369,6 +417,8 @@ end
 | `Permittable.filter_parameter_registry` | The live registry of `sensitive:` field names |
 | `Permittable.filter_parameter_registry=` | Swap in your own duck-typed registry |
 | `Permittable::InvalidParameters` | Raised on violation; carries `#details` and `#status` |
+| `Permittable::JsonSchema` | Contract data → JSON Schema fragments (`.rule`, `.object`, `.field`) |
+| `Permittable::OpenAPI` | OpenAPI 3.1 assembly (`.document`, `.operations_for`, `.request_body_for`, `.components`) |
 
 ## Errors caught at class load
 
@@ -381,7 +431,7 @@ A bad contract is a programmer error, so it fails when the class loads — never
 - `format:`, `length:`, or `normalize:` on a non-`:string` field
 - `length:` that isn't a `Range` or `Integer`; `in:` that doesn't respond to `include?`
 - `validate:` or `transform:` that isn't callable
-- A `default:` that violates its own field's contract, or an array `default:` whose elements violate `of:`
+- A `default:` or `example:` that violates its own field's contract, or an array `default:`/`example:` whose elements violate `of:`
 - `required: true` combined with `default:`
 - A field given both a type and a nested block; an array given both `of:` and a block
 - An empty contract, or a nested block declaring no sub-fields
@@ -404,7 +454,7 @@ Using [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails)? `Concer
 
 ```sh
 bundle install
-bundle exec rspec      # 76 examples
+bundle exec rspec      # 104 examples
 bundle exec rubocop
 ```
 
