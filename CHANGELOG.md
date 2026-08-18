@@ -1,5 +1,16 @@
 <!-- CHANGELOG.md -->
 
+## 0.2.0 (2026-08-16)
+<!-- title: OpenAPI export -->
+
+Contracts gain a third reader. The registry that already drives the validator and the schema-drift guard now also generates **OpenAPI 3.1** — because the schema is emitted from the same frozen data the server enforces, the docs cannot drift from the validation. Fully additive; no behaviour of existing contracts changes.
+
+### Added
+- **`Permittable::JsonSchema`** — converts rules and fields into JSON Schema (draft 2020-12): types map onto their canonical JSON encodings (`:decimal` as `["string", "number"]` + `format: decimal`), `in:` → `enum`/`minimum`/`maximum`, `length:` → `minLength`/`maxLength` or `minItems`/`maxItems`, `format:` → `pattern` with `\A`/`\z` translated to `^`/`$`, `default:` → `default`, `unknown: :error` → `additionalProperties: false` at every level, `root:` → a required wrapper object, `sensitive:` → `writeOnly: true`. Required strings get `minLength: 1` (`""` is absent). What has no ECMA/JSON-Schema equivalent stays visible instead of guessed: Ruby-only or flagged regexps export as `x-permittable-pattern`, `validate:`/`transform:` as `x-permittable-custom-validation`/`x-permittable-transformed`, non-numeric Ranges as `x-permittable-range`. Emission is deterministic, so generated documents are committable and diff-stable.
+- **`Permittable::OpenAPI`** — assembles full OpenAPI 3.1 documents (`.document`) and fragments (`.request_body_for`, `.operations_for`, `.components`) from any set of controllers, plain Ruby, no Rails required. Operations resolve through `permit_rule_for`, so last-matching-rule-wins holds in the docs exactly as at request time; every operation references shared components typing the 422 (and, for rooted contracts, 400) error envelope. Catch-all rules expand through `action_methods` (the concern's own public methods excluded) or surface as `"*"` + `x-permittable-catch-all`; unrouted operations land in `x-permittable-controllers` rather than being dropped.
+- **`bin/rails permittable:openapi[output]`** — rake task (loaded by the Railtie) that eager-loads the app, collects every controller with contracts, maps actions onto `paths` via the route set (`:id` → `{id}`), and prints or writes the document. `OPENAPI_TITLE`/`OPENAPI_VERSION` override the `info` block.
+- **`desc:` and `example:` field options, `desc:` on `permit_params`** — documentation passthrough carried on the frozen contract data and ignored by the runtime. An `example:` is validated against its own field's contract at class load, exactly like `default:`, so published examples can't lie either.
+
 ## 0.1.2 (2026-08-16)
 <!-- title: gem metadata -->
 
