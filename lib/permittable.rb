@@ -63,6 +63,21 @@ require "permittable/filter_parameter_registry"
 # action that never reads params never pays. `enforce: true` installs the
 # check as a before_action instead (reject before the action body runs).
 #
+# MONITOR MODE — the rollout switch. `mode: :monitor` on a rule (or
+# `Permittable.mode = :monitor` app-wide; a rule's own mode: wins) runs the
+# full pipeline but REPORTS violations instead of rejecting: the same
+# "invalid_parameters.permittable" event fires (payload mode: :monitor),
+# the logger warns, and permitted_params returns the raw params passed
+# through untouched — no casts, no defaults, no transforms — so behaviour
+# is identical to the pre-contract app (a missing root: passes an empty
+# hash; a rootless contract drops only the router's bookkeeping keys).
+# Monitor rules validate eagerly in the before_action regardless of
+# enforce:, because telemetry must not depend on the action calling
+# permitted_params — legacy actions still reading `params` directly are
+# exactly the ones being monitored — and monitoring can never halt the
+# request. `permittable_violations` reads the recorded details ([] when
+# the request was clean).
+#
 # Coercion is deliberately STRICT — ActiveModel::Type is not used, because its
 # casts are lenient by design ("abc".to_i == 0, Boolean.cast("abc") == true)
 # and silently corrupting untrusted input is exactly what a contract must not
@@ -119,6 +134,7 @@ module Permittable
   LABEL = "Permittable".freeze
   SCALAR_TYPES = %i[string integer float decimal boolean date datetime].freeze
   UNKNOWN_MODES = %i[ignore log error].freeze
+  MODES = %i[enforce monitor].freeze
   # Rails merges routing bookkeeping into params; a top-level (root: false)
   # unknown-keys check must not flag them.
   ROUTING_KEYS = %w[controller action format].freeze
@@ -144,6 +160,26 @@ module Permittable
     end
 
     attr_writer :filter_parameter_registry
+
+    # App-wide default for rules that don't declare their own mode:.
+    # :enforce (the default) rejects violating requests; :monitor reports
+    # them — same instrumentation event with payload mode: :monitor, plus a
+    # logger.warn — and lets the request proceed with the raw params passed
+    # through. This is the rollout switch for brownfield adoption: set it
+    # from an initializer (Permittable.mode =
+    # ENV.fetch("PERMITTABLE_MODE", "enforce").to_sym) and flip controllers
+    # to their final mode one at a time, since a rule's own mode: always
+    # wins over this default.
+    def mode
+      @mode || :enforce
+    end
+
+    def mode=(value)
+      value = value.to_sym
+      raise ArgumentError, "#{LABEL}: mode must be one of #{MODES.join(', ')}" unless MODES.include?(value)
+
+      @mode = value
+    end
   end
 
   # Raised when the request violates the matching contract. `details` is an
@@ -564,13 +600,22 @@ module Permittable
     #            undeclared keys, at every nesting level.
     #   enforce: false (default) validates lazily on the first
     #            permitted_params call; true validates in a before_action.
+    #   mode:    nil (default) follows Permittable.mode; :enforce rejects
+    #            violating requests; :monitor reports them and passes the
+    #            raw params through (see MONITOR MODE in the module
+    #            comment).
     #   desc:    documentation only — carried on the rule for exporters
     #            (Permittable::OpenAPI); the runtime never reads it.
-    def permit_params(*actions, root: false, model: nil, unknown: :ignore, enforce: false, desc: nil, &block)
+    def permit_params(*actions, root: false, model: nil, unknown: :ignore, enforce: false, mode: nil, desc: nil, &block)
       raise ArgumentError, "#{LABEL}: permit_params requires a block declaring the contract fields" unless block
 
       unknown = unknown.to_sym
       raise ArgumentError, "#{LABEL}: :unknown must be one of #{UNKNOWN_MODES.join(', ')}" unless UNKNOWN_MODES.include?(unknown)
+
+      mode = mode&.to_sym
+      if mode && !MODES.include?(mode)
+        raise ArgumentError, "#{LABEL}: :mode must be one of #{MODES.join(', ')}, or nil to follow Permittable.mode"
+      end
 
       builder = ContractBuilder.new
       fields = builder.build(&block)
@@ -581,7 +626,7 @@ module Permittable
       register_sensitive_params(fields)
 
       rule = { actions: actions.flatten.map(&:to_s).freeze, root: root && root.to_sym,
-               model: model_class, unknown: unknown, enforce: !!enforce, fields: fields,
+               model: model_class, unknown: unknown, enforce: !!enforce, mode: mode, fields: fields,
                finalize: builder.finalizer, desc: desc }.freeze
       self.permittable_contracts = permittable_contracts + [rule]
     end
@@ -657,19 +702,42 @@ module Permittable
     rule = self.class.permit_rule_for(action)
     raise ArgumentError, "#{LABEL}: no params contract declared covering ##{action}" unless rule
 
-    @permittable_validated[action] = validate_params_contract!(rule)
+    @permittable_validated[action] = validate_params_contract!(rule, action)
   end
 
   # before_action entry point (public so hosts can `skip_before_action
-  # :enforce_params_contract`). Only rules that opted in with
-  # `enforce: true` validate here.
+  # :enforce_params_contract`). Two kinds of rule validate here: those that
+  # opted in with `enforce: true`, and monitor-mode rules — monitoring must
+  # not depend on the action calling permitted_params (legacy actions still
+  # reading `params` directly are exactly the ones being monitored), and it
+  # can never halt the request because monitor mode never raises.
   def enforce_params_contract
     action = permittable_action_name
     return nil unless action
 
     rule = self.class.permit_rule_for(action)
-    permitted_params(action) if rule && rule[:enforce]
+    permitted_params(action) if rule && (rule[:enforce] || permittable_mode(rule) == :monitor)
     nil
+  end
+
+  # The violation details recorded by validating `action` (default: the
+  # current action) — [] when the request satisfied the contract. Triggers
+  # the same memoized validation as permitted_params, so under monitor mode
+  # this is the request-level observable ("what would have been
+  # rejected?"); under enforce mode it swallows the raise and hands back
+  # the details, which makes "would this request fail?" a one-liner in
+  # tests.
+  def permittable_violations(action = nil)
+    action = (action || permittable_action_name).to_s
+    @permittable_violations ||= {}
+    unless @permittable_violations.key?(action)
+      begin
+        permitted_params(action)
+      rescue InvalidParameters
+        # validation recorded the details before raising
+      end
+    end
+    @permittable_violations.fetch(action)
   end
 
   # rescue_from target — renders through the shared envelope (the host's
@@ -683,7 +751,7 @@ module Permittable
 
   private
 
-  def validate_params_contract!(rule)
+  def validate_params_contract!(rule, action)
     violations = []
     source = permittable_root_hash(rule, violations)
     result = ActiveSupport::HashWithIndifferentAccess.new
@@ -693,19 +761,53 @@ module Permittable
     end
     # finalize only sees a hash every field vouched for — never garbage.
     result = permittable_run_finalize(rule[:finalize], result, violations) if violations.empty? && rule[:finalize]
+    violations.each(&:freeze)
+    (@permittable_violations ||= {})[action] = violations.freeze
     return result if violations.empty?
+    return permittable_monitor_pass_through(rule, source, violations) if permittable_mode(rule) == :monitor
 
     raise_invalid_parameters!(violations, status: source ? :unprocessable_entity : :bad_request)
   end
 
+  # A rule's own mode: wins; otherwise the app-wide Permittable.mode.
+  def permittable_mode(rule)
+    rule[:mode] || Permittable.mode
+  end
+
+  # Monitor mode's violation path: emit the same instrumentation event the
+  # enforce path does (payload mode: :monitor) plus a warn line, then hand
+  # back exactly what the client sent — no casts, no defaults, no
+  # transforms — so behaviour is identical to the pre-contract app. A
+  # missing root: passes an empty hash through (the envelope you asked for
+  # isn't there); a rootless contract drops only the router's bookkeeping
+  # keys, mirroring their exemption from the unknown-keys check.
+  def permittable_monitor_pass_through(rule, source, violations)
+    permittable_instrument_violations(violations, mode: :monitor)
+    if respond_to?(:logger) && logger
+      logger.warn("#{LABEL}: [monitor] ##{permittable_action_name} would have been rejected: " \
+                  "#{permittable_violation_summary(violations)}")
+    end
+    return ActiveSupport::HashWithIndifferentAccess.new unless source
+
+    passed = ActiveSupport::HashWithIndifferentAccess.new(source)
+    rule[:root] ? passed : passed.except(*ROUTING_KEYS)
+  end
+
   def raise_invalid_parameters!(violations, status:)
-    violations.each(&:freeze)
+    permittable_instrument_violations(violations, mode: :enforce)
+    raise InvalidParameters.new("Invalid parameters: #{permittable_violation_summary(violations)}",
+                                details: violations, status: status)
+  end
+
+  def permittable_instrument_violations(violations, mode:)
     ActiveSupport::Notifications.instrument(
       "invalid_parameters.permittable",
-      controller: permittable_controller_name, action: permittable_action_name, details: violations
+      controller: permittable_controller_name, action: permittable_action_name, details: violations, mode: mode
     )
-    summary = violations.map { |v| v[:message] ? "#{v[:param]} #{v[:message]}" : "#{v[:param]} (#{v[:code]})" }.join(", ")
-    raise InvalidParameters.new("Invalid parameters: #{summary}", details: violations, status: status)
+  end
+
+  def permittable_violation_summary(violations)
+    violations.map { |v| v[:message] ? "#{v[:param]} #{v[:message]}" : "#{v[:param]} (#{v[:code]})" }.join(", ")
   end
 
   # One violation detail entry. A field's `message:` (String, or Hash keyed
