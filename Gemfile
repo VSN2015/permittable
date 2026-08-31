@@ -14,5 +14,5 @@ gem "simplecov", "~> 1.1"
 gem "sqlite3", "~> 2.9.4"
 
 group :development, :test do
-  gem 'rubocop', '~> 1.87', require: false
+  gem 'rubocop', '~> 1.90', require: false
 end
