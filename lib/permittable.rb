@@ -313,9 +313,9 @@ module Permittable
   # declaration is validated eagerly: a bad contract is a programmer error and
   # should fail at class load, not at request time.
   class ContractBuilder
-    SCALAR_OPTS = %i[in format length default normalize validate virtual sensitive transform message].freeze
-    NESTED_OPTS = %i[virtual sensitive message].freeze
-    ARRAY_OPTS  = %i[of length default validate virtual sensitive required transform message].freeze
+    SCALAR_OPTS = %i[in format length default normalize validate virtual sensitive transform message desc example].freeze
+    NESTED_OPTS = %i[virtual sensitive message desc].freeze
+    ARRAY_OPTS  = %i[of length default validate virtual sensitive required transform message desc example].freeze
 
     attr_reader :finalizer
 
@@ -368,7 +368,8 @@ module Permittable
       validate_length!(name, field[:length]) if field.key?(:length)
       validate_callable!(name, :validate, field[:validate]) if field.key?(:validate)
       validate_callable!(name, :transform, field[:transform]) if field.key?(:transform)
-      validate_array_default!(field) if field.key?(:default)
+      validate_array_authored_value!(field, :default) if field.key?(:default)
+      validate_array_authored_value!(field, :example) if field.key?(:example)
       validate_message!(field)
       @fields << field
     end
@@ -442,7 +443,8 @@ module Permittable
       validate_callable!(name, :validate, field[:validate]) if field.key?(:validate)
       validate_callable!(name, :transform, field[:transform]) if field.key?(:transform)
       resolve_normalizer!(field)
-      validate_default!(field)
+      validate_authored_value!(field, :default)
+      validate_authored_value!(field, :example)
       validate_message!(field)
     end
 
@@ -481,27 +483,28 @@ module Permittable
       end
     end
 
-    # A default must satisfy the field's own contract — catching a bad
-    # default at class load beats shipping it to every request.
-    def validate_default!(field)
-      return unless field.key?(:default)
+    # An authored value (`default:`, or a documentation `example:`) must
+    # satisfy the field's own contract — catching a lie at class load beats
+    # shipping it to every request (or publishing it in generated docs).
+    def validate_authored_value!(field, opt)
+      return unless field.key?(opt)
 
-      status, code = Coercion.check_scalar(field, field[:default])
+      status, code = Coercion.check_scalar(field, field[opt])
       return if status == :ok
 
-      raise ArgumentError, "#{LABEL}: :default for field :#{field[:name]} violates its own contract (#{code})"
+      raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{code})"
     end
 
-    def validate_array_default!(field)
-      default = field[:default]
-      raise ArgumentError, "#{LABEL}: :default for array :#{field[:name]} must be an Array" unless default.is_a?(Array)
+    def validate_array_authored_value!(field, opt)
+      value = field[opt]
+      raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} must be an Array" unless value.is_a?(Array)
       return unless field[:of]
 
-      default.each do |element|
+      value.each do |element|
         status, code = Coercion.cast(field[:of], element)
         next if status == :ok
 
-        raise ArgumentError, "#{LABEL}: :default for array :#{field[:name]} contains an element violating of: :#{field[:of]} (#{code})"
+        raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} contains an element violating of: :#{field[:of]} (#{code})"
       end
     end
 
@@ -561,7 +564,9 @@ module Permittable
     #            undeclared keys, at every nesting level.
     #   enforce: false (default) validates lazily on the first
     #            permitted_params call; true validates in a before_action.
-    def permit_params(*actions, root: false, model: nil, unknown: :ignore, enforce: false, &block)
+    #   desc:    documentation only — carried on the rule for exporters
+    #            (Permittable::OpenAPI); the runtime never reads it.
+    def permit_params(*actions, root: false, model: nil, unknown: :ignore, enforce: false, desc: nil, &block)
       raise ArgumentError, "#{LABEL}: permit_params requires a block declaring the contract fields" unless block
 
       unknown = unknown.to_sym
@@ -577,7 +582,7 @@ module Permittable
 
       rule = { actions: actions.flatten.map(&:to_s).freeze, root: root && root.to_sym,
                model: model_class, unknown: unknown, enforce: !!enforce, fields: fields,
-               finalize: builder.finalizer }.freeze
+               finalize: builder.finalizer, desc: desc }.freeze
       self.permittable_contracts = permittable_contracts + [rule]
     end
 
@@ -873,5 +878,11 @@ module Permittable
   end
 end
 
-# Boot-time integration (filter_parameters registration), Rails apps only
+# Contract exporters — the other readers of the frozen contract registry.
+# Loaded after the module body so OpenAPI can see the concern's own methods.
+require "permittable/json_schema"
+require "permittable/open_api"
+
+# Boot-time integration (filter_parameters registration, the
+# permittable:openapi rake task), Rails apps only
 require "permittable/railtie" if defined?(Rails::Railtie)
