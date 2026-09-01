@@ -54,7 +54,7 @@ A violating request never reaches your action:
 - [Violations and error responses](#violations-and-error-responses) · [Custom error messages](#custom-error-messages-message) · [Unknown parameters](#unknown-parameters)
 - [Output reshaping](#output-reshaping-transform-and-finalize) · [The schema-drift guard](#the-schema-drift-guard)
 - [Sensitive parameters](#sensitive-parameters-and-log-redaction) · [Instrumentation](#instrumentation)
-- [Exporting OpenAPI](#exporting-openapi-docs-that-cannot-drift)
+- [Monitor mode](#monitor-mode-roll-out-without-rejecting) · [Exporting OpenAPI](#exporting-openapi-docs-that-cannot-drift)
 - [API reference](#api-reference) · [Errors caught at class load](#errors-caught-at-class-load) · [Compatibility](#compatibility)
 
 ---
@@ -72,6 +72,7 @@ A violating request never reaches your action:
 | Reshapes output | ❌ | ❌ | ✅ |
 | Checked against your schema at boot | ❌ | ❌ | ✅ |
 | Exports OpenAPI / JSON Schema | ❌ | ❌ | ✅ |
+| Report-only rollout mode | ❌ | ❌ | ✅ |
 
 The design rests on one idea: **a contract is data, not code.** It is declared once at the class level, frozen, inheritable, and introspectable. Everything else here follows from that — the drift guard can read it at boot, `finalize` can run on a bare object with no controller state, and the whole contract can be printed or tested without a request.
 
@@ -108,10 +109,12 @@ params
 
 Validation is **lazy by default**: it runs on the first `permitted_params` call, so an action that never reads params never pays for it. Pass `enforce: true` to run it in a `before_action` instead, rejecting bad requests before the action body executes. Results are **memoized per action**.
 
+In [monitor mode](#monitor-mode-roll-out-without-rejecting) the same flow runs, but a violation is reported instead of raised and the request proceeds with the raw params passed through.
+
 ## Declaring a contract
 
 ```ruby
-permit_params(*actions, root: false, model: nil, unknown: :ignore, enforce: false, desc: nil, &contract)
+permit_params(*actions, root: false, model: nil, unknown: :ignore, enforce: false, mode: nil, desc: nil, &contract)
 ```
 
 | Option | Default | Meaning |
@@ -121,6 +124,7 @@ permit_params(*actions, root: false, model: nil, unknown: :ignore, enforce: fals
 | `model:` | `nil` | Model class, or `true` to infer from `controller_name`, enabling the [drift guard](#the-schema-drift-guard) |
 | `unknown:` | `:ignore` | `:ignore` / `:log` / `:error` — how to treat undeclared keys |
 | `enforce:` | `false` | `false` validates lazily on first use; `true` validates in a `before_action` |
+| `mode:` | `nil` | `nil` follows `Permittable.mode`; `:monitor` reports violations instead of rejecting — see [monitor mode](#monitor-mode-roll-out-without-rejecting) |
 | `desc:` | `nil` | Documentation only — becomes the operation description in [exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) |
 
 `permit_params` is **repeatable**, and **the last matching rule wins**. Contracts behave like configuration: a base controller declares a catch-all, and a subclass overrides it for specific actions.
@@ -383,6 +387,47 @@ ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, 
 end
 ```
 
+## Monitor mode (roll out without rejecting)
+
+Adopting contracts on a live API — or tightening one field on an existing contract — has a chicken-and-egg problem: you cannot know what the 422s would break until you enforce them, and you dare not enforce them until you know. Old mobile app versions, third-party integrations, and forgotten cron jobs all send what they send. `mode: :monitor` resolves it: the full pipeline runs (unwrap, cast, validate, defaults), but a violation is **reported instead of rejected** and the request proceeds exactly as it did before the contract existed.
+
+```ruby
+class OrdersController < ApplicationController
+  permit_params :create, root: :order, mode: :monitor do
+    required :sku,      :string
+    optional :quantity, :integer, in: 1..99
+  end
+
+  # The action doesn't have to change while monitoring — it can keep reading
+  # params the old way; the contract validates in the before_action.
+end
+```
+
+Or flip the whole app at once and pin controllers to their final mode one at a time — a rule's own `mode:` always beats the global, in both directions:
+
+```ruby
+# config/initializers/permittable.rb
+Permittable.mode = ENV.fetch("PERMITTABLE_MODE", "enforce").to_sym
+```
+
+On a violating request in monitor mode:
+
+- **Nothing raises and nothing renders** — the action runs.
+- The [`invalid_parameters.permittable` event](#instrumentation) fires with `mode: :monitor` in the payload (enforced violations carry `mode: :enforce`), and the logger warns with the offending paths. Point your existing subscriber at a dashboard and you have a per-controller rollout report.
+- `permitted_params` returns the **raw pass-through**: exactly what the client sent, untouched — no casts, no defaults, no transforms. A missing `root:` passes an empty hash (the envelope you asked for isn't there); a rootless contract drops only Rails' routing keys.
+- `permittable_violations` returns the recorded details (`[]` when the request was clean), if the action wants to branch on or tag the traffic.
+
+Monitor-mode rules validate **eagerly in the `before_action`, regardless of `enforce:`** — telemetry must not depend on the action calling `permitted_params`, since legacy actions still reading `params` directly are exactly the ones worth monitoring. (On a plain-Ruby host without `before_action`, validation stays lazy.)
+
+The rollout recipe:
+
+1. Write contracts for a legacy controller. The action code stays as-is.
+2. Deploy with `PERMITTABLE_MODE=monitor`. Behaviour is unchanged; telemetry starts.
+3. Watch the dashboard. Every entry is a real client that would have been rejected — fix the contract, or wait for that traffic to drain.
+4. Flip to enforce, controller by controller. Every 422 you now return is one you already counted.
+
+[Exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) marks operations whose rule declares `mode: :monitor` with `x-permittable-mode: "monitor"` — the docs shouldn't promise a 422 the server doesn't yet send. Only the per-rule declaration is exported: the global `Permittable.mode` is runtime configuration, not contract data.
+
 ## Exporting OpenAPI (docs that cannot drift)
 
 Because a contract is data, it has a third reader beyond the validator and the drift guard: an exporter that emits **OpenAPI 3.1** (whose request bodies are plain JSON Schema). The schema is generated from the same frozen data the server enforces, so — like the drift guard, pointed outward — the docs cannot lie:
@@ -422,7 +467,7 @@ How contracts map:
 
 Every operation references shared components for the [error envelope](#violations-and-error-responses): a `422` response always, plus a `400` when the contract declares a `root:`. So consumers get typed *errors*, not just typed inputs.
 
-**What is honestly unrepresentable stays visible instead of guessed.** A `format:` regexp using a Ruby-only construct (or flags) is exported as `x-permittable-pattern` rather than a mistranslated `pattern`; `validate:`/`transform:` are flagged `x-permittable-custom-validation`/`x-permittable-transformed`; actions covered only by a catch-all rule on a plain-Ruby host appear under `"*"` with `x-permittable-catch-all`; operations with no matching route land in `x-permittable-controllers` instead of being dropped. The schema documents the canonical JSON encoding — the runtime additionally accepts string-encoded scalars (`"42"`, `"true"`) for form/query payloads.
+**What is honestly unrepresentable stays visible instead of guessed.** A `format:` regexp using a Ruby-only construct (or flags) is exported as `x-permittable-pattern` rather than a mistranslated `pattern`; `validate:`/`transform:` are flagged `x-permittable-custom-validation`/`x-permittable-transformed`; actions covered only by a catch-all rule on a plain-Ruby host appear under `"*"` with `x-permittable-catch-all`; operations whose rule runs in [monitor mode](#monitor-mode-roll-out-without-rejecting) carry `x-permittable-mode: "monitor"`; operations with no matching route land in `x-permittable-controllers` instead of being dropped. The schema documents the canonical JSON encoding — the runtime additionally accepts string-encoded scalars (`"42"`, `"true"`) for form/query payloads.
 
 Output is deterministic (fixed key order, declaration-order properties), so the generated file can be committed and reviewed as a diff — a contract change shows up in the same PR as its documentation change.
 
@@ -432,8 +477,9 @@ Output is deterministic (fixed key order, declaration-order properties), so the 
 
 | Method | Purpose |
 |---|---|
-| `permitted_params(action = action_name)` | The cast, validated, defaulted `HashWithIndifferentAccess`. Memoized per action. Raises `InvalidParameters` on violation, or `ArgumentError` when no contract covers the action |
-| `enforce_params_contract` | The `before_action` entry point. Only validates rules declared `enforce: true`. Public, so hosts can `skip_before_action` it |
+| `permitted_params(action = action_name)` | The cast, validated, defaulted `HashWithIndifferentAccess`. Memoized per action. Raises `InvalidParameters` on violation (in [monitor mode](#monitor-mode-roll-out-without-rejecting), returns the raw pass-through instead), or `ArgumentError` when no contract covers the action |
+| `permittable_violations(action = action_name)` | The violation details recorded by validating `action` — `[]` when clean. Triggers the same memoized validation; under enforce it swallows the raise, making "would this request fail?" a one-liner |
+| `enforce_params_contract` | The `before_action` entry point. Validates rules declared `enforce: true` and all [monitor-mode](#monitor-mode-roll-out-without-rejecting) rules. Public, so hosts can `skip_before_action` it |
 | `render_invalid_parameters(error)` | The `rescue_from` target. Renders via the host's `render_error` when defined, the inline envelope otherwise |
 
 ### Class methods
@@ -450,6 +496,7 @@ Output is deterministic (fixed key order, declaration-order properties), so the 
 |---|---|
 | `Permittable.filter_parameter_registry` | The live registry of `sensitive:` field names |
 | `Permittable.filter_parameter_registry=` | Swap in your own duck-typed registry |
+| `Permittable.mode` / `Permittable.mode=` | App-wide default (`:enforce`) for rules that don't declare their own `mode:` |
 | `Permittable::InvalidParameters` | Raised on violation; carries `#details` and `#status` |
 | `Permittable::JsonSchema` | Contract data → JSON Schema fragments (`.rule`, `.object`, `.field`) |
 | `Permittable::OpenAPI` | OpenAPI 3.1 assembly (`.document`, `.operations_for`, `.request_body_for`, `.components`) |
@@ -471,6 +518,7 @@ A bad contract is a programmer error, so it fails when the class loads — never
 - An empty contract, or a nested block declaring no sub-fields
 - `finalize` declared twice, without a block, or inside a nested block
 - `permit_params` without a block, or an invalid `unknown:` mode
+- An invalid `mode:` (and `Permittable.mode =` rejects invalid values at assignment)
 - A `model:` that isn't an ActiveRecord class, or `model: true` that can't be inferred
 
 ## Compatibility
@@ -488,7 +536,7 @@ Using [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails)? `Concer
 
 ```sh
 bundle install
-bundle exec rspec      # 112 examples
+bundle exec rspec      # 125 examples
 bundle exec rubocop
 ```
 

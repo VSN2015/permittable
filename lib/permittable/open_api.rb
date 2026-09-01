@@ -135,6 +135,10 @@ module Permittable
       operation["description"] = rule[:desc] if rule[:desc]
       operation["requestBody"] = rule_request_body(rule)
       operation["responses"] = responses_for(rule)
+      # The docs must not promise a 422 the server doesn't yet send. Only
+      # the rule's own declaration is contract data — the app-wide
+      # Permittable.mode is runtime configuration the export can't see.
+      operation["x-permittable-mode"] = "monitor" if rule[:mode] == :monitor
       operation["x-permittable-catch-all"] = true if action == "*"
       operation
     end

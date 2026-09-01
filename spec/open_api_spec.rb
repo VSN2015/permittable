@@ -55,6 +55,14 @@ RSpec.describe Permittable::OpenAPI do
       expect(described_class.operations_for(klass)["index"]["responses"].keys).to eq(["422"])
     end
 
+    it "marks monitor-mode rules with x-permittable-mode (per-rule declaration only)" do
+      monitored = controller_class { permit_params(:create, mode: :monitor) { required :name, :string } }
+      expect(described_class.operations_for(monitored)["create"]["x-permittable-mode"]).to eq("monitor")
+
+      enforced = controller_class { permit_params(:create) { required :name, :string } }
+      expect(described_class.operations_for(enforced)["create"]).not_to have_key("x-permittable-mode")
+    end
+
     it "resolves each action through permit_rule_for, so the last matching rule wins" do
       klass = controller_class do
         permit_params { optional :anything, :string }

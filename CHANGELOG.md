@@ -1,5 +1,18 @@
 <!-- CHANGELOG.md -->
 
+## 0.4.0 (2026-08-24)
+<!-- title: monitor mode -->
+
+The rollout switch. Adopting contracts on a live API — or tightening an existing one — used to mean flipping unknown clients from "accepted" to "422" in a single deploy. A contract can now run in **monitor mode**: the full pipeline executes (unwrap, cast, validate, defaults), but a violation is **reported instead of rejected** and the request proceeds exactly as it did before the contract existed. Deploy monitoring, dashboard the would-be rejections, then enforce controller by controller — every 422 you finally return is one you already counted.
+
+### Added
+- **`mode: :monitor` on `permit_params`, and an app-wide `Permittable.mode` default** (`:enforce` unless set; a rule's own `mode:` always wins, in both directions). On a violating request in monitor mode nothing raises and nothing renders: the `invalid_parameters.permittable` event fires with `mode: :monitor`, the logger warns with the offending paths, and `permitted_params` returns the **raw pass-through** — exactly what the client sent, no casts, no defaults, no transforms (a missing `root:` passes an empty hash; a rootless contract drops only the router's bookkeeping keys). Monitor rules validate **eagerly in the `before_action` regardless of `enforce:`**, so telemetry never depends on the action calling `permitted_params` — legacy actions still reading `params` directly are exactly the ones being monitored.
+- **`permittable_violations(action = nil)`** — the recorded violation details for the (memoized) validation of `action`, `[]` when the request was clean. The monitor-mode observable; under enforce it swallows its own trigger's raise, making "would this request fail?" a one-liner in tests.
+- **`mode:` key on the `invalid_parameters.permittable` payload** (`:enforce` / `:monitor`), so one subscriber can dashboard enforced rejections and monitored would-be rejections side by side. Additive — existing subscribers are unaffected.
+- **`x-permittable-mode: "monitor"`** on exported OpenAPI operations whose rule declares monitor mode — the docs must not promise a 422 the server doesn't yet send. Only the per-rule declaration is exported; the app-wide `Permittable.mode` is runtime configuration, not contract data.
+
+Contracts that don't opt in are byte-for-byte unaffected: the default mode is `:enforce` and the enforce path behaves exactly as before.
+
 ## 0.3.0 (2026-08-24)
 <!-- title: OpenAPI export -->
 

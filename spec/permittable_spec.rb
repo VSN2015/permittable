@@ -589,6 +589,7 @@ RSpec.describe Permittable do
       expect(events.length).to eq(1)
       expect(events.first[:action]).to eq("create")
       expect(events.first[:details]).to eq([{ param: "name", code: "missing" }])
+      expect(events.first[:mode]).to eq(:enforce)
     end
 
     it "renders the shared error envelope from render_invalid_parameters" do
@@ -602,6 +603,141 @@ RSpec.describe Permittable do
       expect(c.rendered[:status]).to eq(:unprocessable_entity)
       expect(c.rendered[:json][:error][:code]).to eq("invalid_parameters")
       expect(c.rendered[:json][:error][:details]).to eq([{ param: "name", code: "missing" }])
+    end
+  end
+
+  describe "monitor mode" do
+    after { Permittable.mode = :enforce }
+
+    def recording_notifications
+      events = []
+      subscription = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
+        events << payload
+      end
+      begin
+        yield
+      ensure
+        ActiveSupport::Notifications.unsubscribe(subscription)
+      end
+      events
+    end
+
+    it "rejects an unknown :mode at class load, and an unknown global mode at assignment" do
+      expect { permittable_class { permit_params(:create, mode: :report) { required :a } } }
+        .to raise_error(ArgumentError, /:mode must be one of enforce, monitor/)
+      expect { Permittable.mode = :report }
+        .to raise_error(ArgumentError, /mode must be one of enforce, monitor/)
+      expect(Permittable.mode).to eq(:enforce)
+    end
+
+    it "returns the cast, defaulted result when the request is clean — identical to enforce" do
+      result = permit({ user: { name: "Jo", age: "30" } }) do
+        permit_params(:create, root: :user, mode: :monitor) do
+          required :name, :string
+          optional :age,  :integer
+          optional :plan, :string, default: "free"
+        end
+      end
+      expect(result.to_h).to eq("name" => "Jo", "age" => 30, "plan" => "free")
+    end
+
+    it "reports a violation instead of raising and passes the raw root through untouched" do
+      klass = permittable_class do
+        permit_params(:create, root: :user, mode: :monitor) do
+          required :name, :string
+          optional :age,  :integer, in: 18..120, transform: ->(v) { v * 2 }
+          optional :plan, :string, default: "free"
+        end
+      end
+      c = controller(klass, params: { user: { name: "Jo", age: "7" } })
+      result = nil
+      expect { result = c.permitted_params }.not_to raise_error
+      # Raw pass-through: no cast, no default, no transform.
+      expect(result.to_h).to eq("name" => "Jo", "age" => "7")
+      expect(c.permittable_violations).to eq([{ param: "user.age", code: "inclusion" }])
+    end
+
+    it "instruments with mode: :monitor and warns through the logger" do
+      klass = permittable_class { permit_params(:create, mode: :monitor) { required :name, :string } }
+      c = controller(klass, params: {})
+      messages = []
+      logger = Object.new
+      logger.define_singleton_method(:warn) { |msg| messages << msg }
+      c.define_singleton_method(:logger) { logger }
+
+      events = recording_notifications { c.permitted_params }
+      expect(events.length).to eq(1)
+      expect(events.first[:mode]).to eq(:monitor)
+      expect(events.first[:details]).to eq([{ param: "name", code: "missing" }])
+      expect(messages.join).to match(/\[monitor\] #create would have been rejected: name \(missing\)/)
+    end
+
+    it "passes an empty hash through when the root: key is missing" do
+      klass = permittable_class { permit_params(:create, root: :user, mode: :monitor) { required :name, :string } }
+      c = controller(klass, params: { unrelated: "x" })
+      expect(c.permitted_params.to_h).to eq({})
+      expect(c.permittable_violations).to eq([{ param: "user", code: "missing" }])
+    end
+
+    it "drops only the router's bookkeeping keys from a rootless pass-through" do
+      klass = permittable_class { permit_params(:create, mode: :monitor) { required :name, :string } }
+      c = controller(klass, params: { controller: "users", action: "create", extra: "kept" })
+      expect(c.permitted_params.to_h).to eq("extra" => "kept")
+    end
+
+    it "follows Permittable.mode when the rule declares no mode, and a rule's own mode: wins both ways" do
+      Permittable.mode = :monitor
+      follows = permittable_class { permit_params(:create) { required :name, :string } }
+      expect { controller(follows, params: {}).permitted_params }.not_to raise_error
+
+      overrides = permittable_class { permit_params(:create, mode: :enforce) { required :name, :string } }
+      expect { controller(overrides, params: {}).permitted_params }
+        .to raise_error(described_class::InvalidParameters)
+
+      Permittable.mode = :enforce
+      monitored = permittable_class { permit_params(:create, mode: :monitor) { required :name, :string } }
+      expect { controller(monitored, params: {}).permitted_params }.not_to raise_error
+    end
+
+    it "enforce_params_contract validates monitor rules eagerly, without enforce: true" do
+      klass = permittable_class { permit_params(:create, mode: :monitor) { required :name, :string } }
+      c = controller(klass, params: {})
+      events = recording_notifications { expect { c.enforce_params_contract }.not_to raise_error }
+      expect(events.length).to eq(1)
+      expect(events.first[:mode]).to eq(:monitor)
+    end
+
+    it "memoizes the pass-through — a second read neither revalidates nor re-instruments" do
+      klass = permittable_class { permit_params(:create, mode: :monitor) { required :name, :string } }
+      c = controller(klass, params: {})
+      events = recording_notifications { expect(c.permitted_params).to equal(c.permitted_params) }
+      expect(events.length).to eq(1)
+    end
+
+    it "monitors finalize violations the same way" do
+      klass = permittable_class do
+        permit_params(:create, mode: :monitor) do
+          required :starts_on, :date
+          required :ends_on,   :date
+          finalize do |p|
+            violate!("ends_on", :before_start) if p[:ends_on] < p[:starts_on]
+            p
+          end
+        end
+      end
+      c = controller(klass, params: { starts_on: "2026-08-24", ends_on: "2026-08-01" })
+      expect { c.permitted_params }.not_to raise_error
+      expect(c.permittable_violations).to eq([{ param: "ends_on", code: "before_start" }])
+      expect(c.permitted_params.to_h).to eq("starts_on" => "2026-08-24", "ends_on" => "2026-08-01")
+    end
+
+    it "permittable_violations returns [] for a clean request, and details under enforce without re-raising" do
+      clean = permittable_class { permit_params(:create, mode: :monitor) { optional :name, :string } }
+      expect(controller(clean, params: { name: "a" }).permittable_violations).to eq([])
+
+      enforced = permittable_class { permit_params(:create) { required :name, :string } }
+      c = controller(enforced, params: {})
+      expect(c.permittable_violations).to eq([{ param: "name", code: "missing" }])
     end
   end
 
@@ -926,6 +1062,27 @@ RSpec.describe Permittable do
       end
       result = IntegrationHarness.dispatch(controller, :create, method: "POST", params: {})
       expect(result.status).to eq(400)
+    end
+
+    it "mode: :monitor lets a violating request through to the action with the raw payload" do
+      controller = IntegrationHarness.build_controller do
+        include Permittable
+
+        permit_params :create, root: :user, mode: :monitor do
+          required :name, :string
+          optional :age,  :integer, in: 18..120
+        end
+
+        def create
+          render json: { received: permitted_params, violations: permittable_violations }
+        end
+      end
+      result = IntegrationHarness.dispatch(controller, :create,
+                                           method: "POST", params: { user: { name: "Jo", age: "12" } })
+      expect(result.status).to eq(200)
+      body = JSON.parse(result.body)
+      expect(body["received"]).to eq("name" => "Jo", "age" => "12")
+      expect(body["violations"]).to eq([{ "param" => "user.age", "code" => "inclusion" }])
     end
 
     it "unknown: :error does not flag Rails' routing keys on top-level contracts" do
