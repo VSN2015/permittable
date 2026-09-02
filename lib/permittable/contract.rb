@@ -76,6 +76,17 @@ module Permittable
       @host_class.permittable_contracts.last
     end
 
+    # RSpec-matcher parity with controllers: `expect(MyContract).to
+    # permit_param(:email)` reads the registry through these. A standalone
+    # contract covers every "action", so the argument is irrelevant.
+    def permit_rule_for(_action = nil)
+      rule
+    end
+
+    def permittable_contracts
+      [rule]
+    end
+
     def call(input)
       Result.new(params: call!(input), violations: [].freeze)
     rescue InvalidParameters => e
