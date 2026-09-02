@@ -121,6 +121,14 @@ RSpec.describe "Permittable RSpec matchers" do
   it "rejects a subject that does not include Permittable" do
     expect { expect(Class.new).to permit_param(:email) }
       .to raise_error(ArgumentError, /include Permittable/)
+    expect { expect(Object.new).to permit_param(:email) }
+      .to raise_error(ArgumentError, /include Permittable/)
+  end
+
+  it "accepts a controller instance, resolving through its class" do
+    instance = controller.new(params: {})
+    expect(instance).to permit_param(:email).for_action(:create).as(:string)
+    expect(instance).not_to permit_param(:admin).for_action(:create)
   end
 
   it "fails clearly when the action has no contract at all" do

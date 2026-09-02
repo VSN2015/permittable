@@ -68,6 +68,19 @@ RSpec.describe Permittable::Generator do
       expect(scan.unparsed).to eq(["*extra_keys"])
     end
 
+    it "accepts string-keyed permit arguments, at the top level and inside nested lists" do
+      scan = described_class.scan(%q{params.require(:user).permit("name", 'age', address: ["city", :zip])})
+      expect(scan.scalars).to eq(%i[name age])
+      expect(scan.nested).to eq(address: %i[city zip])
+      expect(scan.unparsed).to eq([])
+    end
+
+    it "keeps mismatched quotes unparsed rather than guessing" do
+      scan = described_class.scan(%q{params.permit(:ok, "broken')})
+      expect(scan.scalars).to eq(%i[ok])
+      expect(scan.unparsed).not_to be_empty
+    end
+
     it "reports found? false when the source has no permit calls" do
       expect(described_class.scan("def index; end")).not_to be_found
     end
@@ -122,6 +135,21 @@ RSpec.describe Permittable::Generator do
       expect(draft).not_to include(":id")
       expect(draft).not_to include("created_at")
       expect(draft).not_to include("updated_at")
+    end
+
+    it "skips every column of a composite primary key (Rails 7.1+ returns an Array)" do
+      composite = Class.new(TestModel) do
+        self.table_name = "gen_articles"
+
+        def self.primary_key
+          %w[id views]
+        end
+      end
+      stub_const("GenCompositeArticle", composite)
+      draft = described_class.draft(model: GenCompositeArticle)
+      expect(draft).not_to include(":id")
+      expect(draft).not_to include(":views")
+      expect(draft).to include("required :title, :string")
     end
 
     it "leaves a TODO comment for columns with no scalar contract type" do

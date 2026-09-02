@@ -45,7 +45,9 @@ module Permittable
     # half-read.
     PERMIT_CALL = /params\s*(?:\.\s*require\(\s*:(\w+)\s*\))?\s*\.\s*permit\(([^()]*)\)/m
 
-    SYMBOL_ARG = /\A:(\w+)\z/
+    # A permit key: `:name`, `"name"`, or `'name'` (quotes must match —
+    # anything else stays unparsed rather than guessed).
+    SCALAR_KEY = /\A(?::(\w+)|"(\w+)"|'(\w+)')\z/
     ARRAY_ARG  = /\A(\w+):\s*\[\s*\]\z/m
     NESTED_ARG = /\A(\w+):\s*\[([^\[\]]*)\]\z/m
 
@@ -97,7 +99,9 @@ module Permittable
       return nil unless model.respond_to?(:columns)
       return nil unless model.table_exists?
 
-      skipped = SKIPPED_COLUMNS + [model.primary_key].compact
+      # Array() flattens a composite primary key (an Array in Rails 7.1+)
+      # into its column names; a nil primary key becomes [].
+      skipped = SKIPPED_COLUMNS + Array(model.primary_key).map(&:to_s)
       model.columns.reject { |c| skipped.include?(c.name) }.to_h { |c| [c.name, c] }
     rescue StandardError
       nil
@@ -121,21 +125,27 @@ module Permittable
     end
 
     def classify_arg(result, arg)
-      case arg
-      when SYMBOL_ARG then result.scalars |= [Regexp.last_match(1).to_sym]
-      when ARRAY_ARG  then result.arrays |= [Regexp.last_match(1).to_sym]
-      when NESTED_ARG then classify_nested(result, arg)
-      else result.unparsed |= [arg.gsub(/\s+/, " ")]
+      if (key = scalar_key(arg))
+        result.scalars |= [key]
+      elsif (match = ARRAY_ARG.match(arg))
+        result.arrays |= [match[1].to_sym]
+      elsif (match = NESTED_ARG.match(arg))
+        classify_nested(result, match, arg)
+      else
+        result.unparsed |= [arg.gsub(/\s+/, " ")]
       end
     end
 
-    def classify_nested(result, arg)
-      match = NESTED_ARG.match(arg)
-      name = match[1].to_sym
-      keys = split_args(match[2]).map { |part| part[SYMBOL_ARG, 1]&.to_sym }
+    def classify_nested(result, match, arg)
+      keys = split_args(match[2]).map { |part| scalar_key(part) }
       return result.unparsed |= [arg.gsub(/\s+/, " ")] if keys.any?(&:nil?)
 
-      result.nested[name] = (result.nested[name] || []) | keys
+      result.nested[match[1].to_sym] = (result.nested[match[1].to_sym] || []) | keys
+    end
+
+    def scalar_key(part)
+      match = SCALAR_KEY.match(part)
+      match && (match[1] || match[2] || match[3]).to_sym
     end
 
     # -- drafting -----------------------------------------------------------
