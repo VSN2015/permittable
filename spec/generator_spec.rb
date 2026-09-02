@@ -1,0 +1,250 @@
+RSpec.describe Permittable::Generator do
+  def permittable_class(&declaration)
+    Class.new(FakeController) do
+      include Permittable
+
+      class_eval(&declaration) if declaration
+    end
+  end
+
+  def controller(klass, params: {}, action: "create")
+    c = klass.new(params: params)
+    c.define_singleton_method(:action_name) { action }
+    c
+  end
+
+  describe ".scan" do
+    it "extracts the root and scalar keys from a require().permit() call" do
+      scan = described_class.scan("params.require(:user).permit(:name, :age)")
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[name age])
+      expect(scan).to be_found
+    end
+
+    it "handles a rootless params.permit call" do
+      scan = described_class.scan("params.permit(:q, :page)")
+      expect(scan.root).to be_nil
+      expect(scan.scalars).to eq(%i[q page])
+    end
+
+    it "classifies `key: []` as an array and `key: [:a, :b]` as nested" do
+      scan = described_class.scan("params.require(:user).permit(:name, tag_names: [], address: [:city, :zip])")
+      expect(scan.scalars).to eq(%i[name])
+      expect(scan.arrays).to eq(%i[tag_names])
+      expect(scan.nested).to eq(address: %i[city zip])
+    end
+
+    it "merges multiple permit calls, keeping the first root found" do
+      source = <<~RUBY
+        def create
+          User.create!(params.require(:user).permit(:name))
+        end
+
+        def update
+          user.update!(params.require(:user).permit(:name, :age))
+        end
+      RUBY
+      scan = described_class.scan(source)
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[name age])
+    end
+
+    it "parses a multiline permit call" do
+      source = <<~RUBY
+        params.require(:user).permit(
+          :name,
+          :age,
+          tag_names: []
+        )
+      RUBY
+      scan = described_class.scan(source)
+      expect(scan.scalars).to eq(%i[name age])
+      expect(scan.arrays).to eq(%i[tag_names])
+    end
+
+    it "records arguments it cannot parse instead of guessing" do
+      scan = described_class.scan("params.require(:user).permit(:name, *extra_keys)")
+      expect(scan.scalars).to eq(%i[name])
+      expect(scan.unparsed).to eq(["*extra_keys"])
+    end
+
+    it "reports found? false when the source has no permit calls" do
+      expect(described_class.scan("def index; end")).not_to be_found
+    end
+  end
+
+  describe ".draft from a model's columns" do
+    before do
+      ActiveRecord::Schema.define do
+        create_table :gen_articles do |t|
+          t.string   :title, null: false
+          t.text     :body
+          t.integer  :views
+          t.float    :rating
+          t.decimal  :price
+          t.boolean  :published
+          t.date     :published_on
+          t.datetime :locked_at
+          t.string   :status, null: false, default: "draft"
+          t.json     :settings
+          t.timestamps
+        end
+      end
+      stub_const("GenArticle", Class.new(TestModel) { self.table_name = "gen_articles" })
+    end
+
+    after { ActiveRecord::Base.connection.drop_table(:gen_articles, if_exists: true) }
+
+    let(:draft) { described_class.draft(model: GenArticle) }
+
+    it "wraps the fields in a monitor-mode permit_params call with root and model" do
+      expect(draft).to include("permit_params :create, :update, root: :gen_article, model: GenArticle, mode: :monitor do")
+      expect(draft).to end_with("end\n")
+    end
+
+    it "maps every column type onto the matching contract type" do
+      expect(draft).to include("required :title, :string")
+      expect(draft).to include("optional :body, :string")
+      expect(draft).to include("optional :views, :integer")
+      expect(draft).to include("optional :rating, :float")
+      expect(draft).to include("optional :price, :decimal")
+      expect(draft).to include("optional :published, :boolean")
+      expect(draft).to include("optional :published_on, :date")
+      expect(draft).to include("optional :locked_at, :datetime")
+    end
+
+    it "marks NOT NULL columns without a database default as required" do
+      expect(draft).to include("required :title, :string")
+      expect(draft).to match(/optional :status, :string\s+# database default: "draft"/)
+    end
+
+    it "skips the primary key and timestamps" do
+      expect(draft).not_to include(":id")
+      expect(draft).not_to include("created_at")
+      expect(draft).not_to include("updated_at")
+    end
+
+    it "leaves a TODO comment for columns with no scalar contract type" do
+      expect(draft).to match(/# TODO: settings \(json\) has no scalar contract type/)
+    end
+
+    it "produces a draft that loads as a real contract and validates a request" do
+      klass = permittable_class { class_eval(Permittable::Generator.draft(model: GenArticle)) }
+      expect(klass.permit_rule_for("create")).not_to be_nil
+
+      params = { gen_article: { title: "Hello", views: "3" } }
+      expect(controller(klass, params: params).permitted_params).to eq("title" => "Hello", "views" => 3)
+    end
+  end
+
+  describe ".draft from a scan plus a model" do
+    before do
+      ActiveRecord::Schema.define do
+        create_table :gen_users do |t|
+          t.string  :name, null: false
+          t.integer :age
+          t.string  :unrelated_column
+        end
+      end
+      stub_const("GenUser", Class.new(TestModel) { self.table_name = "gen_users" })
+    end
+
+    after { ActiveRecord::Base.connection.drop_table(:gen_users, if_exists: true) }
+
+    let(:scan) do
+      described_class.scan(
+        "params.require(:account).permit(:name, :age, :password_confirmation, tag_names: [], address: [:city])"
+      )
+    end
+    let(:draft) { described_class.draft(model: GenUser, scan: scan) }
+
+    it "includes only the scanned keys, typed from their columns" do
+      expect(draft).to include("required :name, :string")
+      expect(draft).to include("optional :age, :integer")
+      expect(draft).not_to include("unrelated_column")
+    end
+
+    it "prefers the scanned root over the model-derived one" do
+      expect(draft).to include("root: :account")
+    end
+
+    it "marks scanned keys that are not columns as virtual with a TODO" do
+      expect(draft).to match(/optional :password_confirmation, :string, virtual: true\s+# TODO: not a database column/)
+    end
+
+    it "drafts array and nested keys with confirmation TODOs" do
+      expect(draft).to match(/array :tag_names, of: :string\s+# TODO: confirm the element type/)
+      expect(draft).to match(/optional :address do\s+# TODO: .*array :address do/)
+      expect(draft).to match(/optional :city, :string\s+# TODO: confirm the type/)
+    end
+
+    it "surfaces unparsed permit arguments as a TODO instead of dropping them" do
+      unparsed = described_class.scan("params.require(:account).permit(:name, *extra)")
+      draft = described_class.draft(model: GenUser, scan: unparsed)
+      expect(draft).to match(/# TODO: could not parse from the permit call: \*extra/)
+    end
+
+    it "produces a draft that loads even with virtual and nested TODO fields" do
+      d = draft
+      klass = permittable_class { class_eval(d) }
+      rule = klass.permit_rule_for("create")
+      expect(rule[:root]).to eq(:account)
+      expect(rule[:fields].map { |f| f[:name] }).to include(:name, :password_confirmation, :tag_names, :address)
+    end
+  end
+
+  describe ".draft from a scan alone" do
+    let(:scan) { described_class.scan("params.permit(:q, :page)") }
+    let(:draft) { described_class.draft(scan: scan) }
+
+    it "stays rootless, omits model:, and asks for type confirmation" do
+      expect(draft).to include("permit_params :create, :update, mode: :monitor do")
+      expect(draft).not_to include("root:")
+      expect(draft).not_to include("model:")
+      expect(draft).to match(/optional :q, :string\s+# TODO: confirm the type/)
+      expect(draft).to match(/optional :page, :string\s+# TODO: confirm the type/)
+    end
+  end
+
+  describe ".draft with nothing to go on" do
+    it "returns nil" do
+      expect(described_class.draft).to be_nil
+      expect(described_class.draft(scan: described_class.scan("def index; end"))).to be_nil
+    end
+  end
+
+  describe ".for_controller" do
+    before do
+      ActiveRecord::Schema.define do
+        create_table :gen_posts do |t|
+          t.string :title, null: false
+        end
+      end
+      stub_const("GenPost", Class.new(TestModel) { self.table_name = "gen_posts" })
+    end
+
+    after { ActiveRecord::Base.connection.drop_table(:gen_posts, if_exists: true) }
+
+    it "infers the model from controller_name and scans the given source" do
+      controller = Class.new do
+        def self.controller_name = "gen_posts"
+      end
+      source = "params.require(:gen_post).permit(:title, :draft_token)"
+      draft = described_class.for_controller(controller, source: source)
+      expect(draft).to include("root: :gen_post, model: GenPost")
+      expect(draft).to include("required :title, :string")
+      expect(draft).to include("optional :draft_token, :string, virtual: true")
+    end
+
+    it "accepts an explicit model" do
+      controller = Class.new { def self.controller_name = "whatever" }
+      draft = described_class.for_controller(controller, model: GenPost)
+      expect(draft).to include("model: GenPost")
+    end
+
+    it "returns nil when there is no model and no permit call to draft from" do
+      controller = Class.new { def self.controller_name = "no_such_things" }
+      expect(described_class.for_controller(controller, source: "def index; end")).to be_nil
+    end
+  end
+end

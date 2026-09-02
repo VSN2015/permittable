@@ -985,6 +985,10 @@ end
 require "permittable/json_schema"
 require "permittable/open_api"
 
+# Contract WRITER — drafts permit_params blocks from a model's columns and
+# existing params.permit calls (the permittable:generate rake task).
+require "permittable/generator"
+
 # Boot-time integration (filter_parameters registration, the
 # permittable:openapi rake task), Rails apps only
 require "permittable/railtie" if defined?(Rails::Railtie)
