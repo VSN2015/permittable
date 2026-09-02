@@ -1,5 +1,11 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Fixed
+- **Nested hash input crashed outside Rails.** `lib/permittable.rb` required `HashWithIndifferentAccess` but not the Hash core extension it needs to convert nested plain Hashes, so a standalone `Permittable::Contract` (or any host that loads only `permittable`) raised `NoMethodError: undefined method 'nested_under_indifferent_access'` on payloads like `{ user: { ... }, address_attributes: { ... } }`. Rails apps and the spec suite loaded the extension indirectly, which is why it went unnoticed; a spec now exercises a nested contract in a bare subprocess.
+- **`root:` rejects anything but one key at class load.** `root: [:user, :address_attributes]` used to leak `NoMethodError: undefined method 'to_sym' for Array`; it now raises a descriptive `ArgumentError` pointing at the recipe for several top-level envelopes — a rootless contract with one nested block per key. Specs pin that recipe, and pin that a rooted contract never sees the root's siblings (even under `unknown: :error`), matching `require(:user).permit`.
+
 ## 0.5.0 (2026-09-02)
 <!-- title: the adoption on-ramp -->
 
