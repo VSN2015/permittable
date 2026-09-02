@@ -94,12 +94,8 @@ module Permittable
       # -- RSpec protocol ---------------------------------------------------
 
       def matches?(subject)
-        @subject = subject
-        unless subject.respond_to?(:permit_rule_for)
-          raise ArgumentError, "#{LABEL}: the subject of permit_param must include Permittable (got #{subject.inspect})"
-        end
-
-        rule = resolve_rule(subject)
+        @subject = resolve_subject(subject)
+        rule = resolve_rule(@subject)
         return false unless rule
 
         @field = resolve_field(rule[:fields], @path.split("."))
@@ -138,6 +134,16 @@ module Permittable
       end
 
       private
+
+      # A controller CLASS carries the contract registry; an instance (a
+      # controller spec's `controller` / `subject`) resolves through its
+      # class. Anything answering permit_rule_for itself is used as-is.
+      def resolve_subject(subject)
+        return subject if subject.respond_to?(:permit_rule_for)
+        return subject.class if subject.class.respond_to?(:permit_rule_for)
+
+        raise ArgumentError, "#{LABEL}: the subject of permit_param must include Permittable (got #{subject.inspect})"
+      end
 
       def resolve_rule(subject)
         return resolve_rule_for_action(subject) if @action
