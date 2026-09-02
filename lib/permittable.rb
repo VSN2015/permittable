@@ -989,6 +989,9 @@ require "permittable/open_api"
 # existing params.permit calls (the permittable:generate rake task).
 require "permittable/generator"
 
+# Standalone contracts — the same DSL callable on any Hash, no controller.
+require "permittable/contract"
+
 # Boot-time integration (filter_parameters registration, the
 # permittable:openapi rake task), Rails apps only
 require "permittable/railtie" if defined?(Rails::Railtie)
