@@ -54,7 +54,8 @@ A violating request never reaches your action:
 - [Violations and error responses](#violations-and-error-responses) · [Custom error messages](#custom-error-messages-message) · [Unknown parameters](#unknown-parameters)
 - [Output reshaping](#output-reshaping-transform-and-finalize) · [The schema-drift guard](#the-schema-drift-guard)
 - [Sensitive parameters](#sensitive-parameters-and-log-redaction) · [Instrumentation](#instrumentation)
-- [Monitor mode](#monitor-mode-roll-out-without-rejecting) · [Generating draft contracts](#generating-draft-contracts-permittablegenerate) · [Testing contracts](#testing-contracts-rspec-matchers) · [Exporting OpenAPI](#exporting-openapi-docs-that-cannot-drift)
+- [Monitor mode](#monitor-mode-roll-out-without-rejecting) · [Generating draft contracts](#generating-draft-contracts-permittablegenerate) · [Testing contracts](#testing-contracts-rspec-matchers)
+- [Standalone contracts](#standalone-contracts-no-controller) · [Exporting OpenAPI](#exporting-openapi-docs-that-cannot-drift)
 - [API reference](#api-reference) · [Errors caught at class load](#errors-caught-at-class-load) · [Compatibility](#compatibility)
 
 ---
@@ -485,6 +486,33 @@ Chains: `for_action`, `as`, `as_array(of:)`, `required` / `optional`, `within` (
 
 `for_action` picks the rule exactly like a request would (`permit_rule_for`), and may be omitted only when the controller declares a single contract — an ambiguous expectation raises instead of silently checking the wrong rule. Failure messages name what the contract actually declares.
 
+## Standalone contracts (no controller)
+
+The same DSL, callable on any Hash — webhook payloads, job arguments, service-object inputs, CSV rows:
+
+```ruby
+CreateUser = Permittable::Contract.define(root: :user) do
+  required :email, :string, format: URI::MailTo::EMAIL_REGEXP
+  optional :age,   :integer, in: 18..120
+  optional :plan,  :string, in: %w[free pro], default: "free"
+end
+
+result = CreateUser.call(payload)     # never raises
+result.valid?                          # => false
+result.violations                      # => [{ param: "user.age", code: "inclusion" }]
+result.params                          # validated HashWithIndifferentAccess; nil when invalid
+
+CreateUser.call!(payload)              # params, or raises Permittable::InvalidParameters
+CreateUser.json_schema                 # the contract as JSON Schema (draft 2020-12)
+CreateUser.rule                        # the frozen, introspectable rule data
+```
+
+Everything carries over — strict coercion, `""`/`nil` absence, defaults, `finalize` with `violate!`, `sensitive:` log-redaction registration, `invalid_parameters.permittable` instrumentation, 400-vs-422 status semantics for a missing `root:`. Three differences, all deliberate:
+
+- **A `Contract` always enforces.** Monitor mode is a request-rollout switch; standalone callers read the `Result` instead, so the app-wide `Permittable.mode` is ignored here.
+- **No router-key exemption.** `unknown: :error` flags a stray `action` or `controller` key — standalone input has no router to excuse.
+- **No memoization.** Every `#call` validates fresh, so one frozen contract is safely reusable and shareable (assign it to a constant).
+
 ## Exporting OpenAPI (docs that cannot drift)
 
 Because a contract is data, it has a third reader beyond the validator and the drift guard: an exporter that emits **OpenAPI 3.1** (whose request bodies are plain JSON Schema). The schema is generated from the same frozen data the server enforces, so — like the drift guard, pointed outward — the docs cannot lie:
@@ -558,6 +586,7 @@ Output is deterministic (fixed key order, declaration-order properties), so the 
 | `Permittable::JsonSchema` | Contract data → JSON Schema fragments (`.rule`, `.object`, `.field`) |
 | `Permittable::OpenAPI` | OpenAPI 3.1 assembly (`.document`, `.operations_for`, `.request_body_for`, `.components`) |
 | `Permittable::Generator` | Contract drafting (`.draft`, `.for_controller`, `.scan`) — see [generating draft contracts](#generating-draft-contracts-permittablegenerate) |
+| `Permittable::Contract` | [Standalone contracts](#standalone-contracts-no-controller) (`.define`, `#call`, `#call!`, `#json_schema`, `#rule`) |
 | `Permittable::Matchers` | RSpec matchers via `require "permittable/rspec"` — see [testing contracts](#testing-contracts-rspec-matchers) |
 
 ## Errors caught at class load
