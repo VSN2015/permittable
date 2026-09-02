@@ -80,6 +80,33 @@ RSpec.describe "I18n violation messages" do
     expect(unknown_details).to eq([{ param: "extra", code: "unknown", message: "is not a recognized parameter" }])
   end
 
+  it "translates violate! codes in finalize, with an explicit message: still winning" do
+    store(before_start: "must be after the start date")
+    translated = violations_for({ a: "2", b: "1" }) do
+      permit_params(:create) do
+        required :a, :integer
+        required :b, :integer
+        finalize do |p|
+          violate!("b", :before_start) if p[:b] < p[:a]
+          p
+        end
+      end
+    end
+    expect(translated).to eq([{ param: "b", code: "before_start", message: "must be after the start date" }])
+
+    explicit = violations_for({ a: "2", b: "1" }) do
+      permit_params(:create) do
+        required :a, :integer
+        required :b, :integer
+        finalize do |p|
+          violate!("b", :before_start, message: "own copy") if p[:b] < p[:a]
+          p
+        end
+      end
+    end
+    expect(explicit).to eq([{ param: "b", code: "before_start", message: "own copy" }])
+  end
+
   it "translates Symbol codes returned by validate:" do
     store(must_be_even: "must be an even number")
     details = violations_for({ n: "3" }) do

@@ -595,7 +595,10 @@ module Permittable
     # `message:` option.
     def violate!(param, code, message: nil)
       entry = { param: param.to_s, code: code.to_s }
-      entry[:message] = message.to_s if message
+      # Same resolution order as field violations: explicit message, then
+      # the app's I18n copy for the code, then the bare shape.
+      resolved = message ? message.to_s : Permittable.default_message_for(code)
+      entry[:message] = resolved if resolved
       @violations << entry
       throw :permittable_finalize_halt
     end

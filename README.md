@@ -308,7 +308,7 @@ en:
       unknown: "is not a recognized parameter"
 ```
 
-Resolution order per violation: the field's own `message:` (String, or the Hash entry for that code) → the app's `permittable.errors.<code>` translation → the bare `{ param:, code: }` shape. The lookup also covers a missing `root:`, `unknown` keys, and Symbol codes returned by `validate:` (`permittable.errors.must_be_even`). Only a String translation counts — a missing key or a nested Hash falls back to the bare shape rather than leaking structure to clients. No I18n, no change: apps without the gem or the keys behave exactly as before.
+Resolution order per violation: the field's own `message:` (String, or the Hash entry for that code) → the app's `permittable.errors.<code>` translation → the bare `{ param:, code: }` shape. The lookup also covers a missing `root:`, `unknown` keys, Symbol codes returned by `validate:` (`permittable.errors.must_be_even`), and `violate!` codes in `finalize` (an explicit `violate!(..., message:)` still wins). Only a String translation counts — a missing key or a nested Hash falls back to the bare shape rather than leaking structure to clients. No I18n, no change: apps without the gem or the keys behave exactly as before.
 
 For full control over the response body itself (RFC 9457, a different envelope), override `render_invalid_parameters` or define `render_error` as described above; `error.details` gives you the structured violations to build from.
 
