@@ -1,5 +1,15 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+The adoption on-ramp. Writing the first contract for a legacy controller used to start from a blank page; now the gem drafts it from what the app already knows, and the contract can be asserted on in specs without dispatching a request.
+
+### Added
+- **`Permittable::Generator` and `bin/rails permittable:generate[controller]`** — drafts a `permit_params` contract for every controller that doesn't declare one (or one named controller), from the model's columns (type, NOT NULL, database default) plus any `params.require(...).permit(...)` calls found in the controller source. Drafts are emitted in **monitor mode**, so pasting one changes no behaviour; everything the generator cannot know for sure becomes a `# TODO` comment instead of a guess (non-column keys get `virtual: true`, unmappable column types and unparseable permit arguments stay visible as comments, database defaults are noted but deliberately **not** copied into `default:` — a contract default would overwrite columns on partial updates). Programmatic API (`Generator.draft(model:)`, `Generator.for_controller`, `Generator.scan`) works without Rails.
+- **RSpec matchers (`require "permittable/rspec"`)** — `permit_param(:age).for_action(:create).as(:integer).within(18..120)` asserts on the same frozen rule the validator enforces, so contracts are testable without a request. Chains: `for_action`, `as`, `as_array(of:)`, `required`/`optional`, `within`, `matching`, `with_length`, `with_default`, `virtual`, `sensitive`; dotted paths (`"address.zip"`, `"line_items.sku"`) walk nested and array blocks. Ambiguity fails loudly: `for_action` may be omitted only when the controller declares exactly one contract.
+
+Both are additive — no behaviour of existing contracts changes.
+
 ## 0.4.0 (2026-08-24)
 <!-- title: monitor mode -->
 

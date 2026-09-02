@@ -54,7 +54,7 @@ A violating request never reaches your action:
 - [Violations and error responses](#violations-and-error-responses) · [Custom error messages](#custom-error-messages-message) · [Unknown parameters](#unknown-parameters)
 - [Output reshaping](#output-reshaping-transform-and-finalize) · [The schema-drift guard](#the-schema-drift-guard)
 - [Sensitive parameters](#sensitive-parameters-and-log-redaction) · [Instrumentation](#instrumentation)
-- [Monitor mode](#monitor-mode-roll-out-without-rejecting) · [Exporting OpenAPI](#exporting-openapi-docs-that-cannot-drift)
+- [Monitor mode](#monitor-mode-roll-out-without-rejecting) · [Generating draft contracts](#generating-draft-contracts-permittablegenerate) · [Testing contracts](#testing-contracts-rspec-matchers) · [Exporting OpenAPI](#exporting-openapi-docs-that-cannot-drift)
 - [API reference](#api-reference) · [Errors caught at class load](#errors-caught-at-class-load) · [Compatibility](#compatibility)
 
 ---
@@ -73,6 +73,7 @@ A violating request never reaches your action:
 | Checked against your schema at boot | ❌ | ❌ | ✅ |
 | Exports OpenAPI / JSON Schema | ❌ | ❌ | ✅ |
 | Report-only rollout mode | ❌ | ❌ | ✅ |
+| Drafts contracts from your schema | ❌ | ❌ | ✅ |
 
 The design rests on one idea: **a contract is data, not code.** It is declared once at the class level, frozen, inheritable, and introspectable. Everything else here follows from that — the drift guard can read it at boot, `finalize` can run on a bare object with no controller state, and the whole contract can be printed or tested without a request.
 
@@ -421,12 +422,68 @@ Monitor-mode rules validate **eagerly in the `before_action`, regardless of `enf
 
 The rollout recipe:
 
-1. Write contracts for a legacy controller. The action code stays as-is.
+1. Write contracts for a legacy controller — or let [`permittable:generate`](#generating-draft-contracts-permittablegenerate) draft them. The action code stays as-is.
 2. Deploy with `PERMITTABLE_MODE=monitor`. Behaviour is unchanged; telemetry starts.
 3. Watch the dashboard. Every entry is a real client that would have been rejected — fix the contract, or wait for that traffic to drain.
 4. Flip to enforce, controller by controller. Every 422 you now return is one you already counted.
 
 [Exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) marks operations whose rule declares `mode: :monitor` with `x-permittable-mode: "monitor"` — the docs shouldn't promise a 422 the server doesn't yet send. Only the per-rule declaration is exported: the global `Permittable.mode` is runtime configuration, not contract data.
+
+## Generating draft contracts (`permittable:generate`)
+
+The blank-page problem, solved: the first draft of every contract can be generated from what the app already knows — the model's columns, and the `params.permit` calls already sitting in the controller.
+
+```sh
+bin/rails permittable:generate                      # every controller without a contract
+bin/rails "permittable:generate[UsersController]"   # one controller, even if covered
+```
+
+For each controller the task infers the model from `controller_name` (columns give types, NOT NULL gives `required`), scans the controller source for `params.require(...).permit(...)` calls (permitted keys give the field list and the `root:`), and prints a paste-ready draft:
+
+```ruby
+# Drafted by permittable:generate — review the TODOs, then deploy: monitor
+# mode reports violations (instrumentation + log) without rejecting requests.
+permit_params :create, :update, root: :user, model: User, mode: :monitor do
+  required :name, :string
+  optional :age, :integer
+  optional :status, :string # database default: "active"
+  optional :password_confirmation, :string, virtual: true # TODO: not a database column — confirm the type
+  array :tag_names, of: :string # TODO: confirm the element type
+end
+```
+
+The generator's one rule is **draft, don't guess** — everything it cannot know for sure stays visible instead of silently decided:
+
+- Drafts come out in **monitor mode**, so pasting one changes nothing until you flip it.
+- A permitted key that isn't a column becomes `virtual: true` with a TODO; a column type with no scalar equivalent (`json`, `binary`) becomes a TODO comment; a permit argument the conservative parser can't read (`*dynamic_keys`) is kept verbatim in a TODO instead of dropped.
+- A database default is noted in a comment but **not** copied into `default:` — a contract default is injected on every request that omits the field, which would overwrite columns on partial updates. The database already handles creation.
+- `key: [:a, :b]` in a permit call drafts as a nested block, with a TODO noting it may be an array of hashes.
+
+No Rails required for the core: `Permittable::Generator.draft(model: User)`, `.for_controller(controller, source: File.read(path))`, and `.scan(source)` are plain Ruby.
+
+Together with [monitor mode](#monitor-mode-roll-out-without-rejecting) this makes the whole adoption path one afternoon: generate drafts, paste, deploy monitoring, watch the dashboard, flip to enforce.
+
+## Testing contracts (RSpec matchers)
+
+Because a contract is data, it can be specified without dispatching a request. `require "permittable/rspec"` (in `spec_helper.rb`) auto-includes the matchers:
+
+```ruby
+RSpec.describe UsersController do
+  it "declares the create contract" do
+    expect(described_class).to permit_param(:email)
+      .for_action(:create).as(:string).matching(URI::MailTo::EMAIL_REGEXP).required
+    expect(described_class).to permit_param(:age).for_action(:create).as(:integer).within(18..120)
+    expect(described_class).to permit_param(:plan).for_action(:create).with_default("free")
+    expect(described_class).to permit_param(:tag_names).for_action(:create).as_array(of: :string)
+    expect(described_class).to permit_param("address.zip").for_action(:create).as(:string).optional
+    expect(described_class).not_to permit_param(:admin).for_action(:create)
+  end
+end
+```
+
+Chains: `for_action`, `as`, `as_array(of:)`, `required` / `optional`, `within` (`in:`), `matching` (`format:`), `with_length`, `with_default`, `virtual`, `sensitive`. Dotted paths walk nested blocks and array-of-hash blocks alike (`"line_items.sku"`).
+
+`for_action` picks the rule exactly like a request would (`permit_rule_for`), and may be omitted only when the controller declares a single contract — an ambiguous expectation raises instead of silently checking the wrong rule. Failure messages name what the contract actually declares.
 
 ## Exporting OpenAPI (docs that cannot drift)
 
@@ -500,6 +557,8 @@ Output is deterministic (fixed key order, declaration-order properties), so the 
 | `Permittable::InvalidParameters` | Raised on violation; carries `#details` and `#status` |
 | `Permittable::JsonSchema` | Contract data → JSON Schema fragments (`.rule`, `.object`, `.field`) |
 | `Permittable::OpenAPI` | OpenAPI 3.1 assembly (`.document`, `.operations_for`, `.request_body_for`, `.components`) |
+| `Permittable::Generator` | Contract drafting (`.draft`, `.for_controller`, `.scan`) — see [generating draft contracts](#generating-draft-contracts-permittablegenerate) |
+| `Permittable::Matchers` | RSpec matchers via `require "permittable/rspec"` — see [testing contracts](#testing-contracts-rspec-matchers) |
 
 ## Errors caught at class load
 
