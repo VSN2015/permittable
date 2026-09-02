@@ -78,6 +78,8 @@ A violating request never reaches your action:
 
 The design rests on one idea: **a contract is data, not code.** It is declared once at the class level, frozen, inheritable, and introspectable. Everything else here follows from that — the drift guard can read it at boot, `finalize` can run on a bare object with no controller state, and the whole contract can be printed or tested without a request.
 
+A longer, honest comparison — `params.expect`, rails_param, dry-validation, typed_params, rswag, with the cases where each of them is the better choice, plus benchmarks and migration costs — lives in [docs/comparison.md](docs/comparison.md).
+
 ## Installation
 
 ```ruby
@@ -291,7 +293,24 @@ The rules:
 - `violate!` in `finalize` takes the same idea as a keyword: `violate!("user.ends_at", :before_start, message: "must be after starts_at")`.
 - A `message:` that is neither a String nor a code → String Hash raises at class load, like every other contract mistake.
 
-Fields without a `message:` are untouched — their details keep the bare `{ param:, code: }` shape. For full control over the response body itself (localization, RFC 9457, a different envelope), override `render_invalid_parameters` or define `render_error` as described above; `error.details` gives you the structured violations to build from.
+### Localizing default messages (I18n)
+
+App-wide copy for a violation code — without repeating `message:` on every field — comes from I18n, under `permittable.errors.<code>`:
+
+```yaml
+# config/locales/en.yml
+en:
+  permittable:
+    errors:
+      missing: "is required"
+      invalid_type: "is the wrong type"
+      inclusion: "is not an allowed value"
+      unknown: "is not a recognized parameter"
+```
+
+Resolution order per violation: the field's own `message:` (String, or the Hash entry for that code) → the app's `permittable.errors.<code>` translation → the bare `{ param:, code: }` shape. The lookup also covers a missing `root:`, `unknown` keys, and Symbol codes returned by `validate:` (`permittable.errors.must_be_even`). Only a String translation counts — a missing key or a nested Hash falls back to the bare shape rather than leaking structure to clients. No I18n, no change: apps without the gem or the keys behave exactly as before.
+
+For full control over the response body itself (RFC 9457, a different envelope), override `render_invalid_parameters` or define `render_error` as described above; `error.details` gives you the structured violations to build from.
 
 ## Unknown parameters
 

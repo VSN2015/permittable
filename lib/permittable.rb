@@ -180,6 +180,21 @@ module Permittable
 
       @mode = value
     end
+
+    # App-wide fallback copy for a violation code, looked up through I18n
+    # under permittable.errors.<code> ("missing", "inclusion", or any Symbol
+    # a validate: returned). Consulted only when the field declares no
+    # matching `message:` of its own, and only when the host app has I18n —
+    # without translations (or without I18n) details keep the bare
+    # { param:, code: } shape, so nothing changes for apps that don't opt
+    # in. Only a String translation counts; anything else (a nested Hash, a
+    # missing-translation object) is ignored rather than leaked to clients.
+    def default_message_for(code)
+      return nil unless defined?(::I18n) && ::I18n.respond_to?(:t)
+
+      message = ::I18n.t("permittable.errors.#{code}", default: nil)
+      message.is_a?(String) ? message : nil
+    end
   end
 
   # Raised when the request violates the matching contract. `details` is an
@@ -820,11 +835,14 @@ module Permittable
     entry
   end
 
+  # Resolution order: the field's own `message:` (String, or Hash entry for
+  # this code), then the app's I18n copy (permittable.errors.<code>), then
+  # nothing — the bare { param:, code: } shape.
   def permittable_message_for(field, code)
     spec = field[:message]
-    return spec if spec.nil? || spec.is_a?(String)
+    return spec if spec.is_a?(String)
 
-    spec[code.to_sym]
+    (spec && spec[code.to_sym]) || Permittable.default_message_for(code)
   end
 
   def permittable_run_finalize(finalizer, result, violations)
@@ -849,7 +867,9 @@ module Permittable
     value = raw[rule[:root].to_s]
     return value if value.is_a?(Hash)
 
-    violations << { param: rule[:root].to_s, code: "missing" }
+    # No field declares the root, so message resolution can only come from
+    # I18n ({} has no :message).
+    violations << permittable_violation({}, rule[:root].to_s, "missing")
     nil
   end
 
@@ -958,7 +978,7 @@ module Permittable
     return if extra.empty?
 
     if unknown == :error
-      extra.each { |key| violations << { param: permittable_path(path, key), code: "unknown" } }
+      extra.each { |key| violations << permittable_violation({}, permittable_path(path, key), "unknown") }
     elsif respond_to?(:logger) && logger
       logger.warn("#{LABEL}: unknown parameter(s) ignored by the ##{permittable_action_name} contract: " \
                   "#{extra.map { |key| permittable_path(path, key) }.join(', ')}")
