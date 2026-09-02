@@ -1,6 +1,9 @@
 <!-- CHANGELOG.md -->
 
-## Unreleased
+## 0.5.1 (2026-09-02)
+<!-- title: nested input outside Rails -->
+
+Patch release. Checking how a contract handles a request with several top-level envelopes (`{ user: { ... }, address_attributes: { ... } }`) surfaced one crash and one unhelpful error; both are fixed below, and no behaviour of existing contracts changes.
 
 ### Fixed
 - **Nested hash input crashed outside Rails.** `lib/permittable.rb` required `HashWithIndifferentAccess` but not the Hash core extension it needs to convert nested plain Hashes, so a standalone `Permittable::Contract` (or any host that loads only `permittable`) raised `NoMethodError: undefined method 'nested_under_indifferent_access'` on payloads like `{ user: { ... }, address_attributes: { ... } }`. Rails apps and the spec suite loaded the extension indirectly, which is why it went unnoticed; a spec now exercises a nested contract in a bare subprocess.
