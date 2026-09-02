@@ -1,15 +1,14 @@
 <!-- CHANGELOG.md -->
 
-## Unreleased
+## 0.5.0 (2026-09-02)
+<!-- title: the adoption on-ramp -->
 
 The adoption on-ramp. Writing the first contract for a legacy controller used to start from a blank page; now the gem drafts it from what the app already knows, and the contract can be asserted on in specs without dispatching a request.
 
 ### Added
 - **`Permittable::Generator` and `bin/rails permittable:generate[controller]`** — drafts a `permit_params` contract for every controller that doesn't declare one (or one named controller), from the model's columns (type, NOT NULL, database default) plus any `params.require(...).permit(...)` calls found in the controller source. Drafts are emitted in **monitor mode**, so pasting one changes no behaviour; everything the generator cannot know for sure becomes a `# TODO` comment instead of a guess (non-column keys get `virtual: true`, unmappable column types and unparseable permit arguments stay visible as comments, database defaults are noted but deliberately **not** copied into `default:` — a contract default would overwrite columns on partial updates). Programmatic API (`Generator.draft(model:)`, `Generator.for_controller`, `Generator.scan`) works without Rails.
 - **RSpec matchers (`require "permittable/rspec"`)** — `permit_param(:age).for_action(:create).as(:integer).within(18..120)` asserts on the same frozen rule the validator enforces, so contracts are testable without a request. Chains: `for_action`, `as`, `as_array(of:)`, `required`/`optional`, `within`, `matching`, `with_length`, `with_default`, `virtual`, `sensitive`; dotted paths (`"address.zip"`, `"line_items.sku"`) walk nested and array blocks. Ambiguity fails loudly: `for_action` may be omitted only when the controller declares exactly one contract.
-
 - **`Permittable::Contract` — standalone contracts, no controller required.** `Contract.define(root: :user) { ... }` takes the identical field DSL and returns a callable object: `#call(hash)` never raises and returns a `Result` (`valid?` / `params` / `violations`); `#call!` returns the validated params or raises `InvalidParameters` with the same 400/422 status semantics a controller sees; `#json_schema` emits the contract as JSON Schema; `#rule` exposes the frozen data. Built for webhook payloads, job arguments, and service objects. Three deliberate differences from the concern: a `Contract` always enforces (the app-wide monitor mode is a request-rollout switch and is ignored), the router bookkeeping keys get no `unknown:` exemption, and nothing is memoized so one frozen contract is reusable everywhere.
-
 - **I18n fallback for violation messages** — a violation without a field-level `message:` now resolves copy from `permittable.errors.<code>` (covering the built-in codes, Symbol codes from `validate:`, missing `root:` keys, `unknown` keys, and `violate!` codes in `finalize`) before falling back to the bare `{ param:, code: }` shape. Resolution order: field `message:` → I18n → bare. Only String translations count; apps without I18n or without the keys are byte-for-byte unchanged.
 - **`docs/comparison.md`** — an honest comparison against `params.permit`, Rails 8's `params.expect`, rails_param, dry-validation, typed_params, and rswag, including the cases where each of those is the better choice, plus migration costs.
 - **`benchmark/overhead.rb`** — measures a full contract validation against the bare `params.permit` filter it replaces (on the reference payload the contract, casting and validating included, ran ~1.7× faster).
