@@ -1,3 +1,5 @@
+require "open3"
+
 RSpec.describe Permittable::Contract do
   let(:contract) do
     described_class.define(root: :user) do
@@ -141,5 +143,31 @@ RSpec.describe Permittable::Contract do
     end
     expect(events.length).to eq(1)
     expect(events.first[:details]).to eq([{ param: "user.email", code: "format" }])
+  end
+
+  describe "without Rails loaded" do
+    # spec_helper loads ActiveRecord, which pulls in every ActiveSupport core
+    # extension and would mask a require the gem itself forgot. A standalone
+    # Contract (webhook payload, job argument) may be the only thing an app
+    # loads, so exercise nested input in a bare subprocess.
+    it "validates nested hash input with only `require \"permittable\"`" do
+      script = <<~RUBY
+        require "json"
+        require "permittable"
+        contract = Permittable::Contract.define(unknown: :error) do
+          required :user do
+            required :test_key, :integer
+          end
+          optional :address_attributes do
+            required :location, :integer
+          end
+        end
+        print JSON.generate(contract.call!(user: { test_key: "1" }, address_attributes: { location: "2" }).to_h)
+      RUBY
+      lib = File.expand_path("../lib", __dir__)
+      out, err, status = Open3.capture3(RbConfig.ruby, "-I", lib, "-e", script)
+      expect(status).to be_success, err
+      expect(out).to eq('{"user":{"test_key":1},"address_attributes":{"location":2}}')
+    end
   end
 end

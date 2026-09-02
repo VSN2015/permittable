@@ -46,6 +46,11 @@ RSpec.describe Permittable do
         .to raise_error(ArgumentError, /:unknown must be one of ignore, log, error/)
     end
 
+    it "rejects a non-Symbol root, pointing at the rootless recipe for several envelopes" do
+      expect { permittable_class { permit_params(:create, root: %i[user address_attributes]) { required :a } } }
+        .to raise_error(ArgumentError, /:root must be one key.*rootless contract with one nested block per key/)
+    end
+
     it "rejects an unknown field option, naming the allowed ones" do
       expect { permittable_class { permit_params(:create) { required :a, :string, minimum: 3 } } }
         .to raise_error(ArgumentError, /unknown option\(s\) :minimum for field :a.*allowed:/)
@@ -434,6 +439,18 @@ RSpec.describe Permittable do
       expect(e.details).to eq([{ param: "user.controller", code: "unknown" }])
     end
 
+    it "never sees the root's siblings: a rooted contract reads only its envelope, like require().permit()" do
+      params = { user: { name: "a" }, address_attributes: { location: 1 } }
+      strict = permittable_class { permit_params(:create, root: :user, unknown: :error) { required :name, :string } }
+      c = controller(strict, params: params)
+      expect(c.permitted_params.to_h).to eq("name" => "a")
+      expect(c.permittable_violations).to eq([])
+
+      # Monitor's raw pass-through is the unwrapped envelope, siblings dropped too.
+      monitored = permittable_class { permit_params(:create, root: :user, mode: :monitor) { required :name, :integer } }
+      expect(controller(monitored, params: params).permitted_params.to_h).to eq("name" => "a")
+    end
+
     it "logs undeclared keys with unknown: :log" do
       klass = permittable_class { permit_params(:create, unknown: :log) { required :name, :string } }
       c = controller(klass, params: { name: "a", extra: "x" })
@@ -448,6 +465,24 @@ RSpec.describe Permittable do
   end
 
   describe "nested hashes and arrays" do
+    it "accepts several top-level envelopes via a rootless contract with one nested block per key" do
+      decl = proc do
+        permit_params(:create, unknown: :error) do
+          required :user do
+            required :test_key, :integer
+          end
+          optional :address_attributes do
+            required :location, :integer
+          end
+        end
+      end
+      params = { user: { test_key: "1" }, address_attributes: { location: "2" }, controller: "users", action: "create" }
+      expect(permit(params, &decl).to_h).to eq("user" => { "test_key" => 1 }, "address_attributes" => { "location" => 2 })
+
+      e = violations_for({ user: { test_key: "1" }, billing_attributes: { plan: "pro" } }, &decl)
+      expect(e.details).to eq([{ param: "billing_attributes", code: "unknown" }])
+    end
+
     it "validates nested fields with dotted violation paths" do
       decl = proc do
         permit_params(:create, root: :user) do

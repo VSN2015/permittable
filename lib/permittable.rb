@@ -2,6 +2,7 @@ require "active_support"
 require "active_support/concern"
 require "active_support/notifications"
 require "active_support/hash_with_indifferent_access"
+require "active_support/core_ext/hash/indifferent_access" # nested plain Hashes inside HWIA.new
 require "active_support/core_ext/class/attribute"
 require "active_support/core_ext/string/inflections"
 require "active_support/core_ext/string/filters"
@@ -611,6 +612,10 @@ module Permittable
     #
     #   root:    key to unwrap first (`require(:user)` equivalent); false
     #            (default) reads top-level params. Missing root renders 400.
+    #            Exactly one key: a rooted contract never sees the root's
+    #            siblings (like `require(:user).permit`), so to accept
+    #            several top-level envelopes stay rootless and declare one
+    #            nested block per key.
     #   model:   a model class (or `true` to infer from controller_name)
     #            enabling the schema-drift check on every non-virtual scalar
     #            field.
@@ -626,6 +631,11 @@ module Permittable
     #            (Permittable::OpenAPI); the runtime never reads it.
     def permit_params(*actions, root: false, model: nil, unknown: :ignore, enforce: false, mode: nil, desc: nil, &block)
       raise ArgumentError, "#{LABEL}: permit_params requires a block declaring the contract fields" unless block
+
+      unless root.nil? || root == false || root.is_a?(Symbol) || root.is_a?(String)
+        raise ArgumentError, "#{LABEL}: :root must be one key (Symbol or String) or false, got #{root.inspect} — " \
+                             "to accept several top-level keys, declare a rootless contract with one nested block per key"
+      end
 
       unknown = unknown.to_sym
       raise ArgumentError, "#{LABEL}: :unknown must be one of #{UNKNOWN_MODES.join(', ')}" unless UNKNOWN_MODES.include?(unknown)
