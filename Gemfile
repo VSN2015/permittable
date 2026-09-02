@@ -9,6 +9,7 @@ gem "rake"
 # sqlite3 the schema-drift specs.
 gem "actionpack", ">= 5.0", "< 9"
 gem "activerecord", ">= 5.0", "< 9"
+gem "benchmark-ips", "~> 2.13", require: false
 gem "rspec", "~> 3.12"
 gem "simplecov", "~> 1.1"
 gem "sqlite3", "~> 2.9.4"
