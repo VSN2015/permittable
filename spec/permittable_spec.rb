@@ -858,6 +858,58 @@ RSpec.describe Permittable do
     end
   end
 
+  describe "array length: as a bound, not just a report" do
+    it "stops at the length violation instead of checking every element" do
+      decl = proc { permit_params(:create) { array :tags, of: :string, length: 0..2 } }
+      # Every element is also wrong-typed; none of that is reported, because
+      # the array is already rejected on its count.
+      e = violations_for({ tags: Array.new(500) { |i| { "not" => i } } }, &decl)
+      expect(e.details).to eq([{ param: "tags", code: "length" }])
+    end
+
+    it "does the same for an array of nested hashes, where each element would violate loudly" do
+      decl = proc do
+        permit_params(:create) do
+          array :line_items, length: 1..2 do
+            required :sku, :string
+            required :qty, :integer
+          end
+        end
+      end
+      e = violations_for({ line_items: Array.new(300) { {} } }, &decl)
+      expect(e.details).to eq([{ param: "line_items", code: "length" }])
+    end
+
+    it "does not hand validate: or transform: an array the contract already rejected" do
+      seen = []
+      decl = proc do
+        permit_params(:create) do
+          array :tags, of: :string, length: 0..1,
+                       validate: ->(a) { seen << [:validate, a.length] }, transform: ->(_a) { seen << :transform }
+        end
+      end
+      violations_for({ tags: %w[a b c] }, &decl)
+      expect(seen).to be_empty
+    end
+
+    it "still reports element violations for an array within its bounds" do
+      decl = proc { permit_params(:create) { array :tags, of: :integer, length: 0..5 } }
+      e = violations_for({ tags: %w[1 x y] }, &decl)
+      expect(e.details).to eq([{ param: "tags[1]", code: "invalid_type" }, { param: "tags[2]", code: "invalid_type" }])
+    end
+
+    it "leaves an array with no declared length: exactly as it was" do
+      decl = proc { permit_params(:create) { array :tags, of: :integer } }
+      e = violations_for({ tags: %w[1 x] }, &decl)
+      expect(e.details).to eq([{ param: "tags[1]", code: "invalid_type" }])
+    end
+
+    it "keeps a valid array valid" do
+      result = permit({ tags: %w[1 2] }) { permit_params(:create) { array :tags, of: :integer, length: 0..5 } }
+      expect(result[:tags]).to eq([1, 2])
+    end
+  end
+
   describe "rule matching and inheritance" do
     it "the LAST matching rule wins and no positional actions means catch-all" do
       klass = permittable_class do
