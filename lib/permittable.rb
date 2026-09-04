@@ -1291,6 +1291,10 @@ require "permittable/contract"
 # Reusable field lists — `Permittable.fields` + the builder's `use` verb.
 require "permittable/field_group"
 
+# Contract COVERAGE — the registry crossed with the route set, so a
+# half-covered controller is as visible as an uncovered one.
+require "permittable/audit"
+
 # Boot-time integration (filter_parameters registration, the
 # permittable:openapi rake task), Rails apps only
 require "permittable/railtie" if defined?(Rails::Railtie)
