@@ -186,7 +186,7 @@ Which options are legal depends on the field kind — anything else raises at cl
 | Option | Scalar | Array | Nested | Meaning |
 |---|:---:|:---:|:---:|---|
 | `in:` | ✅ | — | — | Allowed values: a `Range` (bounds-checked with `cover?`) or an `Array` |
-| `format:` | ✅¹ | — | — | Regexp the value must match |
+| `format:` | ✅¹ | — | — | Regexp the value must match, or a [preset name](#format-presets): `:email`, `:uuid`, `:url`, `:slug`, `:hostname` |
 | `length:` | ✅¹ | ✅ | — | `Range` or `Integer`. Character count on strings, **element count** on arrays |
 | `normalize:` | ✅¹ | — | — | `:squish`, `:strip`, `:downcase`, `:upcase`, `:email`, or a Proc. Runs **before** the cast |
 | `default:` | ✅ | ✅ | — | Value used when the field is absent. Validated against the field's own contract at class load |
@@ -207,6 +207,30 @@ Which options are legal depends on the field kind — anything else raises at cl
 ```ruby
 optional :slug, :string, validate: ->(v) { v.match?(/\A[a-z0-9-]+\z/) || :malformed_slug }
 ```
+
+### `format:` presets
+
+The regexps every app writes by hand, named once:
+
+```ruby
+required :email,   :string, format: :email
+required :id,      :string, format: :uuid
+optional :website, :string, format: :url
+optional :slug,    :string, format: :slug
+optional :host,    :string, format: :hostname
+```
+
+| Preset | Matches | Exported JSON Schema `format` |
+|---|---|---|
+| `:email` | Exactly `URI::MailTo::EMAIL_REGEXP` — the regexp Rails apps already paste in, so switching to the preset cannot change which addresses an endpoint accepts | `email` |
+| `:uuid` | A canonical `8-4-4-4-12` UUID, either case | `uuid` |
+| `:url` | An `http`/`https` URL. A **shape** check, not a reachability guarantee — but it does reject `javascript:` and other schemes | `uri` |
+| `:slug` | Lowercase, digits, single hyphens between segments | — |
+| `:hostname` | A DNS hostname (label rules, no trailing dot) | `hostname` |
+
+A preset carries something a hand-written Regexp cannot: the JSON Schema **`format` keyword** the wider ecosystem understands, so [exported docs](#exporting-openapi-docs-that-cannot-drift) say `"format": "uuid"` rather than only a wall of `pattern`. The `pattern` is still emitted next to it — in draft 2020-12 `format` is an annotation unless a validator opts into asserting it, so the pattern is what actually enforces.
+
+An unknown preset name fails at class load, listing the presets. Passing a `Regexp` directly works exactly as before, and the RSpec matcher speaks both spellings: `matching(:email)` asserts the preset, `matching(/re/)` the Regexp.
 
 ## Types and strict coercion
 
@@ -615,7 +639,8 @@ A bad contract is a programmer error, so it fails when the class loads — never
 - A field declared twice in one contract
 - An unknown option for the field's kind, listing what *is* allowed
 - An unknown type, listing the supported ones
-- An unknown `normalize:` preset, listing the presets
+- An unknown `normalize:` or `format:` preset, listing the presets
+- A `format:` that is neither a `Regexp` nor a preset name
 - `format:`, `length:`, or `normalize:` on a non-`:string` field
 - `length:` that isn't a `Range` or `Integer`; `in:` that doesn't respond to `include?`
 - `validate:` or `transform:` that isn't callable
@@ -643,7 +668,7 @@ Using [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails)? `Concer
 
 ```sh
 bundle install
-bundle exec rspec      # 125 examples
+bundle exec rspec      # 214 examples
 bundle exec rubocop
 ```
 

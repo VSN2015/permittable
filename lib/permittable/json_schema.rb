@@ -83,10 +83,23 @@ module Permittable
 
     def scalar_schema(field)
       schema = SCALAR_SCHEMAS.fetch(field[:type]).dup
+      apply_format_name!(schema, field)
       apply_in!(schema, field[:in])
       apply_string_bounds!(schema, field)
-      apply_pattern!(schema, field[:format])
+      # A preset's pattern is authored by this gem rather than by the app, so
+      # it needs no heuristic — see apply_pattern!.
+      apply_pattern!(schema, field[:format], vouched: !field[:format_name].nil?)
       schema
+    end
+
+    # A `format:` preset also names the JSON Schema `format` keyword the
+    # ecosystem understands, which a hand-written Regexp cannot. `pattern` is
+    # still emitted next to it: in draft 2020-12 `format` is an annotation
+    # unless a validator opts into asserting it, so the pattern is what
+    # actually enforces.
+    def apply_format_name!(schema, field)
+      json = FORMATS.dig(field[:format_name], :json)
+      schema["format"] = json if json
     end
 
     def array_schema(field, unknown:)
@@ -127,10 +140,16 @@ module Permittable
       schema["maxLength"] = max if max
     end
 
-    def apply_pattern!(schema, regexp)
+    # `vouched:` marks a pattern this gem authored (a `format:` preset), which
+    # is known translatable and so skips the conservative scan. It has to:
+    # the RFC-derived :email pattern contains `*+` inside a character class,
+    # which UNTRANSLATABLE reads — deliberately over-eagerly — as a
+    # possessive quantifier, and the most common format in Rails would
+    # otherwise publish no pattern at all.
+    def apply_pattern!(schema, regexp, vouched: false)
       return unless regexp
 
-      pattern = ecma_pattern(regexp)
+      pattern = ecma_pattern(regexp, vouched: vouched)
       if pattern
         schema["pattern"] = pattern
       else
@@ -142,11 +161,11 @@ module Permittable
     # Flagged regexps bail entirely (JSON Schema's `pattern` has no flag
     # slot, and /x//m/i all change semantics), as does any source containing
     # an untranslatable construct.
-    def ecma_pattern(regexp)
+    def ecma_pattern(regexp, vouched: false)
       return nil unless regexp.options.zero?
 
       source = regexp.source
-      return nil if source.match?(UNTRANSLATABLE)
+      return nil if !vouched && source.match?(UNTRANSLATABLE)
 
       source.gsub('\A', "^").gsub('\z', "$")
     end
