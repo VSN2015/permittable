@@ -621,14 +621,14 @@ Monitor-mode rules validate **eagerly in the `before_action`, regardless of `enf
 
 ### Generating draft contracts (`permittable:generate`)
 
-The blank-page problem, solved: the first draft of every contract is generated from what the app already knows.
+The blank-page problem, solved: the first draft of every contract is generated from what the app already knows — the model's columns, and the params calls already sitting in the controller, in either spelling (`params.require(...).permit(...)` or Rails 8's `params.expect(...)`).
 
 ```sh
 bin/rails permittable:generate                      # every controller without a contract
 bin/rails "permittable:generate[UsersController]"   # one controller, even if covered
 ```
 
-For each controller the task infers the model from `controller_name` (columns give types, NOT NULL gives `required`), scans the controller source for `params.require(...).permit(...)` calls (permitted keys give the field list and the `root:`), and prints a paste-ready draft:
+For each controller the task infers the model from `controller_name` (columns give types, NOT NULL gives `required`), scans the controller source for `params.require(...).permit(...)` and `params.expect(...)` calls (permitted keys give the field list and the `root:`), and prints a paste-ready draft:
 
 ```ruby
 # Drafted by permittable:generate — review the TODOs, then deploy: monitor
@@ -645,9 +645,10 @@ end
 The generator's one rule is **draft, don't guess** — everything it cannot know for sure stays visible instead of silently decided:
 
 - Drafts come out in **monitor mode**, so pasting one changes nothing until you flip it.
-- A permitted key that isn't a column becomes `virtual: true` with a TODO; a column type with no scalar equivalent (`json`, `binary`) becomes a TODO comment; a permit argument the conservative parser can't read (`*dynamic_keys`) is kept verbatim in a TODO instead of dropped.
+- A permitted key that isn't a column becomes `virtual: true` with a TODO; a column type with no faithful representation (`binary`, geometry types) becomes a TODO comment; a permit argument the conservative parser can't read (`*dynamic_keys`) is kept verbatim in a TODO instead of dropped.
 - A database default is noted in a comment but **not** copied into `default:` — a contract default is injected on every request that omits the field, which would overwrite columns on partial updates. The database already handles creation.
-- `key: [:a, :b]` in a permit call drafts as a nested block, with a TODO noting it may be an array of hashes.
+- `key: [:a, :b]` in a permit call drafts as a nested block, with a TODO noting it may be an array of hashes. In a `params.expect` call the two shapes are distinguishable — `key: [:a]` is a nested hash, `key: [[:a]]` is an array of hashes — so that draft carries no TODO at all.
+- In a `params.expect` call, a route param sitting next to the envelope (`params.expect(:id, user: [:name])`) is **not** drafted as a field; it stays visible in a TODO, because a routing key is not body input. Neither is a second envelope, which belongs under a different `root:` than one contract can express.
 
 No Rails required for the core: `Permittable::Generator.draft(model: User)`, `.for_controller(controller, source: File.read(path))`, and `.scan(source)` are plain Ruby.
 
