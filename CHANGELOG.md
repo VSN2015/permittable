@@ -1,5 +1,10 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Fixed
+- **A `root:` key sent with the wrong shape reported `missing`, which sent clients looking in the wrong place.** `{"user": "bob"}` against a `root: :user` contract answered `{ param: "user", code: "missing" }` — for a key the client had just sent. An absent root and a malformed one are different client mistakes, and now read differently: `missing` when the key really is absent (`{}`, `{"user": null}`, `{"user": ""}` — the gem's own definition of absence, so an empty string still counts), `invalid_type` when it was sent as something other than an object. Both remain **400**, since either way the envelope itself is malformed, so nothing changes at the HTTP level; only the diagnostic gets accurate.
+
 ## 0.5.1 (2026-09-02)
 <!-- title: nested input outside Rails -->
 

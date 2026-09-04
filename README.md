@@ -247,8 +247,8 @@ Every failure raises `Permittable::InvalidParameters`, carrying `details` (an ar
 
 | Code | Raised when |
 |---|---|
-| `missing` | A required field is absent, or the `root:` key is missing (this one is a **400**) |
-| `invalid_type` | The value cannot be faithfully cast to the declared type |
+| `missing` | A required field is absent, or the `root:` key is absent (that one is a **400**) |
+| `invalid_type` | The value cannot be faithfully cast to the declared type — including a `root:` key the client *did* send with the wrong shape (`{"user": "bob"}`), which is also a **400** |
 | `inclusion` | The value is outside `in:` |
 | `format` | The value doesn't match `format:` |
 | `length` | A string's length, or an array's element count, is outside `length:` |
@@ -258,7 +258,7 @@ Every failure raises `Permittable::InvalidParameters`, carrying `details` (an ar
 
 Paths are fully qualified: `user.address.zip`, `line_items[1].sku`.
 
-**Status codes:** a missing root key renders **400** (the request is malformed — the envelope you asked for isn't there); field-level violations render **422** (well-formed, semantically wrong).
+**Status codes:** a bad root key renders **400** (the request is malformed — the envelope you asked for isn't there, or isn't an object); field-level violations render **422** (well-formed, semantically wrong). The two root failures are told apart by their code: `missing` when the key really is absent (`{}`, `{"user": null}`, `{"user": ""}`), `invalid_type` when the client sent it with the wrong shape.
 
 **Custom rendering:** if your controller defines `render_error`, the envelope delegates to it as `render_error(message:, code:, status:, errors:)` — the `errors:` key is passed only when details exist, so hosts documenting a three-keyword contract keep working. Otherwise the inline JSON shape shown at the top of this README is rendered. Either way, `render_invalid_parameters` is a normal method you can override.
 
@@ -643,7 +643,7 @@ Using [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails)? `Concer
 
 ```sh
 bundle install
-bundle exec rspec      # 125 examples
+bundle exec rspec      # 201 examples
 bundle exec rubocop
 ```
 

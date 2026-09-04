@@ -877,12 +877,21 @@ module Permittable
     raw = permittable_plain_params
     return raw unless rule[:root]
 
-    value = raw[rule[:root].to_s]
+    key = rule[:root].to_s
+    value = raw[key]
     return value if value.is_a?(Hash)
 
+    # A root that is absent and a root sent with the wrong shape
+    # ({"user": "bob"}) are different client mistakes, and telling a client
+    # that the key it just sent is "missing" sends it looking in the wrong
+    # place. Absence is the gem's own definition of it, so `{"user": ""}`
+    # still reads as missing. Either way the envelope is malformed, so both
+    # remain a 400.
+    #
     # No field declares the root, so message resolution can only come from
     # I18n ({} has no :message).
-    violations << permittable_violation({}, rule[:root].to_s, "missing")
+    code = permittable_absent?(value, raw, key) ? "missing" : "invalid_type"
+    violations << permittable_violation({}, key, code)
     nil
   end
 
