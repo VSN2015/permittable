@@ -91,6 +91,17 @@ RSpec.describe "Permittable RSpec matchers" do
       .to include("expected the field to be nullable, but it is not")
   end
 
+  it "checks an opaque :json field with as(:json)" do
+    opaque = Class.new(FakeController) do
+      include Permittable
+
+      permit_params(:create) { optional :metadata, :json, length: 0..8 }
+    end
+    expect(opaque).to permit_param(:metadata).as(:json).optional.with_length(0..8)
+    expect(failure_of { expect(opaque).to permit_param(:metadata).as(:string) })
+      .to include("expected type :string, but the contract declares :json")
+  end
+
   it "checks arrays with as_array and an element type" do
     expect(controller).to permit_param(:tags).for_action(:create).as_array
     expect(controller).to permit_param(:tags).for_action(:create).as_array(of: :string)

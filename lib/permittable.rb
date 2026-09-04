@@ -34,6 +34,7 @@ require "permittable/filter_parameter_registry"
 #       optional :ssn,   :string,  sensitive: true
 #       optional :plan,  :string,  in: %w[free pro], default: "free"
 #       array    :tag_names, of: :string, length: 0..10, virtual: true
+#       optional :metadata,  :json,    max_depth: 3, length: 0..32
 #       optional :address do
 #         required :city, :string
 #         optional :zip,  :string, format: /\A\d{5}\z/
@@ -78,6 +79,17 @@ require "permittable/filter_parameter_registry"
 # exactly the ones being monitored — and monitoring can never halt the
 # request. `permittable_violations` reads the recorded details ([] when
 # the request was clean).
+#
+# THE :json FIELD — the deliberate hole. A json/jsonb column exists precisely
+# so its contents need no schema, and until it was declarable a contract could
+# only drop that key (strong parameters spells it `permit(metadata: {})`).
+# `optional :metadata, :json` passes an arbitrary Hash through untouched —
+# keys are neither filtered nor cast, and `unknown:` does not descend into it
+# — while still letting the contract bound the shape it refuses to describe:
+# `length:` caps the top-level key count, `max_depth:` caps container nesting
+# (arrays count as a level), and `validate:`/`transform:` see the whole hash.
+# Anything that is not a Hash is `invalid_type`, and the field still maps onto
+# a column for the drift guard.
 #
 # Coercion is deliberately STRICT — ActiveModel::Type is not used, because its
 # casts are lenient by design ("abc".to_i == 0, Boolean.cast("abc") == true)
@@ -142,6 +154,9 @@ module Permittable
 
   LABEL = "Permittable".freeze
   SCALAR_TYPES = %i[string integer float decimal boolean date datetime].freeze
+  # Not a scalar: an opaque hash whose shape is deliberately undeclared, for
+  # the json/jsonb column a contract has to be able to carry.
+  JSON_TYPE = :json
   UNKNOWN_MODES = %i[ignore log error].freeze
   MODES = %i[enforce monitor].freeze
   # Rails merges routing bookkeeping into params; a top-level (root: false)
@@ -251,6 +266,31 @@ module Permittable
       return [:error, "length"] if field[:length] && !length_ok?(field[:length], value.length)
 
       check_custom(field[:validate], value)
+    end
+
+    # Free-form hash. The shape is deliberately undeclared, so the only
+    # checks are the bounds the field asked for: breadth (`length:`, the
+    # top-level key count, same reading as an array's element count) and
+    # nesting (`max_depth:`). Shared with macro-time `default:`/`example:`
+    # checking, like check_scalar.
+    def check_json(field, value)
+      return [:error, "invalid_type"] unless value.is_a?(Hash)
+      return [:error, "length"] if field[:length] && !length_ok?(field[:length], value.length)
+      return [:error, "depth"] if field[:max_depth] && depth_exceeds?(value, field[:max_depth])
+
+      check_custom(field[:validate], value)
+    end
+
+    # Container nesting, with the field's own hash as level 1. An Array counts
+    # as a level too — a deeply nested payload is a deeply nested payload
+    # whichever container carries it. Bails at the first breach instead of
+    # measuring the whole tree.
+    def depth_exceeds?(value, limit)
+      return false unless value.is_a?(Hash) || value.is_a?(Array)
+      return true if limit < 1
+
+      children = value.is_a?(Hash) ? value.each_value : value.each
+      children.any? { |child| depth_exceeds?(child, limit - 1) }
     end
 
     # A custom validator returning a Symbol fails with that symbol as the
@@ -376,6 +416,8 @@ module Permittable
     SCALAR_OPTS = %i[in format length default normalize validate virtual sensitive transform message desc example
                      nullable].freeze
     NESTED_OPTS = %i[virtual sensitive message desc nullable].freeze
+    JSON_OPTS   = %i[length max_depth default validate virtual sensitive transform message desc example
+                     nullable].freeze
     ARRAY_OPTS  = %i[of length default validate virtual sensitive required transform message desc example
                      nullable].freeze
 
@@ -447,6 +489,12 @@ module Permittable
         field = { name: name, kind: :nested, required: required,
                   fields: nested_fields!(name, &block), **opts }
         validate_message!(field)
+      elsif type&.to_sym == JSON_TYPE
+        assert_opts!(name, opts, JSON_OPTS)
+        # `type:` is carried alongside `kind:` so the same `as(:json)` matcher
+        # chain and the same error wording work as for a scalar.
+        field = { name: name, kind: :json, required: required, type: JSON_TYPE, **opts }
+        validate_json_opts!(field)
       else
         assert_opts!(name, opts, SCALAR_OPTS)
         field = { name: name, kind: :scalar, required: required,
@@ -508,6 +556,40 @@ module Permittable
       validate_authored_value!(field, :default)
       validate_authored_value!(field, :example)
       validate_message!(field)
+    end
+
+    def validate_json_opts!(field)
+      name = field[:name]
+      if field[:required] && field.key?(:default)
+        raise ArgumentError, "#{LABEL}: field :#{name} is required and cannot have a :default (default implies optional)"
+      end
+
+      validate_length!(name, field[:length]) if field.key?(:length)
+      validate_max_depth!(name, field[:max_depth]) if field.key?(:max_depth)
+      validate_callable!(name, :validate, field[:validate]) if field.key?(:validate)
+      validate_callable!(name, :transform, field[:transform]) if field.key?(:transform)
+      validate_json_authored_value!(field, :default)
+      validate_json_authored_value!(field, :example)
+      validate_message!(field)
+    end
+
+    def validate_max_depth!(name, depth)
+      return if depth.is_a?(Integer) && depth.positive?
+
+      raise ArgumentError, "#{LABEL}: :max_depth for :#{name} must be a positive Integer"
+    end
+
+    # Same rule as a scalar's authored value, over check_json: a `default:` or
+    # `example:` that its own bounds would reject fails at class load.
+    def validate_json_authored_value!(field, opt)
+      return unless field.key?(opt)
+      return if authored_nil!(field, opt)
+      raise ArgumentError, "#{LABEL}: :#{opt} for :#{field[:name]} must be a Hash" unless field[opt].is_a?(Hash)
+
+      status, code = Coercion.check_json(field, field[opt])
+      return if status == :ok
+
+      raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{code})"
     end
 
     # format / length / normalize reason about characters; on any other
@@ -719,9 +801,10 @@ module Permittable
     end
 
     # The drift guard. Nested/array fields are implicitly virtual — only
-    # scalar fields map one-to-one onto columns.
+    # scalar fields, and the opaque `:json` field standing in for a
+    # json/jsonb column, map one-to-one onto columns.
     def guard_contract_columns!(model_class, fields)
-      checked = fields.select { |f| f[:kind] == :scalar && !f[:virtual] }
+      checked = fields.select { |f| %i[scalar json].include?(f[:kind]) && !f[:virtual] }
       return if checked.empty?
 
       types = checked.to_h { |f| [f[:name], f[:type]] }
@@ -948,13 +1031,9 @@ module Permittable
     key = field[:name].to_s
     case field[:kind]
     when :scalar
-      status, out = Coercion.check_scalar(field, value)
-      if status == :ok
-        out = field[:transform].call(out) if field[:transform]
-        result[key] = out
-      else
-        violations << permittable_violation(field, full, out)
-      end
+      permittable_check_whole(field, Coercion.check_scalar(field, value), full, result, violations: violations)
+    when :json
+      permittable_check_whole(field, Coercion.check_json(field, value), full, result, violations: violations)
     when :nested
       if value.is_a?(Hash)
         result[key] = permittable_check_hash(field[:fields], ActiveSupport::HashWithIndifferentAccess.new(value),
@@ -968,6 +1047,19 @@ module Permittable
       else
         violations << permittable_violation(field, full, "invalid_type")
       end
+    end
+  end
+
+  # The shared tail of the two kinds whose entire value is checked in one
+  # call — a scalar, or an opaque hash. A clean value is transformed into the
+  # result; anything else records its code.
+  def permittable_check_whole(field, outcome, full, result, violations:)
+    status, out = outcome
+    if status == :ok
+      out = field[:transform].call(out) if field[:transform]
+      result[field[:name].to_s] = out
+    else
+      violations << permittable_violation(field, full, out)
     end
   end
 

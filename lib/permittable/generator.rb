@@ -19,14 +19,17 @@ module Permittable
     DEFAULT_ACTIONS = %i[create update].freeze
     SKIPPED_COLUMNS = %w[created_at updated_at].freeze
 
-    # Column type => contract type. Anything absent here (json, jsonb, hstore,
-    # binary, ...) has no faithful scalar representation and becomes a TODO
-    # comment rather than a guess.
+    # Column type => contract type. Document-shaped columns map onto the
+    # opaque `:json` field — the shape stays undeclared, which is what a
+    # jsonb column is for, and `max_depth:`/`length:` can bound it later.
+    # Anything absent here (binary, geometry, ...) has no faithful
+    # representation and becomes a TODO comment rather than a guess.
     COLUMN_TYPES = {
       string: :string, text: :string, citext: :string, uuid: :string,
       integer: :integer, bigint: :integer, float: :float, decimal: :decimal,
       boolean: :boolean, date: :date, datetime: :datetime,
-      timestamp: :datetime, timestamptz: :datetime
+      timestamp: :datetime, timestamptz: :datetime,
+      json: :json, jsonb: :json, hstore: :json
     }.freeze
 
     # What a source scan recovered from existing permit calls. `scalars` are
@@ -168,7 +171,7 @@ module Permittable
 
     def column_line(column)
       type = COLUMN_TYPES[column.type]
-      return "# TODO: #{column.name} (#{column.type}) has no scalar contract type — declare it as a nested block or an array" unless type
+      return "# TODO: #{column.name} (#{column.type}) has no contract type — declare it as a nested block or an array" unless type
 
       line = "#{required_column?(column) ? 'required' : 'optional'} :#{column.name}, :#{type}"
       line += " # database default: #{column.default.inspect}" unless column.default.nil?

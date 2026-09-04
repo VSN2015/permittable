@@ -641,6 +641,125 @@ RSpec.describe Permittable do
     end
   end
 
+  describe ":json (free-form hashes)" do
+    let(:decl) { proc { permit_params(:create) { optional :metadata, :json } } }
+
+    it "passes an arbitrary nested hash through untouched" do
+      payload = { "any" => { "deep" => [1, "two", true, nil] }, "n" => 3 }
+      expect(permit({ metadata: payload }, &decl)[:metadata].to_h).to eq(payload)
+    end
+
+    it "accepts an empty hash as a value (only nil and \"\" are absent)" do
+      expect(permit({ metadata: {} }, &decl)[:metadata].to_h).to eq({})
+    end
+
+    it "rejects anything that is not a hash" do
+      [[], "x", 3, true].each do |value|
+        expect(violations_for({ metadata: value }, &decl).details)
+          .to eq([{ param: "metadata", code: "invalid_type" }]), "for #{value.inspect}"
+      end
+    end
+
+    it "omits an absent field and honours default:" do
+      expect(permit({}, &decl).key?("metadata")).to be(false)
+      result = permit({}) { permit_params(:create) { optional :metadata, :json, default: { "seeded" => true } } }
+      expect(result[:metadata]).to eq("seeded" => true)
+    end
+
+    it "violates missing when required and absent" do
+      expect(violations_for({}) { permit_params(:create) { required :metadata, :json } }.details)
+        .to eq([{ param: "metadata", code: "missing" }])
+    end
+
+    it "does NOT descend into the opaque hash for unknown-key checking" do
+      result = permit({ metadata: { "undeclared" => 1 } }) do
+        permit_params(:create, unknown: :error) { optional :metadata, :json }
+      end
+      expect(result[:metadata].to_h).to eq("undeclared" => 1)
+    end
+
+    it "bounds nesting with max_depth:, counting arrays as a level" do
+      decl = proc { permit_params(:create) { optional :metadata, :json, max_depth: 2 } }
+      expect(permit({ metadata: { "a" => { "b" => 1 } } }, &decl)[:metadata]).to be_a(Hash)
+      expect(permit({ metadata: { "a" => [1, 2] } }, &decl)[:metadata]).to be_a(Hash)
+      expect(violations_for({ metadata: { "a" => { "b" => { "c" => 1 } } } }, &decl).details)
+        .to eq([{ param: "metadata", code: "depth" }])
+      expect(violations_for({ metadata: { "a" => [{ "b" => 1 }] } }, &decl).details)
+        .to eq([{ param: "metadata", code: "depth" }])
+    end
+
+    it "bounds breadth with length: on the top-level key count" do
+      decl = proc { permit_params(:create) { optional :metadata, :json, length: 0..2 } }
+      expect(permit({ metadata: { "a" => 1, "b" => 2 } }, &decl)[:metadata].keys.length).to eq(2)
+      expect(violations_for({ metadata: { "a" => 1, "b" => 2, "c" => 3 } }, &decl).details)
+        .to eq([{ param: "metadata", code: "length" }])
+    end
+
+    it "runs validate: and transform: over the whole hash" do
+      result = permit({ metadata: { "kind" => "a" } }) do
+        permit_params(:create) do
+          optional :metadata, :json,
+                   validate: ->(h) { h.key?("kind") || :kind_required },
+                   transform: ->(h) { h.merge("seen" => true) }
+        end
+      end
+      expect(result[:metadata].to_h).to eq("kind" => "a", "seen" => true)
+
+      violations = violations_for({ metadata: { "other" => 1 } }) do
+        permit_params(:create) { optional :metadata, :json, validate: ->(h) { h.key?("kind") || :kind_required } }
+      end
+      expect(violations.details).to eq([{ param: "metadata", code: "kind_required" }])
+    end
+
+    it "does not transform a hash that failed its own bounds" do
+      violations = violations_for({ metadata: { "a" => 1, "b" => 2 } }) do
+        permit_params(:create) { optional :metadata, :json, length: 1, transform: ->(h) { h.merge("t" => 1) } }
+      end
+      expect(violations.details).to eq([{ param: "metadata", code: "length" }])
+    end
+
+    it "carries message:, desc:, sensitive: and nullable: like any other field" do
+      result = permit({ metadata: nil }) do
+        permit_params(:create) { optional :metadata, :json, nullable: true, sensitive: true }
+      end
+      expect(result.fetch("metadata")).to be_nil
+      expect(Permittable.filter_parameter_registry.include?("metadata")).to be(true)
+
+      violations = violations_for({ metadata: 1 }) do
+        permit_params(:create) { optional :metadata, :json, message: "must be an object" }
+      end
+      expect(violations.details).to eq([{ param: "metadata", code: "invalid_type", message: "must be an object" }])
+    end
+
+    describe "macro validation" do
+      it "rejects the string-only and array-only options" do
+        %i[format normalize in of].each do |opt|
+          expect { permittable_class { permit_params(:create) { optional :m, :json, opt => /x/ } } }
+            .to raise_error(ArgumentError, /unknown option\(s\) :#{opt} for field :m/)
+        end
+      end
+
+      it "rejects a nested block alongside the type" do
+        expect { permittable_class { permit_params(:create) { optional(:m, :json) { required :a } } } }
+          .to raise_error(ArgumentError, /takes a type OR a nested block/)
+      end
+
+      it "requires max_depth: to be a positive Integer" do
+        expect { permittable_class { permit_params(:create) { optional :m, :json, max_depth: 0 } } }
+          .to raise_error(ArgumentError, /:max_depth for :m must be a positive Integer/)
+        expect { permittable_class { permit_params(:create) { optional :m, :json, max_depth: 1..3 } } }
+          .to raise_error(ArgumentError, /:max_depth for :m must be a positive Integer/)
+      end
+
+      it "requires an authored default:/example: to be a Hash satisfying the field's own bounds" do
+        expect { permittable_class { permit_params(:create) { optional :m, :json, default: [] } } }
+          .to raise_error(ArgumentError, /:default for :m must be a Hash/)
+        expect { permittable_class { permit_params(:create) { optional :m, :json, max_depth: 1, example: { "a" => { "b" => 1 } } } } }
+          .to raise_error(ArgumentError, /:example for field :m violates its own contract \(depth\)/)
+      end
+    end
+  end
+
   describe "rule matching and inheritance" do
     it "the LAST matching rule wins and no positional actions means catch-all" do
       klass = permittable_class do
@@ -1161,6 +1280,26 @@ RSpec.describe Permittable do
       expect(result.status).to eq(200)
       body = JSON.parse(result.body)
       expect(body["received"]).to eq("name" => "Jo", "age" => 30, "plan" => "free")
+    end
+
+    it "hands a :json field plain data, never nested ActionController::Parameters" do
+      controller = IntegrationHarness.build_controller do
+        include Permittable
+
+        permit_params(:create) { optional :metadata, :json }
+
+        def create
+          value = permitted_params[:metadata]
+          # Assigning ActionController::Parameters to a jsonb attribute raises,
+          # so what a contract passes through must already be plain data.
+          leaked = value.values.map(&:class).map(&:name).grep(/Parameters/)
+          render json: { classes: [value.class.name] + leaked }
+        end
+      end
+      result = IntegrationHarness.dispatch(controller, :create, method: "POST",
+                                                                params: { metadata: { nested: { deep: "1" } } })
+      expect(result.status).to eq(200)
+      expect(JSON.parse(result.body)["classes"]).to eq(["ActiveSupport::HashWithIndifferentAccess"])
     end
 
     it "rescues InvalidParameters into the 422 envelope with machine-readable details" do
