@@ -50,20 +50,14 @@ A violating request never reaches your action:
 
 - [Why](#why) · [Installation](#installation) · [How a request flows](#how-a-request-flows)
 - [Declaring a contract](#declaring-a-contract) · [The field DSL](#the-field-dsl) · [Field options](#field-options)
-<<<<<<< HEAD
-- [Free-form hashes](#free-form-hashes-json)
-- [Types and strict coercion](#types-and-strict-coercion) · [Absence, defaults, and partial updates](#absence-defaults-and-partial-updates) · [Explicit nulls](#explicit-nulls-nullable)
-- [Violations and error responses](#violations-and-error-responses) · [Custom error messages](#custom-error-messages-message) · [Unknown parameters](#unknown-parameters)
-- [Reusing fields](#reusing-fields-permittablefields-and-use) · [Output reshaping](#output-reshaping-transform-and-finalize) · [The schema-drift guard](#the-schema-drift-guard)
-=======
-- [Types and strict coercion](#types-and-strict-coercion) · [Absence, defaults, and partial updates](#absence-defaults-and-partial-updates)
-- [Violations and error responses](#violations-and-error-responses) · [Custom error messages](#custom-error-messages-message)
-- [RFC 9457 problem+json](#rfc-9457-problemjson) · [Unknown parameters](#unknown-parameters)
+- [Types and strict coercion](#types-and-strict-coercion) · [Free-form hashes](#free-form-hashes-json)
+- [Absence, defaults, and partial updates](#absence-defaults-and-partial-updates) · [Explicit nulls](#explicit-nulls-nullable)
+- [Violations and error responses](#violations-and-error-responses) · [Custom error messages](#custom-error-messages-message) · [RFC 9457 problem+json](#rfc-9457-problemjson)
+- [Unknown parameters](#unknown-parameters) · [Reusing fields](#reusing-fields-permittablefields-and-use)
 - [Output reshaping](#output-reshaping-transform-and-finalize) · [The schema-drift guard](#the-schema-drift-guard)
->>>>>>> feature/problem-json
 - [Sensitive parameters](#sensitive-parameters-and-log-redaction) · [Instrumentation](#instrumentation)
-- [Monitor mode](#monitor-mode-roll-out-without-rejecting) · [Generating draft contracts](#generating-draft-contracts-permittablegenerate) · [Auditing coverage](#auditing-coverage-permittableaudit)
-- [Testing contracts](#testing-contracts-rspec-matchers)
+- [Monitor mode](#monitor-mode-roll-out-without-rejecting) · [Generating draft contracts](#generating-draft-contracts-permittablegenerate)
+- [Auditing coverage](#auditing-coverage-permittableaudit) · [Testing contracts](#testing-contracts-rspec-matchers)
 - [Standalone contracts](#standalone-contracts-no-controller) · [Exporting OpenAPI](#exporting-openapi-docs-that-cannot-drift)
 - [API reference](#api-reference) · [Errors caught at class load](#errors-caught-at-class-load) · [Compatibility](#compatibility)
 
@@ -845,12 +839,9 @@ Output is deterministic (fixed key order, declaration-order properties), so the 
 | `Permittable.filter_parameter_registry` | The live registry of `sensitive:` field names |
 | `Permittable.filter_parameter_registry=` | Swap in your own duck-typed registry |
 | `Permittable.mode` / `Permittable.mode=` | App-wide default (`:enforce`) for rules that don't declare their own `mode:` |
-<<<<<<< HEAD
 | `Permittable.fields(&block)` | A reusable [field group](#reusing-fields-permittablefields-and-use) — splice it into a contract with `use` |
-=======
 | `Permittable.error_format` / `=` | `:envelope` (default) or `:problem` — see [RFC 9457 problem+json](#rfc-9457-problemjson) |
 | `Permittable.problem_base_uri` / `=` | Base URI for problem `type` members |
->>>>>>> feature/problem-json
 | `Permittable::InvalidParameters` | Raised on violation; carries `#details` and `#status` |
 | `Permittable::JsonSchema` | Contract data → JSON Schema fragments (`.rule`, `.object`, `.field`) |
 | `Permittable::OpenAPI` | OpenAPI 3.1 assembly (`.document`, `.operations_for`, `.request_body_for`, `.components`) |
@@ -906,23 +897,7 @@ Using [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails)? `Concer
 
 ```sh
 bundle install
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
 bundle exec rspec      # 320 examples
-=======
-bundle exec rspec      # 320 examples
->>>>>>> feature/problem-json
-=======
-bundle exec rspec      # 320 examples
->>>>>>> fix/sensitive-cascade
-=======
-bundle exec rspec      # 320 examples
->>>>>>> fix/validate-once-per-action
-=======
-bundle exec rspec      # 320 examples
->>>>>>> fix/malformed-root-code
 bundle exec rubocop
 ```
 
