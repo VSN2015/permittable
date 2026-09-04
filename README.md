@@ -392,6 +392,20 @@ Mark a field `sensitive: true` and its name is registered with `Permittable.filt
 optional :ssn, :string, sensitive: true
 ```
 
+**On a nested block or an array, `sensitive:` cascades to everything inside it:**
+
+```ruby
+optional :payment, sensitive: true do
+  required :card_number, :string        # redacted
+  optional :cvv,         :string        # redacted
+  optional :id,          :string, sensitive: false   # NOT redacted — see below
+end
+```
+
+It has to. Rails' parameter filtering matches the **leaf key it is currently looking at**, never the path that led there — so registering only `payment` redacts nothing: the filter is handed `("payment", {...})`, a Hash is not a String so nothing is replaced, and it then recurses and asks about `card_number`, which the container's name never matches.
+
+A sub-field opts out with an explicit `sensitive: false`. That exists because matching is a case-insensitive **substring** match, so cascading a generic name like `:id` or `:name` would redact every parameter in the app that happens to contain it — occasionally a worse outcome than the leak it prevents.
+
 The indirection is deliberate. Appending plain symbols to `config.filter_parameters` at class-load time misses every consumer that snapshots the list at boot — ActiveRecord's `filter_attributes` copy, lograge-style initializers, precompiled filters. A **single proc appended once at boot, consulting a live registry at filter time**, means fields registered when a controller loads later (lazy loading in development) are still redacted. The initializer runs before `active_record.set_filter_attributes`, so values are redacted from both request logs and `#inspect`.
 
 Matching mirrors Rails' own symbol-filter semantics: case-insensitive substring match on the parameter key. The registry is fully duck-typed (`#add`, `#include?`, `#to_proc`, `#reset!`) and swappable via `Permittable.filter_parameter_registry=`, so a host gem can pool registrations into its own.
@@ -643,7 +657,7 @@ Using [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails)? `Concer
 
 ```sh
 bundle install
-bundle exec rspec      # 125 examples
+bundle exec rspec      # 204 examples
 bundle exec rubocop
 ```
 

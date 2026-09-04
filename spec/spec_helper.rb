@@ -5,6 +5,7 @@ SimpleCov.start do
   add_filter "/spec/"
 end
 
+require "active_support/parameter_filter" # the sensitive: redaction specs
 require "active_record"
 require "permittable"
 require_relative "support/fake_controller"

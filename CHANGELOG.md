@@ -1,5 +1,13 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Fixed
+- **`sensitive: true` on a nested block or array was a complete no-op, and logged the values it promised to redact.** Rails' parameter filtering matches the **leaf key it is currently looking at**, never the path that led there — so registering only the container's name redacted nothing: the filter is handed `("payment", {...})`, a Hash is not a String so nothing is replaced, and it then recurses and asks about `"card_number"`, which the container's name never matches. A contract declaring `optional :payment, sensitive: true do required :card_number, :string end` printed the card number in the clear. `sensitive:` now **cascades** to every field inside a nested or array container, at any depth, and a spec proves it through `ActiveSupport::ParameterFilter` rather than only asserting on the registry.
+
+### Added
+- **`sensitive: false` opts a sub-field out of an inherited cascade.** Matching is a case-insensitive **substring** match, so cascading a generic name like `:id` or `:name` would redact every parameter in the app that happens to contain it — occasionally a worse outcome than the leak it prevents. An explicit `sensitive: false` on a field (or on a container, for its whole subtree) keeps it readable.
+
 ## 0.5.1 (2026-09-02)
 <!-- title: nested input outside Rails -->
 

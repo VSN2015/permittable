@@ -107,7 +107,12 @@ require "permittable/filter_parameter_registry"
 # `sensitive: true` registers the field name with
 # Permittable.filter_parameter_registry (swappable — a host gem can point it
 # at its own registry), consulted at filter time by the proc
-# Permittable::Railtie appends to `config.filter_parameters`.
+# Permittable::Railtie appends to `config.filter_parameters`. On a nested or
+# array field it CASCADES to every field inside, because Rails' filtering
+# matches the leaf key it is looking at rather than the path to it; a
+# sub-field opts out with `sensitive: false`, since matching is a substring
+# match and a generic cascaded name would redact half the app's logs. See
+# register_sensitive_params.
 #
 # OUTPUT RESHAPING — the safe replacement for params-mutating before_actions.
 # Two layers, both operating on the validated COPY (the request's `params` is
@@ -707,10 +712,24 @@ module Permittable
       end
     end
 
-    def register_sensitive_params(fields)
+    # `sensitive: true` on a nested or array field CASCADES to everything
+    # inside it, because Rails' parameter filtering matches the leaf key it is
+    # currently looking at — never the path that led there. Registering only
+    # the container's own name therefore redacted nothing it promised: the
+    # filter is handed ("payment", {...}), a Hash is not a String so nothing
+    # is replaced, and it then recurses and asks about "card_number", which
+    # was never registered.
+    #
+    # A sub-field opts out with an explicit `sensitive: false`. That escape
+    # hatch exists because matching is a case-insensitive SUBSTRING match, so
+    # cascading a generic name (:id, :name) would redact every parameter
+    # app-wide that happens to contain it — occasionally a worse outcome than
+    # the leak it prevents.
+    def register_sensitive_params(fields, inherited: false)
       fields.each do |field|
-        Permittable.filter_parameter_registry.add(field[:name]) if field[:sensitive]
-        register_sensitive_params(field[:fields]) if field[:fields]
+        sensitive = field.key?(:sensitive) ? field[:sensitive] : inherited
+        Permittable.filter_parameter_registry.add(field[:name]) if sensitive
+        register_sensitive_params(field[:fields], inherited: sensitive) if field[:fields]
       end
     end
   end
