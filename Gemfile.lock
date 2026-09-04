@@ -2,7 +2,7 @@ PATH
   remote: .
   specs:
     permittable (0.8.0)
-      activesupport (>= 5.0, < 9)
+      activesupport (>= 6.1, < 9)
 
 GEM
   remote: https://rubygems.org/
@@ -172,8 +172,8 @@ PLATFORMS
   x86_64-linux
 
 DEPENDENCIES
-  actionpack (>= 5.0, < 9)
-  activerecord (>= 5.0, < 9)
+  actionpack (>= 6.1, < 9)
+  activerecord (>= 6.1, < 9)
   benchmark-ips (~> 2.13)
   permittable!
   railties (>= 5.0, < 9)

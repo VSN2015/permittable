@@ -1,3 +1,10 @@
+# Before active_support: on activesupport <= 7.0.8.4, requiring it raises
+# NameError (ActiveSupport::LoggerThreadSafeLevel::Logger) unless `logger` is
+# already loaded, because concurrent-ruby 1.3.5 stopped requiring it for them.
+# One stdlib require makes `require "permittable"` work on every activesupport
+# version the gemspec claims, whatever the host's own boot order.
+require "logger"
+
 require "active_support"
 require "active_support/concern"
 require "active_support/notifications"

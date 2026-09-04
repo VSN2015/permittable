@@ -1,5 +1,14 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Added
+- **A CI matrix over the whole supported range.** The suite now runs against activesupport 6.1, 7.0, 7.1, 7.2, 8.0 and 8.1 across the supported Rubies, via one pinned gemfile per line in [`gemfiles/`](gemfiles/README.md) (no new dev dependency — plain `BUNDLE_GEMFILE`). The matrix is an explicit include list rather than a cross product, so it doubles as the answer to "which combinations are actually supported?". Variant lockfiles are deliberately not committed: each run resolves the newest patch of its line, so a regression in a supported version fails CI instead of being frozen out by a stale lock.
+- **A `runtime-deps` CI job that proves activesupport is the only runtime dependency.** The spec suite can't: it bundles actionpack and activerecord to exercise the integration and schema-drift paths. This job installs the *built gem* with nothing but its declared dependencies, asserts actionpack/activerecord/rails are genuinely absent, and then exercises every controller-free surface — standalone contracts (casting, defaults, `finalize`, 400/422 semantics, nested plain hashes), the concern on a plain params duck, `unknown: :error` with no logger to warn through, `sensitive:` registration with no Railtie, monitor mode, instrumentation, JSON Schema, OpenAPI assembly, and the generator. Every `respond_to?`/`defined?` guard in the gem is a promise; a missing one now fails CI.
+
+### Changed
+- **The compatibility range is now tested rather than asserted, and narrowed to what passes.** CI ran one combination — the newest of everything — while the gemspec advertised `activesupport >= 5.0, < 9`. Testing the range surfaced two real problems. On **activesupport 5.0 and 5.1 a contract cannot be declared at all**: the registry is a `class_attribute ... default: []`, and `default:` arrived in Rails 5.2, so `permit_params` died on `NoMethodError: undefined method '+' for nil`. And on **activesupport ≤ 7.0.8.4, `require "permittable"` itself raised** `NameError: uninitialized constant ActiveSupport::LoggerThreadSafeLevel::Logger`, because concurrent-ruby 1.3.5 stopped requiring `logger` for them. The floor is now **`>= 6.1`** — the oldest line the full suite is run against — and the load failure is fixed with one stdlib `require "logger"` ahead of `require "active_support"`, so the gem loads whatever the host's own boot order.
+
 ## 0.8.0 (2026-09-19)
 <!-- title: a no-op sensitive: cascade, an invalid OpenAPI export, and megabyte-scale rejections -->
 
