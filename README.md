@@ -368,6 +368,8 @@ Every failure raises `Permittable::InvalidParameters`, carrying `details` (an ar
 
 Paths are fully qualified: `user.address.zip`, `line_items[1].sku`.
 
+**`details` is complete; `message` is prose.** The `details` array names **every** offender, however many there are — it is the machine-readable channel and nothing is dropped from it. The `message` string lists at most ten and counts the rest (`…, and 49990 more`), because it is a sentence for a person and it also lands in your logs and in every exception tracker. Before that bound, a request carrying 50,000 undeclared keys against `unknown: :error` produced a **1 MB** exception message and a 1 MB log line.
+
 **Status codes:** a bad root key renders **400** (the request is malformed — the envelope you asked for isn't there, or isn't an object); field-level violations render **422** (well-formed, semantically wrong). The two root failures are told apart by their code: `missing` when the key really is absent (`{}`, `{"user": null}`, `{"user": ""}`), `invalid_type` when the client sent it with the wrong shape.
 
 **Custom rendering:** if your controller defines `render_error`, the envelope delegates to it as `render_error(message:, code:, status:, errors:)` — the `errors:` key is passed only when details exist, so hosts documenting a three-keyword contract keep working. Otherwise the inline JSON shape shown at the top of this README is rendered. Either way, `render_invalid_parameters` is a normal method you can override, and [`Permittable.error_format = :problem`](#rfc-9457-problemjson) swaps the whole shape for RFC 9457 problem details.
@@ -466,7 +468,7 @@ The setting is app-wide, not per-contract, because the error format of an API is
 | Mode | Behaviour |
 |---|---|
 | `:ignore` (default) | Silently dropped, exactly like strong parameters |
-| `:log` | Dropped, with a `logger.warn` naming the full paths |
+| `:log` | Dropped, with a `logger.warn` naming the full paths — at most ten of them, then a count, so one request cannot write a megabyte of log |
 | `:error` | Each undeclared key becomes an `unknown` violation |
 
 Rails merges `controller`, `action`, and `format` into `params`; these are exempt at the top level so `unknown: :error` doesn't flag the router's own bookkeeping. Inside a `root:` or a nested hash there is no such exemption, because nothing legitimately injects keys there.
@@ -911,7 +913,7 @@ Using [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails)? `Concer
 
 ```sh
 bundle install
-bundle exec rspec      # 320 examples
+bundle exec rspec      # 335 examples
 bundle exec rubocop
 ```
 
