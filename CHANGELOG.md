@@ -1,5 +1,10 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Fixed
+- **A rejected request instrumented `invalid_parameters.permittable` more than once, double-counting itself in every dashboard.** `permitted_params` is documented as memoized per action, but it only memoized *successes* — on a violation it raised without storing anything, so a second read revalidated from scratch and fired the event again. Any action that reads the params twice hit this, and `permittable_violations` followed by `permitted_params` — the pattern the monitor-mode docs suggest for "would this request fail?" — hit it every time. The memo now remembers the **outcome**: a rejection is stored and re-raised (the same exception object, not an equal-looking new one), so a contract runs, and instruments, exactly once per action per request. `ArgumentError` is deliberately still raised fresh every time and never memoized — a contract that doesn't cover the action is a bug to fix, not a verdict on the request.
+
 ## 0.5.1 (2026-09-02)
 <!-- title: nested input outside Rails -->
 
