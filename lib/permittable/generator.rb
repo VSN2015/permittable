@@ -1,8 +1,9 @@
 module Permittable
   # Drafts a permit_params contract from what the app already knows: the
   # model's columns (types, NOT NULL, database defaults) and, when the
-  # controller source is available, the strong-parameters calls already in it
-  # (`params.require(:user).permit(:name, tags: [])`). The draft is a
+  # controller source is available, the params calls already in it — both
+  # spellings, `params.require(:user).permit(:name, tags: [])` and Rails 8's
+  # `params.expect(user: [:name, tags: []])`. The draft is a
   # STARTING POINT, not an oracle — everything the generator cannot know for
   # sure is marked with a TODO comment instead of guessed, and the whole
   # contract is emitted in monitor mode so pasting it changes nothing until
@@ -29,11 +30,14 @@ module Permittable
       timestamp: :datetime, timestamptz: :datetime
     }.freeze
 
-    # What a source scan recovered from existing permit calls. `scalars` are
-    # plain `:key` arguments, `arrays` are `key: []`, `nested` maps `key:
-    # [:a, :b]` onto its sub-keys, and `unparsed` keeps verbatim anything the
-    # conservative parser would otherwise have silently dropped.
-    Scan = Struct.new(:root, :scalars, :arrays, :nested, :unparsed, :calls, keyword_init: true) do
+    # What a source scan recovered from the `params.permit` and Rails 8
+    # `params.expect` calls already in a controller. `scalars` are plain
+    # `:key` arguments, `arrays` are `key: []`, `nested` maps `key: [:a, :b]`
+    # onto its sub-keys, `nested_arrays` maps the `key: [[:a, :b]]` an
+    # `expect` call spells an array of hashes with, and `unparsed` keeps
+    # verbatim anything the conservative parser would otherwise have silently
+    # dropped.
+    Scan = Struct.new(:root, :scalars, :arrays, :nested, :nested_arrays, :unparsed, :calls, keyword_init: true) do
       def found?
         calls.positive?
       end
@@ -45,23 +49,49 @@ module Permittable
     # half-read.
     PERMIT_CALL = /params\s*(?:\.\s*require\(\s*:(\w+)\s*\))?\s*\.\s*permit\(([^()]*)\)/m
 
+    # One Rails 8 `params.expect` call — the replacement for
+    # `require(...).permit(...)`, and the reason this scanner exists twice: a
+    # Rails 8 controller has no permit calls to read, so without this the
+    # generator would fall back to columns alone and lose everything the app
+    # already knows about its own params. Same conservative capture as
+    # PERMIT_CALL: brackets and newlines are fine, a parenthesis means a
+    # method call in the arguments and the whole call is skipped rather than
+    # half-read.
+    EXPECT_CALL = /params\s*\.\s*expect\(([^()]*)\)/m
+
+    # The required root envelope of an expect call: `user: [...]`, where the
+    # brackets hold fields — not the empty `tag_names: []` of an
+    # array-of-scalars root, and not the `comments: [[...]]` of an
+    # array-of-hashes root, neither of which a rooted contract can express.
+    EXPECT_ENVELOPE = /\A(\w+):\s*\[\s*(?![\[\]])(.*?)\s*\]\z/m
+
     # A permit key: `:name`, `"name"`, or `'name'` (quotes must match —
     # anything else stays unparsed rather than guessed).
     SCALAR_KEY = /\A(?::(\w+)|"(\w+)"|'(\w+)')\z/
     ARRAY_ARG  = /\A(\w+):\s*\[\s*\]\z/m
     NESTED_ARG = /\A(\w+):\s*\[([^\[\]]*)\]\z/m
+    # expect-only: `comments: [[:body, :author]]` is an array of hashes.
+    NESTED_ARRAY_ARG = /\A(\w+):\s*\[\s*\[([^\[\]]*)\]\s*\]\z/m
 
     module_function
 
-    # Merge every permit call found in `source` into one Scan. The first
-    # `.require(:root)` seen wins, matching how a controller normally sticks
-    # to one envelope across actions.
+    # Merge every `params.permit` and `params.expect` call found in `source`
+    # into one Scan. The first root seen wins, matching how a controller
+    # normally sticks to one envelope across actions.
     def scan(source)
-      result = Scan.new(root: nil, scalars: [], arrays: [], nested: {}, unparsed: [], calls: 0)
-      (source || "").scan(PERMIT_CALL) do |root, args|
+      result = Scan.new(root: nil, scalars: [], arrays: [], nested: {}, nested_arrays: {},
+                        unparsed: [], calls: 0)
+      source = source.to_s
+      source.scan(PERMIT_CALL) do |root, args|
         result.calls += 1
         result.root ||= root&.to_sym
         split_args(args).each { |arg| classify_arg(result, arg) }
+      end
+      # One capture group, so scan yields a one-element Array rather than
+      # auto-splatting the way PERMIT_CALL's two groups do.
+      source.scan(EXPECT_CALL) do |(args)|
+        result.calls += 1
+        classify_expect_args(result, split_args(args))
       end
       result
     end
@@ -124,23 +154,48 @@ module Permittable
       parts.map(&:strip).reject(&:empty?)
     end
 
+    # An expect call's arguments. The bracketed argument is the required root
+    # envelope and its contents are the fields. Plain symbols are fields only
+    # when there is no envelope (`params.expect(:q, :page)` is a rootless
+    # filter); alongside one they are route params rather than body fields,
+    # so they stay visible instead of being drafted as contract fields — as
+    # does a second envelope, which belongs under a different root than one
+    # rooted contract can express.
+    def classify_expect_args(result, args)
+      envelopes, others = args.partition { |arg| EXPECT_ENVELOPE.match?(arg) }
+      root = envelopes.first
+      return others.each { |arg| classify_arg(result, arg) } unless root
+
+      match = EXPECT_ENVELOPE.match(root)
+      result.root ||= match[1].to_sym
+      split_args(match[2]).each { |inner| classify_arg(result, inner) }
+      (envelopes.drop(1) + others).each { |arg| result.unparsed |= [unparsed_arg(arg)] }
+    end
+
     def classify_arg(result, arg)
       if (key = scalar_key(arg))
         result.scalars |= [key]
       elsif (match = ARRAY_ARG.match(arg))
         result.arrays |= [match[1].to_sym]
+      elsif (match = NESTED_ARRAY_ARG.match(arg))
+        classify_nested(result, match, arg, into: result.nested_arrays)
       elsif (match = NESTED_ARG.match(arg))
-        classify_nested(result, match, arg)
+        classify_nested(result, match, arg, into: result.nested)
       else
-        result.unparsed |= [arg.gsub(/\s+/, " ")]
+        result.unparsed |= [unparsed_arg(arg)]
       end
     end
 
-    def classify_nested(result, match, arg)
+    def classify_nested(result, match, arg, into:)
       keys = split_args(match[2]).map { |part| scalar_key(part) }
-      return result.unparsed |= [arg.gsub(/\s+/, " ")] if keys.any?(&:nil?)
+      return result.unparsed |= [unparsed_arg(arg)] if keys.any?(&:nil?)
 
-      result.nested[match[1].to_sym] = (result.nested[match[1].to_sym] || []) | keys
+      key = match[1].to_sym
+      into[key] = (into[key] || []) | keys
+    end
+
+    def unparsed_arg(arg)
+      arg.gsub(/\s+/, " ")
     end
 
     def scalar_key(part)
@@ -191,6 +246,7 @@ module Permittable
       lines = scan.scalars.map { |name| scanned_scalar_line(name, columns) }
       lines += scan.arrays.map { |name| "array :#{name}, of: :string # TODO: confirm the element type" }
       scan.nested.each { |name, keys| lines += nested_lines(name, keys) }
+      scan.nested_arrays.each { |name, keys| lines += nested_array_lines(name, keys) }
       lines + scan.unparsed.map { |arg| "# TODO: could not parse from the permit call: #{arg}" }
     end
 
@@ -204,8 +260,19 @@ module Permittable
 
     def nested_lines(name, keys)
       ["optional :#{name} do # TODO: drafted from `#{name}: [...]` — if this is an array of hashes, use `array :#{name} do`"] +
-        keys.map { |key| "  optional :#{key}, :string # TODO: confirm the type" } +
+        sub_field_lines(keys) +
         ["end"]
+    end
+
+    # No TODO on the kind here, unlike nested_lines: `params.expect` spells an
+    # array of hashes `#{name}: [[...]]`, which says definitively what the
+    # equivalent permit call (`#{name}: [...]`) leaves ambiguous.
+    def nested_array_lines(name, keys)
+      ["array :#{name} do"] + sub_field_lines(keys) + ["end"]
+    end
+
+    def sub_field_lines(keys)
+      keys.map { |key| "  optional :#{key}, :string # TODO: confirm the type" }
     end
 
     HEADER = "# Drafted by permittable:generate — review the TODOs, then deploy: monitor\n" \
