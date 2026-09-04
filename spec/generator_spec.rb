@@ -176,6 +176,57 @@ RSpec.describe Permittable::Generator do
     end
   end
 
+  describe ".scan and things that are not code" do
+    it "does not read a commented-out permit call" do
+      scan = described_class.scan(<<~RUBY)
+        def create
+          # Legacy, kept for reference:
+          # params.require(:admin).permit(:superuser, :impersonate_id)
+          params.require(:user).permit(:name)
+        end
+      RUBY
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[name])
+      expect(scan.calls).to eq(1)
+    end
+
+    it "does not read a trailing comment on a live line" do
+      scan = described_class.scan('params.permit(:name) # was params.permit(:admin)')
+      expect(scan.scalars).to eq(%i[name])
+      expect(scan.calls).to eq(1)
+    end
+
+    it "does not read a permit call inside an =begin/=end block" do
+      scan = described_class.scan(<<~RUBY)
+        =begin
+        params.require(:old).permit(:legacy)
+        =end
+        params.permit(:name)
+      RUBY
+      expect(scan.root).to be_nil
+      expect(scan.scalars).to eq(%i[name])
+    end
+
+    it "keeps a `#` that is part of a string or interpolation, not a comment" do
+      scan = described_class.scan(<<~RUBY)
+        LABEL = "tracking #1"
+        def create = params.require(:user).permit(:name)
+      RUBY
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[name])
+    end
+
+    it "still reads quoted permit keys, which live in string tokens" do
+      scan = described_class.scan(%(params.permit("name", 'email', :age)))
+      expect(scan.scalars).to eq(%i[name email age])
+    end
+
+    it "falls back to the raw source when the file cannot be lexed" do
+      scan = described_class.scan("def broken( ; params.permit(:name)")
+      expect(scan.scalars).to eq(%i[name])
+    end
+  end
+
   describe ".draft from a model's columns" do
     before do
       ActiveRecord::Schema.define do
