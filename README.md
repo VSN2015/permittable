@@ -931,7 +931,7 @@ Using [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails)? `Concer
 
 ```sh
 bundle install
-bundle exec rspec      # 335 examples
+bundle exec rspec      # 410 examples
 bundle exec rubocop
 ```
 
