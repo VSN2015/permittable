@@ -222,6 +222,67 @@ RSpec.describe Permittable do
     end
   end
 
+  describe "dates are parsed, never guessed" do
+    let(:decl) do
+      proc do
+        permit_params(:create) do
+          optional :on, :date
+          optional :at, :datetime
+        end
+      end
+    end
+
+    it "accepts every format that fully specifies a date" do
+      %w[2026-09-05 2026/09/05].each do |value|
+        expect(permit({ on: value }, &decl)[:on]).to eq(Date.new(2026, 9, 5)), "for #{value}"
+      end
+      ["Sep 5, 2026", "5 September 2026", "2026-09-05T10:00:00Z"].each do |value|
+        expect(permit({ on: value }, &decl)[:on]).to eq(Date.new(2026, 9, 5)), "for #{value}"
+      end
+    end
+
+    it "REJECTS input whose missing parts would be invented from today" do
+      # Date.parse fills these in from the current date, so the same request
+      # produced a different value depending on the day it arrived.
+      {
+        "09/2026" => "no day",
+        "5th" => "no month or year",
+        "Sept" => "no day or year",
+        "September" => "no day or year"
+      }.each do |value, why|
+        expect(violations_for({ on: value }, &decl).details)
+          .to eq([{ param: "on", code: "invalid_type" }]), "expected #{value.inspect} (#{why}) to be rejected"
+      end
+    end
+
+    it "still rejects what it always rejected" do
+      %w[2026-13-01 2026-02-30 nonsense T].each do |value|
+        expect(violations_for({ on: value }, &decl).details)
+          .to eq([{ param: "on", code: "invalid_type" }]), "for #{value}"
+      end
+    end
+
+    it "accepts a Date object unchanged" do
+      expect(permit({ on: Date.new(2026, 9, 5) }, &decl)[:on]).to eq(Date.new(2026, 9, 5))
+    end
+
+    it "applies the same rule to :datetime, where the time part may be absent" do
+      expect(permit({ at: "2026-09-05T10:30:00Z" }, &decl)[:at]).to eq(Time.utc(2026, 9, 5, 10, 30))
+      # A date with no time is midnight UTC, as documented.
+      expect(permit({ at: "2026-09-05" }, &decl)[:at]).to eq(Time.utc(2026, 9, 5))
+      # A time with no date used to become TODAY at that time.
+      expect(violations_for({ at: "10:30" }, &decl).details).to eq([{ param: "at", code: "invalid_type" }])
+      expect(violations_for({ at: "Sept" }, &decl).details).to eq([{ param: "at", code: "invalid_type" }])
+    end
+
+    it "accepts Time, DateTime and Date objects for :datetime, normalising to UTC" do
+      expect(permit({ at: Time.utc(2026, 9, 5, 10, 30) }, &decl)[:at]).to eq(Time.utc(2026, 9, 5, 10, 30))
+      expect(permit({ at: DateTime.new(2026, 9, 5, 10, 30, 0, "+07:00") }, &decl)[:at])
+        .to eq(Time.utc(2026, 9, 5, 3, 30))
+      expect(permit({ at: Date.new(2026, 9, 5) }, &decl)[:at]).to eq(Time.utc(2026, 9, 5))
+    end
+  end
+
   describe "validations" do
     it "checks in: as Range (cover) and as Array (inclusion)" do
       decl = proc { permit_params(:create) { required :age, :integer, in: 18..120 } }
