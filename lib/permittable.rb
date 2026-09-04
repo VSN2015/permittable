@@ -13,6 +13,11 @@ require "active_support/core_ext/hash/indifferent_access" # nested plain Hashes 
 require "active_support/core_ext/class/attribute"
 require "active_support/core_ext/string/inflections"
 require "active_support/core_ext/string/filters"
+# cast_datetime names ActiveSupport::TimeWithZone, which activesupport does not
+# load by default. A Rails app has it via active_support/time at boot; a
+# standalone host (a Contract validating a webhook payload or a job argument)
+# has nothing that loads it, and every :datetime cast raised NameError there.
+require "active_support/time_with_zone"
 require "bigdecimal"
 require "date"
 require "time"
