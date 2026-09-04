@@ -1,5 +1,13 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Added
+- **`spec/schema_conformance_spec.rb` — the "docs cannot drift" claim is now tested rather than argued.** Every other spec checks one side or the other; this one checks that the two **agree**, walking canonical JSON payloads through both a contract and its own exported schema and comparing the verdicts. It covers scalars and bounds, enums, exclusive and endless ranges, exact lengths, formats, arrays of scalars and of hashes, nested hashes under `unknown: :error`, rooted contracts, `nullable:` fields, and opaque `:json` fields with bounds. `spec/support/tiny_json_schema.rb` is a deliberately small validator covering exactly the keywords the exporter emits and nothing else — a measuring instrument, not a dependency — and one example asserts the exporter emits no keyword the validator silently ignores, so the two cannot fall out of step. The spec was mutation-tested: dropping `maxItems`, `additionalProperties: false`, the required-string `minLength: 1`, or the `root:` required wrapper each makes it fail.
+- **Every place the schema and the runtime differ is now labelled, and its direction asserted.** Two go the safe way — the server accepts what the docs reject, so a client following the docs is merely conservative: non-canonical encodings (`"30"` for an `:integer`, `1` for a `:string`, because form and query payloads are all strings), and an explicit `null` read as absence on a field that is not `nullable:`. One goes the other way and is now stated plainly instead of being left to be discovered: a `:json` field's `max_depth:` is a bound JSON Schema has no keyword for, so the published document is **looser** than the server there and an over-nested payload still earns a 422. The bound is exported as `x-permittable-max-depth` rather than dropped, and the spec asserts that extension is present. A new divergence in either direction fails the suite rather than shipping quietly.
+
+No behaviour changes: this release adds tests and documentation only.
+
 ## 0.6.0 (2026-09-08)
 <!-- title: nullable fields, :json, and strict dates -->
 
