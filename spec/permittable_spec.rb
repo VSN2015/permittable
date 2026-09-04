@@ -904,6 +904,114 @@ RSpec.describe Permittable do
       expect(Permittable.filter_parameter_registry.include?("name")).to be(false)
     end
 
+    it "cascades sensitive: from a nested block to every field inside it" do
+      permittable_class do
+        permit_params(:create) do
+          optional :payment, sensitive: true do
+            required :card_number, :string
+            optional :cvv, :string
+            optional :billing do
+              optional :postcode, :string
+            end
+          end
+        end
+      end
+      registry = Permittable.filter_parameter_registry
+      %w[payment card_number cvv billing postcode].each do |name|
+        expect(registry.include?(name)).to be(true), "expected :#{name} to be registered"
+      end
+    end
+
+    it "cascades sensitive: from an array block to its element fields" do
+      permittable_class do
+        permit_params(:create) do
+          array :cards, sensitive: true do
+            required :pan, :string
+            optional :expiry, :string
+          end
+        end
+      end
+      expect(Permittable.filter_parameter_registry.include?("pan")).to be(true)
+      expect(Permittable.filter_parameter_registry.include?("expiry")).to be(true)
+    end
+
+    it "lets a sub-field opt OUT with sensitive: false, for a name too generic to redact app-wide" do
+      permittable_class do
+        permit_params(:create) do
+          optional :payment, sensitive: true do
+            required :card_number, :string
+            # "id" would match user_id, valid, identity... app-wide.
+            optional :id, :string, sensitive: false
+            optional :meta, sensitive: false do
+              optional :name, :string
+            end
+          end
+        end
+      end
+      registry = Permittable.filter_parameter_registry
+      expect(registry.include?("card_number")).to be(true)
+      expect(registry.include?("id")).to be(false)
+      expect(registry.include?("meta")).to be(false)
+      expect(registry.include?("name")).to be(false)
+    end
+
+    it "does not register anything inside a container that is not sensitive" do
+      permittable_class do
+        permit_params(:create) do
+          optional :bank do
+            required :iban, :string, sensitive: true
+            optional :branch, :string
+          end
+        end
+      end
+      registry = Permittable.filter_parameter_registry
+      expect(registry.include?("iban")).to be(true)
+      expect(registry.include?("bank")).to be(false)
+      expect(registry.include?("branch")).to be(false)
+    end
+
+    it "actually redacts the nested values a Rails log would print" do
+      permittable_class do
+        permit_params(:create) do
+          optional :ssn, :string, sensitive: true
+          optional :payment, sensitive: true do
+            required :card_number, :string
+            optional :cvv, :string
+            optional :billing do
+              optional :postcode, :string
+            end
+          end
+          array :cards, sensitive: true do
+            required :pan, :string
+          end
+        end
+      end
+      filter = ActiveSupport::ParameterFilter.new([Permittable.filter_parameter_registry.to_proc])
+      expect(filter.filter("ssn" => "111-22-3333",
+                           "payment" => { "card_number" => "4111111111111111", "cvv" => "123",
+                                          "billing" => { "postcode" => "SW1A 1AA" } },
+                           "cards" => [{ "pan" => "5555555555554444" }]))
+        .to eq("ssn" => "[FILTERED]",
+               "payment" => { "card_number" => "[FILTERED]", "cvv" => "[FILTERED]",
+                              "billing" => { "postcode" => "[FILTERED]" } },
+               "cards" => [{ "pan" => "[FILTERED]" }])
+    end
+
+    it "stamps the cascade onto the field, so every reader of the contract agrees" do
+      klass = permittable_class do
+        permit_params(:create) do
+          optional :payment, sensitive: true do
+            required :card_number, :string
+            optional :id, :string, sensitive: false
+          end
+        end
+      end
+      payment = klass.permit_rule_for(:create)[:fields].first
+      card_number, id = payment[:fields]
+      expect(card_number[:sensitive]).to be(true)
+      expect(id[:sensitive]).to be(false)
+    end
+
     it "instruments invalid_parameters.permittable with the violation details" do
       events = []
       subscription = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|

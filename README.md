@@ -553,6 +553,22 @@ Mark a field `sensitive: true` and its name is registered with `Permittable.filt
 optional :ssn, :string, sensitive: true
 ```
 
+**On a nested block or an array, `sensitive:` cascades to everything inside it:**
+
+```ruby
+optional :payment, sensitive: true do
+  required :card_number, :string        # redacted
+  optional :cvv,         :string        # redacted
+  optional :id,          :string, sensitive: false   # NOT redacted — see below
+end
+```
+
+It has to. Rails' parameter filtering walks into hashes and arrays itself and asks a proc filter about the **leaf values only**, handing it the leaf's own key and never the path that led there. So registering `payment` alone redacts nothing inside it: the filter descends and asks about `card_number`, which the container's name does not match.
+
+A sub-field opts out with an explicit `sensitive: false`. That exists because matching is a case-insensitive **substring** match, so cascading a generic name like `:id` or `:name` would redact every parameter in the app that happens to contain it — occasionally a worse outcome than the leak it prevents. Only `false` opts out; `sensitive: nil` reads as "not stated" and still inherits.
+
+The cascade is resolved onto the field when the contract loads, so everything that reads a contract agrees: the value is redacted from logs, the exported schema marks the child `writeOnly`, and `permit_param("payment.card_number").sensitive` passes.
+
 The indirection is deliberate. Appending plain symbols to `config.filter_parameters` at class-load time misses every consumer that snapshots the list at boot — ActiveRecord's `filter_attributes` copy, lograge-style initializers, precompiled filters. A **single proc appended once at boot, consulting a live registry at filter time**, means fields registered when a controller loads later (lazy loading in development) are still redacted. The initializer runs before `active_record.set_filter_attributes`, so values are redacted from both request logs and `#inspect`.
 
 Matching mirrors Rails' own symbol-filter semantics: case-insensitive substring match on the parameter key. The registry is fully duck-typed (`#add`, `#include?`, `#to_proc`, `#reset!`) and swappable via `Permittable.filter_parameter_registry=`, so a host gem can pool registrations into its own.
