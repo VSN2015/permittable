@@ -30,6 +30,20 @@ RSpec.describe Permittable do
 
   after { Permittable.filter_parameter_registry.reset! }
 
+  # Shared by the observability and monitor-mode blocks.
+  def recording_notifications
+    events = []
+    subscription = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
+      events << payload
+    end
+    begin
+      yield
+    ensure
+      ActiveSupport::Notifications.unsubscribe(subscription)
+    end
+    events
+  end
+
   describe "macro validation" do
     it "requires a block" do
       expect { permittable_class { permit_params :create } }
@@ -999,6 +1013,48 @@ RSpec.describe Permittable do
       expect(events.first[:mode]).to eq(:enforce)
     end
 
+    it "instruments a rejected request exactly ONCE, however often the params are read" do
+      klass = permittable_class { permit_params(:create, root: :user) { required :name, :string } }
+      c = controller(klass, params: { user: {} })
+      events = recording_notifications do
+        c.permittable_violations
+        3.times do
+          c.permitted_params
+        rescue described_class::InvalidParameters
+          nil
+        end
+      end
+      expect(events.length).to eq(1)
+      expect(events.first[:details]).to eq([{ param: "user.name", code: "missing" }])
+    end
+
+    it "memoizes the rejection itself, re-raising the same error rather than revalidating" do
+      klass = permittable_class { permit_params(:create) { required :name, :string } }
+      c = controller(klass, params: {})
+      errors = Array.new(2) do
+        c.permitted_params
+      rescue described_class::InvalidParameters => e
+        e
+      end
+      expect(errors.last).to be(errors.first)
+      expect(c.permittable_violations).to eq([{ param: "name", code: "missing" }])
+    end
+
+    it "never memoizes ArgumentError — a missing contract is a programmer error, not a rejection" do
+      klass = permittable_class { permit_params(:create) { required :name, :string } }
+      c = controller(klass, params: { name: "x" }, action: "archive")
+      2.times do
+        expect { c.permitted_params }.to raise_error(ArgumentError, /no params contract declared/)
+      end
+    end
+
+    it "keeps a clean read memoized and silent" do
+      klass = permittable_class { permit_params(:create) { required :name, :string } }
+      c = controller(klass, params: { name: "x" })
+      events = recording_notifications { expect(c.permitted_params).to be(c.permitted_params) }
+      expect(events).to be_empty
+    end
+
     it "renders the shared error envelope from render_invalid_parameters" do
       klass = permittable_class { permit_params(:create) { required :name, :string } }
       c = controller(klass, params: {})
@@ -1015,19 +1071,6 @@ RSpec.describe Permittable do
 
   describe "monitor mode" do
     after { Permittable.mode = :enforce }
-
-    def recording_notifications
-      events = []
-      subscription = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
-        events << payload
-      end
-      begin
-        yield
-      ensure
-        ActiveSupport::Notifications.unsubscribe(subscription)
-      end
-      events
-    end
 
     it "rejects an unknown :mode at class load, and an unknown global mode at assignment" do
       expect { permittable_class { permit_params(:create, mode: :report) { required :a } } }
