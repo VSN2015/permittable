@@ -471,14 +471,30 @@ module Permittable
       [:error, "invalid_type"]
     end
 
+    # Date.parse fills in what a string omits FROM TODAY: "09/2026" becomes
+    # the 1st, "5th" becomes this month of this year. That is a guess, and a
+    # non-deterministic one — the same request means different things on
+    # different days — which is exactly what this coercion exists to refuse.
+    # So the string must name all three parts; which format it names them in
+    # is Date.parse's business, and every complete format it understands
+    # ("2026-09-05", "2026/09/05", "Sep 5, 2026") still works.
     def cast_date(value)
       case value
       when Date then [:ok, value]
-      when String then [:ok, Date.parse(value)]
+      when String then complete_date?(value) ? [:ok, Date.parse(value)] : [:error, "invalid_type"]
       else [:error, "invalid_type"]
       end
     rescue ArgumentError, RangeError
       [:error, "invalid_type"]
+    end
+
+    # Date._parse is the layer under Date.parse, and reports which components
+    # it actually found rather than the filled-in result.
+    def complete_date?(value)
+      found = Date._parse(value)
+      found.key?(:year) && found.key?(:mon) && found.key?(:mday)
+    rescue ArgumentError, RangeError
+      false
     end
 
     # A zoneless String parses as UTC regardless of the host timezone
@@ -488,7 +504,12 @@ module Permittable
       # DateTime is listed here, ahead of Date, because it subclasses Date.
       when ActiveSupport::TimeWithZone, Time, DateTime then [:ok, value.to_time.utc]
       when Date then [:ok, Time.utc(value.year, value.month, value.day)]
-      when String then [:ok, DateTime.parse(value).to_time.utc]
+      when String
+        # Same rule as :date — the DATE part must be named in full, or it is
+        # taken from today ("10:30" meant today at 10:30). An absent TIME part
+        # is fine and means midnight, which is the documented reading of a
+        # date given to a :datetime field.
+        complete_date?(value) ? [:ok, DateTime.parse(value).to_time.utc] : [:error, "invalid_type"]
       else [:error, "invalid_type"]
       end
     rescue ArgumentError, RangeError
