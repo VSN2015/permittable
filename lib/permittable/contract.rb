@@ -77,6 +77,14 @@ module Permittable
       @host_class.permittable_contracts.last
     end
 
+    # The contract's fields, which is also what makes a Contract usable as a
+    # field group: `use SomeContract` inside a permit_params block splices
+    # them in, so a webhook payload and a controller action can share one
+    # definition instead of two that drift.
+    def fields
+      rule[:fields]
+    end
+
     # RSpec-matcher parity with controllers: `expect(MyContract).to
     # permit_param(:email)` reads the registry through these. A standalone
     # contract covers every "action", so the argument is irrelevant.

@@ -187,6 +187,7 @@ Adopting on an existing API with live traffic? Skip ahead to [Adopting on a live
   - [Custom error messages](#custom-error-messages-message) · [Localizing with I18n](#localizing-default-messages-i18n)
   - [RFC 9457 problem+json](#rfc-9457-problemjson)
   - [Unknown parameters](#unknown-parameters)
+  - [Reusing fields](#reusing-fields-permittablefields-and-use)
   - [Output reshaping](#output-reshaping-transform-and-finalize)
   - [The schema-drift guard](#the-schema-drift-guard)
   - [Sensitive parameters and log redaction](#sensitive-parameters-and-log-redaction)
@@ -574,6 +575,57 @@ Under `:log` that bound is the whole record: nothing else names an undeclared ke
 Rails merges its own keys into `params`: `controller`, `action`, and `format` from the router, plus `authenticity_token`, `_method`, `utf8`, and `commit` from an ordinary form POST. All seven are exempt at the top level. So are the route's **path parameters** (`PATCH /users/1` merges `id`, which the exported OpenAPI documents as a path parameter rather than a body field); a contract that *declares* `id` has it validated as usual, since the URL really carried it. **ParamsWrapper's copy of a JSON body** under the controller's wrapper key (`user` for `UsersController`) goes further: when Rails made that copy, a rootless contract does not see the key at all, because the client never sent it. So an undeclared wrapper key is not flagged, and a scalar or array field that happens to share the wrapper's name (`optional :feedback, :string` on `FeedbackController`) is simply absent, rather than failing as `invalid_type` against Rails' copy of the whole body. The one exception is a rootless contract that declares the wrapper key as a hash container — a nested block (`required :user do ... end`) or `:json`. That contract is reading the copy on purpose, like a `root:` spelled as a field, so the copy is kept and validated as that field. A client that sends `user` itself is checked like any other key: validated if declared, flagged if not. That holds whether the wrapper name is configured as a String or as a Symbol (`wrap_parameters :user`). Either way `unknown: :error` flags what the *client* got wrong rather than what the framework added. Inside a `root:` or a nested hash there is no such exemption, because nothing legitimately injects keys there — and a standalone `Contract` exempts nothing at all, having neither a router, a form, nor a request.
 
 All of this changes what is *checked* only. Monitor mode still hands back the form keys, the path parameters and the wrapper's copy in its raw pass-through, where behaving exactly like the pre-contract app is the whole promise and a legacy action may read `params[:id]` or `_method` itself; only the router's three are dropped there.
+
+### Reusing fields (`Permittable.fields` and `use`)
+
+A growing API produces two kinds of duplication: the `address` block three controllers want, and the `update` contract that is the `create` contract with nothing mandatory. A **field group** is a reusable field list — the same frozen data a contract's fields are, without the contract around them.
+
+```ruby
+AddressFields = Permittable.fields do
+  required :city, :string, length: 1..80
+  optional :zip,  :string, format: /\A\d{5}\z/
+end
+
+UserFields = Permittable.fields do
+  required :name,  :string
+  required :email, :string, format: URI::MailTo::EMAIL_REGEXP
+  optional :plan,  :string, in: %w[free pro], default: "free"
+  optional :address do
+    use AddressFields          # groups compose
+  end
+end
+
+class UsersController < ApplicationController
+  include Permittable
+
+  permit_params :create, root: :user, model: User do
+    use UserFields
+  end
+
+  # PATCH: the same fields, nothing mandatory.
+  permit_params :update, root: :user, model: User do
+    use UserFields, optional: true
+  end
+end
+```
+
+`use` splices the group in **at the point of use**, in the group's own order, exactly as if the fields had been typed there — so the request-time behaviour, the [drift guard](#the-schema-drift-guard), `sensitive:` registration and the [exported schema](#exporting-openapi-docs-that-cannot-drift) are all identical to the inline spelling. It works at the top level of a contract, inside a nested or array block, and inside another group.
+
+| Option | Meaning |
+|---|---|
+| `optional: true` | Relax every spliced field. **Top level only** — if a client sends an `address` at all, the address's own required sub-fields still hold. Types, bounds and `default:` are untouched, so `use UserFields, optional: true` is a complete `PATCH` contract |
+| `only:` / `except:` | Select a subset, in the group's own order. Mutually exclusive |
+
+Because a group is built by the same builder a contract is, **every declaration is validated when the group is defined** — a typo fails once, at the group, instead of at each contract that uses it. Two more things fail at class load rather than silently: `only:`/`except:` naming a field the group doesn't declare (so a typo can't quietly drop a field), and a field declared twice. That last one makes overriding deliberate:
+
+```ruby
+permit_params :create do
+  use AddressFields, except: %i[city]
+  required :city, :string, length: 1..5   # this contract's own stricter city
+end
+```
+
+A group is deliberately **not** a contract: it has no `root:`, `unknown:`, `model:` or `mode:` — those describe the request being validated, not a set of fields — and `finalize` is rejected for the same reason. A [standalone `Contract`](#standalone-contracts-no-controller) does answer `#fields`, though, so `use SomeContract` lets a webhook payload and a controller action share one definition instead of two that drift.
 
 ### Output reshaping (`transform:` and `finalize`)
 
@@ -1090,12 +1142,14 @@ A `format:` regexp that does not translate to ECMA-262 is looser in the same way
 | `Permittable.error_format` / `=` | `:envelope` (default) or `:problem` — see [RFC 9457 problem+json](#rfc-9457-problemjson) |
 | `Permittable.problem_base_uri` / `=` | Base URI for problem `type` members |
 | `Permittable.check_column_types` / `=` | Opt in to the [type half of the drift guard](#checking-types-too-opt-in) (default `false`) |
+| `Permittable.fields(&block)` | A reusable [field group](#reusing-fields-permittablefields-and-use) — splice it into a contract with `use` |
 | `Permittable::InvalidParameters` | Raised on violation; carries `#details` and `#status` |
 | `Permittable::JsonSchema` | Contract data → JSON Schema fragments (`.rule`, `.object`, `.field`) |
 | `Permittable::OpenAPI` | OpenAPI 3.1 assembly (`.document`, `.operations_for`, `.request_body_for`, `.components`) |
 | `Permittable::Generator` | Contract drafting (`.draft`, `.for_controller`, `.scan`) — see [generating draft contracts](#generating-draft-contracts-permittablegenerate) |
 | `Permittable::Audit` | Coverage across the route set (`.entries`, `.summary`, `.stale`, `.format`) — see [auditing coverage](#auditing-coverage-permittableaudit) |
-| `Permittable::Contract` | [Standalone contracts](#standalone-contracts-no-controller) (`.define`, `#call`, `#call!`, `#json_schema`, `#rule`) |
+| `Permittable::Contract` | [Standalone contracts](#standalone-contracts-no-controller) (`.define`, `#call`, `#call!`, `#json_schema`, `#rule`, `#fields`) |
+| `Permittable::FieldGroup` | A [reusable field list](#reusing-fields-permittablefields-and-use) (`#fields`, `#names`) — built by `Permittable.fields` |
 | `Permittable::Matchers` | RSpec matchers via `require "permittable/rspec"` — `permit_param` for the declaration, `accept_params`/`reject_params` for the behaviour. See [testing contracts](#testing-contracts-rspec-matchers) |
 
 ### Errors caught at class load
@@ -1124,7 +1178,9 @@ A bad contract is a programmer error, so it fails when the class loads — never
 - `required: true` combined with `default:`
 - A field given both a type and a nested block; an array given both `of:` and a block
 - An empty contract, or a nested block declaring no sub-fields
-- `finalize` declared twice, without a block, or inside a nested block
+- `finalize` declared twice, without a block, inside a nested block, or inside a field group
+- `use` given something that is not a field group, both `only:` and `except:`, a name the group doesn't declare, or a selection that keeps nothing
+- A field group with no fields, or `Permittable.fields` without a block
 - `permit_params` without a block, or an invalid `unknown:` mode
 - A `root:` that isn't a single key (several top-level envelopes are a rootless contract with one nested block per key)
 - An invalid `mode:` (and `Permittable.mode =` / `Permittable.error_format =` / `Permittable.check_column_types =` reject invalid values at assignment)
