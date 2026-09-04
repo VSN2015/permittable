@@ -140,6 +140,26 @@ RSpec.describe Permittable::OpenAPI do
         ]
       )
     end
+
+    it "templates a wildcard segment too, so the path stays a valid OpenAPI template" do
+      journey_route = Struct.new(:requirements, :verb, :path)
+      journey_path = Struct.new(:spec)
+      route_set = Struct.new(:routes).new(
+        [
+          journey_route.new({ controller: "files", action: "show" }, "GET",
+                            journey_path.new("/files/*rest(.:format)")),
+          journey_route.new({ controller: "files", action: "nested" }, "GET",
+                            journey_path.new("/files/:bucket/*path(.:format)"))
+        ]
+      )
+      app = Struct.new(:routes).new(route_set)
+      expect(described_class.rails_routes(app)).to eq(
+        [
+          { controller: "files", action: "show", verb: "get", path: "/files/{rest}" },
+          { controller: "files", action: "nested", verb: "get", path: "/files/{bucket}/{path}" }
+        ]
+      )
+    end
   end
 
   describe "the golden document" do
