@@ -7,6 +7,18 @@ require "active_support/core_ext/class/attribute"
 require "active_support/core_ext/object/deep_dup" # authored default:/example: values are copied before freezing
 require "active_support/core_ext/string/inflections"
 require "active_support/core_ext/string/filters"
+# cast_datetime names ActiveSupport::TimeWithZone, which activesupport does not
+# load by default. A Rails app has it via active_support/time at boot; a
+# standalone host (a Contract validating a webhook payload or a job argument)
+# has nothing that loads it, and every :datetime cast raised NameError there.
+#
+# The Time core extensions come with it, and are not optional: TimeWithZone is
+# present but not self-sufficient. Converting one goes through
+# TimeZone#utc_to_local, which calls Time#sec_fraction — defined in
+# core_ext/time/calculations, which time_with_zone.rb does not itself require.
+# Without this line a real TimeWithZone raises NoMethodError in a bare host on
+# activesupport 8.1, having merely traded one crash for another.
+require "active_support/core_ext/time/calculations"
 require "bigdecimal"
 require "date"
 require "time"
@@ -517,7 +529,12 @@ module Permittable
     def cast_datetime(value)
       case value
       # DateTime is listed here, ahead of Date, because it subclasses Date.
-      when ActiveSupport::TimeWithZone, Time, DateTime then [:ok, value.to_time.utc]
+      # `getutc` rather than `utc`: `Time#utc` converts the RECEIVER, and
+      # `Time#to_time` returns self, so `value.to_time.utc` silently rewrote
+      # the caller's own object. A TimeWithZone's `getutc` hands back the
+      # instance it caches internally, so that one is duped.
+      when ActiveSupport::TimeWithZone then [:ok, value.getutc.dup]
+      when Time, DateTime then [:ok, value.to_time.getutc]
       when Date then [:ok, Time.utc(value.year, value.month, value.day)]
       when String
         # Same rule as :date — the DATE part must be named in full, or it is
