@@ -633,9 +633,13 @@ A bad contract is a programmer error, so it fails when the class loads — never
 | | |
 |---|---|
 | Ruby | >= 3.2 |
-| Rails / ActiveSupport | >= 5.0, < 9 |
+| Rails / ActiveSupport | >= 6.1, < 9 |
 | Required dependency | `activesupport` only |
 | Optional | `actionpack` (rendering, `before_action`), `activerecord` (drift guard) |
+
+Both claims are **tested rather than asserted**. CI runs the full suite against every ActiveSupport line in the range — 6.1, 7.0, 7.1, 7.2, 8.0, 8.1 — across the supported Rubies (see [`gemfiles/`](gemfiles/README.md)), and a separate job installs the built gem with *nothing but activesupport* and exercises every controller-free surface, so "activesupport is the only runtime dependency" cannot quietly stop being true.
+
+The 6.1 floor isn't arbitrary. `class_attribute ... default:`, which declares the contract registry, arrived in Rails 5.2 — on 5.0 and 5.1 a contract cannot be declared at all — and 5.2/6.0 predate Ruby 3.x support, which this gem's own Ruby floor requires.
 
 Using [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails)? `ConcernsOnRails::Controllers::Permittable` is an alias for this module, and `sensitive:` registrations pool into that gem's shared filter registry.
 
