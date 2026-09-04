@@ -119,6 +119,78 @@ RSpec.describe Permittable::JsonSchema do
     end
   end
 
+  describe "nullable:" do
+    it "adds null to the declared type on every field kind" do
+      props = schema_for do
+        optional :s, :string, nullable: true
+        optional :d, :decimal, nullable: true
+        optional :tags, :string, nullable: true
+        optional :address, nullable: true do
+          required :city, :string
+        end
+      end["properties"]
+      expect(props["s"]["type"]).to eq(%w[string null])
+      expect(props["d"]["type"]).to eq(%w[string number null])
+      expect(props["address"]["type"]).to eq(%w[object null])
+    end
+
+    it "adds null to a nullable array's type without touching its items" do
+      schema = property("tags") { array :tags, of: :integer, nullable: true }
+      expect(schema["type"]).to eq(%w[array null])
+      expect(schema["items"]).to eq("type" => "integer")
+    end
+
+    it "lists null in an enum, which is instance-wide rather than type-scoped" do
+      schema = property("plan") { optional :plan, :string, in: %w[free pro], nullable: true }
+      expect(schema["enum"]).to eq(["free", "pro", nil])
+    end
+
+    it "leaves a numeric range's bounds alone (minimum/maximum only apply to numbers)" do
+      schema = property("age") { optional :age, :integer, in: 18..120, nullable: true }
+      expect(schema).to eq("type" => %w[integer null], "minimum" => 18, "maximum" => 120)
+    end
+
+    it "documents an authored null default" do
+      schema = property("nickname") { optional :nickname, :string, nullable: true, default: nil }
+      expect(schema).to eq("type" => %w[string null], "default" => nil)
+    end
+
+    it "keeps a non-nullable field's type a bare string" do
+      expect(property("s") { optional :s, :string }["type"]).to eq("string")
+    end
+  end
+
+  describe ":json fields" do
+    it "documents an opaque object, carrying the bounds it declares" do
+      schema = property("metadata") { optional :metadata, :json, length: 0..8, max_depth: 3 }
+      expect(schema).to eq("type" => "object", "minProperties" => 0, "maxProperties" => 8,
+                           "x-permittable-max-depth" => 3)
+    end
+
+    it "says nothing about the shape when no bounds are declared" do
+      expect(property("metadata") { optional :metadata, :json }).to eq("type" => "object")
+    end
+
+    it "annotates it like any other field" do
+      schema = property("metadata") do
+        optional :metadata, :json, desc: "Opaque client state", sensitive: true,
+                                   default: { "seeded" => true }, example: { "k" => "v" }
+      end
+      expect(schema).to include("type" => "object", "description" => "Opaque client state",
+                                "writeOnly" => true, "x-permittable-sensitive" => true,
+                                "default" => { "seeded" => true }, "examples" => [{ "k" => "v" }])
+    end
+
+    it "adds null to a nullable opaque object" do
+      expect(property("metadata") { optional :metadata, :json, nullable: true }["type"]).to eq(%w[object null])
+    end
+
+    it "re-encodes non-JSON scalars inside an authored hash" do
+      schema = property("metadata") { optional :metadata, :json, default: { "on" => Date.new(2026, 9, 4) } }
+      expect(schema["default"]).to eq("on" => "2026-09-04")
+    end
+  end
+
   describe "nested hashes and unknown:" do
     it "maps nested blocks to object schemas, propagating unknown: :error at every level" do
       schema = schema_for(unknown: :error) do

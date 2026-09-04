@@ -75,10 +75,27 @@ module Permittable
     def field(field, unknown: :ignore)
       schema = case field[:kind]
                when :scalar then scalar_schema(field)
+               when :json then opaque_schema(field)
                when :nested then object(field[:fields], unknown: unknown)
                when :array then array_schema(field, unknown: unknown)
                end
+      nullify!(schema, field)
       annotate(schema, field)
+    end
+
+    # `nullable: true` means an explicitly-sent empty value yields null, so
+    # the type gains "null". Assigning over the existing key keeps its
+    # position, preserving deterministic emission. `enum` is the one keyword
+    # that constrains the instance rather than one type (minLength, pattern,
+    # minimum and friends only apply to instances of their own type), so a
+    # nullable enum has to list null itself or it would reject the very null
+    # the type now permits.
+    def nullify!(schema, field)
+      return schema unless field[:nullable]
+
+      schema["type"] = Array(schema["type"]) + ["null"] if schema["type"]
+      schema["enum"] += [nil] if schema.key?("enum")
+      schema
     end
 
     def scalar_schema(field)
@@ -86,6 +103,19 @@ module Permittable
       apply_in!(schema, field[:in])
       apply_string_bounds!(schema, field)
       apply_pattern!(schema, field[:format])
+      schema
+    end
+
+    # A `:json` field's shape is deliberately undeclared, so the schema says
+    # "an object" and carries only the bounds the field does declare. JSON
+    # Schema has no nesting-depth keyword, so `max_depth:` stays visible as an
+    # extension rather than being dropped or mistranslated.
+    def opaque_schema(field)
+      schema = { "type" => "object" }
+      min, max = length_bounds(field[:length])
+      schema["minProperties"] = min if min
+      schema["maxProperties"] = max if max
+      schema["x-permittable-max-depth"] = field[:max_depth] if field[:max_depth]
       schema
     end
 
@@ -183,6 +213,9 @@ module Permittable
     def json_value(value)
       case value
       when Array then value.map { |v| json_value(v) }
+      # An authored `:json` default/example is a whole hash; its values get
+      # the same re-encoding as any other authored scalar.
+      when Hash then value.to_h { |k, v| [k.to_s, json_value(v)] }
       when BigDecimal then value.to_s("F")
       when Time then value.utc.iso8601
       # DateTime subclasses Date, so it must match first.

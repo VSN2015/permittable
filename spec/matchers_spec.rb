@@ -77,6 +77,31 @@ RSpec.describe "Permittable RSpec matchers" do
     expect(controller).to permit_param(:ssn).for_action(:create).virtual.sensitive
   end
 
+  it "checks the nullable flag" do
+    nullable = Class.new(FakeController) do
+      include Permittable
+
+      permit_params(:create) do
+        optional :nickname, :string, nullable: true
+        optional :name, :string
+      end
+    end
+    expect(nullable).to permit_param(:nickname).nullable
+    expect(failure_of { expect(nullable).to permit_param(:name).nullable })
+      .to include("expected the field to be nullable, but it is not")
+  end
+
+  it "checks an opaque :json field with as(:json)" do
+    opaque = Class.new(FakeController) do
+      include Permittable
+
+      permit_params(:create) { optional :metadata, :json, length: 0..8 }
+    end
+    expect(opaque).to permit_param(:metadata).as(:json).optional.with_length(0..8)
+    expect(failure_of { expect(opaque).to permit_param(:metadata).as(:string) })
+      .to include("expected type :string, but the contract declares :json")
+  end
+
   it "checks arrays with as_array and an element type" do
     expect(controller).to permit_param(:tags).for_action(:create).as_array
     expect(controller).to permit_param(:tags).for_action(:create).as_array(of: :string)
@@ -149,5 +174,6 @@ RSpec.describe "Permittable RSpec matchers" do
   it "describes itself readably" do
     matcher = permit_param(:age).for_action(:create).as(:integer).within(18..120)
     expect(matcher.description).to eq("permit :age (for #create) as :integer, in: 18..120")
+    expect(permit_param(:nickname).nullable.description).to eq("permit :nickname nullable")
   end
 end

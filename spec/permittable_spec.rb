@@ -402,6 +402,103 @@ RSpec.describe Permittable do
     end
   end
 
+  describe "nullable:" do
+    let(:decl) do
+      proc do
+        permit_params(:create) do
+          optional :nickname, :string, nullable: true
+          optional :plan, :string, in: %w[free pro], default: "free", nullable: true
+          optional :age, :integer, in: 18..120, nullable: true
+          optional :note, :string
+        end
+      end
+    end
+
+    it "yields an explicit nil when the key is present and empty" do
+      result = permit({ nickname: nil }, &decl)
+      expect(result.key?("nickname")).to be(true)
+      expect(result["nickname"]).to be_nil
+    end
+
+    it "treats a present empty string as an explicit null too (the form-encoded convention)" do
+      expect(permit({ nickname: "" }, &decl).fetch("nickname")).to be_nil
+    end
+
+    it "still OMITS the field when the key is absent" do
+      expect(permit({}, &decl).key?("nickname")).to be(false)
+    end
+
+    it "prefers an explicit null over the field's default (the PATCH fix)" do
+      expect(permit({ plan: nil }, &decl).fetch("plan")).to be_nil
+      expect(permit({}, &decl)["plan"]).to eq("free")
+    end
+
+    it "skips in:/format:/length:/validate: for an explicit null" do
+      expect(permit({ age: nil }, &decl).fetch("age")).to be_nil
+      expect(permit({ plan: nil }, &decl).fetch("plan")).to be_nil
+    end
+
+    it "does not apply transform: to an explicit null" do
+      result = permit({ tag: nil }) do
+        permit_params(:create) { optional :tag, :string, nullable: true, transform: ->(v) { v.upcase } }
+      end
+      expect(result.fetch("tag")).to be_nil
+    end
+
+    it "leaves non-nullable fields absent-as-before" do
+      expect(permit({ note: nil }, &decl).key?("note")).to be(false)
+    end
+
+    it "still violates `missing` for a required nullable field whose key is absent" do
+      expect(violations_for({}) { permit_params(:create) { required :a, :string, nullable: true } }.details)
+        .to eq([{ param: "a", code: "missing" }])
+    end
+
+    it "accepts an explicit null for a required nullable field (presence stated, value null)" do
+      result = permit({ a: nil }) { permit_params(:create) { required :a, :string, nullable: true } }
+      expect(result.fetch("a")).to be_nil
+    end
+
+    it "allows default: nil only on a nullable field (absent means clear — PUT semantics)" do
+      result = permit({}) { permit_params(:create) { optional :a, :string, nullable: true, default: nil } }
+      expect(result.fetch("a")).to be_nil
+
+      expect { permittable_class { permit_params(:create) { optional :a, :string, default: nil } } }
+        .to raise_error(ArgumentError, /:default for field :a is nil but the field is not nullable/)
+    end
+
+    it "nulls a whole nested block, distinctly from an empty hash" do
+      decl = proc do
+        permit_params(:create) do
+          optional :address, nullable: true do
+            required :city, :string
+          end
+        end
+      end
+      expect(permit({ address: nil }, &decl).fetch("address")).to be_nil
+      expect(violations_for({ address: {} }, &decl).details).to eq([{ param: "address.city", code: "missing" }])
+    end
+
+    it "nulls a whole array, distinctly from an empty array" do
+      decl = proc { permit_params(:create) { array :tags, of: :string, nullable: true, length: 1..3 } }
+      expect(permit({ tags: nil }, &decl).fetch("tags")).to be_nil
+      expect(violations_for({ tags: [] }, &decl).details).to eq([{ param: "tags", code: "length" }])
+    end
+
+    it "does not make an array's ELEMENTS nullable" do
+      violations = violations_for({ tags: [nil] }) do
+        permit_params(:create) { array :tags, of: :string, nullable: true }
+      end
+      expect(violations.details).to eq([{ param: "tags[0]", code: "invalid_type" }])
+    end
+
+    it "carries nullable: into the frozen rule so exporters can read it" do
+      klass = permittable_class(&decl)
+      field = klass.permit_rule_for("create")[:fields].first
+      expect(field[:nullable]).to be(true)
+    end
+  end
+
   describe "root:" do
     let(:decl) { proc { permit_params(:create, root: :user) { required :name, :string } } }
 
@@ -541,6 +638,125 @@ RSpec.describe Permittable do
     it "runs validate: on the whole cast array" do
       decl = proc { permit_params(:create) { array :ids, of: :integer, validate: ->(v) { v.uniq == v || :duplicates } } }
       expect(violations_for({ ids: %w[1 1] }, &decl).details).to eq([{ param: "ids", code: "duplicates" }])
+    end
+  end
+
+  describe ":json (free-form hashes)" do
+    let(:decl) { proc { permit_params(:create) { optional :metadata, :json } } }
+
+    it "passes an arbitrary nested hash through untouched" do
+      payload = { "any" => { "deep" => [1, "two", true, nil] }, "n" => 3 }
+      expect(permit({ metadata: payload }, &decl)[:metadata].to_h).to eq(payload)
+    end
+
+    it "accepts an empty hash as a value (only nil and \"\" are absent)" do
+      expect(permit({ metadata: {} }, &decl)[:metadata].to_h).to eq({})
+    end
+
+    it "rejects anything that is not a hash" do
+      [[], "x", 3, true].each do |value|
+        expect(violations_for({ metadata: value }, &decl).details)
+          .to eq([{ param: "metadata", code: "invalid_type" }]), "for #{value.inspect}"
+      end
+    end
+
+    it "omits an absent field and honours default:" do
+      expect(permit({}, &decl).key?("metadata")).to be(false)
+      result = permit({}) { permit_params(:create) { optional :metadata, :json, default: { "seeded" => true } } }
+      expect(result[:metadata]).to eq("seeded" => true)
+    end
+
+    it "violates missing when required and absent" do
+      expect(violations_for({}) { permit_params(:create) { required :metadata, :json } }.details)
+        .to eq([{ param: "metadata", code: "missing" }])
+    end
+
+    it "does NOT descend into the opaque hash for unknown-key checking" do
+      result = permit({ metadata: { "undeclared" => 1 } }) do
+        permit_params(:create, unknown: :error) { optional :metadata, :json }
+      end
+      expect(result[:metadata].to_h).to eq("undeclared" => 1)
+    end
+
+    it "bounds nesting with max_depth:, counting arrays as a level" do
+      decl = proc { permit_params(:create) { optional :metadata, :json, max_depth: 2 } }
+      expect(permit({ metadata: { "a" => { "b" => 1 } } }, &decl)[:metadata]).to be_a(Hash)
+      expect(permit({ metadata: { "a" => [1, 2] } }, &decl)[:metadata]).to be_a(Hash)
+      expect(violations_for({ metadata: { "a" => { "b" => { "c" => 1 } } } }, &decl).details)
+        .to eq([{ param: "metadata", code: "depth" }])
+      expect(violations_for({ metadata: { "a" => [{ "b" => 1 }] } }, &decl).details)
+        .to eq([{ param: "metadata", code: "depth" }])
+    end
+
+    it "bounds breadth with length: on the top-level key count" do
+      decl = proc { permit_params(:create) { optional :metadata, :json, length: 0..2 } }
+      expect(permit({ metadata: { "a" => 1, "b" => 2 } }, &decl)[:metadata].keys.length).to eq(2)
+      expect(violations_for({ metadata: { "a" => 1, "b" => 2, "c" => 3 } }, &decl).details)
+        .to eq([{ param: "metadata", code: "length" }])
+    end
+
+    it "runs validate: and transform: over the whole hash" do
+      result = permit({ metadata: { "kind" => "a" } }) do
+        permit_params(:create) do
+          optional :metadata, :json,
+                   validate: ->(h) { h.key?("kind") || :kind_required },
+                   transform: ->(h) { h.merge("seen" => true) }
+        end
+      end
+      expect(result[:metadata].to_h).to eq("kind" => "a", "seen" => true)
+
+      violations = violations_for({ metadata: { "other" => 1 } }) do
+        permit_params(:create) { optional :metadata, :json, validate: ->(h) { h.key?("kind") || :kind_required } }
+      end
+      expect(violations.details).to eq([{ param: "metadata", code: "kind_required" }])
+    end
+
+    it "does not transform a hash that failed its own bounds" do
+      violations = violations_for({ metadata: { "a" => 1, "b" => 2 } }) do
+        permit_params(:create) { optional :metadata, :json, length: 1, transform: ->(h) { h.merge("t" => 1) } }
+      end
+      expect(violations.details).to eq([{ param: "metadata", code: "length" }])
+    end
+
+    it "carries message:, desc:, sensitive: and nullable: like any other field" do
+      result = permit({ metadata: nil }) do
+        permit_params(:create) { optional :metadata, :json, nullable: true, sensitive: true }
+      end
+      expect(result.fetch("metadata")).to be_nil
+      expect(Permittable.filter_parameter_registry.include?("metadata")).to be(true)
+
+      violations = violations_for({ metadata: 1 }) do
+        permit_params(:create) { optional :metadata, :json, message: "must be an object" }
+      end
+      expect(violations.details).to eq([{ param: "metadata", code: "invalid_type", message: "must be an object" }])
+    end
+
+    describe "macro validation" do
+      it "rejects the string-only and array-only options" do
+        %i[format normalize in of].each do |opt|
+          expect { permittable_class { permit_params(:create) { optional :m, :json, opt => /x/ } } }
+            .to raise_error(ArgumentError, /unknown option\(s\) :#{opt} for field :m/)
+        end
+      end
+
+      it "rejects a nested block alongside the type" do
+        expect { permittable_class { permit_params(:create) { optional(:m, :json) { required :a } } } }
+          .to raise_error(ArgumentError, /takes a type OR a nested block/)
+      end
+
+      it "requires max_depth: to be a positive Integer" do
+        expect { permittable_class { permit_params(:create) { optional :m, :json, max_depth: 0 } } }
+          .to raise_error(ArgumentError, /:max_depth for :m must be a positive Integer/)
+        expect { permittable_class { permit_params(:create) { optional :m, :json, max_depth: 1..3 } } }
+          .to raise_error(ArgumentError, /:max_depth for :m must be a positive Integer/)
+      end
+
+      it "requires an authored default:/example: to be a Hash satisfying the field's own bounds" do
+        expect { permittable_class { permit_params(:create) { optional :m, :json, default: [] } } }
+          .to raise_error(ArgumentError, /:default for :m must be a Hash/)
+        expect { permittable_class { permit_params(:create) { optional :m, :json, max_depth: 1, example: { "a" => { "b" => 1 } } } } }
+          .to raise_error(ArgumentError, /:example for field :m violates its own contract \(depth\)/)
+      end
     end
   end
 
@@ -1064,6 +1280,26 @@ RSpec.describe Permittable do
       expect(result.status).to eq(200)
       body = JSON.parse(result.body)
       expect(body["received"]).to eq("name" => "Jo", "age" => 30, "plan" => "free")
+    end
+
+    it "hands a :json field plain data, never nested ActionController::Parameters" do
+      controller = IntegrationHarness.build_controller do
+        include Permittable
+
+        permit_params(:create) { optional :metadata, :json }
+
+        def create
+          value = permitted_params[:metadata]
+          # Assigning ActionController::Parameters to a jsonb attribute raises,
+          # so what a contract passes through must already be plain data.
+          leaked = value.values.map(&:class).map(&:name).grep(/Parameters/)
+          render json: { classes: [value.class.name] + leaked }
+        end
+      end
+      result = IntegrationHarness.dispatch(controller, :create, method: "POST",
+                                                                params: { metadata: { nested: { deep: "1" } } })
+      expect(result.status).to eq(200)
+      expect(JSON.parse(result.body)["classes"]).to eq(["ActiveSupport::HashWithIndifferentAccess"])
     end
 
     it "rescues InvalidParameters into the 422 envelope with machine-readable details" do

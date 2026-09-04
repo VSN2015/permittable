@@ -50,7 +50,8 @@ A violating request never reaches your action:
 
 - [Why](#why) · [Installation](#installation) · [How a request flows](#how-a-request-flows)
 - [Declaring a contract](#declaring-a-contract) · [The field DSL](#the-field-dsl) · [Field options](#field-options)
-- [Types and strict coercion](#types-and-strict-coercion) · [Absence, defaults, and partial updates](#absence-defaults-and-partial-updates)
+- [Free-form hashes](#free-form-hashes-json)
+- [Types and strict coercion](#types-and-strict-coercion) · [Absence, defaults, and partial updates](#absence-defaults-and-partial-updates) · [Explicit nulls](#explicit-nulls-nullable)
 - [Violations and error responses](#violations-and-error-responses) · [Custom error messages](#custom-error-messages-message) · [Unknown parameters](#unknown-parameters)
 - [Output reshaping](#output-reshaping-transform-and-finalize) · [The schema-drift guard](#the-schema-drift-guard)
 - [Sensitive parameters](#sensitive-parameters-and-log-redaction) · [Instrumentation](#instrumentation)
@@ -179,6 +180,14 @@ array :line_items, required: true do
 end
 ```
 
+### Free-form hashes
+
+`:json` declares a hash whose shape is deliberately **undeclared** — the `jsonb` column case. See [free-form hashes](#free-form-hashes-json).
+
+```ruby
+optional :metadata, :json, max_depth: 3, length: 0..32
+```
+
 ## Field options
 
 Which options are legal depends on the field kind — anything else raises at class load.
@@ -196,9 +205,11 @@ Which options are legal depends on the field kind — anything else raises at cl
 | `sensitive:` | ✅ | ✅ | ✅ | Register the field name for [log redaction](#sensitive-parameters-and-log-redaction) |
 | `message:` | ✅ | ✅ | ✅ | Human-readable copy for violations on this field — a String, or a Hash of code → String. See [custom messages](#custom-error-messages-message) |
 | `of:` | — | ✅ | — | Element type for an array of scalars (default `:string`) |
+| `max_depth:` | — | — | — | `:json` fields only — maximum container nesting. See [free-form hashes](#free-form-hashes-json) |
 | `required:` | — | ✅ | — | Arrays are optional unless this is `true` |
 | `desc:` | ✅ | ✅ | ✅ | Documentation only — the field's `description` in [exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) |
 | `example:` | ✅ | ✅ | — | Documentation only, but **validated against the field's own contract at class load**, like `default:` |
+| `nullable:` | ✅ | ✅ | ✅ | An explicitly-sent empty value yields `nil` instead of counting as absent — see [explicit nulls](#explicit-nulls-nullable) |
 
 ¹ `format:`, `length:`, and `normalize:` reason about characters and are **only valid on `:string` fields**. On any other type they would silently apply to an already-cast value, so declaring them raises at class load.
 
@@ -221,11 +232,41 @@ Coercion is **deliberately strict**, and deliberately *not* `ActiveModel::Type`.
 | `:boolean` | `true`/`false`, `"true"`/`"false"`, `"1"`/`"0"`, `1`/`0` | `"yes"`, `"on"`, `2` |
 | `:date` | `Date`; any `Date.parse`-able string | Unparseable strings |
 | `:datetime` | `Time`, `DateTime`, `ActiveSupport::TimeWithZone`, `Date`, parseable strings | Unparseable strings |
+| `:json` | Any `Hash` — passed through uncast, see [free-form hashes](#free-form-hashes-json) | Arrays, scalars |
 
 Two behaviours worth committing to memory:
 
 - **Type confusion is a violation, not a 500.** A request of `?age[]=1` against a scalar `:integer` field yields `invalid_type`. Arrays, hashes, and nested `ActionController::Parameters` can never satisfy a scalar type, so the classic "`NoMethodError` on `[]`" crash is impossible.
 - **Datetimes are normalised to UTC.** A zoneless string parses as UTC regardless of the host timezone, which keeps behaviour deterministic across machines; explicit offsets are honoured and converted.
+
+## Free-form hashes (`:json`)
+
+A `json`/`jsonb` column exists precisely so its contents need no schema. Every other field kind describes a shape, so until `:json` a contract had only bad options for one: declare sub-keys you don't know, or leave the key undeclared — in which case the contract **silently dropped it**, and the column never saw the data. Strong parameters has always had an answer here (`params.permit(metadata: {})`); now so does a contract.
+
+```ruby
+permit_params :create, root: :user, model: User do
+  required :name,     :string
+  optional :metadata, :json, max_depth: 3, length: 0..32
+end
+```
+
+The hash passes through **untouched** — keys are neither filtered nor cast, nested arrays and mixed scalars survive, and `unknown:` does not descend into it. `{}` is a value, not an absence. Anything that is not a hash (an array, a string, a number) is `invalid_type`.
+
+What you give up is the shape. What you keep:
+
+| | |
+|---|---|
+| `length:` | Caps the **top-level key count** — same reading as an array's element count |
+| `max_depth:` | Caps **container nesting**, counting arrays as a level: `{"a": 1}` is 1, `{"a": {"b": 1}}` and `{"a": [1, 2]}` are 2, `{"a": [{"b": 1}]}` is 3. Violation code `depth` |
+| `validate:` / `transform:` | See the whole hash, so any check you can write in Ruby still applies |
+| `model:` | The field maps onto a column like a scalar does, so the [drift guard](#the-schema-drift-guard) still catches a dropped `metadata` column |
+| `sensitive:` / `nullable:` / `message:` / `desc:` / `default:` / `example:` | Behave as on any other field (`default:`/`example:` must be a hash, and are checked against the field's own bounds at class load) |
+
+Bounding it matters more than it looks: an unbounded `jsonb` column is where clients put megabytes and 200-level-deep objects. `max_depth:` and `length:` are how a contract says "opaque, but not unlimited" — which is strictly more than `permit(metadata: {})` can say.
+
+Values arrive as plain data (`HashWithIndifferentAccess`), never `ActionController::Parameters`, so assigning straight to a `jsonb` attribute is safe.
+
+In [exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) the field is `{"type": "object"}` plus `minProperties`/`maxProperties`; JSON Schema has no nesting-depth keyword, so `max_depth:` stays visible as `x-permittable-max-depth` rather than being dropped or mistranslated.
 
 ## Absence, defaults, and partial updates
 
@@ -237,9 +278,38 @@ That single rule produces the behaviour you want from a `PATCH`:
 - An **absent required field violates** with `missing`.
 - An absent field **with a `default:` gets the default** — so a defaulted field can never report `missing`. (Declaring `required:` alongside `default:` is a class-load error, since a default implies optionality.)
 
-Because absence and `nil` are the same thing here, **clearing a column to NULL is outside a contract's vocabulary**. Do that explicitly in the action.
+Because absence and `nil` are the same thing here, a plain field cannot clear a column to NULL. Declare it [`nullable:`](#explicit-nulls-nullable) when it should.
 
 Defaults are checked against the field's own contract when the class loads, so `default: "gold"` on a field declared `in: %w[free pro]` fails at boot rather than on every request.
+
+## Explicit nulls (`nullable:`)
+
+One rule — `nil` and `""` are absent — is right for `PATCH` and wrong for the request that means *clear this*. `nullable: true` splits it in two for a single field:
+
+```ruby
+permit_params :update, root: :user, model: User do
+  optional :nickname, :string, nullable: true
+  optional :plan,     :string, in: %w[free pro], default: "free", nullable: true
+end
+```
+
+| Request | `nickname` in the result |
+|---|---|
+| `{ "user": {} }` | **omitted** — the column is untouched |
+| `{ "user": { "nickname": null } }` | `nil` — the column is cleared |
+| `{ "user": { "nickname": "" } }` | `nil` — the form-encoded spelling of the same intent |
+
+A key the client never sent is still **absent**: `default:` applies to it and a `required` field still violates with `missing`. Only *present-but-empty* changes meaning, and it changes it decisively — an explicit null wins over the field's `default:`, which is the behaviour a `PATCH` needs (`{ "plan": null }` clears the plan instead of silently resetting it to `"free"`).
+
+Nothing is cast or checked for an explicit null. `in:`, `format:`, `length:`, `validate:`, and `transform:` all see a value or nothing at all — never a `nil` they never agreed to handle.
+
+Three more readings worth knowing:
+
+- **`required` + `nullable`** is coherent, and means what it says in SQL: the client *must* state the field, and `null` is a legal statement. A missing key still violates.
+- **`default: nil`** — legal only on a nullable field — gives the `PUT` reading, where absence *also* means clear.
+- **On arrays and nested blocks**, `nullable:` applies to the array or object itself, never to its contents. `{ "tags": null }` yields `nil` (distinct from `[]`, which still gets length-checked); a null *element* inside `tags` is still `invalid_type`.
+
+Exported [OpenAPI](#exporting-openapi-docs-that-cannot-drift) tells the truth about all of this: a nullable field's `type` gains `"null"`, and a nullable `in:` set lists `null` in its `enum`.
 
 ## Violations and error responses
 
@@ -620,6 +690,9 @@ A bad contract is a programmer error, so it fails when the class loads — never
 - `length:` that isn't a `Range` or `Integer`; `in:` that doesn't respond to `include?`
 - `validate:` or `transform:` that isn't callable
 - A `default:` or `example:` that violates its own field's contract, or an array `default:`/`example:` whose elements violate `of:`
+- A `default: nil` or `example: nil` on a field that isn't `nullable:`
+- A `:json` field's `default:`/`example:` that isn't a Hash, or that its own `length:`/`max_depth:` would reject
+- A `max_depth:` that isn't a positive Integer
 - `required: true` combined with `default:`
 - A field given both a type and a nested block; an array given both `of:` and a block
 - An empty contract, or a nested block declaring no sub-fields
@@ -647,7 +720,7 @@ Using [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails)? `Concer
 
 ```sh
 bundle install
-bundle exec rspec      # 125 examples
+bundle exec rspec      # 244 examples
 bundle exec rubocop
 ```
 

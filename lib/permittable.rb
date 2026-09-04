@@ -41,6 +41,7 @@ require "permittable/filter_parameter_registry"
 #       optional :ssn,   :string,  sensitive: true
 #       optional :plan,  :string,  in: %w[free pro], default: "free"
 #       array    :tag_names, of: :string, length: 0..10, virtual: true
+#       optional :metadata,  :json,    max_depth: 3, length: 0..32
 #       optional :address do
 #         required :city, :string
 #         optional :zip,  :string, format: /\A\d{5}\z/
@@ -86,6 +87,17 @@ require "permittable/filter_parameter_registry"
 # request. `permittable_violations` reads the recorded details ([] when
 # the request was clean).
 #
+# THE :json FIELD — the deliberate hole. A json/jsonb column exists precisely
+# so its contents need no schema, and until it was declarable a contract could
+# only drop that key (strong parameters spells it `permit(metadata: {})`).
+# `optional :metadata, :json` passes an arbitrary Hash through untouched —
+# keys are neither filtered nor cast, and `unknown:` does not descend into it
+# — while still letting the contract bound the shape it refuses to describe:
+# `length:` caps the top-level key count, `max_depth:` caps container nesting
+# (arrays count as a level), and `validate:`/`transform:` see the whole hash.
+# Anything that is not a Hash is `invalid_type`, and the field still maps onto
+# a column for the drift guard.
+#
 # Coercion is deliberately STRICT — ActiveModel::Type is not used, because its
 # casts are lenient by design ("abc".to_i == 0, Boolean.cast("abc") == true)
 # and silently corrupting untrusted input is exactly what a contract must not
@@ -93,8 +105,16 @@ require "permittable/filter_parameter_registry"
 # guess. nil and "" are both treated as ABSENT (the query-param convention):
 # absent optional fields are OMITTED from the result (so partial updates never
 # nil-out columns), absent required fields violate, and `default:` fills
-# absence. Clearing a column to NULL is therefore outside a contract's
-# vocabulary — do that explicitly.
+# absence.
+#
+# `nullable: true` splits that rule in two for one field, which is how a PATCH
+# clears a column: a key the client never sent stays absent (defaults apply,
+# required violates), but a key sent EMPTY (JSON null, or "" from a form) is an
+# explicit null and yields nil in the result — ahead of any `default:`, and
+# without casting or checking a value that isn't there. It reads on arrays and
+# nested blocks too (the array/object itself may be null, never its elements),
+# and `default: nil` — legal only on a nullable field — gives the PUT reading
+# where absence also means clear.
 #
 # Failures raise Permittable::InvalidParameters, rescued (on a real
 # controller) into the shared ErrorEnvelope shape with `details:` entries of
@@ -141,6 +161,9 @@ module Permittable
 
   LABEL = "Permittable".freeze
   SCALAR_TYPES = %i[string integer float decimal boolean date datetime].freeze
+  # Not a scalar: an opaque hash whose shape is deliberately undeclared, for
+  # the json/jsonb column a contract has to be able to carry.
+  JSON_TYPE = :json
   UNKNOWN_MODES = %i[ignore log error].freeze
   MODES = %i[enforce monitor].freeze
   # Rails merges routing bookkeeping into params; a top-level (root: false)
@@ -250,6 +273,31 @@ module Permittable
       return [:error, "length"] if field[:length] && !length_ok?(field[:length], value.length)
 
       check_custom(field[:validate], value)
+    end
+
+    # Free-form hash. The shape is deliberately undeclared, so the only
+    # checks are the bounds the field asked for: breadth (`length:`, the
+    # top-level key count, same reading as an array's element count) and
+    # nesting (`max_depth:`). Shared with macro-time `default:`/`example:`
+    # checking, like check_scalar.
+    def check_json(field, value)
+      return [:error, "invalid_type"] unless value.is_a?(Hash)
+      return [:error, "length"] if field[:length] && !length_ok?(field[:length], value.length)
+      return [:error, "depth"] if field[:max_depth] && depth_exceeds?(value, field[:max_depth])
+
+      check_custom(field[:validate], value)
+    end
+
+    # Container nesting, with the field's own hash as level 1. An Array counts
+    # as a level too — a deeply nested payload is a deeply nested payload
+    # whichever container carries it. Bails at the first breach instead of
+    # measuring the whole tree.
+    def depth_exceeds?(value, limit)
+      return false unless value.is_a?(Hash) || value.is_a?(Array)
+      return true if limit < 1
+
+      children = value.is_a?(Hash) ? value.each_value : value.each
+      children.any? { |child| depth_exceeds?(child, limit - 1) }
     end
 
     # A custom validator returning a Symbol fails with that symbol as the
@@ -372,9 +420,13 @@ module Permittable
   # declaration is validated eagerly: a bad contract is a programmer error and
   # should fail at class load, not at request time.
   class ContractBuilder
-    SCALAR_OPTS = %i[in format length default normalize validate virtual sensitive transform message desc example].freeze
-    NESTED_OPTS = %i[virtual sensitive message desc].freeze
-    ARRAY_OPTS  = %i[of length default validate virtual sensitive required transform message desc example].freeze
+    SCALAR_OPTS = %i[in format length default normalize validate virtual sensitive transform message desc example
+                     nullable].freeze
+    NESTED_OPTS = %i[virtual sensitive message desc nullable].freeze
+    JSON_OPTS   = %i[length max_depth default validate virtual sensitive transform message desc example
+                     nullable].freeze
+    ARRAY_OPTS  = %i[of length default validate virtual sensitive required transform message desc example
+                     nullable].freeze
 
     attr_reader :finalizer
 
@@ -444,6 +496,12 @@ module Permittable
         field = { name: name, kind: :nested, required: required,
                   fields: nested_fields!(name, &block), **opts }
         validate_message!(field)
+      elsif type&.to_sym == JSON_TYPE
+        assert_opts!(name, opts, JSON_OPTS)
+        # `type:` is carried alongside `kind:` so the same `as(:json)` matcher
+        # chain and the same error wording work as for a scalar.
+        field = { name: name, kind: :json, required: required, type: JSON_TYPE, **opts }
+        validate_json_opts!(field)
       else
         assert_opts!(name, opts, SCALAR_OPTS)
         field = { name: name, kind: :scalar, required: required,
@@ -507,6 +565,40 @@ module Permittable
       validate_message!(field)
     end
 
+    def validate_json_opts!(field)
+      name = field[:name]
+      if field[:required] && field.key?(:default)
+        raise ArgumentError, "#{LABEL}: field :#{name} is required and cannot have a :default (default implies optional)"
+      end
+
+      validate_length!(name, field[:length]) if field.key?(:length)
+      validate_max_depth!(name, field[:max_depth]) if field.key?(:max_depth)
+      validate_callable!(name, :validate, field[:validate]) if field.key?(:validate)
+      validate_callable!(name, :transform, field[:transform]) if field.key?(:transform)
+      validate_json_authored_value!(field, :default)
+      validate_json_authored_value!(field, :example)
+      validate_message!(field)
+    end
+
+    def validate_max_depth!(name, depth)
+      return if depth.is_a?(Integer) && depth.positive?
+
+      raise ArgumentError, "#{LABEL}: :max_depth for :#{name} must be a positive Integer"
+    end
+
+    # Same rule as a scalar's authored value, over check_json: a `default:` or
+    # `example:` that its own bounds would reject fails at class load.
+    def validate_json_authored_value!(field, opt)
+      return unless field.key?(opt)
+      return if authored_nil!(field, opt)
+      raise ArgumentError, "#{LABEL}: :#{opt} for :#{field[:name]} must be a Hash" unless field[opt].is_a?(Hash)
+
+      status, code = Coercion.check_json(field, field[opt])
+      return if status == :ok
+
+      raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{code})"
+    end
+
     # format / length / normalize reason about characters; on any other
     # type they would silently apply to a cast non-String and mislead.
     def validate_string_only_opts!(field)
@@ -547,6 +639,7 @@ module Permittable
     # shipping it to every request (or publishing it in generated docs).
     def validate_authored_value!(field, opt)
       return unless field.key?(opt)
+      return if authored_nil!(field, opt)
 
       status, code = Coercion.check_scalar(field, field[opt])
       return if status == :ok
@@ -556,6 +649,7 @@ module Permittable
 
     def validate_array_authored_value!(field, opt)
       value = field[opt]
+      return if authored_nil!(field, opt)
       raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} must be an Array" unless value.is_a?(Array)
       return unless field[:of]
 
@@ -565,6 +659,19 @@ module Permittable
 
         raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} contains an element violating of: :#{field[:of]} (#{code})"
       end
+    end
+
+    # An authored nil is only meaningful on a nullable field, where it says
+    # "absent means clear" (PUT semantics) rather than "no default". On any
+    # other field it is a value nil could never satisfy, so it fails at class
+    # load with the fix named.
+    def authored_nil!(field, opt)
+      return false unless field[opt].nil?
+      return true if field[:nullable]
+
+      raise ArgumentError,
+            "#{LABEL}: :#{opt} for field :#{field[:name]} is nil but the field is not nullable — " \
+            "declare nullable: true to make an explicit null part of the contract"
     end
 
     # `message:` customizes what the client reads for a violation on this
@@ -701,9 +808,10 @@ module Permittable
     end
 
     # The drift guard. Nested/array fields are implicitly virtual — only
-    # scalar fields map one-to-one onto columns.
+    # scalar fields, and the opaque `:json` field standing in for a
+    # json/jsonb column, map one-to-one onto columns.
     def guard_contract_columns!(model_class, fields)
-      checked = fields.select { |f| f[:kind] == :scalar && !f[:virtual] }
+      checked = fields.select { |f| %i[scalar json].include?(f[:kind]) && !f[:virtual] }
       return if checked.empty?
 
       types = checked.to_h { |f| [f[:name], f[:type]] }
@@ -910,7 +1018,9 @@ module Permittable
       value = hash[key]
 
       if permittable_absent?(value, hash, key)
-        if field.key?(:default)
+        if permittable_explicit_null?(field, hash, key)
+          result[key] = nil
+        elsif field.key?(:default)
           result[key] = field[:default]
         elsif field[:required]
           violations << permittable_violation(field, full, "missing")
@@ -928,13 +1038,9 @@ module Permittable
     key = field[:name].to_s
     case field[:kind]
     when :scalar
-      status, out = Coercion.check_scalar(field, value)
-      if status == :ok
-        out = field[:transform].call(out) if field[:transform]
-        result[key] = out
-      else
-        violations << permittable_violation(field, full, out)
-      end
+      permittable_check_whole(field, Coercion.check_scalar(field, value), full, result, violations: violations)
+    when :json
+      permittable_check_whole(field, Coercion.check_json(field, value), full, result, violations: violations)
     when :nested
       if value.is_a?(Hash)
         result[key] = permittable_check_hash(field[:fields], ActiveSupport::HashWithIndifferentAccess.new(value),
@@ -948,6 +1054,19 @@ module Permittable
       else
         violations << permittable_violation(field, full, "invalid_type")
       end
+    end
+  end
+
+  # The shared tail of the two kinds whose entire value is checked in one
+  # call — a scalar, or an opaque hash. A clean value is transformed into the
+  # result; anything else records its code.
+  def permittable_check_whole(field, outcome, full, result, violations:)
+    status, out = outcome
+    if status == :ok
+      out = field[:transform].call(out) if field[:transform]
+      result[field[:name].to_s] = out
+    else
+      violations << permittable_violation(field, full, out)
     end
   end
 
@@ -987,6 +1106,15 @@ module Permittable
   # nil and "" are both ABSENT — see the module comment.
   def permittable_absent?(value, hash, key)
     !hash.key?(key) || value.nil? || (value.is_a?(String) && value.empty?)
+  end
+
+  # `nullable: true` splits the one absence rule in two: a key the client
+  # never sent is still absent (defaults apply, required violates), but a key
+  # sent EMPTY is an explicit null — the field yields nil, so a PATCH can
+  # clear a column. Nothing is cast or checked: there is no value to check,
+  # and `transform:` never sees a nil it did not agree to.
+  def permittable_explicit_null?(field, hash, key)
+    field[:nullable] && hash.key?(key)
   end
 
   def permittable_check_unknown(fields, hash, path:, unknown:, top_level:, violations:)
