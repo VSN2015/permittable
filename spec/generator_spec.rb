@@ -86,6 +86,96 @@ RSpec.describe Permittable::Generator do
     end
   end
 
+  describe ".scan of Rails 8 params.expect calls" do
+    it "reads the required root envelope and its scalar keys" do
+      scan = described_class.scan("params.expect(user: [:name, :age])")
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[name age])
+      expect(scan).to be_found
+    end
+
+    it "classifies arrays, nested hashes, and arrays of hashes inside the envelope" do
+      scan = described_class.scan(<<~RUBY)
+        params.expect(user: [:name, tag_names: [], address: [:city, :zip], line_items: [[:sku, :quantity]]])
+      RUBY
+      expect(scan.scalars).to eq(%i[name])
+      expect(scan.arrays).to eq(%i[tag_names])
+      expect(scan.nested).to eq(address: %i[city zip])
+      expect(scan.nested_arrays).to eq(line_items: %i[sku quantity])
+    end
+
+    it "reads a rootless expect as scalars, like a filter contract" do
+      scan = described_class.scan("params.expect(:q, :page)")
+      expect(scan.root).to be_nil
+      expect(scan.scalars).to eq(%i[q page])
+    end
+
+    it "keeps route params alongside an envelope visible instead of drafting them as fields" do
+      scan = described_class.scan("params.expect(:id, user: [:name])")
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[name])
+      expect(scan.unparsed).to eq([":id"])
+    end
+
+    it "keeps a second envelope visible rather than flattening it into the first" do
+      scan = described_class.scan("params.expect(user: [:name], address: [:city])")
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[name])
+      expect(scan.unparsed).to eq(["address: [:city]"])
+    end
+
+    it "does not mistake an array-of-scalars root for an envelope" do
+      scan = described_class.scan("params.expect(tag_names: [])")
+      expect(scan.root).to be_nil
+      expect(scan.arrays).to eq(%i[tag_names])
+    end
+
+    it "skips a call whose arguments contain a method call, rather than half-reading it" do
+      scan = described_class.scan("params.expect(user: [:name, *extra_keys()])")
+      expect(scan).not_to be_found
+    end
+
+    it "merges expect and permit calls from the same controller" do
+      scan = described_class.scan(<<~RUBY)
+        def create
+          params.expect(user: [:name])
+        end
+
+        def update
+          params.require(:user).permit(:email)
+        end
+      RUBY
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[email name])
+      expect(scan.calls).to eq(2)
+    end
+
+    it "still leaves an unrecognised argument shape unparsed" do
+      scan = described_class.scan("params.expect(user: [:name, weird: { a: 1 }])")
+      expect(scan.scalars).to eq(%i[name])
+      expect(scan.unparsed).to eq(["weird: { a: 1 }"])
+    end
+  end
+
+  describe ".draft from an expect scan" do
+    it "drafts an array of hashes with no TODO, because the syntax says so" do
+      draft = described_class.draft(scan: described_class.scan("params.expect(order: [:ref, line_items: [[:sku]]])"))
+      expect(draft).to include("array :line_items do")
+      expect(draft).to include("  optional :sku, :string # TODO: confirm the type")
+      expect(draft).not_to include("if this is an array of hashes")
+    end
+
+    it "produces a draft that loads as a real contract" do
+      source = "params.expect(user: [:name, address: [:city], line_items: [[:sku]]])"
+      klass = permittable_class { class_eval(Permittable::Generator.draft(scan: Permittable::Generator.scan(source))) }
+      params = { user: { name: "Jo", address: { city: "Hanoi" }, line_items: [{ sku: "A-1" }] } }
+      result = controller(klass, params: params).permitted_params
+      expect(result["name"]).to eq("Jo")
+      expect(result["address"].to_h).to eq("city" => "Hanoi")
+      expect(result["line_items"].first.to_h).to eq("sku" => "A-1")
+    end
+  end
+
   describe ".scan and things that are not code" do
     it "does not read a commented-out permit call" do
       scan = described_class.scan(<<~RUBY)
