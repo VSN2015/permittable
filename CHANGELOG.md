@@ -1,5 +1,10 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Fixed
+- **Every `:datetime` cast raised `NameError` in a host that had not loaded ActiveSupport's time extensions.** `cast_datetime` names `ActiveSupport::TimeWithZone` unguarded, and nothing in the gem loaded it — activesupport does not load it by default. A Rails app gets it via `active_support/time` at boot, which is why the spec suite (`require "active_record"`) never saw this; a standalone `Permittable::Contract` validating a webhook payload or a job argument has nothing that loads it, and got `uninitialized constant ActiveSupport::TimeWithZone` instead of a validated param. Fixed with one precise `require "active_support/time_with_zone"`. This is the same shape as the 0.5.1 nested-hash bug — a require the gem needed and the suite masked — so the bare-subprocess spec that fix introduced now exercises **every** scalar type rather than only nested hashes, and a companion spec pins that a real `TimeWithZone` is still accepted and normalised to UTC.
+
 ## 0.5.1 (2026-09-02)
 <!-- title: nested input outside Rails -->
 

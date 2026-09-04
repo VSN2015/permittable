@@ -169,5 +169,43 @@ RSpec.describe Permittable::Contract do
       expect(status).to be_success, err
       expect(out).to eq('{"user":{"test_key":1},"address_attributes":{"location":2}}')
     end
+
+    it "casts every scalar type with only `require \"permittable\"`" do
+      # :datetime named ActiveSupport::TimeWithZone unguarded, and nothing in
+      # the gem loaded it — so a host that had not loaded ActiveSupport's time
+      # extensions got NameError instead of a validated param.
+      script = <<~RUBY
+        require "json"
+        require "permittable"
+        contract = Permittable::Contract.define do
+          required :s, :string
+          required :i, :integer
+          required :f, :float
+          required :d, :decimal
+          required :b, :boolean
+          required :on, :date
+          required :at, :datetime
+        end
+        out = contract.call!(s: "x", i: "1", f: "1.5", d: "2.50", b: "true",
+                             on: "2026-09-05", at: "2026-09-05T10:30:00Z")
+        print JSON.generate(out.transform_values(&:to_s))
+      RUBY
+      lib = File.expand_path("../lib", __dir__)
+      out, err, status = Open3.capture3(RbConfig.ruby, "-I", lib, "-e", script)
+      expect(status).to be_success, err
+      expect(JSON.parse(out)).to eq(
+        "s" => "x", "i" => "1", "f" => "1.5", "d" => "0.25e1", "b" => "true",
+        "on" => "2026-09-05", "at" => "2026-09-05 10:30:00 UTC"
+      )
+    end
+
+    it "accepts an ActiveSupport::TimeWithZone for a :datetime, when the host has one" do
+      require "active_support/time"
+      zone = ActiveSupport::TimeZone["Asia/Bangkok"]
+      contract = described_class.define { required :at, :datetime }
+      result = contract.call!(at: zone.local(2026, 9, 5, 17, 30))
+      expect(result[:at]).to eq(Time.utc(2026, 9, 5, 10, 30))
+      expect(result[:at].utc?).to be(true)
+    end
   end
 end
