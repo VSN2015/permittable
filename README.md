@@ -414,8 +414,8 @@ Every failure raises `Permittable::InvalidParameters`, carrying `details` (an ar
 
 | Code | Raised when |
 |---|---|
-| `missing` | A required field is absent, or the `root:` key is missing (this one is a **400**) |
-| `invalid_type` | The value cannot be faithfully cast to the declared type |
+| `missing` | A required field is absent, or the `root:` key is absent (that one is a **400**) |
+| `invalid_type` | The value cannot be faithfully cast to the declared type — including a `root:` key the client *did* send with the wrong shape (`{"user": "bob"}`), which is also a **400** |
 | `inclusion` | The value is outside `in:` |
 | `format` | The value doesn't match `format:` |
 | `length` | A string's length, or an array's element count, is outside `length:` |
@@ -425,7 +425,7 @@ Every failure raises `Permittable::InvalidParameters`, carrying `details` (an ar
 
 Paths are fully qualified: `user.address.zip`, `line_items[1].sku`.
 
-**Status codes.** A missing root key renders **400** — the request is malformed; the envelope you asked for isn't there. Field-level violations render **422** — well-formed, semantically wrong.
+**Status codes.** A bad root key renders **400** — the request is malformed; the envelope you asked for isn't there, or isn't an object. Field-level violations render **422** — well-formed, semantically wrong. The two root failures are told apart by their code: `missing` when the key really is absent (`{}`, `{"user": null}`, `{"user": ""}`), `invalid_type` when the client sent it with the wrong shape.
 
 **Custom rendering.** If your controller defines `render_error`, the envelope delegates to it as `render_error(message:, code:, status:, errors:)` — the `errors:` key is passed only when details exist, so hosts documenting a three-keyword contract keep working. Otherwise the inline JSON shape is rendered. Either way, `render_invalid_parameters` is a normal method you can override. For full control over the body (RFC 9457, a different envelope), `error.details` gives you the structured violations to build from.
 
