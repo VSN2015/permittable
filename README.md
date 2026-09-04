@@ -52,7 +52,7 @@ A violating request never reaches your action:
 - [Declaring a contract](#declaring-a-contract) · [The field DSL](#the-field-dsl) · [Field options](#field-options)
 - [Types and strict coercion](#types-and-strict-coercion) · [Absence, defaults, and partial updates](#absence-defaults-and-partial-updates)
 - [Violations and error responses](#violations-and-error-responses) · [Custom error messages](#custom-error-messages-message) · [Unknown parameters](#unknown-parameters)
-- [Output reshaping](#output-reshaping-transform-and-finalize) · [The schema-drift guard](#the-schema-drift-guard)
+- [Reusing fields](#reusing-fields-permittablefields-and-use) · [Output reshaping](#output-reshaping-transform-and-finalize) · [The schema-drift guard](#the-schema-drift-guard)
 - [Sensitive parameters](#sensitive-parameters-and-log-redaction) · [Instrumentation](#instrumentation)
 - [Monitor mode](#monitor-mode-roll-out-without-rejecting) · [Generating draft contracts](#generating-draft-contracts-permittablegenerate) · [Testing contracts](#testing-contracts-rspec-matchers)
 - [Standalone contracts](#standalone-contracts-no-controller) · [Exporting OpenAPI](#exporting-openapi-docs-that-cannot-drift)
@@ -323,6 +323,57 @@ For full control over the response body itself (RFC 9457, a different envelope),
 | `:error` | Each undeclared key becomes an `unknown` violation |
 
 Rails merges `controller`, `action`, and `format` into `params`; these are exempt at the top level so `unknown: :error` doesn't flag the router's own bookkeeping. Inside a `root:` or a nested hash there is no such exemption, because nothing legitimately injects keys there.
+
+## Reusing fields (`Permittable.fields` and `use`)
+
+A growing API produces two kinds of duplication: the `address` block three controllers want, and the `update` contract that is the `create` contract with nothing mandatory. A **field group** is a reusable field list — the same frozen data a contract's fields are, without the contract around them.
+
+```ruby
+AddressFields = Permittable.fields do
+  required :city, :string, length: 1..80
+  optional :zip,  :string, format: /\A\d{5}\z/
+end
+
+UserFields = Permittable.fields do
+  required :name,  :string
+  required :email, :string, format: URI::MailTo::EMAIL_REGEXP
+  optional :plan,  :string, in: %w[free pro], default: "free"
+  optional :address do
+    use AddressFields          # groups compose
+  end
+end
+
+class UsersController < ApplicationController
+  include Permittable
+
+  permit_params :create, root: :user, model: User do
+    use UserFields
+  end
+
+  # PATCH: the same fields, nothing mandatory.
+  permit_params :update, root: :user, model: User do
+    use UserFields, optional: true
+  end
+end
+```
+
+`use` splices the group in **at the point of use**, in the group's own order, exactly as if the fields had been typed there — so the request-time behaviour, the [drift guard](#the-schema-drift-guard), `sensitive:` registration and the [exported schema](#exporting-openapi-docs-that-cannot-drift) are all identical to the inline spelling. It works at the top level of a contract, inside a nested or array block, and inside another group.
+
+| Option | Meaning |
+|---|---|
+| `optional: true` | Relax every spliced field. **Top level only** — if a client sends an `address` at all, the address's own required sub-fields still hold. Types, bounds and `default:` are untouched, so `use UserFields, optional: true` is a complete `PATCH` contract |
+| `only:` / `except:` | Select a subset, in the group's own order. Mutually exclusive |
+
+Because a group is built by the same builder a contract is, **every declaration is validated when the group is defined** — a typo fails once, at the group, instead of at each contract that uses it. Two more things fail at class load rather than silently: `only:`/`except:` naming a field the group doesn't declare (so a typo can't quietly drop a field), and a field declared twice. That last one makes overriding deliberate:
+
+```ruby
+permit_params :create do
+  use AddressFields, except: %i[city]
+  required :city, :string, length: 1..5   # this contract's own stricter city
+end
+```
+
+A group is deliberately **not** a contract: it has no `root:`, `unknown:`, `model:` or `mode:` — those describe the request being validated, not a set of fields — and `finalize` is rejected for the same reason. A [standalone `Contract`](#standalone-contracts-no-controller) does answer `#fields`, though, so `use SomeContract` lets a webhook payload and a controller action share one definition instead of two that drift.
 
 ## Output reshaping (`transform:` and `finalize`)
 
@@ -601,11 +652,13 @@ Output is deterministic (fixed key order, declaration-order properties), so the 
 | `Permittable.filter_parameter_registry` | The live registry of `sensitive:` field names |
 | `Permittable.filter_parameter_registry=` | Swap in your own duck-typed registry |
 | `Permittable.mode` / `Permittable.mode=` | App-wide default (`:enforce`) for rules that don't declare their own `mode:` |
+| `Permittable.fields(&block)` | A reusable [field group](#reusing-fields-permittablefields-and-use) — splice it into a contract with `use` |
 | `Permittable::InvalidParameters` | Raised on violation; carries `#details` and `#status` |
 | `Permittable::JsonSchema` | Contract data → JSON Schema fragments (`.rule`, `.object`, `.field`) |
 | `Permittable::OpenAPI` | OpenAPI 3.1 assembly (`.document`, `.operations_for`, `.request_body_for`, `.components`) |
 | `Permittable::Generator` | Contract drafting (`.draft`, `.for_controller`, `.scan`) — see [generating draft contracts](#generating-draft-contracts-permittablegenerate) |
-| `Permittable::Contract` | [Standalone contracts](#standalone-contracts-no-controller) (`.define`, `#call`, `#call!`, `#json_schema`, `#rule`) |
+| `Permittable::Contract` | [Standalone contracts](#standalone-contracts-no-controller) (`.define`, `#call`, `#call!`, `#json_schema`, `#rule`, `#fields`) |
+| `Permittable::FieldGroup` | A [reusable field list](#reusing-fields-permittablefields-and-use) (`#fields`, `#names`) — built by `Permittable.fields` |
 | `Permittable::Matchers` | RSpec matchers via `require "permittable/rspec"` — see [testing contracts](#testing-contracts-rspec-matchers) |
 
 ## Errors caught at class load
@@ -623,7 +676,9 @@ A bad contract is a programmer error, so it fails when the class loads — never
 - `required: true` combined with `default:`
 - A field given both a type and a nested block; an array given both `of:` and a block
 - An empty contract, or a nested block declaring no sub-fields
-- `finalize` declared twice, without a block, or inside a nested block
+- `finalize` declared twice, without a block, inside a nested block, or inside a field group
+- `use` given something that is not a field group, both `only:` and `except:`, a name the group doesn't declare, or a selection that keeps nothing
+- A field group with no fields, or `Permittable.fields` without a block
 - `permit_params` without a block, or an invalid `unknown:` mode
 - An invalid `mode:` (and `Permittable.mode =` rejects invalid values at assignment)
 - A `model:` that isn't an ActiveRecord class, or `model: true` that can't be inferred
@@ -643,7 +698,7 @@ Using [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails)? `Concer
 
 ```sh
 bundle install
-bundle exec rspec      # 125 examples
+bundle exec rspec      # 216 examples
 bundle exec rubocop
 ```
 

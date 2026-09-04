@@ -60,6 +60,14 @@ require "permittable/filter_parameter_registry"
 # (db:create, assets:precompile) the check skips. In CI, one
 # `Rails.application.eager_load!` spec exercises every contract in the app.
 #
+# REUSING FIELDS — `Permittable.fields { ... }` builds a FieldGroup, a frozen
+# reusable field list, and the builder's `use` verb splices one in wherever
+# fields are declared (a contract, a nested block, another group). `use G,
+# optional: true` relaxes every spliced field, which is how an update contract
+# reuses a create contract; `only:`/`except:` select a subset. Because a group
+# is built by the same builder, its declarations are validated once, at the
+# group. See FieldGroup.
+#
 # Validation is LAZY: it runs on the first `permitted_params` call, so an
 # action that never reads params never pays. `enforce: true` installs the
 # check as a before_action instead (reject before the action body runs).
@@ -161,6 +169,19 @@ module Permittable
     end
 
     attr_writer :filter_parameter_registry
+
+    # A reusable field list, shareable by any number of contracts — see
+    # FieldGroup for the whole story.
+    #
+    #   AddressFields = Permittable.fields do
+    #     required :city, :string
+    #     optional :zip,  :string, format: /\A\d{5}\z/
+    #   end
+    #
+    # Splice it into a contract (or another group) with `use`.
+    def fields(&)
+      FieldGroup.new(&)
+    end
 
     # App-wide default for rules that don't declare their own mode:.
     # :enforce (the default) rejects violating requests; :monitor reports
@@ -426,7 +447,68 @@ module Permittable
       @fields << field
     end
 
+    # Splice a reusable field group in at this point — the same fields, in the
+    # same order, as if they had been typed here. Works at the top level of a
+    # contract, inside a nested or array block, and inside another group.
+    #
+    #   permit_params :create, root: :user do
+    #     required :name, :string
+    #     optional :address do
+    #       use AddressFields
+    #     end
+    #   end
+    #
+    # `optional: true` relaxes every spliced field, which is how an update
+    # contract reuses a create contract: nothing is mandatory, but `default:`,
+    # types and bounds all still apply. It relaxes the TOP LEVEL only — if a
+    # client sends an address at all, the address's own required sub-fields
+    # still hold.
+    #
+    # `only:`/`except:` select a subset, in the group's own order. Naming a
+    # field the group doesn't declare is a class-load error, so a typo cannot
+    # silently drop a field. A field declared twice still raises, so
+    # overriding one field of a group is deliberate: `use G, except: [:city]`
+    # and then declare `:city` yourself.
+    def use(group, only: nil, except: nil, optional: false)
+      fields = select_group_fields!(group_fields!(group), only: only, except: except)
+      fields = fields.map { |field| field.merge(required: false).freeze } if optional
+      fields.each do |field|
+        field_name!(field[:name])
+        @fields << field
+      end
+      nil
+    end
+
     private
+
+    def group_fields!(group)
+      return group.fields if group.respond_to?(:fields)
+
+      raise ArgumentError, "#{LABEL}: use expects a field group (Permittable.fields { ... }) or anything " \
+                           "answering #fields, such as a Permittable::Contract — got #{group.class}"
+    end
+
+    def select_group_fields!(fields, only:, except:)
+      raise ArgumentError, "#{LABEL}: use takes only: OR except:, not both" if only && except
+
+      if only || except
+        wanted = assert_group_names!(fields, only || except, only ? "only" : "except")
+        fields = only ? fields.select { |f| wanted.include?(f[:name]) } : fields.reject { |f| wanted.include?(f[:name]) }
+      end
+      return fields unless fields.empty?
+
+      raise ArgumentError, "#{LABEL}: use selects no fields from the group"
+    end
+
+    def assert_group_names!(fields, names, label)
+      wanted = Array(names).map(&:to_sym)
+      declared = fields.map { |f| f[:name] }
+      missing = wanted - declared
+      return wanted if missing.empty?
+
+      raise ArgumentError, "#{LABEL}: use #{label}: names #{missing.map(&:inspect).join(', ')}, which the group " \
+                           "does not declare (it declares: #{declared.map(&:inspect).join(', ')})"
+    end
 
     def add_field(name, type, required:, opts:, &block)
       name = field_name!(name)
@@ -1024,6 +1106,9 @@ require "permittable/generator"
 
 # Standalone contracts — the same DSL callable on any Hash, no controller.
 require "permittable/contract"
+
+# Reusable field lists — `Permittable.fields` + the builder's `use` verb.
+require "permittable/field_group"
 
 # Boot-time integration (filter_parameters registration, the
 # permittable:openapi rake task), Rails apps only
