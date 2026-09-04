@@ -1,5 +1,11 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Fixed
+- **One request could write a megabyte of log line, or hand a megabyte of exception message to every error tracker.** The `unknown: :log` warn line joined **every** undeclared key, and the violation summary behind `InvalidParameters#message` (and the monitor-mode warn line) joined **every** violation. A request carrying 50,000 undeclared keys against `unknown: :log` produced a single **1 MB** `logger.warn`; the same request against `unknown: :error` produced a 1 MB exception message. `unknown: :log` is the mode the rollout documentation recommends, so this was on the recommended path rather than an exotic corner.
+  Both are **prose, written for a person**: they now list at most ten names and count the rest (`…, and 49990 more`), taking that 1 MB line to 261 bytes. The **machine-readable channels are untouched and complete** — `InvalidParameters#details` still names every offender, and so does the `invalid_parameters.permittable` instrumentation payload — because nothing should silently drop data a consumer might be reading. The only visible change is the `message` / problem `detail` string when there are more than ten violations, which no ordinary contract reaches.
+
 ## 0.5.1 (2026-09-02)
 <!-- title: nested input outside Rails -->
 
