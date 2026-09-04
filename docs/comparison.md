@@ -16,6 +16,7 @@ Every option below is good software. This page exists so you can pick the right 
 | Checked against the DB schema at boot | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | Exports OpenAPI / JSON Schema | ❌ | ❌ | ❌ | ❌² | ❌ | ✅ |
 | Report-only rollout mode | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
+| Audits which endpoints have **no** contract | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | Drafts contracts from your schema | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | Works outside controllers | ❌ | ❌ | ❌ | ✅ | ❌ | ✅¹ |
 | Zero new runtime dependencies³ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |

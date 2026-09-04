@@ -16,6 +16,7 @@ module Permittable
     rake_tasks do
       load File.expand_path("tasks/openapi.rake", __dir__)
       load File.expand_path("tasks/generate.rake", __dir__)
+      load File.expand_path("tasks/audit.rake", __dir__)
     end
   end
 end

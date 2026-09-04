@@ -192,6 +192,7 @@ Adopting on an existing API with live traffic? Skip ahead to [Adopting on a live
 - **[Adopting on a live API](#adopting-on-a-live-api)**
   - [Monitor mode](#monitor-mode-roll-out-without-rejecting)
   - [Generating draft contracts](#generating-draft-contracts-permittablegenerate)
+  - [Auditing coverage](#auditing-coverage-permittableaudit)
 - **[Beyond the controller](#beyond-the-controller)**
   - [Testing contracts](#testing-contracts-rspec-matchers)
   - [Standalone contracts](#standalone-contracts-no-controller)
@@ -653,6 +654,47 @@ No Rails required for the core: `Permittable::Generator.draft(model: User)`, `.f
 
 ---
 
+### Auditing coverage (`permittable:audit`)
+
+A controller declaring `permit_params :create` looks adopted. If it also answers `PATCH`, that action is validating **nothing** — and until now nothing in the gem said so. [`permittable:generate`](#generating-draft-contracts-permittablegenerate) only notices controllers with no contract at all, and the [OpenAPI export](#exporting-openapi-docs-that-cannot-drift) documents what exists rather than what is missing.
+
+The audit crosses the contract registry with the **route set**, so a half-covered controller is as visible as an uncovered one:
+
+```sh
+bin/rails permittable:audit             # the table plus a summary
+bin/rails "permittable:audit[strict]"   # ...and exit 1 on any unguarded write action
+```
+
+```
+legacy/invoices
+  POST   /legacy/invoices                   create       no contract — ACCEPTS A BODY
+orders
+  POST   /orders                            create       enforce
+  PUT    /orders/{id}                       update       no contract — ACCEPTS A BODY
+users
+  GET    /users                             index        no contract
+  POST   /users                             create       enforce  model: User  unknown: error
+  DELETE /users/{id}                        destroy      monitor
+  PATCH  /users/{id}                        update       enforce  model: User  unknown: error
+
+7 routed actions: 3 enforced, 1 in monitor mode, 3 without a contract
+  2 of those accept a request body — untrusted input reaches the action unchecked
+  2 covered actions declare no model:, so no schema-drift guard runs for them
+
+Contracts declared for actions no route reaches (renamed or deleted?):
+  users#archive
+```
+
+Three things it tells you that nothing else does:
+
+- **Which write actions are unguarded.** A `GET` without a contract is usually fine; a `POST` without one is untrusted input reaching the action unchecked. That count is the number `[strict]` fails on, which makes the task a CI gate: *no new unguarded write endpoint*.
+- **Which contracts aren't enforcing yet.** The audit runs inside the app, so unlike the exported OpenAPI it resolves the **effective** mode — a rule's own `mode:` first, then your app-wide `Permittable.mode`. This is the [monitor-mode](#monitor-mode-roll-out-without-rejecting) rollout dashboard.
+- **Which contracts have gone stale.** A contract declared for an action no route reaches is a renamed or deleted action that left its contract behind.
+
+Controllers that never included `Permittable` are audited too — those are the ones worth finding. Everything is plain Ruby over the frozen registry plus route descriptors, so `Permittable::Audit.entries(controllers:, routes:)` works without Rails.
+
+---
+
 ## Beyond the controller
 
 Because a contract is data, it has readers other than the request validator.
@@ -788,6 +830,7 @@ Output is deterministic (fixed key order, declaration-order properties), so the 
 | `Permittable::JsonSchema` | Contract data → JSON Schema fragments (`.rule`, `.object`, `.field`) |
 | `Permittable::OpenAPI` | OpenAPI 3.1 assembly (`.document`, `.operations_for`, `.request_body_for`, `.components`) |
 | `Permittable::Generator` | Contract drafting (`.draft`, `.for_controller`, `.scan`) — see [generating draft contracts](#generating-draft-contracts-permittablegenerate) |
+| `Permittable::Audit` | Coverage across the route set (`.entries`, `.summary`, `.stale`, `.format`) — see [auditing coverage](#auditing-coverage-permittableaudit) |
 | `Permittable::Contract` | [Standalone contracts](#standalone-contracts-no-controller) (`.define`, `#call`, `#call!`, `#json_schema`, `#rule`) |
 | `Permittable::Matchers` | RSpec matchers via `require "permittable/rspec"` — see [testing contracts](#testing-contracts-rspec-matchers) |
 
