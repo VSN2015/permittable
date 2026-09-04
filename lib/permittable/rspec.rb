@@ -196,6 +196,7 @@ module Permittable
         when :array then "expected an array field, but it is declared with `#{field[:kind]}`" unless field[:kind] == :array
         when :of then "expected an array of :#{value}, but it is of: :#{field[:of]}" unless field[:of] == value
         when :required then required_mismatch(field, value)
+        when :format then format_mismatch(field, value)
         when :virtual, :sensitive, :nullable then "expected the field to be #{key}, but it is not" unless field[key]
         else option_mismatch(field, key, value)
         end
@@ -215,6 +216,22 @@ module Permittable
         actual = field[:required] ? "required" : "optional"
         expected = required ? "required" : "optional"
         "expected the field to be #{expected}, but it is #{actual}" unless actual == expected
+      end
+
+      # `matching(:email)` asserts the preset by name, `matching(/re/)` the
+      # Regexp itself.
+      def format_mismatch(field, expected)
+        return option_mismatch(field, :format, expected) unless expected.is_a?(Symbol)
+        return if field[:format_name] == expected
+
+        "expected format: :#{expected}, but the contract #{declared_format(field)}"
+      end
+
+      def declared_format(field)
+        return "declares format: :#{field[:format_name]}" if field[:format_name]
+        return "declares format: #{field[:format].inspect}" if field[:format]
+
+        "does not declare format:"
       end
 
       def option_mismatch(field, key, value)

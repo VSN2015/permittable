@@ -9,6 +9,7 @@ require "active_support/core_ext/string/filters"
 require "bigdecimal"
 require "date"
 require "time"
+require "uri" # URI::MailTo::EMAIL_REGEXP backs the :email format preset
 
 require "permittable/version"
 require "permittable/error_envelope"
@@ -162,6 +163,28 @@ module Permittable
   # Rails merges routing bookkeeping into params; a top-level (root: false)
   # unknown-keys check must not flag them.
   ROUTING_KEYS = %w[controller action format].freeze
+
+  # Named `format:` presets — the regexps every app writes by hand, defined
+  # once. A preset carries something a hand-written Regexp cannot: the JSON
+  # Schema `format` keyword the ecosystem understands, so an exported schema
+  # says `"format": "uuid"` and not only a wall of pattern.
+  #
+  # :email is deliberately URI::MailTo::EMAIL_REGEXP itself, the regexp Rails
+  # apps already paste into their contracts, so adopting the preset cannot
+  # change which addresses an endpoint accepts. The rest avoid flags and
+  # Ruby-only constructs (no \h, no /i) so they translate to ECMA-262 and
+  # export as a real `pattern` rather than an x-permittable-pattern
+  # extension. :url and :hostname are shape checks, not reachability
+  # guarantees.
+  FORMATS = {
+    email: { pattern: URI::MailTo::EMAIL_REGEXP, json: "email" }.freeze,
+    uuid: { pattern: /\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z/,
+            json: "uuid" }.freeze,
+    url: { pattern: %r{\Ahttps?://[^\s/?\#]+[^\s]*\z}, json: "uri" }.freeze,
+    slug: { pattern: /\A[a-z0-9]+(?:-[a-z0-9]+)*\z/ }.freeze,
+    hostname: { pattern: /\A[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\z/,
+                json: "hostname" }.freeze
+  }.freeze
 
   NORMALIZERS = {
     squish: ->(v) { v.squish },
@@ -583,6 +606,7 @@ module Permittable
       validate_length!(name, field[:length]) if field.key?(:length)
       validate_callable!(name, :validate, field[:validate]) if field.key?(:validate)
       validate_callable!(name, :transform, field[:transform]) if field.key?(:transform)
+      resolve_format!(field)
       resolve_normalizer!(field)
       validate_authored_value!(field, :default)
       validate_authored_value!(field, :example)
@@ -645,6 +669,28 @@ module Permittable
       return if value.respond_to?(:call)
 
       raise ArgumentError, "#{LABEL}: :#{opt} for field :#{name} must be callable"
+    end
+
+    # A Symbol (or String) `format:` names a preset; a Regexp is used as
+    # given. Resolving here means request-time matching stays a plain
+    # Regexp#match?, and an authored `default:`/`example:` is checked against
+    # the resolved pattern like any other. The preset NAME is kept on the
+    # field so exporters and the RSpec matcher can speak in presets.
+    def resolve_format!(field)
+      preset = field[:format]
+      return if preset.nil? || preset.is_a?(Regexp)
+
+      unless preset.is_a?(Symbol) || preset.is_a?(String)
+        raise ArgumentError, "#{LABEL}: :format for field :#{field[:name]} must be a Regexp or a preset name " \
+                             "(presets: #{FORMATS.keys.join(', ')})"
+      end
+
+      spec = FORMATS.fetch(preset.to_sym) do
+        raise ArgumentError, "#{LABEL}: unknown :format preset :#{preset} for field :#{field[:name]} " \
+                             "(presets: #{FORMATS.keys.join(', ')}, or pass a Regexp)"
+      end
+      field[:format_name] = preset.to_sym
+      field[:format] = spec[:pattern]
     end
 
     def resolve_normalizer!(field)

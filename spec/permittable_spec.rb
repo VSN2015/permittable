@@ -347,6 +347,74 @@ RSpec.describe Permittable do
     end
   end
 
+  describe "format: presets" do
+    def format_violations(value, preset)
+      violations_for({ v: value }) { permit_params(:create) { required :v, :string, format: preset } }.details
+    end
+
+    it "accepts the same emails URI::MailTo::EMAIL_REGEXP does, which is what apps write by hand" do
+      expect(permit({ v: "a.b+c@example.co.uk" }) { permit_params(:create) { required :v, :string, format: :email } }[:v])
+        .to eq("a.b+c@example.co.uk")
+      expect(format_violations("nope", :email)).to eq([{ param: "v", code: "format" }])
+      expect(Permittable::FORMATS[:email][:pattern]).to eq(URI::MailTo::EMAIL_REGEXP)
+    end
+
+    it "matches a canonical UUID in either case, and nothing else" do
+      %w[123e4567-e89b-12d3-a456-426614174000 123E4567-E89B-12D3-A456-426614174000].each do |uuid|
+        expect(permit({ v: uuid }) { permit_params(:create) { required :v, :string, format: :uuid } }[:v]).to eq(uuid)
+      end
+      %w[123e4567e89b12d3a456426614174000 123e4567-e89b-12d3-a456-42661417400 zzz].each do |bad|
+        expect(format_violations(bad, :uuid)).to eq([{ param: "v", code: "format" }]), "for #{bad}"
+      end
+    end
+
+    it "matches an http(s) URL and rejects other schemes or whitespace" do
+      expect(permit({ v: "https://a.example/x?y=1" }) { permit_params(:create) { required :v, :string, format: :url } }[:v])
+        .to eq("https://a.example/x?y=1")
+      ["ftp://a.example", "javascript:alert(1)", "http://a b", "example.com"].each do |bad|
+        expect(format_violations(bad, :url)).to eq([{ param: "v", code: "format" }]), "for #{bad}"
+      end
+    end
+
+    it "matches a lowercase hyphenated slug" do
+      expect(permit({ v: "my-post-2" }) { permit_params(:create) { required :v, :string, format: :slug } }[:v])
+        .to eq("my-post-2")
+      ["My-Post", "-leading", "trailing-", "double--hyphen", "under_score"].each do |bad|
+        expect(format_violations(bad, :slug)).to eq([{ param: "v", code: "format" }]), "for #{bad}"
+      end
+    end
+
+    it "resolves the preset to its Regexp on the frozen field, and remembers the name" do
+      klass = permittable_class { permit_params(:create) { required :v, :string, format: :uuid } }
+      field = klass.permit_rule_for("create")[:fields].first
+      expect(field[:format]).to be_a(Regexp)
+      expect(field[:format_name]).to eq(:uuid)
+    end
+
+    it "leaves a Regexp passed directly alone, with no preset name" do
+      klass = permittable_class { permit_params(:create) { required :v, :string, format: /\Ax\z/ } }
+      field = klass.permit_rule_for("create")[:fields].first
+      expect(field[:format]).to eq(/\Ax\z/)
+      expect(field.key?(:format_name)).to be(false)
+    end
+
+    it "rejects an unknown preset at class load, listing the presets" do
+      expect { permittable_class { permit_params(:create) { required :v, :string, format: :postcode } } }
+        .to raise_error(ArgumentError,
+                        /unknown :format preset :postcode for field :v \(presets: email, uuid, url, slug, hostname, or pass a Regexp\)/)
+    end
+
+    it "still refuses format: on a non-string field" do
+      expect { permittable_class { permit_params(:create) { required :v, :integer, format: :uuid } } }
+        .to raise_error(ArgumentError, /:format is only supported on :string fields/)
+    end
+
+    it "checks an authored default:/example: against the resolved preset at class load" do
+      expect { permittable_class { permit_params(:create) { optional :v, :string, format: :slug, default: "Nope" } } }
+        .to raise_error(ArgumentError, /:default for field :v violates its own contract \(format\)/)
+    end
+  end
+
   describe "message: (custom error messages)" do
     it "rejects a message that is neither a String nor a code => String Hash" do
       expect { permittable_class { permit_params(:create) { required :a, :string, message: :nope } } }
