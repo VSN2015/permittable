@@ -4,6 +4,7 @@
 
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
 ### Added
 <<<<<<< HEAD
 
@@ -42,6 +43,10 @@ Contracts that don't opt in are byte-for-byte unaffected: the default format is 
 ### Fixed
 - **A rejected request instrumented `invalid_parameters.permittable` more than once, double-counting itself in every dashboard.** `permitted_params` is documented as memoized per action, but it only memoized *successes* — on a violation it raised without storing anything, so a second read revalidated from scratch and fired the event again. Any action that reads the params twice hit this, and `permittable_violations` followed by `permitted_params` — the pattern the monitor-mode docs suggest for "would this request fail?" — hit it every time. The memo now remembers the **outcome**: a rejection is stored and re-raised (the same exception object, not an equal-looking new one), so a contract runs, and instruments, exactly once per action per request. `ArgumentError` is deliberately still raised fresh every time and never memoized — a contract that doesn't cover the action is a bug to fix, not a verdict on the request.
 >>>>>>> fix/validate-once-per-action
+=======
+### Fixed
+- **A `root:` key sent with the wrong shape reported `missing`, which sent clients looking in the wrong place.** `{"user": "bob"}` against a `root: :user` contract answered `{ param: "user", code: "missing" }` — for a key the client had just sent. An absent root and a malformed one are different client mistakes, and now read differently: `missing` when the key really is absent (`{}`, `{"user": null}`, `{"user": ""}` — the gem's own definition of absence, so an empty string still counts), `invalid_type` when it was sent as something other than an object. Both remain **400**, since either way the envelope itself is malformed, so nothing changes at the HTTP level; only the diagnostic gets accurate.
+>>>>>>> fix/malformed-root-code
 
 ## 0.5.1 (2026-09-02)
 <!-- title: nested input outside Rails -->
