@@ -917,6 +917,9 @@ module Permittable
       value = field[opt]
       return if authored_nil!(field, opt)
       raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} must be an Array" unless value.is_a?(Array)
+      if field[:length] && !Coercion.length_ok?(field[:length], value.length)
+        raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} violates its own contract (length)"
+      end
 
       validate_array_elements!(field, opt, value) if field[:of]
       validate_array_element_hashes!(field, opt, value) if field[:fields]
@@ -1463,8 +1466,18 @@ module Permittable
   end
 
   def permittable_check_array(field, value, path:, unknown:, violations:)
+    # `length:` is a BOUND, not a report. An array outside it is rejected
+    # whatever its contents, so checking those contents can only add work and
+    # noise: a 200k-element payload against `length: 0..10` used to cast every
+    # element, collect 200k more violations, and answer with a multi-megabyte
+    # 422 — for a request already refused by its first check. Stopping here
+    # keeps the cost of an oversized array proportional to rejecting it.
+    if field[:length] && !Coercion.length_ok?(field[:length], value.length)
+      violations << permittable_violation(field, path, "length")
+      return nil
+    end
+
     before = violations.length
-    violations << permittable_violation(field, path, "length") if field[:length] && !Coercion.length_ok?(field[:length], value.length)
     out = value.each_with_index.map do |element, index|
       permittable_check_element(field, element, "#{path}[#{index}]", unknown: unknown, violations: violations)
     end

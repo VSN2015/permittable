@@ -192,7 +192,9 @@ module Permittable
 
     def scanned_lines(scan, columns)
       lines = scan.scalars.map { |name| scanned_scalar_line(name, columns) }
-      lines += scan.arrays.map { |name| "array :#{name}, of: :string # TODO: confirm the element type" }
+      lines += scan.arrays.map do |name|
+        "array :#{name}, of: :string # TODO: confirm the element type, and declare length: — an array without one is unbounded"
+      end
       scan.nested.each { |name, keys| lines += nested_lines(name, keys) }
       lines + scan.unparsed.map { |arg| "# TODO: could not parse from the permit call: #{arg}" }
     end
