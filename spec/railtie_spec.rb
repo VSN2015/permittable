@@ -62,12 +62,32 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
     ActiveRecord::Schema.define { create_table(:people) { |t| t.string :ssn; t.string :name } }
     class Person < ActiveRecord::Base; end
 
+    # A host gem or app swapping the registry to pool registrations. Rails runs
+    # railtie initializers BEFORE config/initializers, so this necessarily
+    # happens after the gem's filter proc was appended — and after LateController
+    # already registered `ssn` on the default registry.
+    pooled = Permittable::FilterParameterRegistry.new
+    Permittable.filter_parameter_registry = pooled
+
+    class PostSwapController < ActionController::Base
+      include Permittable
+
+      permit_params(:create) { optional :pin, :string, sensitive: true }
+    end
+
+    # Same filter list, unchanged since boot: the appended proc has to resolve
+    # the CURRENT registry, and the swap has to have carried `ssn` across.
+    after_swap = ActiveSupport::ParameterFilter.new(filters).filter(
+      "ssn" => "111-22-3333", "pin" => "1234", "note" => "keep me"
+    )
+
     Rails.application.load_tasks
 
     print JSON.generate(
       procs: filters.count { |f| f.is_a?(Proc) },
       symbols: filters.grep(Symbol).map(&:to_s),
       redacted: redacted,
+      after_swap: after_swap,
       filter_attribute_procs: ActiveRecord::Base.filter_attributes.count { |f| f.is_a?(Proc) },
       model_inspect: Person.new(ssn: "111-22-3333", name: "Ada").inspect,
       tasks: Rake::Task.tasks.map(&:name).grep(/^permittable:/).sort
@@ -118,6 +138,15 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
   it "leaves the app's own filters working and everything else untouched" do
     expect(boot["redacted"]["password"]).to eq("[FILTERED]")
     expect(boot["redacted"]["note"]).to eq("keep me")
+  end
+
+  it "keeps redacting across a registry swapped in from an initializer" do
+    # Both halves: `ssn` was registered BEFORE the swap and carried across,
+    # `pin` by a controller that loaded after it. Getting only one of the two
+    # is the failure mode this covers.
+    expect(boot["after_swap"]["ssn"]).to eq("[FILTERED]")
+    expect(boot["after_swap"]["pin"]).to eq("[FILTERED]")
+    expect(boot["after_swap"]["note"]).to eq("keep me")
   end
 
   it "loads its rake tasks" do

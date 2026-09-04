@@ -163,6 +163,16 @@ module Permittable
   # unknown-keys check must not flag them.
   ROUTING_KEYS = %w[controller action format].freeze
 
+  # The single proc Permittable::Railtie appends to config.filter_parameters.
+  # Declared with an optional third parameter so its own arity is -3 and Rails
+  # passes `original_params`; the registry's callable is then invoked by ITS
+  # arity, so both the 2- and 3-argument proc-filter shapes Rails accepts work
+  # as a swapped-in registry's #to_proc.
+  FILTER_PARAMETER_PROC = lambda do |key, value, original = nil|
+    inner = filter_parameter_registry.to_proc
+    inner.arity == 2 ? inner.call(key, value) : inner.call(key, value, original)
+  end.freeze
+
   NORMALIZERS = {
     squish: ->(v) { v.squish },
     strip: ->(v) { v.strip },
@@ -183,7 +193,45 @@ module Permittable
       end
     end
 
-    attr_writer :filter_parameter_registry
+    # Swapping registries must not un-redact anything. Contracts that loaded
+    # BEFORE the swap registered on the outgoing registry, and after the swap
+    # nothing consults it any more — so its entries are carried into the new
+    # one, which is the mirror image of the bug that made the proc late-bound
+    # in the first place. Validated here rather than at filter time: a
+    # registry with no #to_proc used to be silently never consulted, and
+    # late-binding it would instead raise NoMethodError on every request.
+    def filter_parameter_registry=(registry)
+      unless registry.nil? || registry.respond_to?(:to_proc)
+        raise ArgumentError,
+              "#{LABEL}: filter_parameter_registry must respond to #to_proc (got #{registry.class})"
+      end
+
+      @registry_mutex.synchronize do
+        previous = @filter_parameter_registry
+        @filter_parameter_registry = registry
+        next unless registry && previous.respond_to?(:names) && registry.respond_to?(:add)
+
+        previous.names.each { |name| registry.add(name) }
+      end
+      registry
+    end
+
+    # The proc Permittable::Railtie appends to config.filter_parameters.
+    #
+    # It resolves the registry at FILTER time rather than closing over
+    # whichever instance existed at boot. Rails runs railtie initializers
+    # BEFORE config/initializers, so an app or host gem that swaps the
+    # registry — the pooling the writer exists for — necessarily does so
+    # after the Railtie has already appended its proc. A proc bound to the old
+    # instance would go on consulting an empty registry and silently redact
+    # nothing, while `sensitive:` fields registered themselves in the new one.
+    #
+    # One frozen object for the life of the process, so the Railtie's
+    # idempotence check (include? before <<) holds across repeated initializer
+    # runs with no memo to synchronise.
+    def filter_parameter_proc
+      FILTER_PARAMETER_PROC
+    end
 
     # App-wide default for rules that don't declare their own mode:.
     # :enforce (the default) rejects violating requests; :monitor reports

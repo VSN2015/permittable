@@ -1,5 +1,14 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Fixed
+- **Swapping `Permittable.filter_parameter_registry` silently stopped `sensitive:` redaction.** `Permittable::Railtie` appended `filter_parameter_registry.to_proc` — a proc bound to whichever registry instance existed **at boot**. Rails runs railtie initializers *before* `config/initializers`, so a host gem or app that swaps the registry necessarily does so afterwards, leaving Rails filtering through the old instance: `sensitive:` fields registered themselves in the new registry, and the appended proc went on consulting an empty one. The parameter was logged in the clear, with nothing to indicate it. That swap is the reason the writer exists — the gem's own comment names `concerns_on_rails` as doing exactly this — so the broken ordering was the normal case rather than an exotic one. The Railtie now appends `Permittable.filter_parameter_proc`, which resolves the registry at **filter time**; it is one frozen object for the life of the process, so the Railtie's idempotence check still holds across repeated initializer runs.
+
+### Added
+- **Swapping the registry now carries the entries it already holds into the new one.** Late-binding the proc fixes redaction for contracts that load *after* a swap, but on its own it breaks the other half: nothing consults the outgoing registry again, so a `sensitive:` field registered by a contract that loaded *before* the swap would have stopped being redacted — the exact mirror image of the bug above, and the case a host gem pooling registrations is most likely to hit, since eager loading in production loads plenty of controllers before `config/initializers` runs. `Permittable.filter_parameter_registry=` now re-adds each name from the outgoing registry (read through a new duck-typed `#names`) to the incoming one, and a real Rails boot covers both halves.
+- **`Permittable.filter_parameter_registry=` validates what it is given.** A registry with no `#to_proc` used to be accepted silently and simply never consulted; with the proc late-bound it would instead have raised `NoMethodError` inside `process_action` on every request. It now raises `ArgumentError` at the point of the swap, naming the class. The registry's callable may take Rails' two-argument (`key, value`) or three-argument (`key, value, original_params`) proc-filter shape; both are dispatched by arity.
+
 ## 0.6.0 (2026-09-08)
 <!-- title: nullable fields, :json, and strict dates -->
 
