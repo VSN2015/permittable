@@ -267,14 +267,16 @@ Coercion is **deliberately strict**, and deliberately *not* `ActiveModel::Type`.
 |---|---|---|
 | `:string` | `String`; `Numeric`/`true`/`false` are stringified | Arrays, hashes |
 | `:integer` | `Integer`; whole `Float`s (`4.0`); base-10 numeric strings | `"4.5"`, `"abc"`, `4.5` |
-| `:float` | `Numeric`; any `Float()`-parseable string | `"abc"` |
-| `:decimal` | `Numeric` or `String` → `BigDecimal` | Unparseable strings |
+| `:float` | `Numeric`; any `Float()`-parseable string, as long as the result is **finite** | `"abc"`, and anything that overflows (`"1e400"`) or underflows (`"1e-400"`) |
+| `:decimal` | `Numeric` or `String` → `BigDecimal`, as long as the result is **finite** | Unparseable strings, `"NaN"`, `"Infinity"` |
 | `:boolean` | `true`/`false`, `"true"`/`"false"`, `"1"`/`"0"`, `1`/`0` | `"yes"`, `"on"`, `2` |
 | `:date` | `Date`; any `Date.parse`-able string | Unparseable strings |
 | `:datetime` | `Time`, `DateTime`, `ActiveSupport::TimeWithZone`, `Date`, parseable strings | Unparseable strings |
 | `:json` | Any `Hash` — passed through uncast, see [free-form hashes](#free-form-hashes-json) | Arrays, scalars |
 | `:date` | `Date`; a string naming a **complete** date, in any format `Date.parse` understands (`"2026-09-05"`, `"2026/09/05"`, `"Sep 5, 2026"`) | Unparseable strings, and **incomplete** ones (`"09/2026"`, `"5th"`, `"Sept"`) |
 | `:datetime` | `Time`, `DateTime`, `ActiveSupport::TimeWithZone`, `Date`; a string naming a complete date, with or without a time | Unparseable strings, and any string without a complete date (`"10:30"`) |
+
+**Numbers must be finite.** `Float("1e400")` is `Infinity` and `Float("1e-400")` is `0.0` — neither represents what was sent, and neither is a value a numeric column can store, so both are `invalid_type`. A genuine zero is unaffected however it is spelled (`"0"`, `"0.0"`, `"0e10"`). `:decimal` has no exponent limit, so `"1e400"` is fine there — but `BigDecimal("NaN")` and `BigDecimal("Infinity")` *succeed* where `Float()` raises, so those literal strings are rejected explicitly.
 
 **Dates are parsed, never guessed.** `Date.parse` fills in what a string omits *from today* — `"09/2026"` becomes the 1st, `"5th"` becomes this month of this year — so the same request would mean different things on different days. A `:date` or `:datetime` string must therefore name all three of year, month and day; which **format** it names them in is `Date.parse`'s business, so every complete format it understands still works. A `:datetime` may omit the *time* part, which reads as midnight UTC.
 
