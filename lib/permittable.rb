@@ -469,21 +469,52 @@ module Permittable
 
     def cast_float(value)
       case value
-      when Numeric then [:ok, value.to_f]
-      when String then [:ok, Float(value)]
+      when Numeric then finite_float(value.to_f)
+      when String then finite_float(Float(value), source: value)
       else [:error, "invalid_type"]
       end
     rescue ArgumentError
       [:error, "invalid_type"]
     end
 
+    # A Float that is not finite does not represent what was sent. "1e400"
+    # overflows to Infinity and "1e-400" underflows to zero — both silently,
+    # and both leaving a value no column can faithfully store.
+    #
+    # Underflow is only visible against the source text, since the result is
+    # an ordinary 0.0: a zero result is rejected when the string it came from
+    # named a nonzero SIGNIFICAND. Only the significand, because "0e10" is a
+    # genuine zero whose exponent digits say nothing about the value — as are
+    # "0", "0.0" and "0.0000".
+    def finite_float(result, source: nil)
+      return [:error, "invalid_type"] unless result.finite?
+      return [:error, "invalid_type"] if result.zero? && nonzero_significand?(source)
+
+      [:ok, result]
+    end
+
+    def nonzero_significand?(source)
+      return false unless source
+
+      source.split(/[eE]/, 2).first.match?(/[1-9]/)
+    end
+
     def cast_decimal(value)
       case value
-      when Numeric, String then [:ok, BigDecimal(value.to_s)]
+      when Numeric, String then finite_decimal(BigDecimal(value.to_s))
       else [:error, "invalid_type"]
       end
     rescue ArgumentError
       [:error, "invalid_type"]
+    end
+
+    # BigDecimal has no exponent limit, so a :decimal cannot overflow — but
+    # BigDecimal("NaN") and BigDecimal("Infinity") SUCCEED where Float()
+    # raises, so a client could send the literal string "NaN" for a price and
+    # have it stored. Nothing else in the gem disagreed with itself this
+    # loudly: :float rejected those strings and :decimal did not.
+    def finite_decimal(result)
+      result.finite? ? [:ok, result] : [:error, "invalid_type"]
     end
 
     def cast_boolean(value)

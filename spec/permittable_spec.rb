@@ -413,6 +413,66 @@ RSpec.describe Permittable do
     end
   end
 
+  describe "numbers the type cannot faithfully hold" do
+    let(:decl) do
+      proc do
+        permit_params(:create) do
+          optional :f, :float
+          optional :d, :decimal
+        end
+      end
+    end
+
+    def rejected(key, value, &decl)
+      violations_for({ key => value }, &decl).details
+    end
+
+    it "rejects a :float that overflowed to Infinity" do
+      ["1e400", "-1e400", "1#{"0" * 400}"].each do |value|
+        expect(rejected(:f, value, &decl)).to eq([{ param: "f", code: "invalid_type" }]), "for #{value[0, 12]}"
+      end
+    end
+
+    it "rejects a :float that underflowed to zero, losing the whole value" do
+      ["1e-400", "-1e-400", "0.1e-400"].each do |value|
+        expect(rejected(:f, value, &decl)).to eq([{ param: "f", code: "invalid_type" }]), "for #{value}"
+      end
+    end
+
+    it "still accepts a genuine zero, however it is spelled" do
+      ["0", "0.0", "-0.0", "0e10", "0.0000"].each do |value|
+        expect(permit({ f: value }, &decl)[:f]).to eq(0.0), "for #{value}"
+      end
+    end
+
+    it "rejects non-finite Float objects for both numeric types" do
+      [Float::INFINITY, -Float::INFINITY, Float::NAN].each do |value|
+        expect(rejected(:f, value, &decl)).to eq([{ param: "f", code: "invalid_type" }]), "for :float #{value}"
+        expect(rejected(:d, value, &decl)).to eq([{ param: "d", code: "invalid_type" }]), "for :decimal #{value}"
+      end
+    end
+
+    it "rejects the literal strings a client could send for a :decimal" do
+      # BigDecimal("NaN") succeeds where Float("NaN") raises, so :decimal
+      # accepted these while :float did not.
+      %w[NaN Infinity -Infinity].each do |value|
+        expect(rejected(:d, value, &decl)).to eq([{ param: "d", code: "invalid_type" }]), "for #{value}"
+      end
+    end
+
+    it "keeps accepting the large exponents BigDecimal genuinely represents" do
+      expect(permit({ d: "1e400" }, &decl)[:d]).to eq(BigDecimal("1e400"))
+      expect(permit({ d: "0.0000000000000000001" }, &decl)[:d]).to eq(BigDecimal("1e-19"))
+    end
+
+    it "leaves ordinary numbers alone" do
+      result = permit({ f: "1.5", d: "2.50" }, &decl)
+      expect(result[:f]).to eq(1.5)
+      expect(result[:d]).to eq(BigDecimal("2.5"))
+      expect(permit({ f: 3, d: 4 }, &decl).to_h).to eq("f" => 3.0, "d" => BigDecimal("4"))
+    end
+  end
+
   describe "validations" do
     it "checks in: as Range (cover) and as Array (inclusion)" do
       decl = proc { permit_params(:create) { required :age, :integer, in: 18..120 } }
