@@ -202,6 +202,16 @@ Which options are legal depends on the field kind — anything else raises at cl
 
 ¹ `format:`, `length:`, and `normalize:` reason about characters and are **only valid on `:string` fields**. On any other type they would silently apply to an already-cast value, so declaring them raises at class load.
 
+**Checks run in a fixed order**, and the first failure is the one reported:
+
+```
+normalize:  →  cast  →  length:  →  in:  →  format:  →  validate:
+```
+
+`length:` comes before `in:` and `format:` on purpose. It is an O(1) read of a string's size, while `format:` runs a regexp over the whole value and `validate:` runs your own code — so a value the length bound already excludes never pays for the expensive checks. A 5 MB string against `length: 1..80` is rejected on its length without the regexp ever seeing it, which matters most when the regexp is one with poor worst-case behaviour.
+
+The visible consequence: a value that violates *both* its length and its format reports `length`. That is the more useful answer anyway — a client can't act on "wrong format" for a value that is also far too long.
+
 `validate:` is the escape hatch for anything the built-ins don't cover:
 
 ```ruby
@@ -643,7 +653,7 @@ Using [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails)? `Concer
 
 ```sh
 bundle install
-bundle exec rspec      # 125 examples
+bundle exec rspec      # 203 examples
 bundle exec rubocop
 ```
 

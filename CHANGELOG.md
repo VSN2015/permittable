@@ -1,5 +1,10 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Changed
+- **`length:` is now checked before `in:` and `format:`, so a value the bound already excludes never pays for the expensive checks.** `length:` is an O(1) read of a String's size; `format:` runs a regexp over the whole value and `validate:` runs arbitrary app code. Checking the cheap bound *last* meant a 5 MB string against `length: 1..80` was scanned in full by the field's regexp before being rejected on its length — 121 ms where 38 ms would do, and a lever rather than mere waste when the app's regexp has poor worst-case behaviour. The documented order is now `normalize: → cast → length: → in: → format: → validate:`, with the first failure reported. The only observable change is which code a value violating **both** reports — `length` now, rather than `inclusion`/`format` — and that is the more useful answer anyway, since a client cannot act on "wrong format" for a value that is also far too long. A spec pins that the field's regexp is not consulted at all for an over-long value.
+
 ## 0.5.1 (2026-09-02)
 <!-- title: nested input outside Rails -->
 
