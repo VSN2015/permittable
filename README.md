@@ -575,6 +575,17 @@ Every operation references shared components for the [error envelope](#violation
 
 Output is deterministic (fixed key order, declaration-order properties), so the generated file can be committed and reviewed as a diff — a contract change shows up in the same PR as its documentation change.
 
+### What the schema deliberately does not say
+
+`spec/schema_conformance_spec.rb` holds the "cannot drift" claim to account: it walks canonical JSON payloads through both the contract and its own exported schema and asserts the verdicts agree.
+
+Where they legitimately differ, the divergence is always the same direction — the **server may accept what its docs reject**, never the reverse — so a client validating against the published document is conservative, never surprised by a 422. There are two such cases, both inherent to the wire format rather than to the export:
+
+- **Non-canonical encodings.** Coercion accepts `"30"` for an `:integer` and `1` for a `:string`, because form and query payloads are all strings. The schema documents the canonical JSON encoding only.
+- **`null` as absence.** The runtime reads `{"age": null}` as `{}` ([absence](#absence-defaults-and-partial-updates)); JSON Schema cannot express that, so `type: integer` rejects a null the server would accept and ignore.
+
+Everything else the exporter cannot translate stays visible as an `x-permittable-*` extension rather than being guessed at.
+
 ## API reference
 
 ### Instance methods
@@ -643,7 +654,7 @@ Using [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails)? `Concer
 
 ```sh
 bundle install
-bundle exec rspec      # 125 examples
+bundle exec rspec      # 252 examples
 bundle exec rubocop
 ```
 

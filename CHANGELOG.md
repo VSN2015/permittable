@@ -1,5 +1,13 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Added
+- **`spec/schema_conformance_spec.rb` — the "docs cannot drift" claim is now tested rather than argued.** Every other spec checks one side or the other; this one checks that the two **agree**, walking canonical JSON payloads through both a contract and its own exported schema and comparing the verdicts. It covers scalars and bounds, enums, exclusive and endless ranges, exact lengths, formats, arrays of scalars and of hashes, nested hashes under `unknown: :error`, and rooted contracts. `spec/support/tiny_json_schema.rb` is a deliberately small validator covering exactly the keywords the exporter emits and nothing else — a measuring instrument, not a dependency — and one example asserts the exporter emits no keyword the validator silently ignores, so the two cannot fall out of step. The spec was mutation-tested: dropping `maxItems`, `additionalProperties: false`, the required-string `minLength: 1`, or the `root:` required wrapper each makes it fail.
+- **The two places the schema and the runtime legitimately differ are now documented**, in `Permittable::JsonSchema` and the README. Coercion accepts non-canonical encodings (`"30"` for an `:integer`, `1` for a `:string`) because form and query payloads are all strings; and it reads an explicit `null` as **absence**, which JSON Schema cannot express, so `type: integer` rejects a null the server would accept and ignore. Both leave the schema **stricter** than the server, never looser — a client validating against the published document is conservative, never surprised by a 422 — and the spec asserts that direction for every divergence it permits, so a new one in the dangerous direction fails CI.
+
+No behaviour changes: this release adds tests and documentation only.
+
 ## 0.5.1 (2026-09-02)
 <!-- title: nested input outside Rails -->
 
