@@ -233,14 +233,16 @@ module Permittable
     # { controller:, action:, verb:, path: } descriptors from a Rails
     # application's route set. Duck-typed against Journey routes (each one
     # responds to requirements / verb / path.spec) so it stays unit-testable
-    # without Rails; Rails path params (:id) become OpenAPI templates ({id}).
+    # without Rails; Rails path params become OpenAPI templates — both the
+    # `:id` form and the `*rest` wildcard, which is a real route shape
+    # (`get "files/*path"`) and is not a valid OpenAPI template left as-is.
     def rails_routes(app)
       app.routes.routes.filter_map do |route|
         requirements = route.requirements
         verb = route.verb.to_s
         next if requirements[:controller].nil? || requirements[:action].nil? || verb.empty?
 
-        path = route.path.spec.to_s.sub("(.:format)", "").gsub(/:(\w+)/) { "{#{Regexp.last_match(1)}}" }
+        path = route.path.spec.to_s.sub("(.:format)", "").gsub(/[:*](\w+)/) { "{#{Regexp.last_match(1)}}" }
         { controller: requirements[:controller], action: requirements[:action],
           verb: verb.split("|").first.downcase, path: path }
       end
