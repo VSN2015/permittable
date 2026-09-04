@@ -162,6 +162,24 @@ module Permittable
 
     attr_writer :filter_parameter_registry
 
+    # The proc Permittable::Railtie appends to config.filter_parameters.
+    #
+    # It resolves the registry at FILTER time rather than closing over
+    # whichever instance existed at boot. Rails runs railtie initializers
+    # BEFORE config/initializers, so an app or host gem that swaps the
+    # registry — the pooling this attr_writer exists for — necessarily does so
+    # after the Railtie has already appended its proc. A proc bound to the old
+    # instance would go on consulting an empty registry and silently redact
+    # nothing, while `sensitive:` fields registered themselves in the new one.
+    #
+    # A stable object, so the Railtie's idempotence check (include? before <<)
+    # still holds across repeated initializer runs.
+    def filter_parameter_proc
+      @filter_parameter_proc ||= lambda do |key, value|
+        filter_parameter_registry.to_proc.call(key, value)
+      end
+    end
+
     # App-wide default for rules that don't declare their own mode:.
     # :enforce (the default) rejects violating requests; :monitor reports
     # them — same instrumentation event with payload mode: :monitor, plus a

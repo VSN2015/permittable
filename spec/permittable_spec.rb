@@ -611,6 +611,39 @@ RSpec.describe Permittable do
       expect(Permittable.filter_parameter_registry.include?("name")).to be(false)
     end
 
+    describe "the filter proc the Railtie appends" do
+      # Rails runs railtie initializers BEFORE config/initializers, so an app
+      # or host gem that swaps the registry does so AFTER the Railtie has
+      # already appended its proc.
+      after { Permittable.filter_parameter_registry = nil }
+
+      def boot_filter
+        ActiveSupport::ParameterFilter.new([Permittable.filter_parameter_proc])
+      end
+
+      it "redacts through whichever registry is current, not the one present at boot" do
+        filter = boot_filter # boot: proc appended
+        pooled = Permittable::FilterParameterRegistry.new
+        Permittable.filter_parameter_registry = pooled # initializer: swap
+        permittable_class { permit_params(:create) { optional :ssn, :string, sensitive: true } }
+
+        expect(pooled.include?("ssn")).to be(true)
+        expect(filter.filter("ssn" => "111-22-3333")).to eq("ssn" => "[FILTERED]")
+      end
+
+      it "is a stable object, so the Railtie's idempotence check still holds" do
+        expect(Permittable.filter_parameter_proc).to be(Permittable.filter_parameter_proc)
+        Permittable.filter_parameter_registry = Permittable::FilterParameterRegistry.new
+        expect(Permittable.filter_parameter_proc).to be(Permittable.filter_parameter_proc)
+      end
+
+      it "still redacts through the default registry when nothing is swapped" do
+        filter = boot_filter
+        permittable_class { permit_params(:create) { optional :ssn, :string, sensitive: true } }
+        expect(filter.filter("ssn" => "111-22-3333")).to eq("ssn" => "[FILTERED]")
+      end
+    end
+
     it "instruments invalid_parameters.permittable with the violation details" do
       events = []
       subscription = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|

@@ -1,5 +1,10 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Fixed
+- **Swapping `Permittable.filter_parameter_registry` silently stopped `sensitive:` redaction.** `Permittable::Railtie` appended `filter_parameter_registry.to_proc` — a proc bound to whichever registry instance existed **at boot**. Rails runs railtie initializers *before* `config/initializers`, so a host gem or app that swaps the registry necessarily does so afterwards, leaving Rails filtering through the old instance: `sensitive:` fields registered themselves in the new registry, and the appended proc went on consulting an empty one. The parameter was logged in the clear, with nothing to indicate it. That swap is the reason the writer exists — the gem's own comment names `concerns_on_rails` as doing exactly this — so the broken ordering was the normal case rather than an exotic one. The Railtie now appends `Permittable.filter_parameter_proc`, which resolves the registry at **filter time**; it is a stable object, so the Railtie's idempotence check still holds across repeated initializer runs.
+
 ## 0.5.1 (2026-09-02)
 <!-- title: nested input outside Rails -->
 
