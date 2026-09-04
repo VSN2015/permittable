@@ -1,5 +1,13 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Fixed
+- **One request could write a megabyte of log line, or hand a megabyte of exception message to every error tracker.** The `unknown: :log` warn line joined **every** undeclared key, and the violation summary behind `InvalidParameters#message` (and the monitor-mode warn line) joined **every** violation. A request carrying 50,000 undeclared keys against `unknown: :log` produced a single **1 MB** `logger.warn`; the same request against `unknown: :error` produced a 1 MB exception message. `unknown: :log` is the natural mode for watching what a client really sends during a rollout, so this was on a normal path rather than an exotic corner.
+  Both are **prose, written for a person**: they now list at most ten names, each truncated past 120 characters, and count the rest (`…, and 49990 more`), taking that 1 MB line to 261 bytes. Truncating each name matters as much as capping the count — one 1 MB key name alone produced the same 1 MB line. The **machine-readable channels are untouched and complete** — `InvalidParameters#details` still names every offender, and so does the `invalid_parameters.permittable` instrumentation payload — because nothing should silently drop data a consumer might be reading. The only visible change is the `message` string when there are more than ten violations, or an offender's path is longer than 120 characters — neither of which an ordinary contract reaches.
+
+  One trade-off worth stating: under `unknown: :log` nothing else records an undeclared key, so beyond the tenth only the count survives. Where every name matters, `unknown: :error` in monitor mode records all of them in `details` and in the instrumentation payload without rejecting the request. The 422 body under `unknown: :error` is still proportional to the number of violations, because `details` is deliberately complete.
+
 ## 0.6.0 (2026-09-08)
 <!-- title: nullable fields, :json, and strict dates -->
 

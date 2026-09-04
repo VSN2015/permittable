@@ -162,6 +162,15 @@ module Permittable
   # Rails merges routing bookkeeping into params; a top-level (root: false)
   # unknown-keys check must not flag them.
   ROUTING_KEYS = %w[controller action format].freeze
+  # A log line and an exception message are PROSE, written for a person. They
+  # list at most this many names and count the rest, so one request cannot
+  # write a megabyte of them. The machine-readable channels — a violation's
+  # `details` and the instrumentation payload — stay complete; only the
+  # sentence is bounded.
+  PROSE_LIST_LIMIT = 10
+  # ...and each name it does list is truncated. Capping the COUNT alone still
+  # let ONE 1 MB key name write the 1 MB log line the cap exists to prevent.
+  PROSE_ITEM_LIMIT = 120
 
   NORMALIZERS = {
     squish: ->(v) { v.squish },
@@ -974,7 +983,25 @@ module Permittable
   end
 
   def permittable_violation_summary(violations)
-    violations.map { |v| v[:message] ? "#{v[:param]} #{v[:message]}" : "#{v[:param]} (#{v[:code]})" }.join(", ")
+    permittable_prose_list(violations) do |v|
+      v[:message] ? "#{v[:param]} #{v[:message]}" : "#{v[:param]} (#{v[:code]})"
+    end
+  end
+
+  # See PROSE_LIST_LIMIT. `unknown: :error` on a request carrying 50,000
+  # undeclared keys used to produce a 50,000-item sentence — a megabyte of
+  # log line, or of exception message handed to every error tracker.
+  # The block formats one item, and is called only for the items actually
+  # shown — the rest are counted, never rendered.
+  def permittable_prose_list(items)
+    shown = items.first(PROSE_LIST_LIMIT).map { |item| permittable_prose_item(yield(item)) }.join(", ")
+    return shown if items.length <= PROSE_LIST_LIMIT
+
+    "#{shown}, and #{items.length - PROSE_LIST_LIMIT} more"
+  end
+
+  def permittable_prose_item(item)
+    item.length <= PROSE_ITEM_LIMIT ? item : "#{item[0, PROSE_ITEM_LIMIT - 3]}..."
   end
 
   # One violation detail entry. A field's `message:` (String, or Hash keyed
@@ -1152,8 +1179,8 @@ module Permittable
     if unknown == :error
       extra.each { |key| violations << permittable_violation({}, permittable_path(path, key), "unknown") }
     elsif respond_to?(:logger) && logger
-      logger.warn("#{LABEL}: unknown parameter(s) ignored by the ##{permittable_action_name} contract: " \
-                  "#{extra.map { |key| permittable_path(path, key) }.join(', ')}")
+      listed = permittable_prose_list(extra) { |key| permittable_path(path, key) }
+      logger.warn("#{LABEL}: unknown parameter(s) ignored by the ##{permittable_action_name} contract: #{listed}")
     end
   end
 
