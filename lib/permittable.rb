@@ -858,18 +858,31 @@ module Permittable
   # defaulted values for the given action (default: the current action).
   # Absent optional fields are omitted. Raises InvalidParameters on
   # violation; raises ArgumentError when no contract covers the action
-  # (that is a programmer error, not a client error). Memoized per action.
+  # (that is a programmer error, not a client error).
+  #
+  # Memoized per action, and the memo remembers the OUTCOME rather than only
+  # a success: a rejection is stored and re-raised. Validation is therefore
+  # observable exactly once per action per request, which the
+  # "invalid_parameters.permittable" event depends on — memoizing only
+  # successes meant a rejected request that was read twice (an action calling
+  # permittable_violations before permitted_params, say) instrumented twice
+  # and double-counted itself in every dashboard.
   def permitted_params(action = nil)
     action = (action || permittable_action_name).to_s
     raise ArgumentError, "#{LABEL}: no action given and action_name is not set" if action.empty?
 
     @permittable_validated ||= {}
-    return @permittable_validated[action] if @permittable_validated.key?(action)
+    outcome = @permittable_validated.fetch(action) do
+      @permittable_validated[action] = permittable_outcome_for(action)
+    end
+    # `cause: nil` because a memoized rejection is raised from wherever the
+    # action happens to read the params next — possibly inside a `rescue` of
+    # something unrelated, whose exception Ruby would otherwise adopt as this
+    # error's cause for good. The object and its original backtrace (the
+    # first raise site, where the violation was found) are preserved.
+    raise outcome, cause: nil if outcome.is_a?(InvalidParameters)
 
-    rule = self.class.permit_rule_for(action)
-    raise ArgumentError, "#{LABEL}: no params contract declared covering ##{action}" unless rule
-
-    @permittable_validated[action] = validate_params_contract!(rule, action)
+    outcome
   end
 
   # before_action entry point (public so hosts can `skip_before_action
@@ -917,6 +930,19 @@ module Permittable
   end
 
   private
+
+  # The value permitted_params memoizes: the validated params, or the
+  # InvalidParameters that rejected them. ArgumentError is deliberately NOT
+  # memoized — a contract that does not cover the action is a bug to fix, not
+  # a verdict on this request, so it raises fresh on every call.
+  def permittable_outcome_for(action)
+    rule = self.class.permit_rule_for(action)
+    raise ArgumentError, "#{LABEL}: no params contract declared covering ##{action}" unless rule
+
+    validate_params_contract!(rule, action)
+  rescue InvalidParameters => e
+    e
+  end
 
   def validate_params_contract!(rule, action)
     violations = []
