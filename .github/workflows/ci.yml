@@ -22,8 +22,56 @@ jobs:
     - name: Run RuboCop
       run: bundle exec rubocop --format github
 
+  # The gemspec advertises a range of Ruby and ActiveSupport versions; this
+  # matrix is how that claim is tested rather than assumed. It is an explicit
+  # include list, not a cross product, because it doubles as the answer to
+  # "which combinations does this gem actually support?" — every entry is one
+  # a real app could be running (see gemfiles/README.md).
   test:
-    name: RSpec
+    name: RSpec (${{ matrix.name }}, ruby ${{ matrix.ruby }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        # Newest of everything — the root Gemfile, what local development uses.
+        - { ruby: '3.4', gemfile: 'Gemfile', name: 'newest' }
+        - { ruby: '3.3', gemfile: 'Gemfile', name: 'newest' }
+        - { ruby: '3.2', gemfile: 'Gemfile', name: 'newest' }
+        # The floor. activesupport 6.1 predates official Ruby 3.2 support, so
+        # it is tested on the oldest Ruby this gem allows and no further.
+        - { ruby: '3.2', gemfile: 'gemfiles/activesupport_6.1.gemfile', name: 'activesupport 6.1' }
+        - { ruby: '3.2', gemfile: 'gemfiles/activesupport_7.0.gemfile', name: 'activesupport 7.0' }
+        - { ruby: '3.2', gemfile: 'gemfiles/activesupport_7.1.gemfile', name: 'activesupport 7.1' }
+        - { ruby: '3.3', gemfile: 'gemfiles/activesupport_7.1.gemfile', name: 'activesupport 7.1' }
+        - { ruby: '3.2', gemfile: 'gemfiles/activesupport_7.2.gemfile', name: 'activesupport 7.2' }
+        - { ruby: '3.4', gemfile: 'gemfiles/activesupport_7.2.gemfile', name: 'activesupport 7.2' }
+        - { ruby: '3.2', gemfile: 'gemfiles/activesupport_8.0.gemfile', name: 'activesupport 8.0' }
+        - { ruby: '3.4', gemfile: 'gemfiles/activesupport_8.0.gemfile', name: 'activesupport 8.0' }
+        - { ruby: '3.4', gemfile: 'gemfiles/activesupport_8.1.gemfile', name: 'activesupport 8.1' }
+
+    env:
+      BUNDLE_GEMFILE: ${{ matrix.gemfile }}
+
+    steps:
+    - uses: actions/checkout@v7
+    - name: Set up Ruby
+      uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: ${{ matrix.ruby }}
+        bundler: latest
+        bundler-cache: true
+    - name: Run specs
+      run: bundle exec rspec
+
+  # The gemspec's central claim is that activesupport is the ONLY runtime
+  # dependency — every actionpack and activerecord touchpoint is guarded. The
+  # spec suite cannot prove it, because it bundles both. This job installs the
+  # built gem with nothing but its declared dependencies and exercises the
+  # controller-free surface: if a guard is missing, this is what catches it.
+  runtime-deps:
+    name: Runtime deps (activesupport only)
     runs-on: ubuntu-latest
 
     steps:
@@ -31,15 +79,19 @@ jobs:
     - name: Set up Ruby
       uses: ruby/setup-ruby@v1
       with:
-        ruby-version: '3.2'
+        ruby-version: '3.4'
         bundler: latest
-        bundler-cache: true
-    - name: Run specs
-      run: bundle exec rspec
+        bundler-cache: false
+    - name: Install the built gem with only its declared dependencies
+      run: |
+        gem build permittable.gemspec -o permittable-smoke.gem
+        gem install ./permittable-smoke.gem
+    - name: Assert nothing but activesupport is needed
+      run: ruby spec/support/runtime_deps_smoke.rb
 
   publish:
     name: Build + Publish
-    needs: [lint, test]
+    needs: [lint, test, runtime-deps]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

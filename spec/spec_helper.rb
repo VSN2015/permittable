@@ -1,4 +1,7 @@
 require "bundler/setup"
+# Same reason as lib/permittable.rb: activerecord 6.1 is required here BEFORE
+# permittable, so the suite needs the stdlib logger loaded first too.
+require "logger"
 require "simplecov"
 
 SimpleCov.start do

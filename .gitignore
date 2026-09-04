@@ -4,5 +4,9 @@
 /tmp/
 *.gem
 
+# Compatibility gemfiles resolve fresh on every run, on purpose — a stale lock
+# would freeze out the regression the matrix exists to catch.
+/gemfiles/*.lock
+
 # direnv local environment
 .envrc
