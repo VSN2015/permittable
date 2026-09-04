@@ -910,18 +910,18 @@ bundle install
 <<<<<<< HEAD
 <<<<<<< HEAD
 <<<<<<< HEAD
-bundle exec rspec      # 244 examples
+bundle exec rspec      # 320 examples
 =======
-bundle exec rspec      # 211 examples
+bundle exec rspec      # 320 examples
 >>>>>>> feature/problem-json
 =======
-bundle exec rspec      # 204 examples
+bundle exec rspec      # 320 examples
 >>>>>>> fix/sensitive-cascade
 =======
-bundle exec rspec      # 203 examples
+bundle exec rspec      # 320 examples
 >>>>>>> fix/validate-once-per-action
 =======
-bundle exec rspec      # 201 examples
+bundle exec rspec      # 320 examples
 >>>>>>> fix/malformed-root-code
 bundle exec rubocop
 ```
