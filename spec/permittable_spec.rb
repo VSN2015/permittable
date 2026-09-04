@@ -352,6 +352,68 @@ RSpec.describe Permittable do
     end
   end
 
+  describe "rule ordering: the cheap bound before the expensive one" do
+    # A Regexp subclass, so it satisfies any `format:` type check while
+    # recording whether the contract ever consulted it.
+    let(:spy_format) do
+      Class.new(Regexp) do
+        def consulted?
+          !!@consulted
+        end
+
+        def match?(value)
+          @consulted = true
+          super
+        end
+      end.new("\\A[a-z]+\\z")
+    end
+
+    it "does not consult format: for a value length: has already excluded" do
+      spy = spy_format
+      klass = permittable_class do
+        permit_params(:create) { required :s, :string, length: 1..8, format: spy }
+      end
+      e = begin
+        controller(klass, params: { s: "a" * 5_000 }).permitted_params
+      rescue described_class::InvalidParameters => e
+        e
+      end
+      expect(e.details).to eq([{ param: "s", code: "length" }])
+      expect(spy.consulted?).to be(false)
+    end
+
+    it "still consults format: for a value within the length bound" do
+      spy = spy_format
+      klass = permittable_class do
+        permit_params(:create) { required :s, :string, length: 1..8, format: spy }
+      end
+      e = begin
+        controller(klass, params: { s: "AB" }).permitted_params
+      rescue described_class::InvalidParameters => e
+        e
+      end
+      expect(e.details).to eq([{ param: "s", code: "format" }])
+      expect(spy.consulted?).to be(true)
+    end
+
+    it "reports length before in: and validate:, and leaves each of them working alone" do
+      decl = proc do
+        permit_params(:create) do
+          optional :a, :string, length: 1..3, in: %w[hello]
+          optional :b, :string, length: 1..3, validate: ->(_v) { raise "must not run" }
+        end
+      end
+      expect(violations_for({ a: "hello" }, &decl).details).to eq([{ param: "a", code: "length" }])
+      expect(violations_for({ b: "toolong" }, &decl).details).to eq([{ param: "b", code: "length" }])
+      expect(violations_for({ a: "no" }, &decl).details).to eq([{ param: "a", code: "inclusion" }])
+    end
+
+    it "leaves a field with no length: bound checking format: as before" do
+      decl = proc { permit_params(:create) { required :s, :string, format: /\A[a-z]+\z/ } }
+      expect(violations_for({ s: "AB" }, &decl).details).to eq([{ param: "s", code: "format" }])
+    end
+  end
+
   describe "message: (custom error messages)" do
     it "rejects a message that is neither a String nor a code => String Hash" do
       expect { permittable_class { permit_params(:create) { required :a, :string, message: :nope } } }
