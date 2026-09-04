@@ -178,6 +178,7 @@ Adopting on an existing API with live traffic? Skip ahead to [Adopting on a live
   - [Declaring a contract](#declaring-a-contract)
   - [The field DSL](#the-field-dsl)
   - [Field options](#field-options)
+  - [`format:` presets](#format-presets)
   - [Types and strict coercion](#types-and-strict-coercion)
   - [Free-form hashes](#free-form-hashes-json)
   - [Absence, defaults, and partial updates](#absence-defaults-and-partial-updates)
@@ -292,7 +293,7 @@ Which options are legal depends on the field kind — anything else raises at cl
 | Option | Scalar | Array | Nested | Meaning |
 |---|:---:|:---:|:---:|---|
 | `in:` | ✅ | — | — | Allowed values: a `Range` (bounds-checked with `cover?`) or an `Array` |
-| `format:` | ✅¹ | — | — | Regexp the value must match |
+| `format:` | ✅¹ | — | — | Regexp the value must match, or a [preset name](#format-presets): `:email`, `:uuid`, `:url`, `:slug`, `:hostname` |
 | `length:` | ✅¹ | ✅ | — | `Range` or `Integer`. Character count on strings, **element count** on arrays, where it short-circuits — see [the field DSL](#the-field-dsl) |
 | `normalize:` | ✅¹ | — | — | `:squish`, `:strip`, `:downcase`, `:upcase`, `:email`, or a Proc. Runs **first** — before the absence rule, so a value that normalizes to `""` is absent |
 | `default:` | ✅ | ✅ | — | Value used when the field is absent. Validated against the field's own contract at class load, then stored normalized and frozen (each request gets its own copy) |
@@ -325,6 +326,30 @@ The visible consequence: a value that violates *both* its length and its format 
 ```ruby
 optional :slug, :string, validate: ->(v) { v.match?(/\A[a-z0-9-]+\z/) || :malformed_slug }
 ```
+
+### `format:` presets
+
+The regexps every app writes by hand, named once:
+
+```ruby
+required :email,   :string, format: :email
+required :id,      :string, format: :uuid
+optional :website, :string, format: :url
+optional :slug,    :string, format: :slug
+optional :host,    :string, format: :hostname
+```
+
+| Preset | Matches | Exported JSON Schema `format` |
+|---|---|---|
+| `:email` | Exactly `URI::MailTo::EMAIL_REGEXP` — the regexp Rails apps already paste in, so switching to the preset cannot change which addresses an endpoint accepts | `email` |
+| `:uuid` | A canonical `8-4-4-4-12` UUID, either case | `uuid` |
+| `:url` | An `http`/`https` URL. A **shape** check, not a reachability guarantee — but it does reject `javascript:` and other schemes | `uri` |
+| `:slug` | Lowercase, digits, single hyphens between segments | — |
+| `:hostname` | A DNS hostname (label rules, no trailing dot) | `hostname` |
+
+A preset carries something a hand-written Regexp cannot: the JSON Schema **`format` keyword** the wider ecosystem understands, so [exported docs](#exporting-openapi-docs-that-cannot-drift) say `"format": "uuid"` rather than only a wall of `pattern`. The `pattern` is still emitted next to it — in draft 2020-12 `format` is an annotation unless a validator opts into asserting it, so the pattern is what actually enforces.
+
+An unknown preset name fails at class load, listing the presets. Passing a `Regexp` directly works exactly as before, and the RSpec matcher speaks both spellings: `matching(:email)` asserts the preset, `matching(/re/)` the Regexp.
 
 ### Types and strict coercion
 
@@ -947,7 +972,8 @@ A bad contract is a programmer error, so it fails when the class loads — never
 - A field declared twice in one contract
 - An unknown option for the field's kind, listing what *is* allowed
 - An unknown type, listing the supported ones
-- An unknown `normalize:` preset, listing the presets
+- An unknown `normalize:` or `format:` preset, listing the presets
+- A `format:` that is neither a `Regexp` nor a preset name
 - `format:`, `length:`, or `normalize:` on a non-`:string` field
 - `length:` that isn't a non-negative `Integer` or a `Range`; `in:` that doesn't respond to `include?`
 - A bound **no value could satisfy**: a reversed or empty `Range` (`in: 65..18`, `length: 5..2`, `length: 3...3`), an empty `in:` set, or a `length:` of 0 on a `required` field (where `""` already violates as `missing`)
