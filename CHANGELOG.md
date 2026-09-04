@@ -1,5 +1,10 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Fixed
+- **An array outside its `length:` bound was still fully examined, so an oversized payload cost far more to reject than to accept.** `length:` recorded its violation and then cast, checked and reported on every element anyway. A 200,000-element payload against `array :tags, of: :string, length: 0..10` produced **200,001 violations and a ~9.5 MB error body after ~9.2 seconds of CPU** — for a request already refused by its first check, and against the very bound a developer declares to prevent exactly that. `length:` is now a bound rather than a report: an array outside it returns immediately, so the same payload costs **one violation, ~40 bytes and ~57 ms** of contract work (the rest of the wall time is the `HashWithIndifferentAccess` conversion of the payload, which happens before any field is examined). A consequence worth knowing: `validate:` and `transform:` are no longer handed an array the contract has already rejected, matching the rule `transform:` already followed for element violations. Arrays within their bounds, and arrays with no `length:` declared, behave exactly as before.
+
 ## 0.5.1 (2026-09-02)
 <!-- title: nested input outside Rails -->
 
