@@ -1,5 +1,11 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Fixed
+- **`:float` and `:decimal` accepted numbers the type cannot faithfully hold, including ones a client controls.** `Float("1e400")` is `Infinity` and `Float("1e-400")` is `0.0` — the first overflows, the second loses the entire value — and both were accepted silently, leaving a value no numeric column can store. `Float::INFINITY` and `Float::NAN` objects passed straight through for both types. Worst of the set: **`BigDecimal("NaN")` and `BigDecimal("Infinity")` succeed where `Float()` raises**, so a client could send the literal string `"NaN"` for a `:decimal` price and have it stored — and `:float` rejected exactly those strings, so the two types disagreed, which is what marks the behaviour as accidental rather than designed. Non-finite results are now `invalid_type` for both types.
+  A genuine zero is unaffected however it is spelled — `"0"`, `"0.0"`, `"0.0000"` and `"0e10"` all still cast to `0.0`. Underflow is only visible against the source text (the result is an ordinary `0.0`), so a zero result is rejected only when the string named a nonzero **significand**; the exponent's digits say nothing about the value, which is why `"0e10"` is fine. `:decimal` keeps accepting the large exponents `BigDecimal` genuinely represents (`"1e400"` → `0.1e401`), since it has no exponent limit to overflow.
+
 ## 0.5.1 (2026-09-02)
 <!-- title: nested input outside Rails -->
 

@@ -216,13 +216,15 @@ Coercion is **deliberately strict**, and deliberately *not* `ActiveModel::Type`.
 |---|---|---|
 | `:string` | `String`; `Numeric`/`true`/`false` are stringified | Arrays, hashes |
 | `:integer` | `Integer`; whole `Float`s (`4.0`); base-10 numeric strings | `"4.5"`, `"abc"`, `4.5` |
-| `:float` | `Numeric`; any `Float()`-parseable string | `"abc"` |
-| `:decimal` | `Numeric` or `String` → `BigDecimal` | Unparseable strings |
+| `:float` | `Numeric`; any `Float()`-parseable string, as long as the result is **finite** | `"abc"`, and anything that overflows (`"1e400"`) or underflows (`"1e-400"`) |
+| `:decimal` | `Numeric` or `String` → `BigDecimal`, as long as the result is **finite** | Unparseable strings, `"NaN"`, `"Infinity"` |
 | `:boolean` | `true`/`false`, `"true"`/`"false"`, `"1"`/`"0"`, `1`/`0` | `"yes"`, `"on"`, `2` |
 | `:date` | `Date`; any `Date.parse`-able string | Unparseable strings |
 | `:datetime` | `Time`, `DateTime`, `ActiveSupport::TimeWithZone`, `Date`, parseable strings | Unparseable strings |
 
-Two behaviours worth committing to memory:
+**Numbers must be finite.** `Float("1e400")` is `Infinity` and `Float("1e-400")` is `0.0` — neither represents what was sent, and neither is a value a numeric column can store, so both are `invalid_type`. A genuine zero is unaffected however it is spelled (`"0"`, `"0.0"`, `"0e10"`). `:decimal` has no exponent limit, so `"1e400"` is fine there — but `BigDecimal("NaN")` and `BigDecimal("Infinity")` *succeed* where `Float()` raises, so those literal strings are rejected explicitly.
+
+Two more behaviours worth committing to memory:
 
 - **Type confusion is a violation, not a 500.** A request of `?age[]=1` against a scalar `:integer` field yields `invalid_type`. Arrays, hashes, and nested `ActionController::Parameters` can never satisfy a scalar type, so the classic "`NoMethodError` on `[]`" crash is impossible.
 - **Datetimes are normalised to UTC.** A zoneless string parses as UTC regardless of the host timezone, which keeps behaviour deterministic across machines; explicit offsets are honoured and converted.
@@ -643,7 +645,7 @@ Using [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails)? `Concer
 
 ```sh
 bundle install
-bundle exec rspec      # 125 examples
+bundle exec rspec      # 206 examples
 bundle exec rubocop
 ```
 
