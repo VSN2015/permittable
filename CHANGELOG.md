@@ -1,5 +1,10 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Added
+- **`Permittable::Audit` and `bin/rails permittable:audit` — coverage, including what is *not* covered.** A controller declaring `permit_params :create` looks adopted; if it also answers PATCH, that action validates nothing, and nothing in the gem said so — `permittable:generate` only notices controllers with no contract at all, and the OpenAPI exporter documents what exists rather than what is missing. The audit is the fourth reader of the frozen registry and crosses it with the **route set**, so a half-covered controller is as visible as an uncovered one. It reports, per routed action, the rule a request would actually resolve through, its **effective** mode (a rule's own `mode:` first, then the app-wide `Permittable.mode` — an audit runs inside the app, so unlike the exporter it can resolve this), whether a `model:` guards its columns, and whether an uncovered action **accepts a request body**, which is the difference between a gap in a table and untrusted input reaching an action unchecked. `bin/rails "permittable:audit[strict]"` exits 1 on that count, which makes the task a CI gate: no new unguarded write endpoint. It also lists contracts declared for actions no route reaches — a renamed or deleted action that left its contract behind. Controllers that never included `Permittable` are audited too, since those are the ones worth finding. Plain Ruby over the registry plus `{ controller:, action:, verb:, path: }` route descriptors (the shape `OpenAPI.rails_routes` already produces), so `Permittable::Audit.entries` is unit-testable without Rails.
+
 ## 0.5.1 (2026-09-02)
 <!-- title: nested input outside Rails -->
 
