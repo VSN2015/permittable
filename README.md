@@ -51,7 +51,8 @@ A violating request never reaches your action:
 - [Why](#why) · [Installation](#installation) · [How a request flows](#how-a-request-flows)
 - [Declaring a contract](#declaring-a-contract) · [The field DSL](#the-field-dsl) · [Field options](#field-options)
 - [Types and strict coercion](#types-and-strict-coercion) · [Absence, defaults, and partial updates](#absence-defaults-and-partial-updates)
-- [Violations and error responses](#violations-and-error-responses) · [Custom error messages](#custom-error-messages-message) · [Unknown parameters](#unknown-parameters)
+- [Violations and error responses](#violations-and-error-responses) · [Custom error messages](#custom-error-messages-message)
+- [RFC 9457 problem+json](#rfc-9457-problemjson) · [Unknown parameters](#unknown-parameters)
 - [Output reshaping](#output-reshaping-transform-and-finalize) · [The schema-drift guard](#the-schema-drift-guard)
 - [Sensitive parameters](#sensitive-parameters-and-log-redaction) · [Instrumentation](#instrumentation)
 - [Monitor mode](#monitor-mode-roll-out-without-rejecting) · [Generating draft contracts](#generating-draft-contracts-permittablegenerate) · [Testing contracts](#testing-contracts-rspec-matchers)
@@ -260,7 +261,7 @@ Paths are fully qualified: `user.address.zip`, `line_items[1].sku`.
 
 **Status codes:** a missing root key renders **400** (the request is malformed — the envelope you asked for isn't there); field-level violations render **422** (well-formed, semantically wrong).
 
-**Custom rendering:** if your controller defines `render_error`, the envelope delegates to it as `render_error(message:, code:, status:, errors:)` — the `errors:` key is passed only when details exist, so hosts documenting a three-keyword contract keep working. Otherwise the inline JSON shape shown at the top of this README is rendered. Either way, `render_invalid_parameters` is a normal method you can override.
+**Custom rendering:** if your controller defines `render_error`, the envelope delegates to it as `render_error(message:, code:, status:, errors:)` — the `errors:` key is passed only when details exist, so hosts documenting a three-keyword contract keep working. Otherwise the inline JSON shape shown at the top of this README is rendered. Either way, `render_invalid_parameters` is a normal method you can override, and [`Permittable.error_format = :problem`](#rfc-9457-problemjson) swaps the whole shape for RFC 9457 problem details.
 
 ## Custom error messages (`message:`)
 
@@ -311,6 +312,43 @@ en:
 Resolution order per violation: the field's own `message:` (String, or the Hash entry for that code) → the app's `permittable.errors.<code>` translation → the bare `{ param:, code: }` shape. The lookup also covers a missing `root:`, `unknown` keys, Symbol codes returned by `validate:` (`permittable.errors.must_be_even`), and `violate!` codes in `finalize` (an explicit `violate!(..., message:)` still wins). Only a String translation counts — a missing key or a nested Hash falls back to the bare shape rather than leaking structure to clients. No I18n, no change: apps without the gem or the keys behave exactly as before.
 
 For full control over the response body itself (RFC 9457, a different envelope), override `render_invalid_parameters` or define `render_error` as described above; `error.details` gives you the structured violations to build from.
+
+## RFC 9457 problem+json
+
+For a public API, the standard shape for an error is [RFC 9457 Problem Details](https://www.rfc-editor.org/rfc/rfc9457.html). One app-wide setting renders it:
+
+```ruby
+# config/initializers/permittable.rb
+Permittable.error_format = :problem
+Permittable.problem_base_uri = "https://api.example.com/problems"   # optional
+```
+
+```http
+HTTP/1.1 422 Unprocessable Entity
+Content-Type: application/problem+json
+```
+
+```json
+{
+  "type": "https://api.example.com/problems/invalid-parameters",
+  "title": "Invalid parameters",
+  "status": 422,
+  "detail": "Invalid parameters: user.email (format), user.age (inclusion)",
+  "instance": "/users",
+  "errors": [
+    { "param": "user.email", "code": "format" },
+    { "param": "user.age",   "code": "inclusion" }
+  ]
+}
+```
+
+- **`errors`** is the field-violation extension member, carrying the identical `{ param:, code: }` entries (plus `message:` when the field [declares one](#custom-error-messages-message)) that the default envelope puts in `details`. Nothing about violation reporting changes — only the wrapper.
+- **`title`** describes the problem *type*, not the instance: a missing `root:` is `"Malformed request"` (400), a field violation is `"Invalid parameters"` (422).
+- **`type`** is RFC 9457's default `"about:blank"` until you set `problem_base_uri`, at which point each problem type gets its own URI under it.
+- **`instance`** is the request path, and is omitted rather than guessed when the host can't name one (a params duck, a job).
+- **Setting `:problem` opts out of `render_error` delegation.** A host envelope and a problem document are two answers to the same question, and the explicit setting is the one honoured.
+
+The setting is app-wide, not per-contract, because the error format of an API is a property of the API. [Exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) follows it: with `:problem` configured, the shared response components describe the problem schema under `application/problem+json` instead of the envelope under `application/json` — an export runs inside the app that made the setting, so the documented shape can't drift from the rendered one.
 
 ## Unknown parameters
 
@@ -601,6 +639,8 @@ Output is deterministic (fixed key order, declaration-order properties), so the 
 | `Permittable.filter_parameter_registry` | The live registry of `sensitive:` field names |
 | `Permittable.filter_parameter_registry=` | Swap in your own duck-typed registry |
 | `Permittable.mode` / `Permittable.mode=` | App-wide default (`:enforce`) for rules that don't declare their own `mode:` |
+| `Permittable.error_format` / `=` | `:envelope` (default) or `:problem` — see [RFC 9457 problem+json](#rfc-9457-problemjson) |
+| `Permittable.problem_base_uri` / `=` | Base URI for problem `type` members |
 | `Permittable::InvalidParameters` | Raised on violation; carries `#details` and `#status` |
 | `Permittable::JsonSchema` | Contract data → JSON Schema fragments (`.rule`, `.object`, `.field`) |
 | `Permittable::OpenAPI` | OpenAPI 3.1 assembly (`.document`, `.operations_for`, `.request_body_for`, `.components`) |
@@ -625,7 +665,7 @@ A bad contract is a programmer error, so it fails when the class loads — never
 - An empty contract, or a nested block declaring no sub-fields
 - `finalize` declared twice, without a block, or inside a nested block
 - `permit_params` without a block, or an invalid `unknown:` mode
-- An invalid `mode:` (and `Permittable.mode =` rejects invalid values at assignment)
+- An invalid `mode:` (and `Permittable.mode =` / `Permittable.error_format =` reject invalid values at assignment)
 - A `model:` that isn't an ActiveRecord class, or `model: true` that can't be inferred
 
 ## Compatibility
@@ -643,7 +683,7 @@ Using [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails)? `Concer
 
 ```sh
 bundle install
-bundle exec rspec      # 125 examples
+bundle exec rspec      # 211 examples
 bundle exec rubocop
 ```
 

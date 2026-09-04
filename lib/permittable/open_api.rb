@@ -16,6 +16,25 @@ module Permittable
   module OpenAPI
     module_function
 
+    # One violation, in whichever shape the app renders — the same
+    # { param:, code: } entry rides in the envelope's `details` and the
+    # problem document's `errors`.
+    VIOLATION_SCHEMA = {
+      "type" => "object",
+      "properties" => {
+        "param" => {
+          "type" => "string",
+          "description" => "Fully-qualified parameter path, e.g. user.address.zip or line_items[1].sku"
+        },
+        "code" => {
+          "type" => "string",
+          "description" => "missing / invalid_type / inclusion / format / length / unknown / invalid, " \
+                           "or a contract-specific symbol"
+        }
+      },
+      "required" => %w[param code]
+    }.freeze
+
     # The error envelope rendered by render_invalid_parameters (see
     # ErrorEnvelope): code/details are present on every violation this gem
     # raises, message always.
@@ -28,29 +47,31 @@ module Permittable
           "properties" => {
             "message" => { "type" => "string" },
             "code" => { "type" => "string", "enum" => ["invalid_parameters"] },
-            "details" => {
-              "type" => "array",
-              "items" => {
-                "type" => "object",
-                "properties" => {
-                  "param" => {
-                    "type" => "string",
-                    "description" => "Fully-qualified parameter path, e.g. user.address.zip or line_items[1].sku"
-                  },
-                  "code" => {
-                    "type" => "string",
-                    "description" => "missing / invalid_type / inclusion / format / length / unknown / invalid, " \
-                                     "or a contract-specific symbol"
-                  }
-                },
-                "required" => %w[param code]
-              }
-            }
+            "details" => { "type" => "array", "items" => VIOLATION_SCHEMA }
           },
           "required" => %w[message]
         }
       },
       "required" => %w[success error]
+    }.freeze
+
+    # RFC 9457 Problem Details, the shape rendered when
+    # `Permittable.error_format = :problem`. `type` and `instance` are
+    # URI-references; `errors` is the field-violation extension member.
+    PROBLEM_SCHEMA = {
+      "type" => "object",
+      "properties" => {
+        "type" => {
+          "type" => "string", "format" => "uri-reference",
+          "description" => "Problem type URI — \"about:blank\" unless the app sets Permittable.problem_base_uri"
+        },
+        "title" => { "type" => "string", "enum" => ["Invalid parameters", "Malformed request"] },
+        "status" => { "type" => "integer", "enum" => [400, 422] },
+        "detail" => { "type" => "string" },
+        "instance" => { "type" => "string", "format" => "uri-reference" },
+        "errors" => { "type" => "array", "items" => VIOLATION_SCHEMA }
+      },
+      "required" => %w[title status]
     }.freeze
 
     # Instance methods the concern itself adds to every including controller;
@@ -62,9 +83,15 @@ module Permittable
     end
 
     # Shared `components` for any document referencing Permittable responses.
+    #
+    # Unlike a rule's monitor mode — which the exporter reads only from the
+    # contract, never from runtime configuration — the error FORMAT has no
+    # per-contract declaration to read: it is one app-wide setting, and an
+    # export runs inside the app that made it. Reading it is what keeps the
+    # documented response shape from drifting from the rendered one.
     def components
       {
-        "schemas" => { "PermittableInvalidParameters" => ERROR_SCHEMA },
+        "schemas" => { "PermittableInvalidParameters" => error_schema },
         "responses" => {
           "PermittableBadRequest" => error_response(
             "The root: key is missing or not an object — the request envelope itself is malformed."
@@ -76,11 +103,23 @@ module Permittable
       }
     end
 
+    def problem_format?
+      Permittable.error_format == :problem
+    end
+
+    def error_schema
+      problem_format? ? PROBLEM_SCHEMA : ERROR_SCHEMA
+    end
+
+    def error_media_type
+      problem_format? ? ErrorEnvelope::PROBLEM_MEDIA_TYPE : "application/json"
+    end
+
     def error_response(description)
       {
         "description" => description,
         "content" => {
-          "application/json" => {
+          error_media_type => {
             "schema" => { "$ref" => "#/components/schemas/PermittableInvalidParameters" }
           }
         }

@@ -1,5 +1,13 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Added
+- **`Permittable.error_format = :problem` — RFC 9457 problem details.** For a public API the standard shape for an error is [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457.html), and the gem rendered only its own envelope (`ErrorEnvelope`'s own comment named this as the change it was waiting for). One app-wide setting now renders `application/problem+json` with `type` / `title` / `status` / `detail` / `instance` members and the field violations as the `errors` extension member — the identical `{ param:, code: }` entries (plus `message:` when the field declares one) the default envelope puts in `details`, so nothing about violation reporting changes, only the wrapper. `title` describes the problem **type** rather than the instance, so a missing `root:` reads "Malformed request" (400) and a field violation "Invalid parameters" (422); `status` is numeric, resolved without needing Rack for the statuses this gem raises; `instance` is the request path, omitted rather than guessed when the host cannot name one. `Permittable.problem_base_uri` gives each problem type a real URI, and until it is set `type` is RFC 9457's own default of `"about:blank"`. Choosing `:problem` deliberately **opts out of `render_error` delegation** — a host envelope and a problem document are two answers to the same question, and the explicit setting is the one honoured. The setting is app-wide rather than per-contract because the error format of an API is a property of the API.
+- **Exported OpenAPI follows the configured error format.** With `:problem` set, the shared response components describe the problem schema under `application/problem+json` instead of the envelope under `application/json`. Unlike a rule's monitor mode — which the exporter reads only from contract data, never from runtime configuration — the error format has no per-contract declaration to read, and an export runs inside the app that made the setting, so reading it is what keeps the documented response shape from drifting from the rendered one.
+
+Contracts that don't opt in are byte-for-byte unaffected: the default format is `:envelope` and the exported envelope schema is unchanged (the golden fixture still matches).
+
 ## 0.5.1 (2026-09-02)
 <!-- title: nested input outside Rails -->
 
