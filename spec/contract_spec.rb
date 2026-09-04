@@ -63,6 +63,15 @@ RSpec.describe Permittable::Contract do
       expect(contract.call(user: { email: "a@b.c" })).to be_valid
     end
 
+    it "distinguishes an explicitly-null nullable field from an absent one" do
+      patch = described_class.define do
+        optional :nickname, :string, nullable: true
+        optional :bio, :string
+      end
+      expect(patch.call(nickname: nil, bio: nil).params.to_h).to eq("nickname" => nil)
+      expect(patch.call({}).params.to_h).to eq({})
+    end
+
     it "runs finalize with violate! support" do
       c = described_class.define do
         required :starts_on, :date

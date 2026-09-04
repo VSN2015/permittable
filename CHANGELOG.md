@@ -1,5 +1,12 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Added
+- **`nullable:` field option — an explicit null is now part of a contract's vocabulary.** One absence rule (`nil` and `""` are both absent) is right for `PATCH` and wrong for the request that means *clear this*; `nullable: true` splits it in two for a single field. A key the client never sent stays **absent** — `default:` applies to it, a `required` field still violates `missing` — but a key sent **empty** (JSON `null`, or `""` from a form) is an explicit null and yields `nil` in the result, **ahead of the field's `default:`**, which is exactly what a `PATCH` clearing a column needs. Nothing is cast or checked for an explicit null: `in:`, `format:`, `length:`, `validate:`, and `transform:` never see a `nil` they didn't agree to handle. `required` + `nullable` reads as it does in SQL (the client must state the field; `null` is a legal statement), `default: nil` — legal only on a nullable field — gives the `PUT` reading where absence also means clear, and on arrays and nested blocks `nullable:` applies to the array or object itself, never its contents (a null *element* is still `invalid_type`). Exported JSON Schema / OpenAPI stays truthful: the field's `type` gains `"null"`, and a nullable `in:` set lists `null` in its `enum` (the one keyword that constrains the instance rather than a type). The RSpec matcher gains a `.nullable` chain, and `default: nil` / `example: nil` on a non-nullable field now fails at class load naming the fix, instead of the confusing `invalid_type`.
+
+Contracts that don't opt in are byte-for-byte unaffected: absence keeps its single meaning and nothing new appears in an exported schema.
+
 ## 0.5.1 (2026-09-02)
 <!-- title: nested input outside Rails -->
 
