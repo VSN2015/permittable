@@ -1,5 +1,10 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Fixed
+- **`permittable:generate` read commented-out code as if it ran.** A controller keeping a `# params.require(:admin).permit(:superuser)` line for reference had `:admin` drafted as the contract's `root:` and `:superuser` drafted as a permitted field — a wrong suggestion, and a security-flavoured one, from a line that does not execute. The same applied to `=begin`/`=end` blocks and to trailing comments on live lines. Comments are now removed before scanning, using `Ripper` (stdlib, no new dependency) rather than a regexp, because `#` is only sometimes a comment: a permit call inside `#{'#{...}'}` interpolation **is** live code and is still read, and string **content** is deliberately kept because `permit("name")` is a supported spelling whose keys live in string tokens. A file `Ripper` cannot lex falls back to the raw source, so a syntactically odd controller scans exactly as it did before rather than not at all.
+
 ## 0.6.0 (2026-09-08)
 <!-- title: nullable fields, :json, and strict dates -->
 
