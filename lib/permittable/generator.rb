@@ -1,3 +1,5 @@
+require "ripper"
+
 module Permittable
   # Drafts a permit_params contract from what the app already knows: the
   # model's columns (types, NOT NULL, database defaults) and, when the
@@ -51,14 +53,38 @@ module Permittable
     ARRAY_ARG  = /\A(\w+):\s*\[\s*\]\z/m
     NESTED_ARG = /\A(\w+):\s*\[([^\[\]]*)\]\z/m
 
+    # Comment tokens. Ripper (stdlib) is used rather than a regexp because `#`
+    # is only a comment sometimes — it also appears inside string literals and
+    # `#{}` interpolation, and a permit call inside interpolation IS live code.
+    # String CONTENT is deliberately kept: `permit("name")` is a supported
+    # spelling, and its keys live in string tokens.
+    COMMENT_TOKENS = %i[on_comment on_embdoc on_embdoc_beg on_embdoc_end].freeze
+
     module_function
+
+    # `source` with its comments removed. A controller keeping a commented-out
+    # `params.require(:admin).permit(:superuser)` for reference had :admin
+    # drafted as its root and :superuser as a permitted field — a wrong
+    # suggestion, and a security-flavoured one, from a line that does not run.
+    #
+    # Anything Ripper cannot lex falls back to the source unchanged, so a
+    # syntactically odd file scans exactly as it did before rather than not at
+    # all.
+    def executable_source(source)
+      tokens = Ripper.lex(source)
+      return source if tokens.nil? || tokens.empty?
+
+      tokens.reject { |token| COMMENT_TOKENS.include?(token[1]) }.map { |token| token[2] }.join
+    rescue StandardError
+      source
+    end
 
     # Merge every permit call found in `source` into one Scan. The first
     # `.require(:root)` seen wins, matching how a controller normally sticks
     # to one envelope across actions.
     def scan(source)
       result = Scan.new(root: nil, scalars: [], arrays: [], nested: {}, unparsed: [], calls: 0)
-      (source || "").scan(PERMIT_CALL) do |root, args|
+      executable_source(source.to_s).scan(PERMIT_CALL) do |root, args|
         result.calls += 1
         result.root ||= root&.to_sym
         split_args(args).each { |arg| classify_arg(result, arg) }

@@ -476,6 +476,7 @@ The generator's one rule is **draft, don't guess** — everything it cannot know
 
 - Drafts come out in **monitor mode**, so pasting one changes nothing until you flip it.
 - A permitted key that isn't a column becomes `virtual: true` with a TODO; a column type with no scalar equivalent (`json`, `binary`) becomes a TODO comment; a permit argument the conservative parser can't read (`*dynamic_keys`) is kept verbatim in a TODO instead of dropped.
+- **Comments are not code.** A commented-out `params.require(:admin).permit(:superuser)` kept for reference is skipped, so it can't contribute a root or a field to the draft. The source is tokenised with `Ripper` for this, because `#` is only sometimes a comment — a permit call inside `#{'#{...}'}` interpolation is live code and is still read, and quoted keys like `permit("name")` still work.
 - A database default is noted in a comment but **not** copied into `default:` — a contract default is injected on every request that omits the field, which would overwrite columns on partial updates. The database already handles creation.
 - `key: [:a, :b]` in a permit call drafts as a nested block, with a TODO noting it may be an array of hashes.
 
@@ -643,7 +644,7 @@ Using [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails)? `Concer
 
 ```sh
 bundle install
-bundle exec rspec      # 125 examples
+bundle exec rspec      # 205 examples
 bundle exec rubocop
 ```
 
