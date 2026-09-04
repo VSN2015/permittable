@@ -1,5 +1,12 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Fixed
+- **An array outside its `length:` bound was still fully examined, so an oversized payload cost far more to reject than to accept.** `length:` recorded its violation and then cast, checked and reported on every element anyway. A payload of 200,000 non-string elements against `array :tags, of: :string, length: 0..10` produced **200,001 violations and a ~9.5 MB error body after ~9.2 seconds of CPU** — for a request already refused by its first check, and against the very bound a developer declares to prevent exactly that. `length:` is now a bound rather than a report: an array outside it returns immediately, so the same payload costs **one violation, ~40 bytes and ~57 ms** of contract work (the rest of the wall time is the `HashWithIndifferentAccess` conversion of the payload, which happens before any field is examined). A consequence worth knowing: `validate:` and `transform:` are no longer handed an array the contract has already rejected, matching the rule `transform:` already followed for element violations. Arrays within their bounds, and arrays with no `length:` declared, behave exactly as before — note in particular that there is still **no default cap**, so an array with no `length:` remains unbounded and every element of it is cast and checked. `benchmark/oversized_array.rb` re-runs the measurement.
+
+  An authored `default:`/`example:` on an array is now also checked against that array's own `length:` at class load, instead of loading and handing the action an out-of-bounds default.
+
 ## 0.6.0 (2026-09-08)
 <!-- title: nullable fields, :json, and strict dates -->
 
