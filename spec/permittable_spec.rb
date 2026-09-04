@@ -890,6 +890,22 @@ RSpec.describe Permittable do
 
       expect(violations_for({ user: "nope" }, &decl).status).to eq(:bad_request)
     end
+
+    it "says `missing` only when the root really is absent" do
+      [{}, { user: nil }, { user: "" }].each do |params|
+        expect(violations_for(params, &decl).details)
+          .to eq([{ param: "user", code: "missing" }]), "for #{params.inspect}"
+      end
+    end
+
+    it "says `invalid_type` for a root the client DID send with the wrong shape" do
+      [{ user: "bob" }, { user: [] }, { user: 3 }, { user: false }].each do |params|
+        e = violations_for(params, &decl)
+        expect(e.details).to eq([{ param: "user", code: "invalid_type" }]), "for #{params.inspect}"
+        # Still a malformed envelope, so still a 400.
+        expect(e.status).to eq(:bad_request)
+      end
+    end
   end
 
   describe "unknown:" do
