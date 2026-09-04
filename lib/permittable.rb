@@ -151,6 +151,13 @@ require "permittable/filter_parameter_registry"
 # the value and expects in-place mutation, and never calls the proc at all
 # for a Hash — so a name in config.filter_parameters is what covers an
 # :integer field or a sensitive nested block.
+# Permittable::Railtie appends to `config.filter_parameters`. On a nested or
+# array field it CASCADES to every field inside, because Rails' filtering
+# asks about the leaf key it is looking at rather than the path to it; a
+# sub-field opts out with `sensitive: false`, since matching is a substring
+# match and a generic cascaded name would redact half the app's logs. The
+# cascade is resolved onto the field data at class load — see
+# ContractBuilder#cascade_sensitive.
 #
 # OUTPUT RESHAPING — the safe replacement for params-mutating before_actions.
 # Two layers, both operating on the validated COPY (the request's `params` is
@@ -687,7 +694,7 @@ module Permittable
       if block
         raise ArgumentError, "#{LABEL}: array :#{name} takes of: OR a block, not both" if opts.key?(:of)
 
-        field[:fields] = nested_fields!(name, &block)
+        field[:fields] = cascade_sensitive(nested_fields!(name, &block), field[:sensitive])
         field.delete(:of)
       else
         field[:of] = scalar_type!(name, opts[:of] || :string)
@@ -711,6 +718,7 @@ module Permittable
         assert_opts!(name, opts, NESTED_OPTS)
         field = { name: name, kind: :nested, required: required,
                   fields: nested_fields!(name, &block), **opts }
+        field[:fields] = cascade_sensitive(field[:fields], field[:sensitive])
         validate_message!(field)
       elsif type&.to_sym == JSON_TYPE
         assert_opts!(name, opts, JSON_OPTS)
@@ -760,6 +768,43 @@ module Permittable
       end
 
       fields
+    end
+
+    # `sensitive: true` on a nested or array field CASCADES to every field
+    # inside it, and the cascade is resolved HERE, at class load, so that
+    # `field[:sensitive]` stays the single source of truth every reader
+    # consults: the filter registry, the exported schema's `writeOnly`, and
+    # the RSpec matcher's `.sensitive` chain. Resolving it privately inside
+    # the registry walk would have redacted a cascaded child at runtime
+    # while the schema and the matcher went on calling it public.
+    #
+    # It has to cascade: ActiveSupport::ParameterFilter recurses into Hash
+    # and Array values itself and consults proc filters only for the LEAVES,
+    # handing each one the leaf's own key and never the path that led there.
+    # So registering only `payment` is asked about `card_number`, which it
+    # does not match, and redacts nothing inside the container.
+    #
+    # A sub-field opts out with an explicit `sensitive: false`, because
+    # matching is a case-insensitive SUBSTRING match and cascading a generic
+    # name (:id, :name) would redact every parameter app-wide that contains
+    # it. Only `false` opts out; `sensitive: nil` reads as "not stated" and
+    # still inherits.
+    def cascade_sensitive(fields, inherited)
+      updated = fields.map { |field| cascade_field_sensitive(field, inherited) }
+      updated.zip(fields).all? { |new_field, old| new_field.equal?(old) } ? fields : updated.freeze
+    end
+
+    def cascade_field_sensitive(field, inherited)
+      declared = field[:sensitive]
+      effective = declared.nil? ? inherited : declared
+      children = field[:fields] ? cascade_sensitive(field[:fields], effective) : nil
+      unchanged = (effective ? declared == true : declared == false || !field.key?(:sensitive)) &&
+                  (children.nil? || children.equal?(field[:fields]))
+      return field if unchanged
+
+      updated = field.merge(sensitive: effective)
+      updated[:fields] = children if children
+      updated.freeze
     end
 
     def validate_scalar_opts!(field)
@@ -1163,6 +1208,21 @@ module Permittable
       end
     end
 
+    # `sensitive: true` on a nested or array field CASCADES to everything
+    # inside it, because Rails' parameter filtering matches the leaf key it is
+    # currently looking at — never the path that led there. Registering only
+    # the container's own name therefore redacted nothing it promised: the
+    # filter is handed ("payment", {...}), a Hash is not a String so nothing
+    # is replaced, and it then recurses and asks about "card_number", which
+    # was never registered.
+    #
+    # A sub-field opts out with an explicit `sensitive: false`. That escape
+    # hatch exists because matching is a case-insensitive SUBSTRING match, so
+    # cascading a generic name (:id, :name) would redact every parameter
+    # app-wide that happens to contain it — occasionally a worse outcome than
+    # the leak it prevents.
+    # The cascade is already resolved on the field data (see
+    # ContractBuilder#cascade_sensitive), so this only has to read it.
     def register_sensitive_params(fields)
       fields.each do |field|
         Permittable.register_sensitive_parameter(field[:name]) if field[:sensitive]
