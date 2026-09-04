@@ -1,5 +1,12 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Added
+- **`Permittable.fields` and the `use` verb — reusable field groups.** A growing API produces two kinds of duplication that the DSL had no answer for: the `address` block three controllers want, and the `update` contract that is the `create` contract with nothing mandatory. `Permittable.fields { ... }` builds a **`FieldGroup`** — a frozen, reusable field list, the same data a contract's fields are — and `use SomeGroup` splices it in at the point of use, in the group's own order, exactly as if those fields had been typed there: identical request-time behaviour, drift guard, `sensitive:` registration and exported schema. It works at the top level of a contract, inside a nested or array block, and inside another group, so groups compose. **`use G, optional: true`** relaxes every spliced field — top level only, so an `address` sent at all still needs its own required sub-fields — which makes `use UserFields, optional: true` a complete `PATCH` contract with types, bounds and `default:` intact. **`only:`/`except:`** select a subset. Because a group is built by the same builder a contract is, every declaration is validated **when the group is defined**, so a typo fails once at the group rather than at each contract using it; `only:`/`except:` naming a field the group doesn't declare is a class-load error too, so a typo cannot quietly drop a field. A group is deliberately not a contract — no `root:`, `unknown:`, `model:` or `mode:`, and `finalize` is rejected — but a standalone **`Permittable::Contract` now answers `#fields`**, so `use SomeContract` lets a webhook payload and a controller action share one definition instead of two that drift.
+
+All additive — contracts that don't use a group are byte-for-byte unaffected.
+
 ## 0.6.0 (2026-09-08)
 <!-- title: nullable fields, :json, and strict dates -->
 
