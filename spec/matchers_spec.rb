@@ -193,4 +193,108 @@ RSpec.describe "Permittable RSpec matchers" do
     expect(matcher.description).to eq("permit :age (for #create) as :integer, in: 18..120")
     expect(permit_param(:nickname).nullable.description).to eq("permit :nickname nullable")
   end
+
+  describe "accept_params / reject_params" do
+    let(:users) do
+      Class.new(FakeController) do
+        include Permittable
+
+        def self.name = "UsersController"
+
+        permit_params :create, root: :user do
+          required :name,  :string, length: 1..8
+          required :email, :string, format: /@/
+          optional :age,   :integer, in: 18..120
+          optional :plan,  :string, in: %w[free pro], default: "free"
+        end
+
+        permit_params(:destroy) { required :reason, :string }
+      end
+    end
+
+    let(:valid) { { user: { name: "Jo", email: "a@b.co", age: "30" } } }
+
+    it "passes for a payload the contract accepts" do
+      expect(users).to accept_params(valid).for_action(:create)
+    end
+
+    it "asserts the cast, defaulted output with returning" do
+      expect(users).to accept_params(valid).for_action(:create)
+                                           .returning("name" => "Jo", "email" => "a@b.co", "age" => 30, "plan" => "free")
+    end
+
+    it "explains an unexpected rejection by naming the violations" do
+      message = failure_of do
+        expect(users).to accept_params({ user: { name: "Jo" } }).for_action(:create)
+      end
+      expect(message).to include("expected UsersController to accept those params for #create")
+      expect(message).to include("user.email (missing)")
+    end
+
+    it "explains a returning mismatch with the actual params" do
+      message = failure_of do
+        expect(users).to accept_params(valid).for_action(:create).returning("name" => "Jo")
+      end
+      expect(message).to include("accepted them but returned")
+      expect(message).to include("plan")
+    end
+
+    it "passes for a payload the contract rejects, optionally naming the violation" do
+      expect(users).to reject_params({ user: {} }).for_action(:create)
+      expect(users).to reject_params({ user: { name: "Jo", email: "nope" } })
+        .for_action(:create).with_violation("user.email", :format)
+      expect(users).to reject_params({ user: {} }).for_action(:create)
+                                                  .with_violation("user.name").with_violation("user.email", :missing)
+    end
+
+    it "explains a rejection that did not happen" do
+      message = failure_of { expect(users).to reject_params(valid).for_action(:create) }
+      expect(message).to include("expected UsersController to reject those params for #create")
+      expect(message).to include("accepted them")
+    end
+
+    it "explains a rejection that happened for a different reason" do
+      message = failure_of do
+        expect(users).to reject_params({ user: {} }).for_action(:create).with_violation("user.age", :inclusion)
+      end
+      expect(message).to include("user.age (inclusion)")
+      expect(message).to include("user.name (missing)")
+    end
+
+    it "reads the contract, not the rollout mode: a monitor-mode rule still rejects" do
+      monitored = Class.new(FakeController) do
+        include Permittable
+
+        permit_params(:create, mode: :monitor) { required :a, :string }
+      end
+      expect(monitored).to reject_params({}).for_action(:create).with_violation("a", :missing)
+    end
+
+    it "demands for_action when several contracts are declared, like permit_param" do
+      expect { expect(users).to accept_params(valid) }
+        .to raise_error(ArgumentError, /declares 2 contracts/)
+    end
+
+    it "works without for_action when there is exactly one contract" do
+      single = Class.new(FakeController) do
+        include Permittable
+
+        permit_params(:create) { required :a, :string }
+      end
+      expect(single).to accept_params({ a: "x" })
+      expect(single).to reject_params({})
+    end
+
+    it "works on a standalone Contract too" do
+      contract = Permittable::Contract.define { required :a, :integer }
+      expect(contract).to accept_params({ a: "1" }).returning("a" => 1)
+      expect(contract).to reject_params({ a: "x" }).with_violation("a", :invalid_type)
+    end
+
+    it "describes itself readably" do
+      expect(accept_params({}).for_action(:create).description).to eq("accept those params for #create")
+      expect(reject_params({}).with_violation("a", :missing).description)
+        .to eq("reject those params with a (missing)")
+    end
+  end
 end
