@@ -1600,6 +1600,95 @@ RSpec.describe Permittable do
       end.not_to raise_error
     end
 
+    describe "column types (Permittable.check_column_types)" do
+      before do
+        ActiveRecord::Schema.define do
+          create_table :typed_things do |t|
+            t.string   :title
+            t.integer  :count
+            t.decimal  :price
+            t.boolean  :active
+            t.datetime :starts_at
+            t.date     :on
+            t.json     :payload
+            t.binary   :blob
+          end
+        end
+      end
+
+      after do
+        Permittable.check_column_types = false
+        ActiveRecord::Base.connection.drop_table(:typed_things, if_exists: true)
+      end
+
+      let(:typed) { Class.new(TestModel) { self.table_name = "typed_things" } }
+
+      def declaring(model, &fields)
+        -> { permittable_class { permit_params(:create, model: model, &fields) } }
+      end
+
+      it "is off by default, so no existing contract starts failing its deploy" do
+        expect(&declaring(typed) { required :title, :integer }).not_to raise_error
+      end
+
+      context "when enabled" do
+        before { Permittable.check_column_types = true }
+
+        it "raises when the declared type and the column disagree, naming both and the fix" do
+          expect(&declaring(typed) { required :title, :integer }).to raise_error(ArgumentError) do |e|
+            expect(e.message).to match(/'title' is declared :integer but the column is :string/)
+            expect(e.message).to match(/typed_things/)
+          end
+        end
+
+        it "catches the drift that matters: a column retyped out from under a contract" do
+          expect(&declaring(typed) { required :starts_at, :string }).to raise_error(ArgumentError, /:string but the column is :datetime/)
+          expect(&declaring(typed) { required :count, :datetime }).to raise_error(ArgumentError, /:datetime but the column is :integer/)
+        end
+
+        it "accepts every declaration that matches" do
+          expect(&declaring(typed) do
+            required :title, :string
+            optional :count, :integer
+            optional :price, :decimal
+            optional :active, :boolean
+            optional :starts_at, :datetime
+            optional :on, :date
+          end).not_to raise_error
+        end
+
+        it "allows numeric and boolean to mix, which legacy schemas genuinely do" do
+          # A boolean stored as an integer 0/1 is a real pattern, and AR casts
+          # cleanly between the numeric types.
+          expect(&declaring(typed) { optional :active, :integer }).not_to raise_error
+          expect(&declaring(typed) { optional :count, :decimal }).not_to raise_error
+          expect(&declaring(typed) { optional :price, :float }).not_to raise_error
+        end
+
+        it "allows the temporal types to mix" do
+          expect(&declaring(typed) { optional :starts_at, :date }).not_to raise_error
+          expect(&declaring(typed) { optional :on, :datetime }).not_to raise_error
+        end
+
+        it "never guesses about a column it has no faithful type for" do
+          # json/jsonb/binary have no scalar contract type, so whatever an app
+          # improvised for them is left alone rather than second-guessed.
+          expect(&declaring(typed) { optional :payload, :string }).not_to raise_error
+          expect(&declaring(typed) { optional :blob, :string }).not_to raise_error
+        end
+
+        it "still skips virtual fields and a missing column still reports as missing" do
+          expect(&declaring(typed) { optional :title, :integer, virtual: true }).not_to raise_error
+          expect(&declaring(typed) { optional :nope, :integer }).to raise_error(ArgumentError, /does not exist/)
+        end
+
+        it "rejects an invalid setting at assignment" do
+          expect { Permittable.check_column_types = "yes" }
+            .to raise_error(ArgumentError, /check_column_types must be true or false/)
+        end
+      end
+    end
+
     it "skips silently when the schema is unreachable (the ColumnGuard contract)" do
       unreachable = Class.new(TestModel) { self.table_name = "no_such_table" }
       expect do
