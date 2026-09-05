@@ -402,6 +402,29 @@ module Permittable
     # problem types and each type gets its own URI under it.
     attr_accessor :problem_base_uri
 
+    # Whether the schema-drift guard also checks that a field's declared type
+    # matches its column's, on top of checking the column exists.
+    #
+    # OFF by default, deliberately. Every cross-type declaration has some
+    # legitimate use — a :string contract on a date column that lets
+    # ActiveRecord do the casting, a :boolean contract on a legacy integer
+    # column — and breaking those apps on an upgrade would cost more than the
+    # drift it catches. Turn it on and fix what it finds:
+    #
+    #   Permittable.check_column_types = true
+    #
+    # It compares type GROUPS rather than exact types, and never fires on a
+    # column it has no faithful contract type for. See ColumnGuard.
+    def check_column_types
+      @check_column_types || false
+    end
+
+    def check_column_types=(value)
+      raise ArgumentError, "#{LABEL}: check_column_types must be true or false" unless [true, false].include?(value)
+
+      @check_column_types = value
+    end
+
     # App-wide fallback copy for a violation code, looked up through I18n
     # under permittable.errors.<code> ("missing", "inclusion", or any Symbol
     # a validate: returned). Consulted only when the field declares no
@@ -1281,8 +1304,13 @@ module Permittable
 
       types = checked.to_h { |f| [f[:name], f[:type]] }
       begin
-        ColumnGuard.ensure_columns_on!(LABEL, model_class, *checked.map { |f| f[:name] }, types: types)
+        ColumnGuard.ensure_columns_on!(LABEL, model_class, *checked.map { |f| f[:name] },
+                                       types: types, check_types: Permittable.check_column_types)
       rescue ArgumentError => e
+        # The type error carries its own guidance; only the missing-column one
+        # needs the virtual: hint appended.
+        raise e unless e.message.include?("does not exist in the database")
+
         raise ArgumentError, "#{e.message} If this parameter is not backed by a column, declare it with virtual: true."
       end
     end
