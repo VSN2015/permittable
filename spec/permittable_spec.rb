@@ -262,6 +262,22 @@ RSpec.describe Permittable do
       end
     end
 
+    it "matches what Date.parse would have produced, including calendar validation" do
+      # The Date is built from the parsed components rather than by parsing a
+      # second time, so this pins that the two agree — leap years included.
+      { "2026-09-05" => Date.new(2026, 9, 5),
+        "2026/09/05" => Date.new(2026, 9, 5),
+        "20260905" => Date.new(2026, 9, 5),
+        "2024-02-29" => Date.new(2024, 2, 29) }.each do |value, expected|
+        expect(permit({ on: value }, &decl)[:on]).to eq(expected), "for #{value}"
+      end
+      # 2026 is not a leap year, and there is no 30th of February in any.
+      %w[2026-02-29 2026-02-30].each do |value|
+        expect(violations_for({ on: value }, &decl).details)
+          .to eq([{ param: "on", code: "invalid_type" }]), "for #{value}"
+      end
+    end
+
     it "accepts a Date object unchanged" do
       expect(permit({ on: Date.new(2026, 9, 5) }, &decl)[:on]).to eq(Date.new(2026, 9, 5))
     end
