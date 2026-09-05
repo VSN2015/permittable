@@ -9,7 +9,10 @@ module Permittable
   class Railtie < Rails::Railtie
     initializer "permittable.filter_parameters",
                 before: "active_record.set_filter_attributes" do |app|
-      filter = ::Permittable.filter_parameter_registry.to_proc
+      # Late-bound on purpose — see Permittable.filter_parameter_proc. This
+      # initializer runs before config/initializers, so a registry swapped
+      # there must still be the one consulted at filter time.
+      filter = ::Permittable.filter_parameter_proc
       app.config.filter_parameters << filter unless app.config.filter_parameters.include?(filter)
     end
 

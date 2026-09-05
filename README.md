@@ -616,6 +616,8 @@ The indirection is deliberate. Appending plain symbols to `config.filter_paramet
 
 Matching mirrors Rails' own symbol-filter semantics: case-insensitive substring match on the parameter key. The registry is fully duck-typed (`#add`, `#include?`, `#to_proc`, `#reset!`) and swappable via `Permittable.filter_parameter_registry=`, so a host gem can pool registrations into its own.
 
+**The swap works at any point**, including from `config/initializers` — which matters, because Rails runs railtie initializers *before* those, so a swap always happens after `Permittable::Railtie` has appended its filter. The appended proc (`Permittable.filter_parameter_proc`) resolves the registry at **filter time** rather than closing over whichever instance existed at boot, so whichever registry is current does the redacting.
+
 ## Instrumentation
 
 Every violation emits an `ActiveSupport::Notifications` event, so rejected requests can be dashboarded and alerted on — **exactly once per action per request**, however many times the action reads the params (`permitted_params` memoizes the outcome, rejections included):
