@@ -378,6 +378,35 @@ If this parameter is not backed by a column, declare it with virtual: true.
 
 The error carries a ready-to-paste migration command, typed from your own field declaration.
 
+### Checking types too (opt-in)
+
+A dropped column fails the deploy; a **retyped** one doesn't, unless you ask:
+
+```ruby
+# config/initializers/permittable.rb
+Permittable.check_column_types = true
+```
+
+```
+Permittable: 'placed_at' is declared :string but the column is :datetime (table: orders).
+Change the contract to match the column, migrate the column to match the contract,
+or declare the field virtual: true if it is not backed by this column.
+```
+
+**It is off by default on purpose.** Every cross-type declaration has some legitimate use — a `:string` contract on a `date` column that lets ActiveRecord do the casting, a `:boolean` contract on a legacy integer column — and breaking those apps on an upgrade would cost more than the drift it catches. Turn it on and fix what it finds.
+
+When enabled it compares **groups**, not exact types, so it fires on a genuine cross-family mismatch and stays quiet otherwise:
+
+| Group | Column types |
+|---|---|
+| text | `string`, `text`, `citext`, `uuid`, `enum`, `char` |
+| numeric | `integer`, `bigint`, `float`, `decimal`, **`boolean`** |
+| temporal | `date`, `datetime`, `time`, `timestamp`, `timestamptz` |
+
+`boolean` sits with the numerics because a boolean stored as an integer `0`/`1` is a real legacy pattern and ActiveRecord casts cleanly between them; the temporal types are one group because a `:date` contract on a `datetime` column is a narrowing, not drift.
+
+Any column type **not** in that table — `json`, `jsonb`, `binary`, an adapter's own `inet` or `money` — is never checked. A contract has no faithful type for those, so whatever you improvised is left alone rather than guessed about.
+
 - **Fields not backed by a column** — `password_confirmation`, terms checkboxes, search filters — opt out with `virtual: true`.
 - **Nested and array fields are implicitly virtual**, since only scalars map one-to-one onto columns.
 - **The check skips when the schema is unreachable** (`db:create`, a fresh `db:migrate`, `assets:precompile`, CI bootstrap), so controller classes stay loadable. Skipping is self-healing: once the migration runs and classes reload, the check happens for real. A missing column with a *reachable* schema still raises — the rescue is scoped to `ActiveRecord::ActiveRecordError` precisely so real bugs keep surfacing.
@@ -601,6 +630,7 @@ Output is deterministic (fixed key order, declaration-order properties), so the 
 | `Permittable.filter_parameter_registry` | The live registry of `sensitive:` field names |
 | `Permittable.filter_parameter_registry=` | Swap in your own duck-typed registry |
 | `Permittable.mode` / `Permittable.mode=` | App-wide default (`:enforce`) for rules that don't declare their own `mode:` |
+| `Permittable.check_column_types` / `=` | Opt in to the [type half of the drift guard](#checking-types-too-opt-in) (default `false`) |
 | `Permittable::InvalidParameters` | Raised on violation; carries `#details` and `#status` |
 | `Permittable::JsonSchema` | Contract data → JSON Schema fragments (`.rule`, `.object`, `.field`) |
 | `Permittable::OpenAPI` | OpenAPI 3.1 assembly (`.document`, `.operations_for`, `.request_body_for`, `.components`) |
@@ -625,7 +655,8 @@ A bad contract is a programmer error, so it fails when the class loads — never
 - An empty contract, or a nested block declaring no sub-fields
 - `finalize` declared twice, without a block, or inside a nested block
 - `permit_params` without a block, or an invalid `unknown:` mode
-- An invalid `mode:` (and `Permittable.mode =` rejects invalid values at assignment)
+- An invalid `mode:` (and `Permittable.mode =` / `Permittable.check_column_types =` reject invalid values at assignment)
+- A field whose declared type disagrees with its column's, when `Permittable.check_column_types` is on
 - A `model:` that isn't an ActiveRecord class, or `model: true` that can't be inferred
 
 ## Compatibility
@@ -643,7 +674,7 @@ Using [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails)? `Concer
 
 ```sh
 bundle install
-bundle exec rspec      # 125 examples
+bundle exec rspec      # 208 examples
 bundle exec rubocop
 ```
 

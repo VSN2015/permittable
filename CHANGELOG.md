@@ -1,5 +1,12 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Added
+- **`Permittable.check_column_types` — the drift guard can now check types, not just existence.** A column dropped by a migration already failed the deploy; a column **retyped** by one did not, so a contract could go on declaring `:datetime` long after the column became a string. Enabling the setting adds that half: `'placed_at' is declared :string but the column is :datetime`, with the same three fixes named as the missing-column error.
+  **It is off by default on purpose.** Every cross-type declaration has some legitimate use — a `:string` contract on a `date` column that lets ActiveRecord do the casting, a `:boolean` contract on a legacy integer column — and breaking those apps on an upgrade would cost more than the drift it catches.
+  When enabled it compares type **groups** rather than exact types, so it fires on a genuine cross-family mismatch and stays quiet otherwise. `boolean` is grouped with the numerics, because a boolean stored as an integer `0`/`1` is a real legacy pattern and ActiveRecord casts cleanly between them; the temporal types are one group, because a `:date` contract on a `datetime` column is a narrowing rather than drift. Any column type the gem has no faithful contract type for — `json`, `jsonb`, `binary`, an adapter's own `inet` or `money` — is **never** checked, so whatever an app improvised for those is left alone rather than guessed about. `virtual: true` opts out as before, and a missing column still reports as missing.
+
 ## 0.5.1 (2026-09-02)
 <!-- title: nested input outside Rails -->
 
