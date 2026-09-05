@@ -553,7 +553,15 @@ module Permittable
     def cast_date(value)
       case value
       when Date then [:ok, value]
-      when String then complete_date?(value) ? [:ok, Date.parse(value)] : [:error, "invalid_type"]
+      when String
+        found = Date._parse(value)
+        return [:error, "invalid_type"] unless complete_date?(found)
+
+        # Built from the components rather than re-running Date.parse, which
+        # would parse the same string a second time — and Date.parse is the
+        # expensive half. Date.new applies the same calendar validation, so
+        # "2026-02-30" still fails.
+        [:ok, Date.new(found[:year], found[:mon], found[:mday])]
       else [:error, "invalid_type"]
       end
     rescue ArgumentError, RangeError
@@ -561,12 +569,9 @@ module Permittable
     end
 
     # Date._parse is the layer under Date.parse, and reports which components
-    # it actually found rather than the filled-in result.
-    def complete_date?(value)
-      found = Date._parse(value)
+    # it actually FOUND rather than the filled-in result.
+    def complete_date?(found)
       found.key?(:year) && found.key?(:mon) && found.key?(:mday)
-    rescue ArgumentError, RangeError
-      false
     end
 
     # A zoneless String parses as UTC regardless of the host timezone
@@ -581,7 +586,12 @@ module Permittable
         # taken from today ("10:30" meant today at 10:30). An absent TIME part
         # is fine and means midnight, which is the documented reading of a
         # date given to a :datetime field.
-        complete_date?(value) ? [:ok, DateTime.parse(value).to_time.utc] : [:error, "invalid_type"]
+        #
+        # Unlike :date this still parses twice, deliberately: rebuilding a
+        # Time from components would have to reimplement DateTime.parse's
+        # handling of offsets, zone names and sub-second precision, and
+        # getting that subtly wrong costs more than the parse.
+        complete_date?(Date._parse(value)) ? [:ok, DateTime.parse(value).to_time.utc] : [:error, "invalid_type"]
       else [:error, "invalid_type"]
       end
     rescue ArgumentError, RangeError
