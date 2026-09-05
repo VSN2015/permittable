@@ -1,5 +1,10 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Added
+- **`accept_params` / `reject_params` RSpec matchers — asserting on what a contract *does*.** `permit_param` reads the declaration, which leaves the behaviour untested: whether a payload is accepted, and what it casts to. These run the rule against a payload directly — still no request dispatched — and assert the outcome. `accept_params(payload).returning(hash)` pins the **cast, defaulted, transformed** output, which the declaration matcher cannot reach; `reject_params(payload).with_violation("user.email", :format)` pins the violation, repeatably, with the code optional. Both take `for_action` and resolve it exactly as `permit_param` does, so ambiguity fails loudly the same way, and both work on a controller class, a controller instance, or a standalone `Permittable::Contract`. Failure messages name what actually happened rather than only that the expectation failed — `expected UsersController to reject those params with user.age (inclusion), but the violations were: user.name (missing), user.email (missing)`. They read the **contract**, not the rollout mode: a monitor-mode rule still `reject_params`, because the question a spec is asking is what the contract says, not what the deploy currently does with it.
+
 ## 0.5.1 (2026-09-02)
 <!-- title: nested input outside Rails -->
 
