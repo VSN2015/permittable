@@ -1248,7 +1248,6 @@ RSpec.describe Permittable do
                "cards" => [{ "pan" => "[FILTERED]" }])
     end
 
-
     describe "the filter proc the Railtie appends" do
       # Rails runs railtie initializers BEFORE config/initializers, so an app
       # or host gem that swaps the registry does so AFTER the Railtie has

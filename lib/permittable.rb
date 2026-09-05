@@ -316,7 +316,6 @@ module Permittable
     # problem types and each type gets its own URI under it.
     attr_accessor :problem_base_uri
 
-
     # Whether the schema-drift guard also checks that a field's declared type
     # matches its column's, on top of checking the column exists.
     #
@@ -339,7 +338,6 @@ module Permittable
 
       @check_column_types = value
     end
-
 
     # App-wide fallback copy for a violation code, looked up through I18n
     # under permittable.errors.<code> ("missing", "inclusion", or any Symbol
