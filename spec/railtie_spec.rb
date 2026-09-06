@@ -77,9 +77,10 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
   # One boot, several expectations — booting Rails per example would dominate
   # the suite's runtime for no extra coverage.
   def self.boot
-    @boot ||= begin
+    # The block form removes the directory once the subprocess has exited,
+    # including when the boot raises, so repeated runs leave nothing behind.
+    @boot ||= Dir.mktmpdir do |root|
       lib = File.expand_path("../lib", __dir__)
-      root = Dir.mktmpdir
       Dir.mkdir(File.join(root, "config"))
       File.write(File.join(root, "config", "database.yml"),
                  "test:\n  adapter: sqlite3\n  database: \":memory:\"\n")
