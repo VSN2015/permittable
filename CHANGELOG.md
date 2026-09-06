@@ -1,5 +1,12 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Added
+- **`spec/railtie_spec.rb` — the boot-time integration is now covered.** Everything `Permittable::Railtie` does happens during a Rails boot, and none of it had a spec: the `filter_parameters` wiring, its reach into ActiveRecord, or the rake tasks. Unit specs cannot see any of it, and the `FakeController` harness deliberately has no Rails at all. The new spec boots a **real Rails application in a subprocess** — the same approach the "without Rails loaded" specs use, and for the same reason: a boot mutates global state (`Rails.application` is a singleton, initializers run once) and must not leak into the rest of the suite. It asserts that exactly one filter proc is appended without disturbing the app's own entries, that a `sensitive:` field declared by a controller loaded **after** boot is redacted (the whole reason for a live registry rather than appended symbols), that the proc reaches `ActiveRecord::Base.filter_attributes` so a model's `#inspect` redacts too, and that both rake tasks load. `railties` joins the dev bundle for it, and the spec skips rather than fails where railties is absent, so a host without Rails — and the compatibility gemfiles that omit it — are unaffected.
+
+No behaviour changes: tests and a dev dependency only.
+
 ## 0.5.1 (2026-09-02)
 <!-- title: nested input outside Rails -->
 
