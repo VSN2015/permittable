@@ -7,6 +7,11 @@
 
 Contracts that don't opt in are byte-for-byte unaffected: absence keeps its single meaning and nothing new appears in an exported schema.
 
+### Fixed
+- **`:date` and `:datetime` invented the parts a string left out, from today's date.** Coercion is documented as strict — "a value the type cannot faithfully represent is a violation, not a guess" — but it handed strings straight to `Date.parse`, which fills in what they omit from the current date: `"09/2026"` became the 1st of September, `"5th"` became the 5th of *this* month of *this* year, `"Sept"` became the 1st of September *this* year. The same request therefore meant different things on different days, which is a guess and a non-deterministic one. A `:date` or `:datetime` string must now name all three of year, month and day; which **format** it names them in is still `Date.parse`'s business, so every complete format it understands keeps working (`"2026-09-05"`, `"2026/09/05"`, `"Sep 5, 2026"`, `"5 September 2026"`). A `:datetime` may still omit the **time** part, which reads as midnight UTC as documented, but a string with only a time (`"10:30"`, previously *today* at 10:30) is now `invalid_type`. `Date`, `Time`, `DateTime` and `ActiveSupport::TimeWithZone` objects are unaffected.
+
+  This is a **behaviour change** for any endpoint that was relying on the fill-in, but the values it produced were not the ones the client meant, and an exported `"format": "date"` already promised RFC 3339 rather than `"5th"`.
+
 ## 0.5.2 (2026-09-06)
 <!-- title: Railtie coverage and a new README -->
 
