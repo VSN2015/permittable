@@ -91,6 +91,11 @@ module Permittable
         self
       end
 
+      def nullable
+        @expected[:nullable] = true
+        self
+      end
+
       # -- RSpec protocol ---------------------------------------------------
 
       def matches?(subject)
@@ -191,7 +196,7 @@ module Permittable
         when :array then "expected an array field, but it is declared with `#{field[:kind]}`" unless field[:kind] == :array
         when :of then "expected an array of :#{value}, but it is of: :#{field[:of]}" unless field[:of] == value
         when :required then required_mismatch(field, value)
-        when :virtual, :sensitive then "expected the field to be #{key}, but it is not" unless field[key]
+        when :virtual, :sensitive, :nullable then "expected the field to be #{key}, but it is not" unless field[key]
         else option_mismatch(field, key, value)
         end
       end
@@ -226,7 +231,7 @@ module Permittable
         when :array then "as an array"
         when :of then "of :#{value}"
         when :required then value ? "required" : "optional"
-        when :virtual, :sensitive then key.to_s
+        when :virtual, :sensitive, :nullable then key.to_s
         else "#{OPTION_LABELS.fetch(key)} #{value.inspect}"
         end
       end

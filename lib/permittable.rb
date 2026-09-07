@@ -86,8 +86,16 @@ require "permittable/filter_parameter_registry"
 # guess. nil and "" are both treated as ABSENT (the query-param convention):
 # absent optional fields are OMITTED from the result (so partial updates never
 # nil-out columns), absent required fields violate, and `default:` fills
-# absence. Clearing a column to NULL is therefore outside a contract's
-# vocabulary — do that explicitly.
+# absence.
+#
+# `nullable: true` splits that rule in two for one field, which is how a PATCH
+# clears a column: a key the client never sent stays absent (defaults apply,
+# required violates), but a key sent EMPTY (JSON null, or "" from a form) is an
+# explicit null and yields nil in the result — ahead of any `default:`, and
+# without casting or checking a value that isn't there. It reads on arrays and
+# nested blocks too (the array/object itself may be null, never its elements),
+# and `default: nil` — legal only on a nullable field — gives the PUT reading
+# where absence also means clear.
 #
 # Failures raise Permittable::InvalidParameters, rescued (on a real
 # controller) into the shared ErrorEnvelope shape with `details:` entries of
@@ -396,9 +404,11 @@ module Permittable
   # declaration is validated eagerly: a bad contract is a programmer error and
   # should fail at class load, not at request time.
   class ContractBuilder
-    SCALAR_OPTS = %i[in format length default normalize validate virtual sensitive transform message desc example].freeze
-    NESTED_OPTS = %i[virtual sensitive message desc].freeze
-    ARRAY_OPTS  = %i[of length default validate virtual sensitive required transform message desc example].freeze
+    SCALAR_OPTS = %i[in format length default normalize validate virtual sensitive transform message desc example
+                     nullable].freeze
+    NESTED_OPTS = %i[virtual sensitive message desc nullable].freeze
+    ARRAY_OPTS  = %i[of length default validate virtual sensitive required transform message desc example
+                     nullable].freeze
 
     attr_reader :finalizer
 
@@ -571,6 +581,7 @@ module Permittable
     # shipping it to every request (or publishing it in generated docs).
     def validate_authored_value!(field, opt)
       return unless field.key?(opt)
+      return if authored_nil!(field, opt)
 
       status, code = Coercion.check_scalar(field, field[opt])
       return if status == :ok
@@ -580,6 +591,7 @@ module Permittable
 
     def validate_array_authored_value!(field, opt)
       value = field[opt]
+      return if authored_nil!(field, opt)
       raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} must be an Array" unless value.is_a?(Array)
       return unless field[:of]
 
@@ -589,6 +601,19 @@ module Permittable
 
         raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} contains an element violating of: :#{field[:of]} (#{code})"
       end
+    end
+
+    # An authored nil is only meaningful on a nullable field, where it says
+    # "absent means clear" (PUT semantics) rather than "no default". On any
+    # other field it is a value nil could never satisfy, so it fails at class
+    # load with the fix named.
+    def authored_nil!(field, opt)
+      return false unless field[opt].nil?
+      return true if field[:nullable]
+
+      raise ArgumentError,
+            "#{LABEL}: :#{opt} for field :#{field[:name]} is nil but the field is not nullable — " \
+            "declare nullable: true to make an explicit null part of the contract"
     end
 
     # `message:` customizes what the client reads for a violation on this
@@ -934,7 +959,9 @@ module Permittable
       value = hash[key]
 
       if permittable_absent?(value, hash, key)
-        if field.key?(:default)
+        if permittable_explicit_null?(field, hash, key)
+          result[key] = nil
+        elsif field.key?(:default)
           result[key] = field[:default]
         elsif field[:required]
           violations << permittable_violation(field, full, "missing")
@@ -1011,6 +1038,15 @@ module Permittable
   # nil and "" are both ABSENT — see the module comment.
   def permittable_absent?(value, hash, key)
     !hash.key?(key) || value.nil? || (value.is_a?(String) && value.empty?)
+  end
+
+  # `nullable: true` splits the one absence rule in two: a key the client
+  # never sent is still absent (defaults apply, required violates), but a key
+  # sent EMPTY is an explicit null — the field yields nil, so a PATCH can
+  # clear a column. Nothing is cast or checked: there is no value to check,
+  # and `transform:` never sees a nil it did not agree to.
+  def permittable_explicit_null?(field, hash, key)
+    field[:nullable] && hash.key?(key)
   end
 
   def permittable_check_unknown(fields, hash, path:, unknown:, top_level:, violations:)

@@ -78,7 +78,23 @@ module Permittable
                when :nested then object(field[:fields], unknown: unknown)
                when :array then array_schema(field, unknown: unknown)
                end
+      nullify!(schema, field)
       annotate(schema, field)
+    end
+
+    # `nullable: true` means an explicitly-sent empty value yields null, so
+    # the type gains "null". Assigning over the existing key keeps its
+    # position, preserving deterministic emission. `enum` is the one keyword
+    # that constrains the instance rather than one type (minLength, pattern,
+    # minimum and friends only apply to instances of their own type), so a
+    # nullable enum has to list null itself or it would reject the very null
+    # the type now permits.
+    def nullify!(schema, field)
+      return schema unless field[:nullable]
+
+      schema["type"] = Array(schema["type"]) + ["null"] if schema["type"]
+      schema["enum"] += [nil] if schema.key?("enum")
+      schema
     end
 
     def scalar_schema(field)

@@ -479,6 +479,103 @@ RSpec.describe Permittable do
     end
   end
 
+  describe "nullable:" do
+    let(:decl) do
+      proc do
+        permit_params(:create) do
+          optional :nickname, :string, nullable: true
+          optional :plan, :string, in: %w[free pro], default: "free", nullable: true
+          optional :age, :integer, in: 18..120, nullable: true
+          optional :note, :string
+        end
+      end
+    end
+
+    it "yields an explicit nil when the key is present and empty" do
+      result = permit({ nickname: nil }, &decl)
+      expect(result.key?("nickname")).to be(true)
+      expect(result["nickname"]).to be_nil
+    end
+
+    it "treats a present empty string as an explicit null too (the form-encoded convention)" do
+      expect(permit({ nickname: "" }, &decl).fetch("nickname")).to be_nil
+    end
+
+    it "still OMITS the field when the key is absent" do
+      expect(permit({}, &decl).key?("nickname")).to be(false)
+    end
+
+    it "prefers an explicit null over the field's default (the PATCH fix)" do
+      expect(permit({ plan: nil }, &decl).fetch("plan")).to be_nil
+      expect(permit({}, &decl)["plan"]).to eq("free")
+    end
+
+    it "skips in:/format:/length:/validate: for an explicit null" do
+      expect(permit({ age: nil }, &decl).fetch("age")).to be_nil
+      expect(permit({ plan: nil }, &decl).fetch("plan")).to be_nil
+    end
+
+    it "does not apply transform: to an explicit null" do
+      result = permit({ tag: nil }) do
+        permit_params(:create) { optional :tag, :string, nullable: true, transform: ->(v) { v.upcase } }
+      end
+      expect(result.fetch("tag")).to be_nil
+    end
+
+    it "leaves non-nullable fields absent-as-before" do
+      expect(permit({ note: nil }, &decl).key?("note")).to be(false)
+    end
+
+    it "still violates `missing` for a required nullable field whose key is absent" do
+      expect(violations_for({}) { permit_params(:create) { required :a, :string, nullable: true } }.details)
+        .to eq([{ param: "a", code: "missing" }])
+    end
+
+    it "accepts an explicit null for a required nullable field (presence stated, value null)" do
+      result = permit({ a: nil }) { permit_params(:create) { required :a, :string, nullable: true } }
+      expect(result.fetch("a")).to be_nil
+    end
+
+    it "allows default: nil only on a nullable field (absent means clear — PUT semantics)" do
+      result = permit({}) { permit_params(:create) { optional :a, :string, nullable: true, default: nil } }
+      expect(result.fetch("a")).to be_nil
+
+      expect { permittable_class { permit_params(:create) { optional :a, :string, default: nil } } }
+        .to raise_error(ArgumentError, /:default for field :a is nil but the field is not nullable/)
+    end
+
+    it "nulls a whole nested block, distinctly from an empty hash" do
+      decl = proc do
+        permit_params(:create) do
+          optional :address, nullable: true do
+            required :city, :string
+          end
+        end
+      end
+      expect(permit({ address: nil }, &decl).fetch("address")).to be_nil
+      expect(violations_for({ address: {} }, &decl).details).to eq([{ param: "address.city", code: "missing" }])
+    end
+
+    it "nulls a whole array, distinctly from an empty array" do
+      decl = proc { permit_params(:create) { array :tags, of: :string, nullable: true, length: 1..3 } }
+      expect(permit({ tags: nil }, &decl).fetch("tags")).to be_nil
+      expect(violations_for({ tags: [] }, &decl).details).to eq([{ param: "tags", code: "length" }])
+    end
+
+    it "does not make an array's ELEMENTS nullable" do
+      violations = violations_for({ tags: [nil] }) do
+        permit_params(:create) { array :tags, of: :string, nullable: true }
+      end
+      expect(violations.details).to eq([{ param: "tags[0]", code: "invalid_type" }])
+    end
+
+    it "carries nullable: into the frozen rule so exporters can read it" do
+      klass = permittable_class(&decl)
+      field = klass.permit_rule_for("create")[:fields].first
+      expect(field[:nullable]).to be(true)
+    end
+  end
+
   describe "root:" do
     let(:decl) { proc { permit_params(:create, root: :user) { required :name, :string } } }
 

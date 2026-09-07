@@ -180,6 +180,7 @@ Adopting on an existing API with live traffic? Skip ahead to [Adopting on a live
   - [Field options](#field-options)
   - [Types and strict coercion](#types-and-strict-coercion)
   - [Absence, defaults, and partial updates](#absence-defaults-and-partial-updates)
+  - [Explicit nulls](#explicit-nulls-nullable)
   - [Violations and error responses](#violations-and-error-responses)
   - [Custom error messages](#custom-error-messages-message) · [Localizing with I18n](#localizing-default-messages-i18n)
   - [Unknown parameters](#unknown-parameters)
@@ -296,6 +297,7 @@ Which options are legal depends on the field kind — anything else raises at cl
 | `required:` | — | ✅ | — | Arrays are optional unless this is `true` |
 | `desc:` | ✅ | ✅ | ✅ | Documentation only — the field's `description` in [exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) |
 | `example:` | ✅ | ✅ | — | Documentation only, but **validated against the field's own contract at class load**, like `default:` |
+| `nullable:` | ✅ | ✅ | ✅ | An explicitly-sent empty value yields `nil` instead of counting as absent — see [explicit nulls](#explicit-nulls-nullable) |
 
 ¹ `format:`, `length:`, and `normalize:` reason about characters and are **only valid on `:string` fields**. On any other type they would silently apply to an already-cast value, so declaring them raises at class load.
 
@@ -338,9 +340,38 @@ That single rule produces the behaviour you want from a `PATCH`:
 | absent and **required** | a `missing` violation |
 | absent with a **`default:`** | the default — a defaulted field can never report `missing` |
 
-Declaring `required:` alongside `default:` is a class-load error, since a default implies optionality. And because absence and `nil` are the same thing here, **clearing a column to NULL is outside a contract's vocabulary** — do that explicitly in the action.
+Declaring `required:` alongside `default:` is a class-load error, since a default implies optionality. And because absence and `nil` are the same thing here, a plain field cannot clear a column to NULL — declare it [`nullable:`](#explicit-nulls-nullable) when it should.
 
 Defaults are checked against the field's own contract when the class loads, so `default: "gold"` on a field declared `in: %w[free pro]` fails at boot rather than on every request.
+
+### Explicit nulls (`nullable:`)
+
+One rule — `nil` and `""` are absent — is right for `PATCH` and wrong for the request that means *clear this*. `nullable: true` splits it in two for a single field:
+
+```ruby
+permit_params :update, root: :user, model: User do
+  optional :nickname, :string, nullable: true
+  optional :plan,     :string, in: %w[free pro], default: "free", nullable: true
+end
+```
+
+| Request | `nickname` in the result |
+|---|---|
+| `{ "user": {} }` | **omitted** — the column is untouched |
+| `{ "user": { "nickname": null } }` | `nil` — the column is cleared |
+| `{ "user": { "nickname": "" } }` | `nil` — the form-encoded spelling of the same intent |
+
+A key the client never sent is still **absent**: `default:` applies to it and a `required` field still violates with `missing`. Only *present-but-empty* changes meaning, and it changes it decisively — an explicit null wins over the field's `default:`, which is the behaviour a `PATCH` needs (`{ "plan": null }` clears the plan instead of silently resetting it to `"free"`).
+
+Nothing is cast or checked for an explicit null. `in:`, `format:`, `length:`, `validate:`, and `transform:` all see a value or nothing at all — never a `nil` they never agreed to handle.
+
+Three more readings worth knowing:
+
+- **`required` + `nullable`** is coherent, and means what it says in SQL: the client *must* state the field, and `null` is a legal statement. A missing key still violates.
+- **`default: nil`** — legal only on a nullable field — gives the `PUT` reading, where absence *also* means clear.
+- **On arrays and nested blocks**, `nullable:` applies to the array or object itself, never to its contents. `{ "tags": null }` yields `nil` (distinct from `[]`, which still gets length-checked); a null *element* inside `tags` is still `invalid_type`.
+
+Exported [OpenAPI](#exporting-openapi-docs-that-cannot-drift) tells the truth about all of this: a nullable field's `type` gains `"null"`, and a nullable `in:` set lists `null` in its `enum`.
 
 ### Violations and error responses
 
@@ -742,6 +773,7 @@ A bad contract is a programmer error, so it fails when the class loads — never
 - `length:` that isn't a `Range` or `Integer`; `in:` that doesn't respond to `include?`
 - `validate:` or `transform:` that isn't callable
 - A `default:` or `example:` that violates its own field's contract, or an array `default:`/`example:` whose elements violate `of:`
+- A `default: nil` or `example: nil` on a field that isn't `nullable:`
 - `required: true` combined with `default:`
 - A field given both a type and a nested block; an array given both `of:` and a block
 - An empty contract, or a nested block declaring no sub-fields

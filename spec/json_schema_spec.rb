@@ -119,6 +119,47 @@ RSpec.describe Permittable::JsonSchema do
     end
   end
 
+  describe "nullable:" do
+    it "adds null to the declared type on every field kind" do
+      props = schema_for do
+        optional :s, :string, nullable: true
+        optional :d, :decimal, nullable: true
+        optional :tags, :string, nullable: true
+        optional :address, nullable: true do
+          required :city, :string
+        end
+      end["properties"]
+      expect(props["s"]["type"]).to eq(%w[string null])
+      expect(props["d"]["type"]).to eq(%w[string number null])
+      expect(props["address"]["type"]).to eq(%w[object null])
+    end
+
+    it "adds null to a nullable array's type without touching its items" do
+      schema = property("tags") { array :tags, of: :integer, nullable: true }
+      expect(schema["type"]).to eq(%w[array null])
+      expect(schema["items"]).to eq("type" => "integer")
+    end
+
+    it "lists null in an enum, which is instance-wide rather than type-scoped" do
+      schema = property("plan") { optional :plan, :string, in: %w[free pro], nullable: true }
+      expect(schema["enum"]).to eq(["free", "pro", nil])
+    end
+
+    it "leaves a numeric range's bounds alone (minimum/maximum only apply to numbers)" do
+      schema = property("age") { optional :age, :integer, in: 18..120, nullable: true }
+      expect(schema).to eq("type" => %w[integer null], "minimum" => 18, "maximum" => 120)
+    end
+
+    it "documents an authored null default" do
+      schema = property("nickname") { optional :nickname, :string, nullable: true, default: nil }
+      expect(schema).to eq("type" => %w[string null], "default" => nil)
+    end
+
+    it "keeps a non-nullable field's type a bare string" do
+      expect(property("s") { optional :s, :string }["type"]).to eq("string")
+    end
+  end
+
   describe "nested hashes and unknown:" do
     it "maps nested blocks to object schemas, propagating unknown: :error at every level" do
       schema = schema_for(unknown: :error) do
