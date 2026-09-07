@@ -100,6 +100,7 @@ RSpec.describe Permittable::Generator do
           t.datetime :locked_at
           t.string   :status, null: false, default: "draft"
           t.json     :settings
+          t.binary   :thumbnail
           t.timestamps
         end
       end
@@ -152,8 +153,12 @@ RSpec.describe Permittable::Generator do
       expect(draft).to include("required :title, :string")
     end
 
-    it "leaves a TODO comment for columns with no scalar contract type" do
-      expect(draft).to match(/# TODO: settings \(json\) has no scalar contract type/)
+    it "maps a json column onto the opaque :json contract type" do
+      expect(draft).to include("optional :settings, :json")
+    end
+
+    it "leaves a TODO comment for columns with no contract type at all" do
+      expect(draft).to match(/# TODO: thumbnail \(binary\) has no contract type/)
     end
 
     it "produces a draft that loads as a real contract and validates a request" do

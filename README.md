@@ -179,6 +179,7 @@ Adopting on an existing API with live traffic? Skip ahead to [Adopting on a live
   - [The field DSL](#the-field-dsl)
   - [Field options](#field-options)
   - [Types and strict coercion](#types-and-strict-coercion)
+  - [Free-form hashes](#free-form-hashes-json)
   - [Absence, defaults, and partial updates](#absence-defaults-and-partial-updates)
   - [Explicit nulls](#explicit-nulls-nullable)
   - [Violations and error responses](#violations-and-error-responses)
@@ -273,6 +274,9 @@ array :line_items, required: true do
   required :sku,      :string
   required :quantity, :integer, in: 1..99
 end
+
+# Free-form hashes — :json takes any hash, uncast and unfiltered, with bounds
+optional :metadata, :json, max_depth: 3, length: 0..32
 ```
 
 Arrays are **optional unless `required: true`**, and `length:` on an array constrains the element **count**.
@@ -294,6 +298,7 @@ Which options are legal depends on the field kind — anything else raises at cl
 | `sensitive:` | ✅ | ✅ | ✅ | Register the field name for [log redaction](#sensitive-parameters-and-log-redaction) |
 | `message:` | ✅ | ✅ | ✅ | Human-readable copy for violations on this field — a String, or a Hash of code → String. See [custom messages](#custom-error-messages-message) |
 | `of:` | — | ✅ | — | Element type for an array of scalars (default `:string`) |
+| `max_depth:` | — | — | — | `:json` fields only — maximum container nesting. See [free-form hashes](#free-form-hashes-json) |
 | `required:` | — | ✅ | — | Arrays are optional unless this is `true` |
 | `desc:` | ✅ | ✅ | ✅ | Documentation only — the field's `description` in [exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) |
 | `example:` | ✅ | ✅ | — | Documentation only, but **validated against the field's own contract at class load**, like `default:` |
@@ -320,6 +325,7 @@ Coercion is **deliberately strict**, and deliberately *not* `ActiveModel::Type`.
 | `:boolean` | `true`/`false`, `"true"`/`"false"`, `"1"`/`"0"`, `1`/`0` | `"yes"`, `"on"`, `2` |
 | `:date` | `Date`; a string naming a **complete** date, in any format `Date.parse` understands (`"2026-09-05"`, `"2026/09/05"`, `"Sep 5, 2026"`) | Unparseable strings, and **incomplete** ones (`"09/2026"`, `"5th"`, `"Sept"`) |
 | `:datetime` | `Time`, `DateTime`, `ActiveSupport::TimeWithZone`, `Date`; a string naming a complete date, with or without a time | Unparseable strings, and any string without a complete date (`"10:30"`) |
+| `:json` | Any `Hash` — passed through uncast, see [free-form hashes](#free-form-hashes-json) | Arrays, scalars |
 
 **Dates are parsed, never guessed.** `Date.parse` fills in what a string omits *from today* — `"09/2026"` becomes the 1st, `"5th"` becomes this month of this year — so the same request would mean different things on different days. A `:date` or `:datetime` string must therefore name all three of year, month and day; which **format** it names them in is `Date.parse`'s business, so every complete format it understands still works. A `:datetime` may omit the *time* part, which reads as midnight UTC.
 
@@ -327,6 +333,35 @@ Two more behaviours worth committing to memory:
 
 - **Type confusion is a violation, not a 500.** A request of `?age[]=1` against a scalar `:integer` field yields `invalid_type`. Arrays, hashes, and nested `ActionController::Parameters` can never satisfy a scalar type, so the classic "`NoMethodError` on `[]`" crash is impossible.
 - **Datetimes are normalised to UTC.** A zoneless string parses as UTC regardless of the host timezone, which keeps behaviour deterministic across machines; explicit offsets are honoured and converted.
+
+### Free-form hashes (`:json`)
+
+A `json`/`jsonb` column exists precisely so its contents need no schema. Every other field kind describes a shape, so until `:json` a contract had only bad options for one: declare sub-keys you don't know, or leave the key undeclared — in which case the contract **silently dropped it**, and the column never saw the data. Strong parameters has always had an answer here (`params.permit(metadata: {})`); now so does a contract.
+
+```ruby
+permit_params :create, root: :user, model: User do
+  required :name,     :string
+  optional :metadata, :json, max_depth: 3, length: 0..32
+end
+```
+
+The hash passes through **untouched** — keys are neither filtered nor cast, nested arrays and mixed scalars survive, and `unknown:` does not descend into it. `{}` is a value, not an absence. Anything that is not a hash (an array, a string, a number) is `invalid_type`.
+
+What you give up is the shape. What you keep:
+
+| | |
+|---|---|
+| `length:` | Caps the **top-level key count** — same reading as an array's element count |
+| `max_depth:` | Caps **container nesting**, counting arrays as a level: `{"a": 1}` is 1, `{"a": {"b": 1}}` and `{"a": [1, 2]}` are 2, `{"a": [{"b": 1}]}` is 3. Violation code `depth` |
+| `validate:` / `transform:` | See the whole hash, so any check you can write in Ruby still applies |
+| `model:` | The field maps onto a column like a scalar does, so the [drift guard](#the-schema-drift-guard) still catches a dropped `metadata` column |
+| `sensitive:` / `nullable:` / `message:` / `desc:` / `default:` / `example:` | Behave as on any other field (`default:`/`example:` must be a hash, and are checked against the field's own bounds at class load) |
+
+Bounding it matters more than it looks: an unbounded `jsonb` column is where clients put megabytes and 200-level-deep objects. `max_depth:` and `length:` are how a contract says "opaque, but not unlimited" — which is strictly more than `permit(metadata: {})` can say.
+
+Values arrive as plain data (`HashWithIndifferentAccess`), never `ActionController::Parameters`, so assigning straight to a `jsonb` attribute is safe.
+
+In [exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) the field is `{"type": "object"}` plus `minProperties`/`maxProperties`; JSON Schema has no nesting-depth keyword, so `max_depth:` stays visible as `x-permittable-max-depth` rather than being dropped or mistranslated.
 
 ### Absence, defaults, and partial updates
 
@@ -774,6 +809,8 @@ A bad contract is a programmer error, so it fails when the class loads — never
 - `validate:` or `transform:` that isn't callable
 - A `default:` or `example:` that violates its own field's contract, or an array `default:`/`example:` whose elements violate `of:`
 - A `default: nil` or `example: nil` on a field that isn't `nullable:`
+- A `:json` field's `default:`/`example:` that isn't a Hash, or that its own `length:`/`max_depth:` would reject
+- A `max_depth:` that isn't a positive Integer
 - `required: true` combined with `default:`
 - A field given both a type and a nested block; an array given both `of:` and a block
 - An empty contract, or a nested block declaring no sub-fields

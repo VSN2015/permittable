@@ -160,6 +160,37 @@ RSpec.describe Permittable::JsonSchema do
     end
   end
 
+  describe ":json fields" do
+    it "documents an opaque object, carrying the bounds it declares" do
+      schema = property("metadata") { optional :metadata, :json, length: 0..8, max_depth: 3 }
+      expect(schema).to eq("type" => "object", "minProperties" => 0, "maxProperties" => 8,
+                           "x-permittable-max-depth" => 3)
+    end
+
+    it "says nothing about the shape when no bounds are declared" do
+      expect(property("metadata") { optional :metadata, :json }).to eq("type" => "object")
+    end
+
+    it "annotates it like any other field" do
+      schema = property("metadata") do
+        optional :metadata, :json, desc: "Opaque client state", sensitive: true,
+                                   default: { "seeded" => true }, example: { "k" => "v" }
+      end
+      expect(schema).to include("type" => "object", "description" => "Opaque client state",
+                                "writeOnly" => true, "x-permittable-sensitive" => true,
+                                "default" => { "seeded" => true }, "examples" => [{ "k" => "v" }])
+    end
+
+    it "adds null to a nullable opaque object" do
+      expect(property("metadata") { optional :metadata, :json, nullable: true }["type"]).to eq(%w[object null])
+    end
+
+    it "re-encodes non-JSON scalars inside an authored hash" do
+      schema = property("metadata") { optional :metadata, :json, default: { "on" => Date.new(2026, 9, 4) } }
+      expect(schema["default"]).to eq("on" => "2026-09-04")
+    end
+  end
+
   describe "nested hashes and unknown:" do
     it "maps nested blocks to object schemas, propagating unknown: :error at every level" do
       schema = schema_for(unknown: :error) do
