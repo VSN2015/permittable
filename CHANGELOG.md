@@ -10,6 +10,17 @@
 
 Contracts that don't opt in are byte-for-byte unaffected: absence keeps its single meaning and nothing new appears in an exported schema.
 
+## 0.5.2 (2026-09-06)
+<!-- title: Railtie coverage and a new README -->
+
+Patch release with no behaviour changes: the boot-time integration gets its first real spec, and the README was rewritten from the ground up.
+
+### Added
+- **`spec/railtie_spec.rb` — the boot-time integration is now covered.** Everything `Permittable::Railtie` does happens during a Rails boot, and none of it had a spec: the `filter_parameters` wiring, its reach into ActiveRecord, or the rake tasks. Unit specs cannot see any of it, and the `FakeController` harness deliberately has no Rails at all. The new spec boots a **real Rails application in a subprocess** — the same approach the "without Rails loaded" specs use, and for the same reason: a boot mutates global state (`Rails.application` is a singleton, initializers run once) and must not leak into the rest of the suite. It asserts that exactly one filter proc is appended without disturbing the app's own entries, that a `sensitive:` field declared by a controller loaded **after** boot is redacted (the whole reason for a live registry rather than appended symbols), that the proc reaches `ActiveRecord::Base.filter_attributes` so a model's `#inspect` redacts too, and that both rake tasks load. `railties` joins the dev bundle for it, and the spec skips rather than fails where railties is absent, so a host without Rails — and the compatibility gemfiles that omit it — are unaffected.
+
+### Changed
+- **README rewritten as a navigable overview.** A badges-and-nav header, a table of contents, and sections grouped into Guide, Adopting on a live API, Beyond the controller, and Reference; a motivating before/after example; a diagram of how one contract feeds validation, the drift guard, OpenAPI export, and the RSpec matchers; and the long enumerations (class-load errors, the schema mapping table) folded into `<details>` blocks. Documentation only.
+
 ## 0.5.1 (2026-09-02)
 <!-- title: nested input outside Rails -->
 

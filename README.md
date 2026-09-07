@@ -1,14 +1,30 @@
-# Permittable
+<h1 align="center">Permittable</h1>
 
-[![Gem Version](https://img.shields.io/gem/v/permittable.svg)](https://rubygems.org/gems/permittable)
-[![CI](https://github.com/VSN2015/permittable/actions/workflows/ci.yml/badge.svg)](https://github.com/VSN2015/permittable/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.txt)
+<p align="center"><strong>Strong parameters for Rails that also know types, bounds, and defaults.</strong></p>
 
-**Strong parameters for Rails that also know types, bounds, and defaults.**
+<p align="center">
+  <a href="https://rubygems.org/gems/permittable"><img src="https://img.shields.io/gem/v/permittable.svg" alt="Gem Version"></a>
+  <a href="https://github.com/VSN2015/permittable/actions/workflows/ci.yml"><img src="https://github.com/VSN2015/permittable/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://www.ruby-lang.org/"><img src="https://img.shields.io/badge/ruby-%E2%89%A5%203.2-CC342D.svg" alt="Ruby >= 3.2"></a>
+  <a href="https://rubyonrails.org/"><img src="https://img.shields.io/badge/rails-5.0%20%E2%80%93%208.x-D30001.svg" alt="Rails 5.0 - 8.x"></a>
+  <a href="LICENSE.txt"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#guide">Guide</a> ·
+  <a href="#adopting-on-a-live-api">Adopting on a live API</a> ·
+  <a href="#beyond-the-controller">Beyond the controller</a> ·
+  <a href="#reference">Reference</a> ·
+  <a href="docs/comparison.md">Comparison</a> ·
+  <a href="CHANGELOG.md">Changelog</a>
+</p>
+
+---
 
 `params.permit` answers exactly one question: *which keys may pass?* Everything else — is `age` really a number, is `email` shaped like an email, what should `plan` be when the client omits it, and *why* was this request rejected — is left to you, usually as hand-written checks scattered through the action.
 
-A Permittable contract answers those questions too. It **casts** each field to a declared type, **validates** it, applies **defaults**, optionally **reshapes** the output, and turns every failure into a machine-readable 422 that names the offending parameter.
+A Permittable **contract** answers those questions too. Declared once on the controller class, it **casts** each field to a declared type, **validates** it, applies **defaults**, optionally **reshapes** the output, and turns every failure into a machine-readable 422 that names the offending parameter.
 
 And because a contract is *class-level data* rather than code inside the action, it can be inspected — and checked against your database when the controller loads, so a column dropped by a migration fails the deploy instead of the request.
 
@@ -44,27 +60,33 @@ A violating request never reaches your action:
              "details": [{ "param": "user.age", "code": "inclusion" }] } }
 ```
 
----
-
-## Contents
-
-- [Why](#why) · [Installation](#installation) · [How a request flows](#how-a-request-flows)
-- [Declaring a contract](#declaring-a-contract) · [The field DSL](#the-field-dsl) · [Field options](#field-options)
-- [Free-form hashes](#free-form-hashes-json)
-- [Types and strict coercion](#types-and-strict-coercion) · [Absence, defaults, and partial updates](#absence-defaults-and-partial-updates) · [Explicit nulls](#explicit-nulls-nullable)
-- [Violations and error responses](#violations-and-error-responses) · [Custom error messages](#custom-error-messages-message) · [Unknown parameters](#unknown-parameters)
-- [Output reshaping](#output-reshaping-transform-and-finalize) · [The schema-drift guard](#the-schema-drift-guard)
-- [Sensitive parameters](#sensitive-parameters-and-log-redaction) · [Instrumentation](#instrumentation)
-- [Monitor mode](#monitor-mode-roll-out-without-rejecting) · [Generating draft contracts](#generating-draft-contracts-permittablegenerate) · [Testing contracts](#testing-contracts-rspec-matchers)
-- [Standalone contracts](#standalone-contracts-no-controller) · [Exporting OpenAPI](#exporting-openapi-docs-that-cannot-drift)
-- [API reference](#api-reference) · [Errors caught at class load](#errors-caught-at-class-load) · [Compatibility](#compatibility)
-
----
-
 ## Why
 
+Here is what the contract above replaces. Every Rails codebase has a version of this, and no two of them agree on the error shape:
+
+```ruby
+def create
+  attrs = params.require(:user).permit(:name, :email, :age, :plan)
+
+  if attrs[:age].present?
+    age = Integer(attrs[:age], exception: false)
+    return render(json: { error: "age must be a number" }, status: 422) if age.nil?
+    return render(json: { error: "age must be 18..120" },  status: 422) unless (18..120).cover?(age)
+    attrs[:age] = age
+  end
+  unless attrs[:email].to_s.match?(URI::MailTo::EMAIL_REGEXP)
+    return render(json: { error: "email is invalid" }, status: 422)
+  end
+  attrs[:plan] = "free" if attrs[:plan].blank?
+
+  User.create!(attrs)
+end
+```
+
+A contract moves all of it out of the action and into data that the rest of your toolchain can read:
+
 | | `params.permit` | `params.expect` (Rails 8) | Permittable |
-|---|---|---|---|
+|---|:---:|:---:|:---:|
 | Filters unknown keys | ✅ | ✅ | ✅ |
 | Requires a root key | via `require` | ✅ | ✅ |
 | Casts to a declared type | ❌ | ❌ | ✅ |
@@ -76,18 +98,50 @@ A violating request never reaches your action:
 | Exports OpenAPI / JSON Schema | ❌ | ❌ | ✅ |
 | Report-only rollout mode | ❌ | ❌ | ✅ |
 | Drafts contracts from your schema | ❌ | ❌ | ✅ |
+| Works outside controllers | ❌ | ❌ | ✅ |
 
-The design rests on one idea: **a contract is data, not code.** It is declared once at the class level, frozen, inheritable, and introspectable. Everything else here follows from that — the drift guard can read it at boot, `finalize` can run on a bare object with no controller state, and the whole contract can be printed or tested without a request.
+Every option in this space is good software, and Permittable is not always the right one. A longer, honest comparison — `params.expect`, rails_param, dry-validation, typed_params, rswag, the cases where each is the better choice, benchmarks, and migration costs — lives in [docs/comparison.md](docs/comparison.md).
 
-A longer, honest comparison — `params.expect`, rails_param, dry-validation, typed_params, rswag, with the cases where each of them is the better choice, plus benchmarks and migration costs — lives in [docs/comparison.md](docs/comparison.md).
+## One idea: a contract is data
 
-## Installation
+Everything in this gem follows from a single decision. A contract is **declared once at the class level, frozen, inheritable, and introspectable**. It is not code that runs inside your action. That makes it readable by more than the validator:
+
+```
+                  ┌────────────────────────────────────────────────────┐
+                  │  permit_params :create, root: :user, model: User   │
+                  │    required :email, :string, format: EMAIL_REGEXP  │
+                  │    optional :age,   :integer, in: 18..120          │
+                  │  end                                               │
+                  └──────────────────────────┬─────────────────────────┘
+                             one frozen, class-level contract
+                                             │
+         ┌─────────────────┬─────────────────┼─────────────────┬─────────────────┐
+         ▼                 ▼                 ▼                 ▼                 ▼
+   Validator         Drift guard       OpenAPI           RSpec matchers    Contract
+   casts, checks,    compares fields   3.1 export from   assert on the     the same DSL on
+   defaults; a 422   to DB columns     the same data     rule itself, no   any Hash, no
+   names the         at class load;    the server        request needed    controller
+   parameter         fails the deploy  enforces                            required
+```
+
+The principles that fall out of it:
+
+- **Strict, never lenient.** `"abc"` is never `0`. A value the type cannot faithfully represent is a violation, not a guess.
+- **`nil` and `""` are absent.** Absent optionals are omitted from the result, so partial updates never nil-out columns.
+- **Mistakes fail at class load.** A malformed contract, a default that violates its own field, or a column that no longer exists fails the boot, never the request.
+- **The request's `params` is never mutated.** Reshaping happens on the validated copy.
+- **Exports never guess.** Anything JSON Schema cannot represent stays visible as an `x-permittable-*` extension instead of being mistranslated.
+- **One dependency.** `activesupport` is the only runtime requirement. Rails, ActionPack, and ActiveRecord are optional integration points.
+
+## Quick start
+
+**1. Add the gem**
 
 ```ruby
 gem "permittable"
 ```
 
-Then include it wherever you need it — typically once in `ApplicationController`:
+**2. Include it once**
 
 ```ruby
 class ApplicationController < ActionController::Base
@@ -95,28 +149,79 @@ class ApplicationController < ActionController::Base
 end
 ```
 
-The **only runtime dependency is `activesupport`**. `actionpack` (for `rescue_from`, `before_action`, and `ActionController::Parameters`) and `activerecord` (for the `model:` schema-drift guard) are optional — every touchpoint is guarded with `respond_to?`/`defined?`, so your app brings whatever it already has. The concern works on a plain Ruby object that responds to `params`, which is what makes it straightforward to unit-test.
+**3. Declare a contract and read `permitted_params`**
+
+```ruby
+class OrdersController < ApplicationController
+  permit_params :create, root: :order, model: Order do
+    required :sku,      :string
+    optional :quantity, :integer, in: 1..99, default: 1
+    optional :notes,    :string,  length: 0..500
+  end
+
+  def create
+    Order.create!(permitted_params)
+  end
+end
+```
+
+That is the whole integration. Violations render the 422 envelope automatically, `model: Order` verifies the fields against the `orders` table when the class loads, and every rejected request emits an `invalid_parameters.permittable` notification.
+
+Adopting on an existing API with live traffic? Skip ahead to [Adopting on a live API](#adopting-on-a-live-api): the gem can draft the contracts for you, and run them in a report-only mode until you are ready to enforce.
 
 > **Naming note:** some legacy stacks (InheritedResources) define their own `permitted_params`. Don't include both on one controller.
 
-## How a request flows
+## Contents
+
+- **[Guide](#guide)**
+  - [How a request flows](#how-a-request-flows)
+  - [Declaring a contract](#declaring-a-contract)
+  - [The field DSL](#the-field-dsl)
+  - [Field options](#field-options)
+  - [Types and strict coercion](#types-and-strict-coercion)
+  - [Free-form hashes](#free-form-hashes-json)
+  - [Absence, defaults, and partial updates](#absence-defaults-and-partial-updates)
+  - [Explicit nulls](#explicit-nulls-nullable)
+  - [Violations and error responses](#violations-and-error-responses)
+  - [Custom error messages](#custom-error-messages-message) · [Localizing with I18n](#localizing-default-messages-i18n)
+  - [Unknown parameters](#unknown-parameters)
+  - [Output reshaping](#output-reshaping-transform-and-finalize)
+  - [The schema-drift guard](#the-schema-drift-guard)
+  - [Sensitive parameters and log redaction](#sensitive-parameters-and-log-redaction)
+  - [Instrumentation](#instrumentation)
+- **[Adopting on a live API](#adopting-on-a-live-api)**
+  - [Monitor mode](#monitor-mode-roll-out-without-rejecting)
+  - [Generating draft contracts](#generating-draft-contracts-permittablegenerate)
+- **[Beyond the controller](#beyond-the-controller)**
+  - [Testing contracts](#testing-contracts-rspec-matchers)
+  - [Standalone contracts](#standalone-contracts-no-controller)
+  - [Exporting OpenAPI](#exporting-openapi-docs-that-cannot-drift)
+- **[Reference](#reference)**
+  - [API](#api) · [Errors caught at class load](#errors-caught-at-class-load) · [Compatibility](#compatibility)
+- [Development](#development) · [License](#license)
+
+---
+
+## Guide
+
+### How a request flows
 
 ```
-params
-  │
-  ├─ 1. unwrap root:          params[:user]        → 400 if missing or not a hash
-  ├─ 2. per field:  normalize → cast → validate → transform
-  ├─ 3. unknown-key check     at every nesting level
-  ├─ 4. finalize              only if nothing violated
-  │
-  └─ permitted_params → HashWithIndifferentAccess     (or raises InvalidParameters)
+request params
+   │
+   ├─ 1  unwrap root:        params[:user]                missing or not a hash → 400
+   ├─ 2  each field          normalize → cast → validate → transform
+   ├─ 3  unknown-key check   at every nesting level       (unknown: :ignore | :log | :error)
+   ├─ 4  finalize            only when nothing violated
+   │
+   └─ permitted_params  →  HashWithIndifferentAccess      or raises InvalidParameters → 422
 ```
 
 Validation is **lazy by default**: it runs on the first `permitted_params` call, so an action that never reads params never pays for it. Pass `enforce: true` to run it in a `before_action` instead, rejecting bad requests before the action body executes. Results are **memoized per action**.
 
 In [monitor mode](#monitor-mode-roll-out-without-rejecting) the same flow runs, but a violation is reported instead of raised and the request proceeds with the raw params passed through.
 
-## Declaring a contract
+### Declaring a contract
 
 ```ruby
 permit_params(*actions, root: false, model: nil, unknown: :ignore, enforce: false, mode: nil, desc: nil, &contract)
@@ -148,47 +253,35 @@ end
 
 Rules accumulate by **reassignment, never mutation**, so subclasses inherit copy-on-write and can never corrupt a parent's contract.
 
-## The field DSL
+### The field DSL
 
-### Scalars
+Three verbs. `required` and `optional` declare scalars (or, with a block, nested hashes); `array` declares a list.
 
 ```ruby
-required :name, :string          # type defaults to :string
+# Scalars — the type defaults to :string
+required :name, :string
 optional :age,  :integer
-```
 
-### Nested hashes
-
-Pass a block instead of a type. Violation paths are dotted (`user.address.zip`).
-
-```ruby
+# Nested hashes — pass a block instead of a type. Violation paths are dotted: user.address.zip
 optional :address do
   required :city, :string
   optional :zip,  :string, format: /\A\d{5}\z/
 end
-```
 
-### Arrays
-
-`of:` declares an array of scalars; a block declares an array of hashes. Arrays are **optional unless `required: true`**, `length:` constrains the element **count**, and element failures carry their index (`items[1]`).
-
-```ruby
-array :tag_names, of: :string, length: 0..10
+# Arrays — of: for scalars, a block for hashes. Element failures carry their index: items[1].sku
+array :tag_names,  of: :string, length: 0..10
 array :line_items, required: true do
   required :sku,      :string
   required :quantity, :integer, in: 1..99
 end
-```
 
-### Free-form hashes
-
-`:json` declares a hash whose shape is deliberately **undeclared** — the `jsonb` column case. See [free-form hashes](#free-form-hashes-json).
-
-```ruby
+# Free-form hashes — :json takes any hash, uncast and unfiltered, with bounds
 optional :metadata, :json, max_depth: 3, length: 0..32
 ```
 
-## Field options
+Arrays are **optional unless `required: true`**, and `length:` on an array constrains the element **count**.
+
+### Field options
 
 Which options are legal depends on the field kind — anything else raises at class load.
 
@@ -219,7 +312,7 @@ Which options are legal depends on the field kind — anything else raises at cl
 optional :slug, :string, validate: ->(v) { v.match?(/\A[a-z0-9-]+\z/) || :malformed_slug }
 ```
 
-## Types and strict coercion
+### Types and strict coercion
 
 Coercion is **deliberately strict**, and deliberately *not* `ActiveModel::Type`. Rails' casts are lenient by design — `"abc".to_i` is `0`, `Boolean.cast("abc")` is `true` — and silently corrupting untrusted input is precisely what a contract must not do. A value the type cannot faithfully represent is a **violation, not a guess**.
 
@@ -239,7 +332,7 @@ Two behaviours worth committing to memory:
 - **Type confusion is a violation, not a 500.** A request of `?age[]=1` against a scalar `:integer` field yields `invalid_type`. Arrays, hashes, and nested `ActionController::Parameters` can never satisfy a scalar type, so the classic "`NoMethodError` on `[]`" crash is impossible.
 - **Datetimes are normalised to UTC.** A zoneless string parses as UTC regardless of the host timezone, which keeps behaviour deterministic across machines; explicit offsets are honoured and converted.
 
-## Free-form hashes (`:json`)
+### Free-form hashes (`:json`)
 
 A `json`/`jsonb` column exists precisely so its contents need no schema. Every other field kind describes a shape, so until `:json` a contract had only bad options for one: declare sub-keys you don't know, or leave the key undeclared — in which case the contract **silently dropped it**, and the column never saw the data. Strong parameters has always had an answer here (`params.permit(metadata: {})`); now so does a contract.
 
@@ -268,21 +361,23 @@ Values arrive as plain data (`HashWithIndifferentAccess`), never `ActionControll
 
 In [exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) the field is `{"type": "object"}` plus `minProperties`/`maxProperties`; JSON Schema has no nesting-depth keyword, so `max_depth:` stays visible as `x-permittable-max-depth` rather than being dropped or mistranslated.
 
-## Absence, defaults, and partial updates
+### Absence, defaults, and partial updates
 
 `nil` and `""` are **both treated as absent** — the query-parameter convention, where an untouched form field arrives as an empty string. Boolean `false` is present.
 
 That single rule produces the behaviour you want from a `PATCH`:
 
-- An **absent optional field is omitted** from the result, so partial updates never nil-out columns.
-- An **absent required field violates** with `missing`.
-- An absent field **with a `default:` gets the default** — so a defaulted field can never report `missing`. (Declaring `required:` alongside `default:` is a class-load error, since a default implies optionality.)
+| The field is… | Result |
+|---|---|
+| absent and **optional** | omitted from the result, so partial updates never nil-out columns |
+| absent and **required** | a `missing` violation |
+| absent with a **`default:`** | the default — a defaulted field can never report `missing` |
 
-Because absence and `nil` are the same thing here, a plain field cannot clear a column to NULL. Declare it [`nullable:`](#explicit-nulls-nullable) when it should.
+Declaring `required:` alongside `default:` is a class-load error, since a default implies optionality. And because absence and `nil` are the same thing here, a plain field cannot clear a column to NULL — declare it [`nullable:`](#explicit-nulls-nullable) when it should.
 
 Defaults are checked against the field's own contract when the class loads, so `default: "gold"` on a field declared `in: %w[free pro]` fails at boot rather than on every request.
 
-## Explicit nulls (`nullable:`)
+### Explicit nulls (`nullable:`)
 
 One rule — `nil` and `""` are absent — is right for `PATCH` and wrong for the request that means *clear this*. `nullable: true` splits it in two for a single field:
 
@@ -311,9 +406,9 @@ Three more readings worth knowing:
 
 Exported [OpenAPI](#exporting-openapi-docs-that-cannot-drift) tells the truth about all of this: a nullable field's `type` gains `"null"`, and a nullable `in:` set lists `null` in its `enum`.
 
-## Violations and error responses
+### Violations and error responses
 
-Every failure raises `Permittable::InvalidParameters`, carrying `details` (an array of `{ param:, code: }`, plus a `message:` when the field [declares one](#custom-error-messages-message)) and a `status`. On a real controller it is auto-rescued into the error envelope.
+Every failure raises `Permittable::InvalidParameters`, carrying `details` (an array of `{ param:, code: }`, plus a `message:` when the field [declares one](#custom-error-messages-message)) and a `status`. On a real controller it is auto-rescued into the error envelope shown at the [top of this README](#permittable).
 
 | Code | Raised when |
 |---|---|
@@ -328,11 +423,11 @@ Every failure raises `Permittable::InvalidParameters`, carrying `details` (an ar
 
 Paths are fully qualified: `user.address.zip`, `line_items[1].sku`.
 
-**Status codes:** a missing root key renders **400** (the request is malformed — the envelope you asked for isn't there); field-level violations render **422** (well-formed, semantically wrong).
+**Status codes.** A missing root key renders **400** — the request is malformed; the envelope you asked for isn't there. Field-level violations render **422** — well-formed, semantically wrong.
 
-**Custom rendering:** if your controller defines `render_error`, the envelope delegates to it as `render_error(message:, code:, status:, errors:)` — the `errors:` key is passed only when details exist, so hosts documenting a three-keyword contract keep working. Otherwise the inline JSON shape shown at the top of this README is rendered. Either way, `render_invalid_parameters` is a normal method you can override.
+**Custom rendering.** If your controller defines `render_error`, the envelope delegates to it as `render_error(message:, code:, status:, errors:)` — the `errors:` key is passed only when details exist, so hosts documenting a three-keyword contract keep working. Otherwise the inline JSON shape is rendered. Either way, `render_invalid_parameters` is a normal method you can override. For full control over the body (RFC 9457, a different envelope), `error.details` gives you the structured violations to build from.
 
-## Custom error messages (`message:`)
+### Custom error messages (`message:`)
 
 Violations stay machine-first — the `code` is the contract — but any field can attach human-readable copy with `message:`. A **String** covers every code on the field; a **Hash of code → String** targets specific codes, and codes without an entry keep the default rendering:
 
@@ -363,7 +458,7 @@ The rules:
 - `violate!` in `finalize` takes the same idea as a keyword: `violate!("user.ends_at", :before_start, message: "must be after starts_at")`.
 - A `message:` that is neither a String nor a code → String Hash raises at class load, like every other contract mistake.
 
-### Localizing default messages (I18n)
+#### Localizing default messages (I18n)
 
 App-wide copy for a violation code — without repeating `message:` on every field — comes from I18n, under `permittable.errors.<code>`:
 
@@ -380,9 +475,7 @@ en:
 
 Resolution order per violation: the field's own `message:` (String, or the Hash entry for that code) → the app's `permittable.errors.<code>` translation → the bare `{ param:, code: }` shape. The lookup also covers a missing `root:`, `unknown` keys, Symbol codes returned by `validate:` (`permittable.errors.must_be_even`), and `violate!` codes in `finalize` (an explicit `violate!(..., message:)` still wins). Only a String translation counts — a missing key or a nested Hash falls back to the bare shape rather than leaking structure to clients. No I18n, no change: apps without the gem or the keys behave exactly as before.
 
-For full control over the response body itself (RFC 9457, a different envelope), override `render_invalid_parameters` or define `render_error` as described above; `error.details` gives you the structured violations to build from.
-
-## Unknown parameters
+### Unknown parameters
 
 `unknown:` decides what happens to keys you never declared, **at every nesting level**.
 
@@ -394,13 +487,11 @@ For full control over the response body itself (RFC 9457, a different envelope),
 
 Rails merges `controller`, `action`, and `format` into `params`; these are exempt at the top level so `unknown: :error` doesn't flag the router's own bookkeeping. Inside a `root:` or a nested hash there is no such exemption, because nothing legitimately injects keys there.
 
-## Output reshaping (`transform:` and `finalize`)
+### Output reshaping (`transform:` and `finalize`)
 
 This is the safe replacement for params-mutating `before_action`s. **Both layers operate on the validated copy — the request's `params` is never touched.**
 
-### `transform:` — per field
-
-A callable applied **after** cast and validation, reshaping one field's output:
+**`transform:` — per field.** A callable applied **after** cast and validation, reshaping one field's output:
 
 ```ruby
 required :tags, :string, transform: ->(v) { v.split(",") }
@@ -408,11 +499,9 @@ required :tags, :string, transform: ->(v) { v.split(",") }
 
 It runs only on request-supplied values. Absent fields stay absent, `default:` values are authored in their final shape, and a **partially-invalid array is never transformed** — user code is never handed garbage it didn't agree to see.
 
-### `finalize` — per contract
+**`finalize` — per contract.** Declared once, at the top level only. It runs after every field has validated cleanly, receives the result hash, and must return the final `Hash`. Use it to combine parallel fields, build value objects, or drop scaffolding keys.
 
-Declared once, at the top level only. It runs after every field has validated cleanly, receives the result hash, and must return the final `Hash`. Use it to combine parallel fields, build value objects, or drop scaffolding keys.
-
-It executes on a **bare runner, not the controller**, so contracts stay pure data plus pure functions and can never grow a dependency on request state. Its one extra verb is `violate!(param, code, message: nil)`, which records a violation (the optional [`message:`](#custom-error-messages-message) rides into the detail) and **halts the block immediately** — so the code after a `violate!` may assume the invariant it just checked. That makes `finalize` the natural home for cross-field validation (`ends_at` after `starts_at`, matching array lengths).
+It executes on a **bare runner, not the controller**, so contracts stay pure data plus pure functions and can never grow a dependency on request state. Its one extra verb is `violate!(param, code, message: nil)`, which records a violation and **halts the block immediately** — so the code after a `violate!` may assume the invariant it just checked. That makes `finalize` the natural home for cross-field validation (`ends_at` after `starts_at`, matching array lengths).
 
 ```ruby
 permit_params :create, root: :lease_addendum_form do
@@ -434,7 +523,7 @@ end
 
 Forgetting to return the hash raises an `ArgumentError` telling you exactly that.
 
-## The schema-drift guard
+### The schema-drift guard
 
 This is why `model:` exists. Pass a model class (or `true` to infer it from `controller_name`) and **every non-virtual scalar field is checked against the model's columns when the macro runs** — that is, at controller class load.
 
@@ -454,7 +543,7 @@ The error carries a ready-to-paste migration command, typed from your own field 
 
 In CI, one spec calling `Rails.application.eager_load!` exercises every contract in the whole app.
 
-## Sensitive parameters and log redaction
+### Sensitive parameters and log redaction
 
 Mark a field `sensitive: true` and its name is registered with `Permittable.filter_parameter_registry`; `Permittable::Railtie` appends a filter proc to `config.filter_parameters` at boot.
 
@@ -466,7 +555,7 @@ The indirection is deliberate. Appending plain symbols to `config.filter_paramet
 
 Matching mirrors Rails' own symbol-filter semantics: case-insensitive substring match on the parameter key. The registry is fully duck-typed (`#add`, `#include?`, `#to_proc`, `#reset!`) and swappable via `Permittable.filter_parameter_registry=`, so a host gem can pool registrations into its own.
 
-## Instrumentation
+### Instrumentation
 
 Every violation emits an `ActiveSupport::Notifications` event, so rejected requests can be dashboarded and alerted on:
 
@@ -474,13 +563,29 @@ Every violation emits an `ActiveSupport::Notifications` event, so rejected reque
 ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
   payload[:controller]  # "users"
   payload[:action]      # "create"
+  payload[:mode]        # :enforce, or :monitor for a would-be rejection
   payload[:details]     # [{ param: "user.age", code: "inclusion" }]
 end
 ```
 
-## Monitor mode (roll out without rejecting)
+---
 
-Adopting contracts on a live API — or tightening one field on an existing contract — has a chicken-and-egg problem: you cannot know what the 422s would break until you enforce them, and you dare not enforce them until you know. Old mobile app versions, third-party integrations, and forgotten cron jobs all send what they send. `mode: :monitor` resolves it: the full pipeline runs (unwrap, cast, validate, defaults), but a violation is **reported instead of rejected** and the request proceeds exactly as it did before the contract existed.
+## Adopting on a live API
+
+Adding contracts to an API with real traffic has a chicken-and-egg problem: you cannot know what the 422s would break until you enforce them, and you dare not enforce them until you know. Old mobile app versions, third-party integrations, and forgotten cron jobs all send what they send.
+
+Permittable's answer is an afternoon-sized recipe:
+
+1. **Draft.** `bin/rails permittable:generate` writes a first contract for every controller from the model's columns and the `params.permit` calls already in the source. Action code stays as-is.
+2. **Monitor.** Deploy with `PERMITTABLE_MODE=monitor`. Behaviour is unchanged; every would-be rejection is logged and instrumented.
+3. **Watch.** Point your existing notification subscriber at a dashboard. Every entry is a real client that would have been rejected — fix the contract, or wait for that traffic to drain.
+4. **Enforce.** Flip to enforce, controller by controller. Every 422 you now return is one you already counted.
+
+The two halves of that recipe are below.
+
+### Monitor mode (roll out without rejecting)
+
+`mode: :monitor` runs the full pipeline — unwrap, cast, validate, defaults — but a violation is **reported instead of rejected** and the request proceeds exactly as it did before the contract existed.
 
 ```ruby
 class OrdersController < ApplicationController
@@ -504,24 +609,17 @@ Permittable.mode = ENV.fetch("PERMITTABLE_MODE", "enforce").to_sym
 On a violating request in monitor mode:
 
 - **Nothing raises and nothing renders** — the action runs.
-- The [`invalid_parameters.permittable` event](#instrumentation) fires with `mode: :monitor` in the payload (enforced violations carry `mode: :enforce`), and the logger warns with the offending paths. Point your existing subscriber at a dashboard and you have a per-controller rollout report.
-- `permitted_params` returns the **raw pass-through**: exactly what the client sent, untouched — no casts, no defaults, no transforms. A missing `root:` passes an empty hash (the envelope you asked for isn't there); a rootless contract drops only Rails' routing keys.
+- The [`invalid_parameters.permittable` event](#instrumentation) fires with `mode: :monitor` in the payload (enforced violations carry `mode: :enforce`), and the logger warns with the offending paths.
+- `permitted_params` returns the **raw pass-through**: exactly what the client sent, untouched — no casts, no defaults, no transforms. A missing `root:` passes an empty hash; a rootless contract drops only Rails' routing keys.
 - `permittable_violations` returns the recorded details (`[]` when the request was clean), if the action wants to branch on or tag the traffic.
 
 Monitor-mode rules validate **eagerly in the `before_action`, regardless of `enforce:`** — telemetry must not depend on the action calling `permitted_params`, since legacy actions still reading `params` directly are exactly the ones worth monitoring. (On a plain-Ruby host without `before_action`, validation stays lazy.)
 
-The rollout recipe:
-
-1. Write contracts for a legacy controller — or let [`permittable:generate`](#generating-draft-contracts-permittablegenerate) draft them. The action code stays as-is.
-2. Deploy with `PERMITTABLE_MODE=monitor`. Behaviour is unchanged; telemetry starts.
-3. Watch the dashboard. Every entry is a real client that would have been rejected — fix the contract, or wait for that traffic to drain.
-4. Flip to enforce, controller by controller. Every 422 you now return is one you already counted.
-
 [Exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) marks operations whose rule declares `mode: :monitor` with `x-permittable-mode: "monitor"` — the docs shouldn't promise a 422 the server doesn't yet send. Only the per-rule declaration is exported: the global `Permittable.mode` is runtime configuration, not contract data.
 
-## Generating draft contracts (`permittable:generate`)
+### Generating draft contracts (`permittable:generate`)
 
-The blank-page problem, solved: the first draft of every contract can be generated from what the app already knows — the model's columns, and the `params.permit` calls already sitting in the controller.
+The blank-page problem, solved: the first draft of every contract is generated from what the app already knows.
 
 ```sh
 bin/rails permittable:generate                      # every controller without a contract
@@ -551,11 +649,15 @@ The generator's one rule is **draft, don't guess** — everything it cannot know
 
 No Rails required for the core: `Permittable::Generator.draft(model: User)`, `.for_controller(controller, source: File.read(path))`, and `.scan(source)` are plain Ruby.
 
-Together with [monitor mode](#monitor-mode-roll-out-without-rejecting) this makes the whole adoption path one afternoon: generate drafts, paste, deploy monitoring, watch the dashboard, flip to enforce.
+---
 
-## Testing contracts (RSpec matchers)
+## Beyond the controller
 
-Because a contract is data, it can be specified without dispatching a request. `require "permittable/rspec"` (in `spec_helper.rb`) auto-includes the matchers:
+Because a contract is data, it has readers other than the request validator.
+
+### Testing contracts (RSpec matchers)
+
+A contract can be specified without dispatching a request. `require "permittable/rspec"` (in `spec_helper.rb`) auto-includes the matchers:
 
 ```ruby
 RSpec.describe UsersController do
@@ -575,7 +677,7 @@ Chains: `for_action`, `as`, `as_array(of:)`, `required` / `optional`, `within` (
 
 `for_action` picks the rule exactly like a request would (`permit_rule_for`), and may be omitted only when the controller declares a single contract — an ambiguous expectation raises instead of silently checking the wrong rule. Failure messages name what the contract actually declares.
 
-## Standalone contracts (no controller)
+### Standalone contracts (no controller)
 
 The same DSL, callable on any Hash — webhook payloads, job arguments, service-object inputs, CSV rows:
 
@@ -602,9 +704,9 @@ Everything carries over — strict coercion, `""`/`nil` absence, defaults, `fina
 - **No router-key exemption.** `unknown: :error` flags a stray `action` or `controller` key — standalone input has no router to excuse.
 - **No memoization.** Every `#call` validates fresh, so one frozen contract is safely reusable and shareable (assign it to a constant).
 
-## Exporting OpenAPI (docs that cannot drift)
+### Exporting OpenAPI (docs that cannot drift)
 
-Because a contract is data, it has a third reader beyond the validator and the drift guard: an exporter that emits **OpenAPI 3.1** (whose request bodies are plain JSON Schema). The schema is generated from the same frozen data the server enforces, so — like the drift guard, pointed outward — the docs cannot lie:
+An exporter emits **OpenAPI 3.1** (whose request bodies are plain JSON Schema) from the same frozen data the server enforces. Like the drift guard pointed outward: the docs cannot lie.
 
 ```sh
 bin/rails permittable:openapi                       # JSON to stdout
@@ -622,7 +724,16 @@ Permittable::OpenAPI.operations_for(UsersController)                    # { acti
 Permittable::OpenAPI.document(controllers: [...], info: { "title" => "My API" })
 ```
 
-How contracts map:
+Every operation references shared components for the [error envelope](#violations-and-error-responses): a `422` response always, plus a `400` when the contract declares a `root:`. So consumers get typed *errors*, not just typed inputs.
+
+**What is honestly unrepresentable stays visible instead of guessed.** A `format:` regexp using a Ruby-only construct (or flags) is exported as `x-permittable-pattern` rather than a mistranslated `pattern`; `validate:`/`transform:` are flagged `x-permittable-custom-validation`/`x-permittable-transformed`; actions covered only by a catch-all rule on a plain-Ruby host appear under `"*"` with `x-permittable-catch-all`; operations whose rule runs in [monitor mode](#monitor-mode-roll-out-without-rejecting) carry `x-permittable-mode: "monitor"`; operations with no matching route land in `x-permittable-controllers` instead of being dropped. The schema documents the canonical JSON encoding — the runtime additionally accepts string-encoded scalars (`"42"`, `"true"`) for form/query payloads.
+
+Output is deterministic (fixed key order, declaration-order properties), so the generated file can be committed and reviewed as a diff — a contract change shows up in the same PR as its documentation change.
+
+<details>
+<summary><strong>How contracts map onto JSON Schema</strong></summary>
+
+<br>
 
 | Contract | Emitted schema |
 |---|---|
@@ -639,15 +750,15 @@ How contracts map:
 | `root:` | the wrapping object, itself required |
 | `sensitive: true` | `writeOnly: true` (never echoed in responses) |
 
-Every operation references shared components for the [error envelope](#violations-and-error-responses): a `422` response always, plus a `400` when the contract declares a `root:`. So consumers get typed *errors*, not just typed inputs.
+</details>
 
-**What is honestly unrepresentable stays visible instead of guessed.** A `format:` regexp using a Ruby-only construct (or flags) is exported as `x-permittable-pattern` rather than a mistranslated `pattern`; `validate:`/`transform:` are flagged `x-permittable-custom-validation`/`x-permittable-transformed`; actions covered only by a catch-all rule on a plain-Ruby host appear under `"*"` with `x-permittable-catch-all`; operations whose rule runs in [monitor mode](#monitor-mode-roll-out-without-rejecting) carry `x-permittable-mode: "monitor"`; operations with no matching route land in `x-permittable-controllers` instead of being dropped. The schema documents the canonical JSON encoding — the runtime additionally accepts string-encoded scalars (`"42"`, `"true"`) for form/query payloads.
+---
 
-Output is deterministic (fixed key order, declaration-order properties), so the generated file can be committed and reviewed as a diff — a contract change shows up in the same PR as its documentation change.
+## Reference
 
-## API reference
+### API
 
-### Instance methods
+**Instance methods**
 
 | Method | Purpose |
 |---|---|
@@ -656,7 +767,7 @@ Output is deterministic (fixed key order, declaration-order properties), so the 
 | `enforce_params_contract` | The `before_action` entry point. Validates rules declared `enforce: true` and all [monitor-mode](#monitor-mode-roll-out-without-rejecting) rules. Public, so hosts can `skip_before_action` it |
 | `render_invalid_parameters(error)` | The `rescue_from` target. Renders via the host's `render_error` when defined, the inline envelope otherwise |
 
-### Class methods
+**Class methods**
 
 | Method | Purpose |
 |---|---|
@@ -664,9 +775,9 @@ Output is deterministic (fixed key order, declaration-order properties), so the 
 | `permittable_contracts` | The frozen array of every declared rule — introspectable, testable |
 | `permit_rule_for(action)` | The last rule matching `action`, or `nil` |
 
-### Module
+**Module**
 
-| | |
+| Constant | Purpose |
 |---|---|
 | `Permittable.filter_parameter_registry` | The live registry of `sensitive:` field names |
 | `Permittable.filter_parameter_registry=` | Swap in your own duck-typed registry |
@@ -678,9 +789,14 @@ Output is deterministic (fixed key order, declaration-order properties), so the 
 | `Permittable::Contract` | [Standalone contracts](#standalone-contracts-no-controller) (`.define`, `#call`, `#call!`, `#json_schema`, `#rule`) |
 | `Permittable::Matchers` | RSpec matchers via `require "permittable/rspec"` — see [testing contracts](#testing-contracts-rspec-matchers) |
 
-## Errors caught at class load
+### Errors caught at class load
 
 A bad contract is a programmer error, so it fails when the class loads — never at request time. Every message names the field and explains the fix.
+
+<details>
+<summary><strong>The full list</strong></summary>
+
+<br>
 
 - A field declared twice in one contract
 - An unknown option for the field's kind, listing what *is* allowed
@@ -698,17 +814,22 @@ A bad contract is a programmer error, so it fails when the class loads — never
 - An empty contract, or a nested block declaring no sub-fields
 - `finalize` declared twice, without a block, or inside a nested block
 - `permit_params` without a block, or an invalid `unknown:` mode
+- A `root:` that isn't a single key (several top-level envelopes are a rootless contract with one nested block per key)
 - An invalid `mode:` (and `Permittable.mode =` rejects invalid values at assignment)
 - A `model:` that isn't an ActiveRecord class, or `model: true` that can't be inferred
 
-## Compatibility
+</details>
 
-| | |
+### Compatibility
+
+| Requirement | Supported |
 |---|---|
 | Ruby | >= 3.2 |
 | Rails / ActiveSupport | >= 5.0, < 9 |
 | Required dependency | `activesupport` only |
 | Optional | `actionpack` (rendering, `before_action`), `activerecord` (drift guard) |
+
+`actionpack` and `activerecord` are optional because every touchpoint is guarded with `respond_to?`/`defined?` — your app brings whatever it already has. The concern works on a plain Ruby object that responds to `params`, which is what makes it straightforward to unit-test.
 
 Using [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails)? `ConcernsOnRails::Controllers::Permittable` is an alias for this module, and `sensitive:` registrations pool into that gem's shared filter registry.
 
@@ -716,8 +837,9 @@ Using [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails)? `Concer
 
 ```sh
 bundle install
-bundle exec rspec      # 244 examples
+bundle exec rspec                        # the suite, with a coverage report in coverage/
 bundle exec rubocop
+bundle exec ruby benchmark/overhead.rb   # a full contract vs. the params.permit call it replaces
 ```
 
 Releases are automated: bump `lib/permittable/version.rb`, add a `CHANGELOG.md` section, then push a `vX.Y.Z` tag. CI publishes to RubyGems via trusted publishing (OIDC — no API keys stored) and creates the GitHub release.
