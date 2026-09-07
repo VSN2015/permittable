@@ -366,14 +366,35 @@ module Permittable
       [:error, "invalid_type"]
     end
 
+    # Date.parse fills in what a string omits FROM TODAY: "09/2026" becomes
+    # the 1st, "5th" becomes this month of this year. That is a guess, and a
+    # non-deterministic one — the same request means different things on
+    # different days — which is exactly what this coercion exists to refuse.
+    # So the string must name all three parts; which format it names them in
+    # is Date.parse's business, and every complete format it understands
+    # ("2026-09-05", "2026/09/05", "Sep 5, 2026") still works.
     def cast_date(value)
       case value
       when Date then [:ok, value]
-      when String then [:ok, Date.parse(value)]
+      when String
+        found = Date._parse(value)
+        return [:error, "invalid_type"] unless complete_date?(found)
+
+        # Built from the components rather than re-running Date.parse, which
+        # would parse the same string a second time — and Date.parse is the
+        # expensive half. Date.new applies the same calendar validation, so
+        # "2026-02-30" still fails.
+        [:ok, Date.new(found[:year], found[:mon], found[:mday])]
       else [:error, "invalid_type"]
       end
     rescue ArgumentError, RangeError
       [:error, "invalid_type"]
+    end
+
+    # Date._parse is the layer under Date.parse, and reports which components
+    # it actually FOUND rather than the filled-in result.
+    def complete_date?(found)
+      found.key?(:year) && found.key?(:mon) && found.key?(:mday)
     end
 
     # A zoneless String parses as UTC regardless of the host timezone
@@ -383,7 +404,17 @@ module Permittable
       # DateTime is listed here, ahead of Date, because it subclasses Date.
       when ActiveSupport::TimeWithZone, Time, DateTime then [:ok, value.to_time.utc]
       when Date then [:ok, Time.utc(value.year, value.month, value.day)]
-      when String then [:ok, DateTime.parse(value).to_time.utc]
+      when String
+        # Same rule as :date — the DATE part must be named in full, or it is
+        # taken from today ("10:30" meant today at 10:30). An absent TIME part
+        # is fine and means midnight, which is the documented reading of a
+        # date given to a :datetime field.
+        #
+        # Unlike :date this still parses twice, deliberately: rebuilding a
+        # Time from components would have to reimplement DateTime.parse's
+        # handling of offsets, zone names and sub-second precision, and
+        # getting that subtly wrong costs more than the parse.
+        complete_date?(Date._parse(value)) ? [:ok, DateTime.parse(value).to_time.utc] : [:error, "invalid_type"]
       else [:error, "invalid_type"]
       end
     rescue ArgumentError, RangeError
