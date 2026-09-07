@@ -1,6 +1,9 @@
 <!-- CHANGELOG.md -->
 
-## Unreleased
+## 0.6.0 (2026-09-08)
+<!-- title: nullable fields, :json, and strict dates -->
+
+Two gaps in the field vocabulary closed and one guess removed. A contract can now say *clear this column* (`nullable:`) and *this hash has no shape, but it has bounds* (`:json`), and a date string must name the whole date instead of borrowing the missing parts from today. Contracts that use neither new option see only the date-parsing change, which is called out below.
 
 ### Added
 - **`:json` field type — free-form hashes, the `jsonb` column case.** A `json`/`jsonb` column exists precisely so its contents need no schema, and every other field kind describes a shape. Until now a contract had only bad options for one: declare sub-keys you don't know, or leave the key undeclared — in which case the contract **silently dropped it** and the column never saw the data. Strong parameters has always had an answer (`params.permit(metadata: {})`); now so does a contract. `optional :metadata, :json` passes an arbitrary Hash through untouched — keys neither filtered nor cast, nested arrays and mixed scalars intact, `unknown:` deliberately not descending into it, `{}` a value rather than an absence, anything that is not a Hash an `invalid_type`. What it gives up is the shape; what it keeps is every bound worth having: **`length:`** caps the top-level key count, **`max_depth:`** caps container nesting with arrays counting as a level (violation code `depth`), `validate:`/`transform:` see the whole hash, and the field maps onto a column like a scalar does, so the schema-drift guard still catches a dropped `metadata` column. That matters more than it looks — an unbounded `jsonb` column is where clients put megabytes and 200-level-deep objects, and "opaque, but not unlimited" is strictly more than `permit(metadata: {})` can say. Values arrive as plain data, never `ActionController::Parameters`, so assigning straight to a `jsonb` attribute is safe. Exported as `{"type": "object"}` with `minProperties`/`maxProperties`, plus `x-permittable-max-depth` for the nesting bound JSON Schema has no keyword for.
