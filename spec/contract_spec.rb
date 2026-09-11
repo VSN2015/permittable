@@ -178,5 +178,62 @@ RSpec.describe Permittable::Contract do
       expect(status).to be_success, err
       expect(out).to eq('{"user":{"test_key":1},"address_attributes":{"location":2}}')
     end
+
+    it "casts every scalar type with only `require \"permittable\"`" do
+      # :datetime named ActiveSupport::TimeWithZone unguarded, and nothing in
+      # the gem loaded it — so a host that had not loaded ActiveSupport's time
+      # extensions got NameError instead of a validated param.
+      script = <<~RUBY
+        require "json"
+        require "permittable"
+        contract = Permittable::Contract.define do
+          required :s, :string
+          required :i, :integer
+          required :f, :float
+          required :d, :decimal
+          required :b, :boolean
+          required :on, :date
+          required :at, :datetime
+          required :zoned, :datetime
+        end
+        # A REAL TimeWithZone, cast here rather than in-process: the constant
+        # existing is not enough, it also needs the Time core extensions, and
+        # an in-process example cannot see that because spec_helper has
+        # already loaded them.
+        require "active_support/time_with_zone"
+        zoned = ActiveSupport::TimeZone["Asia/Bangkok"].local(2026, 9, 5, 17, 30)
+        out = contract.call!(s: "x", i: "1", f: "1.5", d: "2.50", b: "true",
+                             on: "2026-09-05", at: "2026-09-05T10:30:00Z", zoned: zoned)
+        print JSON.generate(out.transform_values(&:to_s))
+      RUBY
+      lib = File.expand_path("../lib", __dir__)
+      out, err, status = Open3.capture3(RbConfig.ruby, "-I", lib, "-e", script)
+      expect(status).to be_success, err
+      expect(JSON.parse(out)).to eq(
+        "s" => "x", "i" => "1", "f" => "1.5", "d" => "0.25e1", "b" => "true",
+        "on" => "2026-09-05", "at" => "2026-09-05 10:30:00 UTC",
+        "zoned" => "2026-09-05 10:30:00 UTC"
+      )
+    end
+
+    it "does not rewrite the caller's own Time while normalising it to UTC" do
+      moment = Time.new(2026, 9, 5, 17, 30, 0, "+07:00")
+      result = described_class.define { required :at, :datetime }.call!(at: moment)
+      expect(result[:at]).to eq(Time.utc(2026, 9, 5, 10, 30))
+      expect(result[:at].utc?).to be(true)
+      # `Time#utc` converts its receiver, and `Time#to_time` returns self.
+      expect(moment.utc?).to be(false)
+      expect(moment.utc_offset).to eq(7 * 3600)
+    end
+
+    it "accepts an ActiveSupport::TimeWithZone for a :datetime without touching its cached UTC instance" do
+      require "active_support/time"
+      zone = ActiveSupport::TimeZone["Asia/Bangkok"]
+      moment = zone.local(2026, 9, 5, 17, 30)
+      result = described_class.define { required :at, :datetime }.call!(at: moment)
+      expect(result[:at]).to eq(Time.utc(2026, 9, 5, 10, 30))
+      expect(result[:at].utc?).to be(true)
+      expect(result[:at]).not_to be(moment.utc)
+    end
   end
 end

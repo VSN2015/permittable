@@ -1,5 +1,13 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Fixed
+- **Every `:datetime` cast raised `NameError` in a host that had not loaded ActiveSupport's time extensions.** A standalone `Permittable::Contract` — validating a webhook payload or a job argument — got `uninitialized constant ActiveSupport::TimeWithZone` instead of a validated param, because activesupport does not load that class by default and the gem never asked for it. A Rails app gets it via `active_support/time` at boot, which is why the spec suite (`require "active_record"`) masked it, the same shape as the 0.5.1 nested-hash bug. Fixed by requiring `active_support/core_ext/time/calculations`, which loads `TimeWithZone` **and** the `Time` extensions it needs: the class alone is not self-sufficient, and converting a real zoned time calls `Time#sec_fraction`, so requiring only `time_with_zone` would have traded `NameError` for `NoMethodError` on activesupport 8.1. The bare-subprocess spec now casts every scalar type, including a real `TimeWithZone`, in a process with no Rails.
+
+### Changed
+- **A `Time` passed to a `:datetime` field is no longer converted in place.** Normalising to UTC went through `value.to_time.utc`; `Time#to_time` returns `self` and `Time#utc` converts its **receiver**, so validating a request quietly rewrote the caller's own object — after `call!(at: t)`, `t` had become UTC. The cast now returns a new instance and leaves the argument alone. An `ActiveSupport::TimeWithZone` is likewise no longer handed back by way of the UTC instance it caches internally.
+
 ## 0.6.0 (2026-09-08)
 <!-- title: nullable fields, :json, and strict dates -->
 
