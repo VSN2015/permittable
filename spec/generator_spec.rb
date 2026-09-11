@@ -206,7 +206,7 @@ RSpec.describe Permittable::Generator do
     end
 
     it "drafts array and nested keys with confirmation TODOs" do
-      expect(draft).to match(/array :tag_names, of: :string\s+# TODO: confirm the element type/)
+      expect(draft).to match(/array :tag_names, of: :string\s+# TODO: confirm the element type, and declare length:/)
       expect(draft).to match(/optional :address do\s+# TODO: .*array :address do/)
       expect(draft).to match(/optional :city, :string\s+# TODO: confirm the type/)
     end

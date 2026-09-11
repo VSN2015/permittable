@@ -270,7 +270,7 @@ end
 
 # Arrays — of: for scalars, a block for hashes. Element failures carry their index: items[1].sku
 array :tag_names,  of: :string, length: 0..10
-array :line_items, required: true do
+array :line_items, required: true, length: 1..50 do
   required :sku,      :string
   required :quantity, :integer, in: 1..99
 end
@@ -281,6 +281,8 @@ optional :metadata, :json, max_depth: 3, length: 0..32
 
 Arrays are **optional unless `required: true`**, and `length:` on an array constrains the element **count**.
 
+`length:` is a **bound, not a report**: an array outside it is rejected without its elements being examined at all. A 200,000-element payload against `length: 0..10` is refused by its first check, so it costs one violation and a 40-byte body instead of 200,001 violations and several megabytes — milliseconds of contract work instead of seconds. There is **no default cap**: an array with no `length:` is unbounded, and every element of it is cast and checked however many arrive. Declare `length:` on every array you accept.
+
 ### Field options
 
 Which options are legal depends on the field kind — anything else raises at class load.
@@ -289,7 +291,7 @@ Which options are legal depends on the field kind — anything else raises at cl
 |---|:---:|:---:|:---:|---|
 | `in:` | ✅ | — | — | Allowed values: a `Range` (bounds-checked with `cover?`) or an `Array` |
 | `format:` | ✅¹ | — | — | Regexp the value must match |
-| `length:` | ✅¹ | ✅ | — | `Range` or `Integer`. Character count on strings, **element count** on arrays |
+| `length:` | ✅¹ | ✅ | — | `Range` or `Integer`. Character count on strings, **element count** on arrays, where it short-circuits — see [the field DSL](#the-field-dsl) |
 | `normalize:` | ✅¹ | — | — | `:squish`, `:strip`, `:downcase`, `:upcase`, `:email`, or a Proc. Runs **before** the cast |
 | `default:` | ✅ | ✅ | — | Value used when the field is absent. Validated against the field's own contract at class load |
 | `validate:` | ✅ | ✅ | — | Callable. Falsy fails as `"invalid"`; a returned `Symbol` becomes the violation code |
@@ -638,7 +640,7 @@ permit_params :create, :update, root: :user, model: User, mode: :monitor do
   optional :age, :integer
   optional :status, :string # database default: "active"
   optional :password_confirmation, :string, virtual: true # TODO: not a database column — confirm the type
-  array :tag_names, of: :string # TODO: confirm the element type
+  array :tag_names, of: :string # TODO: confirm the element type, and declare length: — an array without one is unbounded
 end
 ```
 
