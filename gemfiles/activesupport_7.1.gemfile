@@ -1,0 +1,16 @@
+# Compatibility gemfile: activesupport 7.1.x — see gemfiles/README.md.
+source "https://rubygems.org"
+
+gemspec path: ".."
+
+gem "activesupport", "~> 7.1.0"
+
+# Dev/test only, matched to the pinned line: actionpack drives the
+# real-ActionController integration specs, activerecord + sqlite3 the
+# schema-drift specs.
+gem "actionpack", "~> 7.1.0"
+gem "activerecord", "~> 7.1.0"
+gem "rake"
+gem "rspec", "~> 3.12"
+gem "simplecov", "~> 1.1"
+gem "sqlite3", "~> 1.4"
