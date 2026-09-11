@@ -1,5 +1,12 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Added
+- **`format:` presets — `:email`, `:uuid`, `:url`, `:slug`, `:hostname`.** The regexps every app writes by hand, named once, mirroring how `normalize:` already works. `:email` is deliberately `URI::MailTo::EMAIL_REGEXP` *itself* — the regexp Rails apps already paste into their contracts — so adopting the preset cannot change which addresses an endpoint accepts. The rest avoid flags and Ruby-only constructs so they translate to ECMA-262 and export as real patterns. A preset name is resolved to its `Regexp` at class load, so request-time matching stays a plain `Regexp#match?` and an authored `default:`/`example:` is checked against the resolved pattern like any other; an unknown preset fails at class load listing the presets, and a `format:` that is neither a `Regexp` nor a preset name now fails too (previously a String was silently accepted and behaved as `String#match?`, which is not what anyone meant).
+- **Presets export the JSON Schema `format` keyword**, which a hand-written Regexp cannot: `"format": "email"` / `"uuid"` / `"uri"` / `"hostname"`, alongside the `pattern` that still does the asserting (in draft 2020-12 `format` is an annotation unless a validator opts in). A preset's pattern is authored by this gem rather than by the app, so it skips the deliberately over-eager untranslatable-construct scan — it has to: the RFC-derived `:email` pattern contains `*+` inside a character class, which that scan reads as a possessive quantifier, so the most common format in Rails would otherwise have published no pattern at all. App-authored regexps keep the conservative treatment unchanged.
+- **The RSpec matcher speaks both spellings**: `matching(:email)` asserts the preset by name, `matching(/re/)` the Regexp itself, and a mismatch says which of the two the contract declares.
+
 ## 0.6.0 (2026-09-08)
 <!-- title: nullable fields, :json, and strict dates -->
 
