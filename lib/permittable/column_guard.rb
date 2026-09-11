@@ -10,22 +10,63 @@ module Permittable
   # (NameError from a typo etc.) keep surfacing. Skipping is self-healing:
   # once the migration runs and classes reload, validation happens for real.
   module ColumnGuard
+    # Column types that mean the same thing for a contract's purposes, grouped
+    # so the check can catch a column RETYPED out from under a contract
+    # without second-guessing a declaration that merely differs in flavour.
+    #
+    # The numeric group deliberately includes :boolean — a boolean stored as
+    # an integer 0/1 is a real legacy pattern, and ActiveRecord casts cleanly
+    # between all of them. The temporal group is one group for the same
+    # reason: a :date contract on a datetime column is a narrowing, not drift.
+    #
+    # Anything absent here — :json, :jsonb, :binary, an adapter's own :inet or
+    # :money — is NOT checked. A contract has no faithful type for those, so
+    # whatever an app improvised is left alone rather than guessed about.
+    TYPE_GROUPS = {
+      string: :text, text: :text, citext: :text, uuid: :text, enum: :text, char: :text,
+      integer: :numeric, bigint: :numeric, float: :numeric, decimal: :numeric, boolean: :numeric,
+      date: :temporal, datetime: :temporal, time: :temporal, timestamp: :temporal, timestamptz: :temporal
+    }.freeze
+
     module_function
 
     # `types:` teaches the error message: a Symbol/String applies to every
     # listed field, a Hash maps field => type. The raised ArgumentError then
     # appends a ready-to-paste migration command.
-    def ensure_columns_on!(label, klass, *fields, types: nil)
+    def ensure_columns_on!(label, klass, *fields, types: nil, check_types: false)
       return false unless schema_reachable?(klass)
 
       fields.flatten.compact.each do |field|
-        next if klass.column_names.include?(field.to_s)
+        unless klass.column_names.include?(field.to_s)
+          raise ArgumentError,
+                "#{label}: '#{field}' does not exist in the database (table: #{klass.table_name})." \
+                "#{column_migration_hint(klass, field, types)}"
+        end
 
-        raise ArgumentError,
-              "#{label}: '#{field}' does not exist in the database (table: #{klass.table_name})." \
-              "#{column_migration_hint(klass, field, types)}"
+        ensure_column_type!(label, klass, field, types) if check_types
       end
       true
+    end
+
+    # The type half of the drift guard, opt-in via Permittable
+    # .check_column_types. It compares GROUPS rather than exact types (see
+    # TYPE_GROUPS) and stays silent unless both sides are known, so it can
+    # only fire on a genuine cross-family mismatch — a contract still saying
+    # :datetime after the column became a string, say.
+    def ensure_column_type!(label, klass, field, types)
+      declared = types.is_a?(Hash) ? types[field.to_sym] : types
+      column = klass.columns_hash[field.to_s]
+      return unless declared && column
+
+      wanted = TYPE_GROUPS[declared.to_sym]
+      actual = TYPE_GROUPS[column.type.to_sym]
+      return if wanted.nil? || actual.nil? || wanted == actual
+
+      raise ArgumentError,
+            "#{label}: '#{field}' is declared :#{declared} but the column is :#{column.type} " \
+            "(table: #{klass.table_name}). Change the contract to match the column, migrate the " \
+            "column to match the contract, or declare the field virtual: true if it is not " \
+            "backed by this column."
     end
 
     def column_migration_hint(klass, field, types)
