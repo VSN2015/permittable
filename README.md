@@ -425,6 +425,8 @@ Every failure raises `Permittable::InvalidParameters`, carrying `details` (an ar
 
 Paths are fully qualified: `user.address.zip`, `line_items[1].sku`.
 
+**`details` is complete; `message` is prose.** The `details` array names **every** offender, however many there are — it is the machine-readable channel and nothing is dropped from it. The `message` string is a sentence for a person, and it also lands in your logs and in every exception tracker, so it is bounded: at most ten offenders, each truncated past 120 characters, then a count of the rest (`…, and 49990 more`). Before that bound, a request carrying 50,000 undeclared keys against `unknown: :error` produced a **1 MB** exception message and a 1 MB log line. The 422 body still carries the complete `details`, so it stays proportional to the number of violations; the field bounds are what keep that number down.
+
 **Status codes.** A missing root key renders **400** — the request is malformed; the envelope you asked for isn't there. Field-level violations render **422** — well-formed, semantically wrong.
 
 **Custom rendering.** If your controller defines `render_error`, the envelope delegates to it as `render_error(message:, code:, status:, errors:)` — the `errors:` key is passed only when details exist, so hosts documenting a three-keyword contract keep working. Otherwise the inline JSON shape is rendered. Either way, `render_invalid_parameters` is a normal method you can override. For full control over the body (RFC 9457, a different envelope), `error.details` gives you the structured violations to build from.
@@ -484,8 +486,10 @@ Resolution order per violation: the field's own `message:` (String, or the Hash 
 | Mode | Behaviour |
 |---|---|
 | `:ignore` (default) | Silently dropped, exactly like strong parameters |
-| `:log` | Dropped, with a `logger.warn` naming the full paths |
+| `:log` | Dropped, with a `logger.warn` naming the full paths — at most ten of them, then a count, so one request cannot write a megabyte of log |
 | `:error` | Each undeclared key becomes an `unknown` violation |
+
+Under `:log` that bound is the whole record: nothing else names an undeclared key, so beyond the tenth only the count survives. Where you need every name — auditing what a client really sends during a rollout — use `unknown: :error` in monitor mode, which records all of them in `details` and in the instrumentation payload without rejecting the request.
 
 Rails merges `controller`, `action`, and `format` into `params`; these are exempt at the top level so `unknown: :error` doesn't flag the router's own bookkeeping. Inside a `root:` or a nested hash there is no such exemption, because nothing legitimately injects keys there.
 
