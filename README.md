@@ -732,6 +732,22 @@ Every operation references shared components for the [error envelope](#violation
 
 Output is deterministic (fixed key order, declaration-order properties), so the generated file can be committed and reviewed as a diff — a contract change shows up in the same PR as its documentation change.
 
+#### What the schema deliberately does not say
+
+`spec/schema_conformance_spec.rb` holds the "cannot drift" claim to account: it walks canonical JSON payloads through both the contract and its own exported schema and asserts the verdicts agree.
+
+Where they legitimately differ, the spec names the reason and asserts the **direction**, so a new divergence fails the suite instead of shipping quietly. Two cases go the safe way — the **server accepts what its docs reject**, leaving a client that follows the docs merely conservative:
+
+- **Non-canonical encodings.** Coercion accepts `"30"` for an `:integer` and `1` for a `:string`, because form and query payloads are all strings. The schema documents the canonical JSON encoding only.
+- **`null` as absence.** The runtime reads `{"age": null}` as `{}` ([absence](#absence-defaults-and-partial-updates)); JSON Schema cannot express that, so `type: integer` rejects a null the server would accept and ignore. A [`nullable:`](#explicit-nulls-nullable) field is not this case — there the null is a value, the exported `type` widens to say so, and the two agree.
+
+One case goes the other way, and is worth knowing before you hand the document to a client:
+
+- **Bounds JSON Schema has no keyword for.** A `:json` field's `max_depth:` is enforced by the server but cannot be written as a JSON Schema keyword, so the published document is **looser** there and an over-nested payload still earns a 422. The bound is not dropped — it is exported as `x-permittable-max-depth` — so a generator or linter that wants it can read it.
+
+Everything else the exporter cannot translate stays visible as an `x-permittable-*` extension rather than being guessed at.
+
+
 <details>
 <summary><strong>How contracts map onto JSON Schema</strong></summary>
 
