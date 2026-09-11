@@ -1,5 +1,16 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Added
+- **`sensitive: false` opts a sub-field out of an inherited cascade.** Matching is a case-insensitive **substring** match, so cascading a generic name like `:id` or `:name` would redact every parameter in the app that happens to contain it — occasionally a worse outcome than the leak it prevents. An explicit `sensitive: false` on a field (or on a container, for its whole subtree) keeps it readable. Only `false` opts out — `sensitive: nil` reads as "not stated" and still inherits.
+
+### Upgrading
+- **A contract that already declares `sensitive: true` on a nested block or array will redact more than it did before.** That is the point of the fix, but the widening is app-wide and worth a look before deploying: every cascaded child's name is registered as a case-insensitive **substring** filter, so a child called `id`, `name`, `type`, `status` or `zip` starts redacting `user_id`, `company_name`, `content_type` and `gzip` in **every** controller's logs, not only in the contract that declared it. Run `grep -n "sensitive: true" app/controllers` and add `sensitive: false` to any child whose name is too generic to filter globally.
+
+### Fixed
+- **`sensitive: true` on a nested block or array was a complete no-op, and logged the values it promised to redact.** Rails' parameter filtering walks into hashes and arrays itself and asks a proc filter about the **leaf values only**, handing it the leaf's own key and never the path that led there — so registering only the container's name redacted nothing: the filter descended and asked about `"card_number"`, which the container's name does not match. A contract declaring `optional :payment, sensitive: true do required :card_number, :string end` printed the card number in the clear. `sensitive:` now **cascades** to every field inside a nested or array container, at any depth, and a spec proves it through `ActiveSupport::ParameterFilter` rather than only asserting on the registry. The cascade is resolved onto the field data at class load, so every reader of a contract agrees with the redaction: the exported JSON Schema marks a cascaded child `writeOnly`, and the RSpec matcher's `.sensitive` chain passes for it.
+
 ## 0.6.0 (2026-09-08)
 <!-- title: nullable fields, :json, and strict dates -->
 
