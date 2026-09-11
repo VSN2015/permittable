@@ -1,5 +1,12 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Added
+- **`permittable:generate` now reads Rails 8 `params.expect` calls, not just `params.permit`.** The generator is the adoption on-ramp, and it was blind to the syntax Rails 8 apps actually use — a modern controller has no permit calls to scan, so the draft fell back to columns alone and lost everything the app already knew about its own params (the `root:`, the permitted key list, which keys aren't columns). `params.expect(user: [:name, tag_names: [], address: [:city], line_items: [[:sku]]])` is now scanned into the same `Scan`, merged with any permit calls in the same controller.
+- **Arrays of hashes are drafted without a TODO when the source says so.** `expect` distinguishes what `permit` cannot: `key: [:a]` is a nested hash, `key: [[:a]]` is an array of hashes. A scanned `[[...]]` therefore drafts as `array :key do ... end` with no "this may be an array of hashes" TODO, and `Scan` carries the new `nested_arrays` member alongside `nested`.
+- **Route params are not mistaken for fields.** In `params.expect(:id, user: [:name])` the `:id` is a routing key, not body input, so it stays visible in a TODO rather than being drafted as a contract field — as does a second envelope (`params.expect(user: [...], address: [...])`), which belongs under a different `root:` than one rooted contract can express. A rootless `params.expect(:q, :page)` still drafts as scalars, since there is no envelope to be a sibling of.
+
 ## 0.6.0 (2026-09-08)
 <!-- title: nullable fields, :json, and strict dates -->
 
