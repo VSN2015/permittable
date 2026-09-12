@@ -593,12 +593,18 @@ module Permittable
       if field[:required] && field.key?(:default)
         raise ArgumentError, "#{LABEL}: field :#{name} is required and cannot have a :default (default implies optional)"
       end
-      if field.key?(:in) && !field[:in].respond_to?(:include?)
-        raise ArgumentError, "#{LABEL}: :in for field :#{name} must respond to include? (Range or Array)"
+
+      if field.key?(:in)
+        unless field[:in].respond_to?(:include?)
+          raise ArgumentError, "#{LABEL}: :in for field :#{name} must respond to include? (Range or Array)"
+        end
+
+        assert_satisfiable!(name, :in, field[:in])
       end
 
       validate_string_only_opts!(field)
       validate_length!(name, field[:length]) if field.key?(:length)
+      validate_required_length!(field)
       validate_callable!(name, :validate, field[:validate]) if field.key?(:validate)
       validate_callable!(name, :transform, field[:transform]) if field.key?(:transform)
       resolve_normalizer!(field)
@@ -654,9 +660,62 @@ module Permittable
     end
 
     def validate_length!(name, length)
-      return if length.is_a?(Range) || length.is_a?(Integer)
+      assert_length_shape!(name, length)
+      assert_satisfiable!(name, :length, length)
+    end
 
-      raise ArgumentError, "#{LABEL}: :length for :#{name} must be a Range or Integer"
+    def assert_length_shape!(name, length)
+      return if length.is_a?(Range) || (length.is_a?(Integer) && !length.negative?)
+
+      raise ArgumentError, "#{LABEL}: :length for :#{name} must be a non-negative Integer or a Range " \
+                           "(got #{length.inspect})"
+    end
+
+    # A reversed Range (5..2), an exclusive Range with equal endpoints
+    # (3...3), or an empty set (in: []) excludes every value there is, so the
+    # field it bounds can never validate. That used to surface as every
+    # request to the action failing on that field — a contract mistake
+    # reported as a client error, once per request, forever. Endless and
+    # beginless Ranges are legitimate bounds, and endpoints that cannot be
+    # compared are left alone rather than guessed at.
+    def assert_satisfiable!(name, opt, bound)
+      return unless unsatisfiable?(bound)
+
+      raise ArgumentError, "#{LABEL}: :#{opt} for :#{name} is empty (#{bound.inspect}) — no value can satisfy it"
+    end
+
+    def unsatisfiable?(bound)
+      return bound.empty? if bound.respond_to?(:empty?)
+      return false unless bound.is_a?(Range)
+
+      first = bound.begin
+      last = bound.end
+      return false if first.nil? || last.nil?
+
+      comparison = first <=> last
+      return false if comparison.nil?
+
+      comparison.positive? || (comparison.zero? && bound.exclude_end?)
+    end
+
+    # "" is ABSENT and an absent required field violates as missing, so a
+    # required string can never validly be empty: a maximum length of 0
+    # leaves it nothing at all to accept. The exported schema already said
+    # so — minLength 1 alongside maxLength 0 — while nothing refused the
+    # declaration that produced it.
+    def validate_required_length!(field)
+      return unless field[:required] && field.key?(:length)
+
+      spec = field[:length]
+      max = if spec.is_a?(Range)
+              spec.end && spec.exclude_end? ? spec.end - 1 : spec.end
+            else
+              spec
+            end
+      return unless max&.zero?
+
+      raise ArgumentError, "#{LABEL}: :length for :#{field[:name]} is 0 on a required field — an absent or " \
+                           "empty value already violates as missing, so nothing could satisfy it"
     end
 
     def validate_callable!(name, opt, value)
@@ -699,7 +758,42 @@ module Permittable
       raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} must be an Array" unless value.is_a?(Array)
 
       validate_array_elements!(field, opt, value) if field[:of]
+      validate_array_element_hashes!(field, opt, value) if field[:fields]
       field[opt] = freeze_authored(value)
+    end
+
+    # The nested-block counterpart of the of: element check below. Without it
+    # `field[:of]` was nil for a block array, so its `default:` skipped
+    # validation entirely and whatever was authored went straight to every
+    # request that omitted the key. Shallow in the same way the of: check is:
+    # required sub-fields must be present and scalar ones must satisfy their
+    # own contract, which is what an authored value gets wrong.
+    def validate_array_element_hashes!(field, opt, value)
+      value.each do |element|
+        unless element.is_a?(Hash)
+          raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} contains #{element.class} " \
+                               "where the block declares a hash"
+        end
+
+        field[:fields].each { |sub| validate_array_element_field!(field, opt, element, sub) }
+      end
+    end
+
+    def validate_array_element_field!(field, opt, element, sub)
+      value = element.key?(sub[:name]) ? element[sub[:name]] : element[sub[:name].to_s]
+      if value.nil?
+        return unless sub[:required]
+
+        raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} is missing :#{sub[:name]}, " \
+                             "which the block declares as required"
+      end
+      return unless sub[:kind] == :scalar
+
+      status, code = Coercion.check_scalar(sub, Coercion.apply_normalize(sub[:normalize], value))
+      return if status == :ok
+
+      raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} has :#{sub[:name]} " \
+                           "violating its own contract (#{code})"
     end
 
     def validate_array_elements!(field, opt, value)
