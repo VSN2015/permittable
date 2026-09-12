@@ -78,6 +78,67 @@ RSpec.describe Permittable do
         .to raise_error(ArgumentError, /:in for field :a must respond to include\?/)
     end
 
+    it "rejects a bound no value could satisfy, rather than failing every request" do
+      expect { permittable_class { permit_params(:create) { optional :age, :integer, in: 65..18 } } }
+        .to raise_error(ArgumentError, /:in for :age is empty \(65\.\.18\)/)
+      expect { permittable_class { permit_params(:create) { optional :s, :string, length: 5..2 } } }
+        .to raise_error(ArgumentError, /:length for :s is empty \(5\.\.2\)/)
+      expect { permittable_class { permit_params(:create) { optional :s, :string, length: 3...3 } } }
+        .to raise_error(ArgumentError, /:length for :s is empty/)
+      expect { permittable_class { permit_params(:create) { optional :plan, :string, in: [] } } }
+        .to raise_error(ArgumentError, /:in for :plan is empty/)
+      expect { permittable_class { permit_params(:create) { optional :s, :string, length: -1 } } }
+        .to raise_error(ArgumentError, /:length for :s must be a non-negative Integer or a Range/)
+    end
+
+    it "accepts an endless, beginless, or single-value bound" do
+      expect { permittable_class { permit_params(:create) { optional :age, :integer, in: 18.. } } }.not_to raise_error
+      expect { permittable_class { permit_params(:create) { optional :s, :string, length: ..80 } } }.not_to raise_error
+      expect { permittable_class { permit_params(:create) { optional :s, :string, length: 5..5 } } }.not_to raise_error
+    end
+
+    it "rejects a required field whose length: forbids every non-empty value" do
+      # "" is absent and an absent required field violates, so a required
+      # string can never validly be empty — a max length of 0 leaves nothing.
+      expect { permittable_class { permit_params(:create) { required :n, :string, length: 0 } } }
+        .to raise_error(ArgumentError, /:length for :n is 0 on a required field/)
+      expect { permittable_class { permit_params(:create) { required :n, :string, length: 0..0 } } }
+        .to raise_error(ArgumentError, /:length for :n is 0 on a required field/)
+      expect { permittable_class { permit_params(:create) { optional :n, :string, length: 0 } } }.not_to raise_error
+    end
+
+    it "checks a block array's default: against the block's own fields" do
+      expect do
+        permittable_class do
+          permit_params(:create) do
+            array :items, default: [{ "nonsense" => true }] do
+              required :sku, :string
+            end
+          end
+        end
+      end.to raise_error(ArgumentError, /:default for array :items.*is missing :sku/)
+
+      expect do
+        permittable_class do
+          permit_params(:create) do
+            array :items, default: [{ "sku" => %w[an array] }] do
+              required :sku, :string
+            end
+          end
+        end
+      end.to raise_error(ArgumentError, /:default for array :items.*:sku.*invalid_type/)
+
+      expect do
+        permittable_class do
+          permit_params(:create) do
+            array :items, default: [{ "sku" => "a" }] do
+              required :sku, :string
+            end
+          end
+        end
+      end.not_to raise_error
+    end
+
     it "rejects a non-callable :validate" do
       expect { permittable_class { permit_params(:create) { required :a, :string, validate: :nope } } }
         .to raise_error(ArgumentError, /:validate for field :a must be callable/)
