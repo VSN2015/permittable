@@ -105,6 +105,16 @@
       "patch": {
         "operationId": "users_update",
         "description": "Create or update a user",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -232,7 +242,11 @@
                     },
                     "code": {
                       "type": "string",
-                      "description": "missing / invalid_type / inclusion / format / length / unknown / invalid, or a contract-specific symbol"
+                      "description": "missing / invalid_type / inclusion / format / length / depth / unknown / invalid, or a contract-specific symbol"
+                    },
+                    "message": {
+                      "type": "string",
+                      "description": "Human-readable copy for this violation, when the contract or I18n supplies it"
                     }
                   },
                   "required": [
