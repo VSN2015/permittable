@@ -337,6 +337,32 @@ RSpec.describe Permittable do
       expect(custom[:sku]).to eq("AB-1")
     end
 
+    it "treats a value that NORMALIZES to empty as absent, like any other empty value" do
+      decl = proc do
+        permit_params(:create) do
+          required :name, :string, normalize: :squish
+          optional :plan, :string, normalize: :strip, default: "free"
+          optional :note, :string, normalize: :strip, nullable: true
+        end
+      end
+      expect(violations_for({ name: "   " }, &decl).details).to eq([{ param: "name", code: "missing" }])
+      expect(permit({ name: "a", plan: "  " }, &decl)[:plan]).to eq("free")
+      expect(permit({ name: "a", note: "  " }, &decl)[:note]).to be_nil
+      expect(permit({ name: "  a   b  " }, &decl)[:name]).to eq("a b")
+    end
+
+    it "normalizes exactly once per value" do
+      calls = 0
+      counting = lambda do |v|
+        calls += 1
+        v.strip
+      end
+      result = permit({ name: " a " }) { permit_params(:create) { required :name, :string, normalize: counting } }
+
+      expect(result[:name]).to eq("a")
+      expect(calls).to eq(1)
+    end
+
     it "runs a custom validate: — falsy fails as 'invalid', a Symbol fails as that code, truthy passes" do
       falsy = proc { permit_params(:create) { required :n, :integer, validate: ->(v) { v.even? } } }
       expect(permit({ n: "4" }, &falsy)[:n]).to eq(4)
@@ -477,6 +503,43 @@ RSpec.describe Permittable do
       result = permit({ ok: false }) { permit_params(:create) { required :ok, :boolean } }
       expect(result[:ok]).to be(false)
     end
+
+    it "hands each request its own copy of a mutable default:" do
+      klass = permittable_class do
+        permit_params(:create) do
+          array :tags, of: :string, default: ["a"]
+          optional :plan, :string, default: "free"
+          optional :meta, :json, default: { "k" => "v" }
+        end
+      end
+      first = controller(klass).permitted_params
+      first[:tags] << "leak"
+      first[:plan] << "!"
+      first[:meta]["leak"] = true
+
+      second = controller(klass).permitted_params
+      expect(second[:tags]).to eq(["a"])
+      expect(second[:plan]).to eq("free")
+      expect(second[:meta].to_h).to eq("k" => "v")
+      expect(second[:tags]).not_to be(first[:tags])
+    end
+
+    it "freezes its own copy of an authored value, never the caller's object" do
+      authored = ["a"]
+      klass = permittable_class { permit_params(:create) { array :tags, of: :string, default: authored } }
+      stored = klass.permittable_contracts.last[:fields].first[:default]
+
+      expect(stored).to be_frozen
+      expect(stored).not_to be(authored)
+      expect(authored).not_to be_frozen
+    end
+
+    it "delivers a default: in the normalized form it was validated in" do
+      result = permit({}) do
+        permit_params(:create) { optional :plan, :string, normalize: :squish, default: "  free  " }
+      end
+      expect(result[:plan]).to eq("free")
+    end
   end
 
   describe "nullable:" do
@@ -604,6 +667,27 @@ RSpec.describe Permittable do
         permit_params(:create, unknown: :error) { required :name, :string }
       end
       expect(e.details).to eq([{ param: "extra", code: "unknown" }])
+    end
+
+    it "skips the form bookkeeping keys Rails merges into a POST, flagging only the real stray" do
+      e = violations_for({ name: "a", extra: "x", authenticity_token: "tok",
+                           _method: "patch", utf8: "✓", commit: "Save" }) do
+        permit_params(:create, unknown: :error) { required :name, :string }
+      end
+      expect(e.details).to eq([{ param: "extra", code: "unknown" }])
+    end
+
+    it "still flags a form key smuggled inside a root (the exemption is top-level only)" do
+      e = violations_for({ user: { name: "a", authenticity_token: "smuggled" } }) do
+        permit_params(:create, root: :user, unknown: :error) { required :name, :string }
+      end
+      expect(e.details).to eq([{ param: "user.authenticity_token", code: "unknown" }])
+    end
+
+    it "passes the form keys through in monitor mode — only the router's own keys are dropped" do
+      klass = permittable_class { permit_params(:create, mode: :monitor) { required :n, :integer } }
+      passed = controller(klass, params: { n: "x", _method: "patch", controller: "users" }).permitted_params
+      expect(passed.to_h).to eq("n" => "x", "_method" => "patch")
     end
 
     it "flags undeclared keys inside root and nested hashes (routing keys are only top-level)" do
