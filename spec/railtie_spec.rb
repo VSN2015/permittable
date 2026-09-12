@@ -34,6 +34,13 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
       config.secret_key_base = "x" * 64
       # An entry of the app's own, to prove the gem appends rather than replaces.
       config.filter_parameters += [:password]
+      # What `load_defaults "7.1"` turns on, and the reason the mechanism has
+      # to be a NAME rather than a live matcher object: railties REPLACES
+      # config.filter_parameters with patterns joined by source, which drops
+      # any object whose matching is decided at filter time. Set directly
+      # rather than through load_defaults, which would raise on the older
+      # Rails versions the compatibility gemfiles cover.
+      config.precompile_filter_parameters = true if config.respond_to?(:precompile_filter_parameters=)
     end
 
     ProbeApp.initialize!
@@ -45,13 +52,21 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
 
       permit_params(:create) do
         optional :ssn, :string, sensitive: true
+        optional :pin_code, :integer, sensitive: true
+        optional :payment, sensitive: true do
+          required :card_number, :string
+        end
         optional :note, :string
       end
     end
 
+    # What a real request does, and what triggers precompilation.
+    Rails.application.env_config
+
     filters = Rails.application.config.filter_parameters
     redacted = ActiveSupport::ParameterFilter.new(filters).filter(
-      "ssn" => "111-22-3333", "password" => "hunter2", "note" => "keep me"
+      "ssn" => "111-22-3333", "pin_code" => 1234, "payment" => { "card_number" => "4111111111111111" },
+      "password" => "hunter2", "note" => "keep me"
     )
 
     # The documented promise is redaction from BOTH request logs and #inspect.
@@ -59,7 +74,9 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
     # this is the half a parameter filter alone cannot show.
     ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
     ActiveRecord::Schema.verbose = false
-    ActiveRecord::Schema.define { create_table(:people) { |t| t.string :ssn; t.string :name } }
+    ActiveRecord::Schema.define do
+      create_table(:people) { |t| t.string :ssn; t.integer :pin_code; t.string :name }
+    end
     class Person < ActiveRecord::Base; end
 
     # A host gem or app swapping the registry to pool registrations. Rails runs
@@ -89,7 +106,11 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
       redacted: redacted,
       after_swap: after_swap,
       filter_attribute_procs: ActiveRecord::Base.filter_attributes.count { |f| f.is_a?(Proc) },
-      model_inspect: Person.new(ssn: "111-22-3333", name: "Ada").inspect,
+      model_inspect: Person.new(ssn: "111-22-3333", pin_code: 1234, name: "Ada").inspect,
+      # Precompilation joins the app's own patterns into one Regexp; without
+      # it the array carries no Regexp at all, so this is the signal that the
+      # probe really is exercising the modern default.
+      precompiled: filters.any? { |f| f.is_a?(Regexp) },
       tasks: Rake::Task.tasks.map(&:name).grep(/^permittable:/).sort
     )
   RUBY
@@ -114,9 +135,20 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
 
   let(:boot) { self.class.boot }
 
-  it "appends exactly one filter proc, leaving the app's own entries alone" do
+  it "appends exactly one filter proc, which survives precompilation" do
+    # Precompilation joins patterns by source but partitions procs out and
+    # keeps them, so the count is still the assertion that the append is
+    # idempotent across repeated initializer runs.
+    expect(boot["precompiled"]).to be(true), "the probe app is not exercising precompilation"
     expect(boot["procs"]).to eq(1)
-    expect(boot["symbols"]).to include("password")
+  end
+
+  it "redacts a sensitive: value that is not a String" do
+    # A proc filter can only redact Strings — it mutates in place, and
+    # ParameterFilter never even calls it for a Hash value, recursing instead.
+    # Registering the NAME is what covers these.
+    expect(boot["redacted"]["pin_code"]).to eq("[FILTERED]")
+    expect(boot["redacted"]["payment"]).to eq("[FILTERED]")
   end
 
   it "reaches ActiveRecord's filter_attributes, so #inspect redacts too" do
@@ -126,6 +158,7 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
     # asserts the promise rather than the ordering that is meant to produce it.
     expect(boot["filter_attribute_procs"]).to eq(1)
     expect(boot["model_inspect"]).to include("ssn: [FILTERED]")
+    expect(boot["model_inspect"]).to include("pin_code: [FILTERED]")
     expect(boot["model_inspect"]).to include('name: "Ada"')
   end
 

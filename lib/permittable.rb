@@ -127,7 +127,12 @@ require "permittable/filter_parameter_registry"
 # `sensitive: true` registers the field name with
 # Permittable.filter_parameter_registry (swappable — a host gem can point it
 # at its own registry), consulted at filter time by the proc
-# Permittable::Railtie appends to `config.filter_parameters`.
+# Permittable::Railtie appends to `config.filter_parameters`. The name is
+# ALSO published to that Railtie by name (see register_sensitive_parameter),
+# because a proc filter can only redact String values — ActiveSupport dups
+# the value and expects in-place mutation, and never calls the proc at all
+# for a Hash — so a name in config.filter_parameters is what covers an
+# :integer field or a sensitive nested block.
 #
 # OUTPUT RESHAPING — the safe replacement for params-mutating before_actions.
 # Two layers, both operating on the validated COPY (the request's `params` is
@@ -231,6 +236,45 @@ module Permittable
     # runs with no memo to synchronise.
     def filter_parameter_proc
       FILTER_PARAMETER_PROC
+    end
+
+    # Every `sensitive:` registration, published to whatever is listening.
+    #
+    # A proc filter cannot be the whole mechanism: ActiveSupport's
+    # ParameterFilter dups the value and expects in-place mutation, so a proc
+    # can only redact Strings — and it is never even CALLED for a Hash value,
+    # because ParameterFilter checks `value.is_a?(Hash)` first and recurses.
+    # So `optional :pin, :integer, sensitive: true` and `sensitive:` on a
+    # nested block both logged in the clear. What redacts any value type is a
+    # NAME in config.filter_parameters, which only Rails can be told about —
+    # hence a sink, installed by Permittable::Railtie, rather than Rails
+    # knowledge in this file or in the registry.
+    def register_sensitive_parameter(name)
+      filter_parameter_registry.add(name)
+      # Normalized the way the registry normalizes, so the name a sink sees is
+      # the same whether it arrives here or through on_sensitive_parameter's
+      # replay of #names — otherwise a sink deduplicating by value would hold
+      # both :ssn and "ssn".
+      name = name.to_s.downcase
+      sensitive_parameter_sinks.each { |sink| sink.call(name) } unless name.empty?
+      nil
+    end
+
+    # Install a sink. It is replayed over the names already registered, since
+    # a contract can be declared before the Railtie's initializer runs (a
+    # Permittable::Contract at require time, an eager-loaded controller) and
+    # would otherwise never reach it.
+    def on_sensitive_parameter(&sink)
+      @registry_mutex.synchronize { sensitive_parameter_sinks << sink }
+      registry = filter_parameter_registry
+      registry.names.each { |name| sink.call(name) } if registry.respond_to?(:names)
+      sink
+    end
+
+    # The installed sinks. Process-global, like the registry — specs that
+    # install one `.clear` this afterwards.
+    def sensitive_parameter_sinks
+      @sensitive_parameter_sinks ||= []
     end
 
     # App-wide default for rules that don't declare their own mode:.
@@ -896,7 +940,7 @@ module Permittable
 
     def register_sensitive_params(fields)
       fields.each do |field|
-        Permittable.filter_parameter_registry.add(field[:name]) if field[:sensitive]
+        Permittable.register_sensitive_parameter(field[:name]) if field[:sensitive]
         register_sensitive_params(field[:fields]) if field[:fields]
       end
     end
