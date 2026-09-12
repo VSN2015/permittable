@@ -11,8 +11,9 @@ module Permittable
   # Everything the exporter cannot know is left visible rather than guessed:
   # actions covered only by a catch-all rule on a host without
   # `action_methods` appear under the "*" key with `x-permittable-catch-all`,
-  # and operations with no matching route land in `x-permittable-controllers`
-  # instead of being dropped silently.
+  # and operations with no matching route — or whose path+verb slot another
+  # controller already claimed, which a document cannot represent twice —
+  # land in `x-permittable-controllers` instead of being dropped silently.
   module OpenAPI
     module_function
 
@@ -39,8 +40,15 @@ module Permittable
                   },
                   "code" => {
                     "type" => "string",
-                    "description" => "missing / invalid_type / inclusion / format / length / unknown / invalid, " \
-                                     "or a contract-specific symbol"
+                    "description" => "missing / invalid_type / inclusion / format / length / depth / unknown / " \
+                                     "invalid, or a contract-specific symbol"
+                  },
+                  # Present only when the field declares `message:` or the app
+                  # has I18n copy for the code; a violation without one keeps
+                  # the bare { param:, code: } shape, so this is not required.
+                  "message" => {
+                    "type" => "string",
+                    "description" => "Human-readable copy for this violation, when the contract or I18n supplies it"
                   }
                 },
                 "required" => %w[param code]
@@ -176,12 +184,40 @@ module Permittable
     def place_operations(controller, operations, routes, paths, unrouted)
       key = controller_key(controller) || controller.inspect
       operations.each do |action, operation|
-        matched = routes_for(routes, key, action)
-        if matched.empty?
+        # A path+verb pair carries exactly one operation, so a slot another
+        # controller already claimed is not written over: the loser stays
+        # visible under x-permittable-controllers, where an operation with no
+        # route at all lands, rather than disappearing from the document.
+        free = routes_for(routes, key, action).reject { |route| paths.dig(route[:path], verb_of(route)) }
+        if free.empty?
           (unrouted[key] ||= {})[action] = operation
         else
-          matched.each { |route| (paths[route[:path]] ||= {})[route[:verb].to_s.downcase] = operation }
+          free.each { |route| (paths[route[:path]] ||= {})[verb_of(route)] = with_path_parameters(operation, route[:path]) }
         end
+      end
+    end
+
+    def verb_of(route)
+      route[:verb].to_s.downcase
+    end
+
+    # OpenAPI 3.1 requires every variable in a path template to be declared as
+    # a path parameter — a document templating {id} without declaring it is
+    # invalid, which every member route produced. The route set does not say
+    # what an :id is and the exporter does not guess: a path segment arrives as
+    # a string, so that is what it is documented as.
+    def with_path_parameters(operation, path)
+      variables = path.scan(/\{(\w+)\}/).flatten
+      return operation if variables.empty?
+
+      parameters = variables.map do |name|
+        { "name" => name, "in" => "path", "required" => true, "schema" => { "type" => "string" } }
+      end
+      # Inserted ahead of requestBody, where a reader of the document expects
+      # it; emission stays deterministic either way.
+      operation.each_with_object({}) do |(key, value), out|
+        out["parameters"] = parameters if key == "requestBody"
+        out[key] = value
       end
     end
 
@@ -198,14 +234,19 @@ module Permittable
     # `:id` form and the `*rest` wildcard, which is a real route shape
     # (`get "files/*path"`) and is not a valid OpenAPI template left as-is.
     def rails_routes(app)
-      app.routes.routes.filter_map do |route|
+      app.routes.routes.flat_map do |route|
         requirements = route.requirements
         verb = route.verb.to_s
-        next if requirements[:controller].nil? || requirements[:action].nil? || verb.empty?
+        next [] if requirements[:controller].nil? || requirements[:action].nil? || verb.empty?
 
         path = route.path.spec.to_s.sub("(.:format)", "").gsub(/[:*](\w+)/) { "{#{Regexp.last_match(1)}}" }
-        { controller: requirements[:controller], action: requirements[:action],
-          verb: verb.split("|").first.downcase, path: path }
+        # One route can answer several verbs (`match via: [:patch, :put]`, and
+        # the PATCH|PUT pair resources generates); documenting only the first
+        # dropped the others from the export entirely.
+        verb.split("|").map do |single|
+          { controller: requirements[:controller], action: requirements[:action],
+            verb: single.downcase, path: path }
+        end
       end
     end
 
