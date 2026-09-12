@@ -4,6 +4,7 @@ require "active_support/notifications"
 require "active_support/hash_with_indifferent_access"
 require "active_support/core_ext/hash/indifferent_access" # nested plain Hashes inside HWIA.new
 require "active_support/core_ext/class/attribute"
+require "active_support/core_ext/object/deep_dup" # authored default:/example: values are copied before freezing
 require "active_support/core_ext/string/inflections"
 require "active_support/core_ext/string/filters"
 require "bigdecimal"
@@ -98,7 +99,12 @@ require "permittable/filter_parameter_registry"
 # guess. nil and "" are both treated as ABSENT (the query-param convention):
 # absent optional fields are OMITTED from the result (so partial updates never
 # nil-out columns), absent required fields violate, and `default:` fills
-# absence.
+# absence. `normalize:` runs BEFORE that rule rather than inside the cast, so
+# there is exactly one reading of absence and a value that normalizes to empty
+# ("   " under :squish) cannot satisfy a required field by becoming "". An
+# authored `default:`/`example:` is stored normalized — the form it was
+# validated in — and deep-frozen on a copy, so no request can corrupt it for
+# the next.
 #
 # `nullable: true` splits that rule in two for one field, which is how a PATCH
 # clears a column: a key the client never sent stays absent (defaults apply,
@@ -167,6 +173,16 @@ module Permittable
   # Rails merges routing bookkeeping into params; a top-level (root: false)
   # unknown-keys check must not flag them.
   ROUTING_KEYS = %w[controller action format].freeze
+  # Nor the keys an ordinary form POST carries — the CSRF token, the verb
+  # override, the encoding probe, and the submit button's name. Without this
+  # `unknown: :error` was unusable outside a JSON API: every browser form
+  # failed on the framework's own keys rather than on anything the client got
+  # wrong. Exempt from the CHECK only: unlike ROUTING_KEYS these are NOT
+  # stripped from monitor mode's raw pass-through, where handing back an
+  # untouched params hash is the whole promise and a legacy action may well
+  # read `_method` itself.
+  FORM_KEYS = %w[authenticity_token _method utf8 commit].freeze
+  UNCHECKED_TOP_LEVEL_KEYS = (ROUTING_KEYS + FORM_KEYS).freeze
 
   # The single proc Permittable::Railtie appends to config.filter_parameters.
   # Declared with an optional third parameter so its own arity is -3 and Rails
@@ -342,10 +358,12 @@ module Permittable
     TRUE_VALUES = [true, "true", "1", 1].freeze
     FALSE_VALUES = [false, "false", "0", 0].freeze
 
-    # Full pipeline for one scalar field: normalize → cast → in / format /
-    # length / validate.
+    # Pipeline for one scalar field: cast → in / format / length / validate.
+    # `normalize:` is NOT applied here — it is its own stage, run by the
+    # caller before the absence rule (a value that normalizes to "" is absent
+    # like any other empty value), so normalizing again here would call a
+    # host's `normalize:` proc twice per value.
     def check_scalar(field, value)
-      value = apply_normalize(field[:normalize], value)
       status, value = cast(field[:type], value)
       return [status, value] unless status == :ok
 
@@ -710,9 +728,9 @@ module Permittable
       raise ArgumentError, "#{LABEL}: :#{opt} for :#{field[:name]} must be a Hash" unless field[opt].is_a?(Hash)
 
       status, code = Coercion.check_json(field, field[opt])
-      return if status == :ok
+      raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{code})" unless status == :ok
 
-      raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{code})"
+      field[opt] = freeze_authored(field[opt])
     end
 
     # format / length / normalize reason about characters; on any other
@@ -753,28 +771,57 @@ module Permittable
     # An authored value (`default:`, or a documentation `example:`) must
     # satisfy the field's own contract — catching a lie at class load beats
     # shipping it to every request (or publishing it in generated docs).
+    # The authored value is STORED normalized, because that is the form it was
+    # validated in: `default: "  free  "` with `normalize: :squish` was
+    # checked as "free" and used to be handed to requests as "  free  ".
     def validate_authored_value!(field, opt)
       return unless field.key?(opt)
       return if authored_nil!(field, opt)
 
-      status, code = Coercion.check_scalar(field, field[opt])
-      return if status == :ok
+      value = Coercion.apply_normalize(field[:normalize], field[opt])
+      status, code = Coercion.check_scalar(field, value)
+      raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{code})" unless status == :ok
 
-      raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{code})"
+      field[opt] = freeze_authored(value)
     end
 
     def validate_array_authored_value!(field, opt)
       value = field[opt]
       return if authored_nil!(field, opt)
       raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} must be an Array" unless value.is_a?(Array)
-      return unless field[:of]
 
+      validate_array_elements!(field, opt, value) if field[:of]
+      field[opt] = freeze_authored(value)
+    end
+
+    def validate_array_elements!(field, opt, value)
       value.each do |element|
         status, code = Coercion.cast(field[:of], element)
         next if status == :ok
 
         raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} contains an element violating of: :#{field[:of]} (#{code})"
       end
+    end
+
+    # A contract is frozen data, but `@fields.map(&:freeze)` freezes only the
+    # field hashes — an authored `default:` or `example:` value stayed
+    # mutable, and HashWithIndifferentAccess hands a non-frozen Array (and
+    # any String) to the result BY REFERENCE. So one request appending to
+    # `permitted_params[:tags]` corrupted the default for every later request
+    # in the process. Freezing a COPY fixes that without freezing an object
+    # the host app passed in and may still be using.
+    def freeze_authored(value)
+      deep_freeze(value.deep_dup)
+    end
+
+    def deep_freeze(value)
+      case value
+      when Hash
+        value.each_key { |key| deep_freeze(key) }
+        value.each_value { |element| deep_freeze(element) }
+      when Array then value.each { |element| deep_freeze(element) }
+      end
+      value.freeze
     end
 
     # An authored nil is only meaningful on a nullable field, where it says
@@ -1131,13 +1178,13 @@ module Permittable
     fields.each do |field|
       key = field[:name].to_s
       full = permittable_path(path, key)
-      value = hash[key]
+      value = permittable_normalized(field, hash[key])
 
       if permittable_absent?(value, hash, key)
         if permittable_explicit_null?(field, hash, key)
           result[key] = nil
         elsif field.key?(:default)
-          result[key] = field[:default]
+          result[key] = permittable_default(field)
         elsif field[:required]
           violations << permittable_violation(field, full, "missing")
         end
@@ -1154,6 +1201,7 @@ module Permittable
     key = field[:name].to_s
     case field[:kind]
     when :scalar
+      # Already normalized by permittable_normalized, before the absence rule.
       permittable_check_whole(field, Coercion.check_scalar(field, value), full, result, violations: violations)
     when :json
       permittable_check_whole(field, Coercion.check_json(field, value), full, result, violations: violations)
@@ -1219,6 +1267,26 @@ module Permittable
     nil
   end
 
+  # `normalize:` runs BEFORE the absence rule, not inside the cast, so there
+  # stays exactly ONE reading of absence. Otherwise a value that normalizes to
+  # empty walked straight past it: `required :name, :string, normalize:
+  # :squish` rejected "" as missing but accepted "   " as "" — the silent
+  # corruption strict coercion exists to refuse, delivered by the gem's own
+  # preset. Only scalars take normalize:.
+  def permittable_normalized(field, value)
+    field[:normalize] ? Coercion.apply_normalize(field[:normalize], value) : value
+  end
+
+  # An authored default belongs to the contract, which is frozen data (see
+  # ContractBuilder#freeze_authored). HashWithIndifferentAccess copies a
+  # frozen Array or Hash as it assigns it, but stores a String as-is — so
+  # that one is copied here, leaving every value in the result the app's own
+  # to mutate.
+  def permittable_default(field)
+    value = field[:default]
+    value.is_a?(String) ? value.dup : value
+  end
+
   # nil and "" are both ABSENT — see the module comment.
   def permittable_absent?(value, hash, key)
     !hash.key?(key) || value.nil? || (value.is_a?(String) && value.empty?)
@@ -1238,7 +1306,7 @@ module Permittable
 
     declared = fields.map { |f| f[:name].to_s }
     extra = hash.keys.map(&:to_s) - declared
-    extra -= ROUTING_KEYS if top_level
+    extra -= UNCHECKED_TOP_LEVEL_KEYS if top_level
     return if extra.empty?
 
     if unknown == :error
