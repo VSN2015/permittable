@@ -12,9 +12,9 @@ gem "activerecord", ">= 5.0", "< 9"
 gem "benchmark-ips", "~> 2.13", require: false
 gem "railties", ">= 5.0", "< 9"
 gem "rspec", "~> 3.12"
-gem "simplecov", "~> 1.1"
+gem "simplecov", "~> 1.2"
 gem "sqlite3", "~> 2.9.4"
 
 group :development, :test do
-  gem 'rubocop', '~> 1.90', require: false
+  gem 'rubocop', '~> 1.91', require: false
 end
