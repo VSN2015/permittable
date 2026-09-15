@@ -904,6 +904,47 @@ RSpec.describe Permittable do
       expect(Permittable.filter_parameter_registry.include?("name")).to be(false)
     end
 
+    describe "sensitive: name publication" do
+      # A proc filter can only redact Strings, and ParameterFilter never calls
+      # one for a Hash value at all — so the name has to reach Rails as a NAME
+      # too. Permittable::Railtie installs the sink that does it; this covers
+      # the publication itself, with no Rails in sight.
+      after { Permittable.sensitive_parameter_sinks.clear }
+
+      it "publishes every sensitive: name to an installed sink, nested ones included" do
+        seen = []
+        Permittable.on_sensitive_parameter { |name| seen << name }
+        permittable_class do
+          permit_params(:create) do
+            required :name, :string
+            optional :pin_code, :integer, sensitive: true
+            optional :payment, sensitive: true do
+              required :card_number, :string, sensitive: true
+            end
+          end
+        end
+        expect(seen).to contain_exactly("pin_code", "payment", "card_number")
+      end
+
+      it "replays the names already registered, so a late sink misses nothing" do
+        # A contract can be declared before the Railtie's initializer runs —
+        # a Permittable::Contract at require time, an eager-loaded controller.
+        permittable_class { permit_params(:create) { optional :ssn, :string, sensitive: true } }
+        seen = []
+        Permittable.on_sensitive_parameter { |name| seen << name }
+
+        expect(seen).to eq(["ssn"])
+      end
+
+      it "publishes the name normalized, however the field declared it" do
+        seen = []
+        Permittable.on_sensitive_parameter { |name| seen << name }
+        permittable_class { permit_params(:create) { optional :SSN, :string, sensitive: true } }
+
+        expect(seen).to eq(["ssn"])
+      end
+    end
+
     describe "the filter proc the Railtie appends" do
       # Rails runs railtie initializers BEFORE config/initializers, so an app
       # or host gem that swaps the registry does so AFTER the Railtie has

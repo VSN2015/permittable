@@ -14,6 +14,19 @@ module Permittable
       # there must still be the one consulted at filter time.
       filter = ::Permittable.filter_parameter_proc
       app.config.filter_parameters << filter unless app.config.filter_parameters.include?(filter)
+
+      # The proc above redacts Strings, live, and survives precompilation.
+      # What it cannot reach is a value that is not a String — ParameterFilter
+      # mutates values in place for proc filters, and skips them entirely for
+      # a Hash — so each registered name is ALSO added by name, which redacts
+      # any value type. Appending later still works: precompilation `replace`s
+      # this array in place and ActionDispatch reads the same object per
+      # request, so a name registered when a controller loads is seen by the
+      # next request. It is the array, not a snapshot, that has to be fed.
+      ::Permittable.on_sensitive_parameter do |name|
+        filters = app.config.filter_parameters
+        filters << name unless filters.include?(name)
+      end
     end
 
     rake_tasks do
