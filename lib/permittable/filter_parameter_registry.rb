@@ -10,8 +10,9 @@ module Permittable
   #
   # Matching mirrors Rails symbol-filter semantics: case-insensitive substring
   # match on the parameter key. The whole object is duck-typed (#add,
-  # #include?, #to_proc, #reset!) so a host can swap in its own registry via
-  # `Permittable.filter_parameter_registry=` and pool registrations.
+  # #include?, #to_proc, #names, #reset!) so a host can swap in its own
+  # registry via `Permittable.filter_parameter_registry=` and pool
+  # registrations.
   class FilterParameterRegistry
     FILTERED = "[FILTERED]".freeze
 
@@ -53,6 +54,14 @@ module Permittable
 
     def to_proc
       @proc
+    end
+
+    # The names registered so far. Permittable.filter_parameter_registry=
+    # reads this off the outgoing registry and re-adds each name to the
+    # incoming one, so a swap never un-redacts a field that a contract
+    # loaded before it had already registered.
+    def names
+      @mutex.synchronize { @fields.to_a }
     end
 
     # Spec hygiene — the registry is process-global.

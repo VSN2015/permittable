@@ -555,7 +555,9 @@ optional :ssn, :string, sensitive: true
 
 The indirection is deliberate. Appending plain symbols to `config.filter_parameters` at class-load time misses every consumer that snapshots the list at boot — ActiveRecord's `filter_attributes` copy, lograge-style initializers, precompiled filters. A **single proc appended once at boot, consulting a live registry at filter time**, means fields registered when a controller loads later (lazy loading in development) are still redacted. The initializer runs before `active_record.set_filter_attributes`, so values are redacted from both request logs and `#inspect`.
 
-Matching mirrors Rails' own symbol-filter semantics: case-insensitive substring match on the parameter key. The registry is fully duck-typed (`#add`, `#include?`, `#to_proc`, `#reset!`) and swappable via `Permittable.filter_parameter_registry=`, so a host gem can pool registrations into its own.
+Matching mirrors Rails' own symbol-filter semantics: case-insensitive substring match on the parameter key. The registry is fully duck-typed (`#add`, `#include?`, `#to_proc`, `#names`, `#reset!`) and swappable via `Permittable.filter_parameter_registry=`, so a host gem can pool registrations into its own. `#to_proc` must return a callable of arity 2 (`key, value`) or 3 (`key, value, original_params`), matching what Rails' own parameter filtering accepts; anything that does not respond to `#to_proc` is refused at the point of the swap rather than on the next request.
+
+**The swap works at any point**, including from `config/initializers` — which matters, because Rails runs railtie initializers *before* those, so a swap always happens after `Permittable::Railtie` has appended its filter. Two things make that safe. The appended proc (`Permittable.filter_parameter_proc`) resolves the registry at **filter time** rather than closing over whichever instance existed at boot, so whichever registry is current does the redacting. And the swap **carries the previous registry's names into the new one**, so a `sensitive:` field registered by a contract that loaded before the swap keeps being redacted afterwards. Without that, the two halves of an app would each redact only what the other did not.
 
 ### Instrumentation
 
@@ -782,7 +784,8 @@ Output is deterministic (fixed key order, declaration-order properties), so the 
 | Constant | Purpose |
 |---|---|
 | `Permittable.filter_parameter_registry` | The live registry of `sensitive:` field names |
-| `Permittable.filter_parameter_registry=` | Swap in your own duck-typed registry |
+| `Permittable.filter_parameter_registry=` | Swap in your own duck-typed registry; entries already registered are carried across |
+| `Permittable.filter_parameter_proc` | The single proc `Permittable::Railtie` appends to `config.filter_parameters`; consults the current registry at filter time |
 | `Permittable.mode` / `Permittable.mode=` | App-wide default (`:enforce`) for rules that don't declare their own `mode:` |
 | `Permittable::InvalidParameters` | Raised on violation; carries `#details` and `#status` |
 | `Permittable::JsonSchema` | Contract data → JSON Schema fragments (`.rule`, `.object`, `.field`) |

@@ -904,6 +904,79 @@ RSpec.describe Permittable do
       expect(Permittable.filter_parameter_registry.include?("name")).to be(false)
     end
 
+    describe "the filter proc the Railtie appends" do
+      # Rails runs railtie initializers BEFORE config/initializers, so an app
+      # or host gem that swaps the registry does so AFTER the Railtie has
+      # already appended its proc.
+      after { Permittable.filter_parameter_registry = nil }
+
+      def boot_filter
+        ActiveSupport::ParameterFilter.new([Permittable.filter_parameter_proc])
+      end
+
+      it "redacts through whichever registry is current, not the one present at boot" do
+        filter = boot_filter # boot: proc appended
+        pooled = Permittable::FilterParameterRegistry.new
+        Permittable.filter_parameter_registry = pooled # initializer: swap
+        permittable_class { permit_params(:create) { optional :ssn, :string, sensitive: true } }
+
+        expect(pooled.include?("ssn")).to be(true)
+        expect(filter.filter("ssn" => "111-22-3333")).to eq("ssn" => "[FILTERED]")
+      end
+
+      it "is a stable object, so the Railtie's idempotence check still holds" do
+        expect(Permittable.filter_parameter_proc).to be(Permittable.filter_parameter_proc)
+        Permittable.filter_parameter_registry = Permittable::FilterParameterRegistry.new
+        expect(Permittable.filter_parameter_proc).to be(Permittable.filter_parameter_proc)
+      end
+
+      it "still redacts through the default registry when nothing is swapped" do
+        filter = boot_filter
+        permittable_class { permit_params(:create) { optional :ssn, :string, sensitive: true } }
+        expect(filter.filter("ssn" => "111-22-3333")).to eq("ssn" => "[FILTERED]")
+      end
+
+      it "carries entries registered BEFORE the swap into the new registry" do
+        filter = boot_filter
+        # A contract that loaded before the initializer ran — eager loading,
+        # or any file required ahead of the swap.
+        permittable_class { permit_params(:create) { optional :ssn, :string, sensitive: true } }
+
+        pooled = Permittable::FilterParameterRegistry.new
+        Permittable.filter_parameter_registry = pooled
+
+        permittable_class { permit_params(:create) { optional :pin, :string, sensitive: true } }
+
+        expect(pooled.include?("ssn")).to be(true)
+        # Without the carry-forward this is the mirror image of the bug above:
+        # the swap redacts only what was registered after it.
+        expect(filter.filter("ssn" => "111-22-3333", "pin" => "1234", "note" => "keep"))
+          .to eq("ssn" => "[FILTERED]", "pin" => "[FILTERED]", "note" => "keep")
+      end
+
+      it "refuses a registry that cannot be turned into a filter, at the swap rather than per request" do
+        expect { Permittable.filter_parameter_registry = Set.new }
+          .to raise_error(ArgumentError, /must respond to #to_proc \(got Set\)/)
+        expect(Permittable.filter_parameter_registry).to be_a(Permittable::FilterParameterRegistry)
+      end
+
+      it "accepts a registry whose proc takes Rails' three-argument filter shape" do
+        three = Class.new do
+          def add(name) = names << name.to_s
+          def names = (@names ||= [])
+          def include?(key) = names.any? { |n| key.to_s.include?(n) }
+
+          def to_proc
+            registry = self
+            ->(key, value, _original) { value.replace("[FILTERED]") if value.is_a?(String) && registry.include?(key) }
+          end
+        end.new
+        Permittable.filter_parameter_registry = three
+        permittable_class { permit_params(:create) { optional :ssn, :string, sensitive: true } }
+        expect(boot_filter.filter("ssn" => "111-22-3333")).to eq("ssn" => "[FILTERED]")
+      end
+    end
+
     it "instruments invalid_parameters.permittable with the violation details" do
       events = []
       subscription = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
