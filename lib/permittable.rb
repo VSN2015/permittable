@@ -544,6 +544,14 @@ module Permittable
       normalizer.call(value)
     end
 
+    # nil and "" are both ABSENT — see the module comment. The VALUE half of
+    # that rule (the walker adds the key-presence half), shared with
+    # macro-time `default:`/`example:` checking so a default cannot be held
+    # to a different reading of absence than the request it stands in for.
+    def absent_value?(value)
+      value.nil? || (value.is_a?(String) && value.empty?)
+    end
+
     # Range#include? walks discrete ranges; cover? is the O(1) bounds check
     # and the right semantics for validation.
     def included_in?(allowed, value)
@@ -867,8 +875,15 @@ module Permittable
     end
 
     def validate_array_element_field!(field, opt, element, sub)
-      value = element[sub[:name]]
-      if value.nil?
+      # Normalized before absence is read, and absence read with the runtime's
+      # own rule: a default: is applied WITHOUT revalidation, so anything this
+      # check waves through is handed to the app unexamined — and "" here used
+      # to mean a default could carry the very value a client is refused.
+      value = Coercion.apply_normalize(sub[:normalize], element[sub[:name]])
+      if Coercion.absent_value?(value)
+        # nullable: splits that rule exactly as permittable_explicit_null?
+        # does — a key present but empty is an explicit null, not an absence.
+        return if sub[:nullable] && element.key?(sub[:name])
         return unless sub[:required]
 
         raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} is missing :#{sub[:name]}, " \
@@ -876,7 +891,7 @@ module Permittable
       end
       return unless sub[:kind] == :scalar
 
-      status, code = Coercion.check_scalar(sub, Coercion.apply_normalize(sub[:normalize], value))
+      status, code = Coercion.check_scalar(sub, value)
       return if status == :ok
 
       raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} has :#{sub[:name]} " \
@@ -1381,7 +1396,7 @@ module Permittable
 
   # nil and "" are both ABSENT — see the module comment.
   def permittable_absent?(value, hash, key)
-    !hash.key?(key) || value.nil? || (value.is_a?(String) && value.empty?)
+    !hash.key?(key) || Coercion.absent_value?(value)
   end
 
   # `nullable: true` splits the one absence rule in two: a key the client

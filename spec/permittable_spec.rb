@@ -139,6 +139,59 @@ RSpec.describe Permittable do
       end.not_to raise_error
     end
 
+    it "reads absence in a block array's default: the way a request does" do
+      # "" is absent, so a client sending { "sku" => "" } gets `missing` — but
+      # a default: is applied WITHOUT revalidation, so accepting one here
+      # hands the app the exact value the contract refuses from a client.
+      expect do
+        permittable_class do
+          permit_params(:create) do
+            array :items, default: [{ "sku" => "" }] do
+              required :sku, :string
+            end
+          end
+        end
+      end.to raise_error(ArgumentError, /:default for array :items.*is missing :sku/)
+
+      # normalize: runs BEFORE the absence rule at request time; a default
+      # that normalizes to empty is absent for the same reason.
+      expect do
+        permittable_class do
+          permit_params(:create) do
+            array :items, default: [{ "sku" => "   " }] do
+              required :sku, :string, normalize: :squish
+            end
+          end
+        end
+      end.to raise_error(ArgumentError, /:default for array :items.*is missing :sku/)
+    end
+
+    it "accepts an empty value a block array's default: is allowed to carry" do
+      # nullable: splits the absence rule — an explicitly-sent empty value is
+      # a null, not an absence, so it is a legal thing for a default to say.
+      expect do
+        permittable_class do
+          permit_params(:create) do
+            array :items, default: [{ "sku" => "" }] do
+              required :sku, :string, nullable: true
+            end
+          end
+        end
+      end.not_to raise_error
+
+      # An optional sub-field is simply omitted when absent.
+      expect do
+        permittable_class do
+          permit_params(:create) do
+            array :items, default: [{ "sku" => "a", "note" => "" }] do
+              required :sku, :string
+              optional :note, :string
+            end
+          end
+        end
+      end.not_to raise_error
+    end
+
     it "rejects a non-callable :validate" do
       expect { permittable_class { permit_params(:create) { required :a, :string, validate: :nope } } }
         .to raise_error(ArgumentError, /:validate for field :a must be callable/)
