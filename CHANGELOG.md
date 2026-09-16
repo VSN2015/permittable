@@ -1,6 +1,9 @@
 <!-- CHANGELOG.md -->
 
-## Unreleased
+## 0.7.0 (2026-09-16)
+<!-- title: sensitive: redaction, uncorruptible defaults, and stricter class load -->
+
+Two silent disclosures and three silent corruptions, all in code that was doing its job wrongly rather than not at all: `sensitive:` redacted nothing unless the value was a String, a swapped filter registry stopped being consulted, a mutable `default:` was shared by every request in the process, `normalize:` could manufacture an empty value that walked past `required`, and `unknown: :error` rejected the keys Rails itself adds to a form POST. Contract mistakes that could only ever fail at request time now fail at class load instead.
 
 ### Fixed
 - **Swapping `Permittable.filter_parameter_registry` silently stopped `sensitive:` redaction.** `Permittable::Railtie` appended `filter_parameter_registry.to_proc` — a proc bound to whichever registry instance existed **at boot**. Rails runs railtie initializers *before* `config/initializers`, so a host gem or app that swaps the registry necessarily does so afterwards, leaving Rails filtering through the old instance: `sensitive:` fields registered themselves in the new registry, and the appended proc went on consulting an empty one. The parameter was logged in the clear, with nothing to indicate it. That swap is the reason the writer exists — the gem's own comment names `concerns_on_rails` as doing exactly this — so the broken ordering was the normal case rather than an exotic one. The Railtie now appends `Permittable.filter_parameter_proc`, which resolves the registry at **filter time**; it is one frozen object for the life of the process, so the Railtie's idempotence check still holds across repeated initializer runs.
