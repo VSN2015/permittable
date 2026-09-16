@@ -81,6 +81,22 @@ RSpec.describe Permittable::JsonSchema do
       expect(property("zip") { optional :zip, :string, format: /\A\d{5}\z/ }["pattern"]).to eq("^\\d{5}$")
     end
 
+    it "refuses to translate Ruby's ^ and $, which are LINE anchors" do
+      # The runtime accepts "evil\n12345" for /^\d{5}$/ — Ruby anchors a line,
+      # ECMA-262 anchors the whole string without the m flag. Emitting the
+      # source verbatim would publish a pattern stricter than the server
+      # enforces, which is the one thing an export from contract data is
+      # supposed to make impossible.
+      prop = property("zip") { optional :zip, :string, format: /^\d{5}$/ }
+      expect(prop).not_to have_key("pattern")
+      expect(prop["x-permittable-pattern"]).to eq("/^\\d{5}$/")
+    end
+
+    it "still translates an ESCAPED dollar or caret, which are literals" do
+      expect(property("amount") { optional :amount, :string, format: /\A\$\d+\z/ }["pattern"])
+        .to eq("^\\$\\d+$")
+    end
+
     it "falls back to x-permittable-pattern for flagged or Ruby-only regexps" do
       [/abc/i, /\A\h+\z/, /(?i)x/, /[[:alpha:]]+/, /a*+b/].each do |regexp|
         prop = property("a") { optional :a, :string, format: regexp }

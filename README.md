@@ -736,7 +736,7 @@ Permittable::OpenAPI.document(controllers: [...], info: { "title" => "My API" })
 
 Every operation references shared components for the [error envelope](#violations-and-error-responses): a `422` response always, plus a `400` when the contract declares a `root:`. So consumers get typed *errors*, not just typed inputs.
 
-**What is honestly unrepresentable stays visible instead of guessed.** A `format:` regexp using a Ruby-only construct (or flags) is exported as `x-permittable-pattern` rather than a mistranslated `pattern`; `validate:`/`transform:` are flagged `x-permittable-custom-validation`/`x-permittable-transformed`; actions covered only by a catch-all rule on a plain-Ruby host appear under `"*"` with `x-permittable-catch-all`; operations whose rule runs in [monitor mode](#monitor-mode-roll-out-without-rejecting) carry `x-permittable-mode: "monitor"`; operations with no matching route land in `x-permittable-controllers` instead of being dropped. The schema documents the canonical JSON encoding — the runtime additionally accepts string-encoded scalars (`"42"`, `"true"`) for form/query payloads.
+**What is honestly unrepresentable stays visible instead of guessed.** A `format:` regexp using a Ruby-only construct (or flags) is exported as `x-permittable-pattern` rather than a mistranslated `pattern` — including one anchored with `^`/`$`, which in Ruby anchor a **line** and in ECMA-262 anchor the whole string, so `/^\d{5}$/` accepts `"evil\n12345"` at runtime and publishing that source would promise a stricter rule than the server enforces (use `\A`/`\z`, which translate exactly); `validate:`/`transform:` are flagged `x-permittable-custom-validation`/`x-permittable-transformed`; actions covered only by a catch-all rule on a plain-Ruby host appear under `"*"` with `x-permittable-catch-all`; operations whose rule runs in [monitor mode](#monitor-mode-roll-out-without-rejecting) carry `x-permittable-mode: "monitor"`; operations with no matching route land in `x-permittable-controllers` instead of being dropped. The schema documents the canonical JSON encoding — the runtime additionally accepts string-encoded scalars (`"42"`, `"true"`) for form/query payloads.
 
 Output is deterministic (fixed key order, declaration-order properties), so the generated file can be committed and reviewed as a diff — a contract change shows up in the same PR as its documentation change.
 
@@ -814,9 +814,10 @@ A bad contract is a programmer error, so it fails when the class loads — never
 - An unknown type, listing the supported ones
 - An unknown `normalize:` preset, listing the presets
 - `format:`, `length:`, or `normalize:` on a non-`:string` field
-- `length:` that isn't a `Range` or `Integer`; `in:` that doesn't respond to `include?`
+- `length:` that isn't a non-negative `Integer` or a `Range`; `in:` that doesn't respond to `include?`
+- A bound **no value could satisfy**: a reversed or empty `Range` (`in: 65..18`, `length: 5..2`, `length: 3...3`), an empty `in:` set, or a `length:` of 0 on a `required` field (where `""` already violates as `missing`)
 - `validate:` or `transform:` that isn't callable
-- A `default:` or `example:` that violates its own field's contract, or an array `default:`/`example:` whose elements violate `of:`
+- A `default:` or `example:` that violates its own field's contract, or an array `default:`/`example:` whose elements violate `of:` — or, for an array declared with a **block**, an element that isn't a hash the block would accept
 - A `default: nil` or `example: nil` on a field that isn't `nullable:`
 - A `:json` field's `default:`/`example:` that isn't a Hash, or that its own `length:`/`max_depth:` would reject
 - A `max_depth:` that isn't a positive Integer
