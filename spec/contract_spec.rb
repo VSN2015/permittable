@@ -86,12 +86,13 @@ RSpec.describe Permittable::Contract do
       expect(c.call(starts_on: "2026-01-01", ends_on: "2026-01-02")).to be_valid
     end
 
-    it "does not exempt the router's bookkeeping keys — standalone input has no router" do
+    it "does not exempt the router's or a form's bookkeeping keys — standalone input has neither" do
       c = described_class.define(unknown: :error) { optional :name, :string }
-      result = c.call(name: "x", action: "boom", controller: "hax")
+      result = c.call(name: "x", action: "boom", controller: "hax", authenticity_token: "tok")
       expect(result.violations).to contain_exactly(
         { param: "action", code: "unknown" },
-        { param: "controller", code: "unknown" }
+        { param: "controller", code: "unknown" },
+        { param: "authenticity_token", code: "unknown" }
       )
     end
 

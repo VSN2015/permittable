@@ -210,7 +210,7 @@ Adopting on an existing API with live traffic? Skip ahead to [Adopting on a live
 request params
    │
    ├─ 1  unwrap root:        params[:user]                missing or not a hash → 400
-   ├─ 2  each field          normalize → cast → validate → transform
+   ├─ 2  each field          normalize → absent? → cast → validate → transform
    ├─ 3  unknown-key check   at every nesting level       (unknown: :ignore | :log | :error)
    ├─ 4  finalize            only when nothing violated
    │
@@ -290,8 +290,8 @@ Which options are legal depends on the field kind — anything else raises at cl
 | `in:` | ✅ | — | — | Allowed values: a `Range` (bounds-checked with `cover?`) or an `Array` |
 | `format:` | ✅¹ | — | — | Regexp the value must match |
 | `length:` | ✅¹ | ✅ | — | `Range` or `Integer`. Character count on strings, **element count** on arrays |
-| `normalize:` | ✅¹ | — | — | `:squish`, `:strip`, `:downcase`, `:upcase`, `:email`, or a Proc. Runs **before** the cast |
-| `default:` | ✅ | ✅ | — | Value used when the field is absent. Validated against the field's own contract at class load |
+| `normalize:` | ✅¹ | — | — | `:squish`, `:strip`, `:downcase`, `:upcase`, `:email`, or a Proc. Runs **first** — before the absence rule, so a value that normalizes to `""` is absent |
+| `default:` | ✅ | ✅ | — | Value used when the field is absent. Validated against the field's own contract at class load, then stored normalized and frozen (each request gets its own copy) |
 | `validate:` | ✅ | ✅ | — | Callable. Falsy fails as `"invalid"`; a returned `Symbol` becomes the violation code |
 | `transform:` | ✅ | ✅ | — | Callable applied **after** cast and validation — see [output reshaping](#output-reshaping-transform-and-finalize) |
 | `virtual:` | ✅ | ✅ | ✅ | Exempt this field from the schema-drift guard |
@@ -365,7 +365,7 @@ In [exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) the field is `{
 
 ### Absence, defaults, and partial updates
 
-`nil` and `""` are **both treated as absent** — the query-parameter convention, where an untouched form field arrives as an empty string. Boolean `false` is present.
+`nil` and `""` are **both treated as absent** — the query-parameter convention, where an untouched form field arrives as an empty string. Boolean `false` is present. `normalize:` runs *before* this rule, so a field declared `normalize: :squish` treats `"   "` as absent too: whitespace cannot satisfy a `required` field by becoming `""`.
 
 That single rule produces the behaviour you want from a `PATCH`:
 
@@ -487,7 +487,9 @@ Resolution order per violation: the field's own `message:` (String, or the Hash 
 | `:log` | Dropped, with a `logger.warn` naming the full paths |
 | `:error` | Each undeclared key becomes an `unknown` violation |
 
-Rails merges `controller`, `action`, and `format` into `params`; these are exempt at the top level so `unknown: :error` doesn't flag the router's own bookkeeping. Inside a `root:` or a nested hash there is no such exemption, because nothing legitimately injects keys there.
+Rails merges its own keys into `params`: `controller`, `action`, and `format` from the router, plus `authenticity_token`, `_method`, `utf8`, and `commit` from an ordinary form POST. All seven are exempt at the top level, so `unknown: :error` flags what the *client* got wrong rather than what the framework added. Inside a `root:` or a nested hash there is no such exemption, because nothing legitimately injects keys there — and a standalone `Contract` exempts nothing at all, having neither a router nor a form.
+
+The exemption covers the *check* only. Monitor mode still hands back the form keys in its raw pass-through, where behaving exactly like the pre-contract app is the whole promise and a legacy action may read `_method` itself; only the router's three are dropped there.
 
 ### Output reshaping (`transform:` and `finalize`)
 
