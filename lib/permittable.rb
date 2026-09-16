@@ -177,12 +177,17 @@ module Permittable
   # override, the encoding probe, and the submit button's name. Without this
   # `unknown: :error` was unusable outside a JSON API: every browser form
   # failed on the framework's own keys rather than on anything the client got
-  # wrong. Exempt from the CHECK only: unlike ROUTING_KEYS these are NOT
+  # wrong. Exempt from the CHECK only: unlike the routing keys these are NOT
   # stripped from monitor mode's raw pass-through, where handing back an
   # untouched params hash is the whole promise and a legacy action may well
   # read `_method` itself.
   FORM_KEYS = %w[authenticity_token _method utf8 commit].freeze
+  # ROUTING_KEYS/FORM_KEYS name where the keys come FROM; these two name what
+  # is DECIDED with them, which is what the call sites care about — and the
+  # asymmetry between them is the deliberate point, so spell it once here
+  # rather than leaving a bare ROUTING_KEYS to read like an oversight.
   UNCHECKED_TOP_LEVEL_KEYS = (ROUTING_KEYS + FORM_KEYS).freeze
+  MONITOR_DROPPED_KEYS = ROUTING_KEYS
 
   # The single proc Permittable::Railtie appends to config.filter_parameters.
   # Declared with an optional third parameter so its own arity is -3 and Rails
@@ -817,8 +822,10 @@ module Permittable
     def deep_freeze(value)
       case value
       when Hash
-        value.each_key { |key| deep_freeze(key) }
-        value.each_value { |element| deep_freeze(element) }
+        value.each_pair do |key, element|
+          deep_freeze(key)
+          deep_freeze(element)
+        end
       when Array then value.each { |element| deep_freeze(element) }
       end
       value.freeze
@@ -1096,7 +1103,7 @@ module Permittable
     return ActiveSupport::HashWithIndifferentAccess.new unless source
 
     passed = ActiveSupport::HashWithIndifferentAccess.new(source)
-    rule[:root] ? passed : passed.except(*ROUTING_KEYS)
+    rule[:root] ? passed : passed.except(*MONITOR_DROPPED_KEYS)
   end
 
   def raise_invalid_parameters!(violations, status:)
@@ -1272,9 +1279,10 @@ module Permittable
   # empty walked straight past it: `required :name, :string, normalize:
   # :squish` rejected "" as missing but accepted "   " as "" — the silent
   # corruption strict coercion exists to refuse, delivered by the gem's own
-  # preset. Only scalars take normalize:.
+  # preset. Only scalars take normalize:, and apply_normalize is itself a
+  # no-op without one, so it owns that decision for every caller.
   def permittable_normalized(field, value)
-    field[:normalize] ? Coercion.apply_normalize(field[:normalize], value) : value
+    Coercion.apply_normalize(field[:normalize], value)
   end
 
   # An authored default belongs to the contract, which is frozen data (see
