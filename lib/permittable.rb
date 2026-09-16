@@ -757,15 +757,12 @@ module Permittable
     end
 
     def validate_length!(name, length)
-      assert_length_shape!(name, length)
+      unless length.is_a?(Range) || (length.is_a?(Integer) && !length.negative?)
+        raise ArgumentError, "#{LABEL}: :length for :#{name} must be a non-negative Integer or a Range " \
+                             "(got #{length.inspect})"
+      end
+
       assert_satisfiable!(name, :length, length)
-    end
-
-    def assert_length_shape!(name, length)
-      return if length.is_a?(Range) || (length.is_a?(Integer) && !length.negative?)
-
-      raise ArgumentError, "#{LABEL}: :length for :#{name} must be a non-negative Integer or a Range " \
-                           "(got #{length.inspect})"
     end
 
     # A reversed Range (5..2), an exclusive Range with equal endpoints
@@ -783,16 +780,12 @@ module Permittable
 
     def unsatisfiable?(bound)
       return bound.empty? if bound.respond_to?(:empty?)
-      return false unless bound.is_a?(Range)
+      return false unless bound.is_a?(Range) && bound.begin && bound.end
 
-      first = bound.begin
-      last = bound.end
-      return false if first.nil? || last.nil?
-
-      comparison = first <=> last
+      comparison = bound.begin <=> bound.end
       return false if comparison.nil?
 
-      comparison.positive? || (comparison.zero? && bound.exclude_end?)
+      bound.exclude_end? ? !comparison.negative? : comparison.positive?
     end
 
     # "" is ABSENT and an absent required field violates as missing, so a
@@ -801,15 +794,9 @@ module Permittable
     # so — minLength 1 alongside maxLength 0 — while nothing refused the
     # declaration that produced it.
     def validate_required_length!(field)
-      return unless field[:required] && field.key?(:length)
-
       spec = field[:length]
-      max = if spec.is_a?(Range)
-              spec.end && spec.exclude_end? ? spec.end - 1 : spec.end
-            else
-              spec
-            end
-      return unless max&.zero?
+      return unless field[:required] && spec
+      return unless Coercion.length_ok?(spec, 0) && !Coercion.length_ok?(spec, 1)
 
       raise ArgumentError, "#{LABEL}: :length for :#{field[:name]} is 0 on a required field — an absent or " \
                            "empty value already violates as missing, so nothing could satisfy it"
@@ -872,12 +859,15 @@ module Permittable
                                "where the block declares a hash"
         end
 
-        field[:fields].each { |sub| validate_array_element_field!(field, opt, element, sub) }
+        # Wrapped the way permittable_check_element wraps an element at
+        # request time, so class load reads keys exactly as a request does.
+        indifferent = ActiveSupport::HashWithIndifferentAccess.new(element)
+        field[:fields].each { |sub| validate_array_element_field!(field, opt, indifferent, sub) }
       end
     end
 
     def validate_array_element_field!(field, opt, element, sub)
-      value = element.key?(sub[:name]) ? element[sub[:name]] : element[sub[:name].to_s]
+      value = element[sub[:name]]
       if value.nil?
         return unless sub[:required]
 

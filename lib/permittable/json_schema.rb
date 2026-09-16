@@ -37,10 +37,11 @@ module Permittable
     # ECMA-262 without the m flag anchors the whole string. /^\d{5}$/ accepts
     # "evil\n12345" at runtime, so emitting its source as `pattern` would
     # publish a rule stricter than the server enforces, and an export from
-    # contract data is supposed to make that impossible. A caret straight
-    # after [ is class negation, not an anchor, and stays translatable.
-    # Otherwise the scan is deliberately over-eager on escaped lookalikes,
-    # because a wrong pattern in published docs is worse than a missing one.
+    # contract data is supposed to make that impossible. Straight after a [
+    # neither is an anchor — ^ is class negation and $ is a literal — so both
+    # stay translatable there. Otherwise the scan is deliberately over-eager
+    # on escaped lookalikes, because a wrong pattern in published docs is
+    # worse than a missing one.
     UNTRANSLATABLE = /
       \\[ZhHKRG]          |
       \(\?[a-z-]+[:)]     |
@@ -48,8 +49,7 @@ module Permittable
       \(\?\(              |
       \[\[:               |
       [*+?]\+             |
-      (?<![\\\[])\^        |
-      (?<!\\)\$
+      (?<![\\\[])[\^$]
     /x
 
     # Request-body schema for one rule from `permittable_contracts` /
