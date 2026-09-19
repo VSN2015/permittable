@@ -7,12 +7,21 @@ module Permittable
   # actually enforces.
   #
   # The exported schema describes the DECLARED INPUT SHAPE in its canonical
-  # JSON encoding. Two deliberate consequences:
+  # JSON encoding. Three deliberate consequences:
   #   * Coercion additionally accepts string-encoded scalars ("42", "true")
   #     for form/query payloads; the schema documents the JSON types only.
+  #   * Coercion reads an explicit `null` as ABSENCE, so `{"age": null}` means
+  #     the same as `{}`. JSON Schema cannot say that — `type: integer` reads
+  #     null as a present value of the wrong type — so the schema rejects a
+  #     null the server would accept and ignore.
   #   * `validate:`/`transform:`/`finalize` are opaque callables — they never
   #     change what a client may SEND, so fields carrying them are flagged
   #     with `x-permittable-*` extensions rather than mistranslated.
+  #
+  # All three leave the schema STRICTER than the server, never looser: a
+  # client that validates against the published document is conservative,
+  # never surprised by a 422. spec/schema_conformance_spec.rb holds that line,
+  # asserting the direction of every divergence it permits.
   #
   # Emission is deterministic (fixed key insertion order, declaration-order
   # properties) so generated documents are committable and diff-stable.

@@ -16,6 +16,7 @@ require "active_record"
 require "permittable"
 require_relative "support/fake_controller"
 require_relative "support/integration_harness"
+require_relative "support/tiny_json_schema"
 
 ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
 ActiveRecord::Base.logger = nil
