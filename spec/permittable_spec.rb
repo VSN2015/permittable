@@ -1485,6 +1485,108 @@ RSpec.describe Permittable do
     end
   end
 
+  describe "bounded prose: log lines and summaries" do
+    def logging_controller(klass, params:, action: "create")
+      c = controller(klass, params: params, action: action)
+      lines = []
+      logger = Object.new
+      logger.define_singleton_method(:warn) { |message| lines << message }
+      c.define_singleton_method(:logger) { logger }
+      [c, lines]
+    end
+
+    let(:many) { Array.new(5_000) { |i| ["extra_#{i}", "v"] }.to_h.merge("a" => "x") }
+
+    it "lists at most ten unknown keys and counts the rest, instead of writing them all" do
+      klass = permittable_class { permit_params(:create, unknown: :log) { required :a, :string } }
+      c, lines = logging_controller(klass, params: many)
+      c.permitted_params
+      expect(lines.length).to eq(1)
+      expect(lines.first.bytesize).to be < 400
+      expect(lines.first).to include("extra_0, extra_1")
+      expect(lines.first).to match(/and 4990 more/)
+    end
+
+    it "lists them in full when there are ten or fewer" do
+      klass = permittable_class { permit_params(:create, unknown: :log) { required :a, :string } }
+      c, lines = logging_controller(klass, params: { "a" => "x", "b" => 1, "c" => 2 })
+      c.permitted_params
+      expect(lines.first).to end_with("contract: b, c")
+      expect(lines.first).not_to include("more")
+    end
+
+    it "bounds the exception summary while details stays complete" do
+      klass = permittable_class { permit_params(:create, unknown: :error) { required :a, :string } }
+      e = begin
+        controller(klass, params: many).permitted_params
+      rescue described_class::InvalidParameters => e
+        e
+      end
+      expect(e.message.bytesize).to be < 400
+      expect(e.message).to match(/and 4990 more/)
+      # The machine-readable channel is untouched: every offender is still named.
+      expect(e.details.length).to eq(5_000)
+      expect(e.details.first).to eq(param: "extra_0", code: "unknown")
+    end
+
+    it "bounds the monitor-mode warn line too, and still instruments every violation" do
+      klass = permittable_class { permit_params(:create, unknown: :error, mode: :monitor) { required :a, :string } }
+      c, lines = logging_controller(klass, params: many)
+      events = []
+      subscription = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
+        events << payload
+      end
+      begin
+        c.permitted_params
+      ensure
+        ActiveSupport::Notifications.unsubscribe(subscription)
+      end
+      expect(lines.first.bytesize).to be < 400
+      expect(lines.first).to match(/and 4990 more/)
+      expect(events.first[:details].length).to eq(5_000)
+    end
+
+    it "lists exactly ten without a count, and eleven with one" do
+      klass = permittable_class { permit_params(:create, unknown: :log) { required :a, :string } }
+      ten = Array.new(10) { |i| ["k#{i}", "v"] }.to_h.merge("a" => "x")
+      c, lines = logging_controller(klass, params: ten)
+      c.permitted_params
+      expect(lines.first).to end_with("contract: k0, k1, k2, k3, k4, k5, k6, k7, k8, k9")
+
+      eleven = ten.merge("k10" => "v")
+      c2, lines2 = logging_controller(klass, params: eleven)
+      c2.permitted_params
+      expect(lines2.first).to end_with("k0, k1, k2, k3, k4, k5, k6, k7, k8, k9, and 1 more")
+    end
+
+    it "truncates a single enormous key, which the count cap alone did not bound" do
+      klass = permittable_class { permit_params(:create, unknown: :error) { required :a, :string } }
+      huge = "z" * 100_000
+      e = begin
+        controller(klass, params: { "a" => "x", huge => "v" }).permitted_params
+      rescue described_class::InvalidParameters => e
+        e
+      end
+      expect(e.message.bytesize).to be < 300
+      expect(e.message).to include("z" * 20)
+      expect(e.message).to include("...")
+      # The machine-readable channel keeps the key whole.
+      expect(e.details.first[:param]).to eq(huge)
+    end
+
+    it "truncates an enormous key in the :log line too" do
+      klass = permittable_class { permit_params(:create, unknown: :log) { required :a, :string } }
+      c, lines = logging_controller(klass, params: { "a" => "x", "y" * 100_000 => "v" })
+      c.permitted_params
+      expect(lines.first.bytesize).to be < 300
+    end
+
+    it "leaves an ordinary contract's message exactly as it was" do
+      decl = proc { permit_params(:create) { required :a, :string, in: %w[x] } }
+      expect(violations_for({ a: "nope" }, &decl).message).to eq("Invalid parameters: a (inclusion)")
+    end
+  end
+
   describe "monitor mode" do
     after { Permittable.mode = :enforce }
 
