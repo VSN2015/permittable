@@ -1,5 +1,10 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+
+### Fixed
+- **A wildcard route exported an invalid OpenAPI path.** `OpenAPI.rails_routes` templated the `:id` form of a Rails path parameter but not the `*rest` wildcard, so `get "files/*path"` produced the path `/files/*path` — which is not a valid OpenAPI path template, and makes the whole exported document fail validation. Both forms are now templated: `/files/{path}`, including mixed routes like `/files/:bucket/*path` → `/files/{bucket}/{path}`.
+
 ## 0.7.0 (2026-09-16)
 <!-- title: sensitive: redaction, uncorruptible defaults, and stricter class load -->
 
