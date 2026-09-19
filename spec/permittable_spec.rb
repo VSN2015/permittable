@@ -30,6 +30,20 @@ RSpec.describe Permittable do
 
   after { Permittable.filter_parameter_registry.reset! }
 
+  # Shared by the observability and monitor-mode blocks.
+  def recording_notifications
+    events = []
+    subscription = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
+      events << payload
+    end
+    begin
+      yield
+    ensure
+      ActiveSupport::Notifications.unsubscribe(subscription)
+    end
+    events
+  end
+
   describe "macro validation" do
     it "requires a block" do
       expect { permittable_class { permit_params :create } }
@@ -1370,6 +1384,93 @@ RSpec.describe Permittable do
       expect(events.first[:mode]).to eq(:enforce)
     end
 
+    it "instruments a rejected request exactly ONCE, however often the params are read" do
+      klass = permittable_class { permit_params(:create, root: :user) { required :name, :string } }
+      c = controller(klass, params: { user: {} })
+      events = recording_notifications do
+        c.permittable_violations
+        3.times do
+          c.permitted_params
+        rescue described_class::InvalidParameters
+          nil
+        end
+      end
+      expect(events.length).to eq(1)
+      expect(events.first[:details]).to eq([{ param: "user.name", code: "missing" }])
+    end
+
+    it "memoizes the rejection itself, re-raising the same error rather than revalidating" do
+      klass = permittable_class { permit_params(:create) { required :name, :string } }
+      c = controller(klass, params: {})
+      errors = Array.new(2) do
+        c.permitted_params
+      rescue described_class::InvalidParameters => e
+        e
+      end
+      expect(errors.last).to be(errors.first)
+      expect(c.permittable_violations).to eq([{ param: "name", code: "missing" }])
+    end
+
+    it "never memoizes ArgumentError — a missing contract is a programmer error, not a rejection" do
+      klass = permittable_class { permit_params(:create) { required :name, :string } }
+      c = controller(klass, params: { name: "x" }, action: "archive")
+      2.times do
+        expect { c.permitted_params }.to raise_error(ArgumentError, /no params contract declared/)
+      end
+    end
+
+    it "keys the rejection memo per action, so a second action validates and instruments on its own" do
+      klass = permittable_class do
+        permit_params(:create) { required :name, :string }
+        permit_params(:update) { required :email, :string }
+      end
+      c = controller(klass, params: {})
+      events = recording_notifications do
+        2.times do
+          c.permitted_params(:create)
+        rescue described_class::InvalidParameters
+          nil
+        end
+        2.times do
+          c.permitted_params(:update)
+        rescue described_class::InvalidParameters
+          nil
+        end
+      end
+      expect(events.map { |e| e[:details] })
+        .to eq([[{ param: "name", code: "missing" }], [{ param: "email", code: "missing" }]])
+    end
+
+    it "does not adopt an unrelated exception as the memoized rejection's cause" do
+      klass = permittable_class { permit_params(:create) { required :name, :string } }
+      c = controller(klass, params: {})
+      first = begin
+        c.permitted_params
+      rescue described_class::InvalidParameters => e
+        e
+      end
+      # A re-read from inside a rescue of something else: Ruby would otherwise
+      # attach that exception to the memoized error as its cause, permanently.
+      again = begin
+        begin
+          raise IOError, "unrelated"
+        rescue IOError
+          c.permitted_params
+        end
+      rescue described_class::InvalidParameters => e
+        e
+      end
+      expect(again).to be(first)
+      expect(again.cause).to be_nil
+    end
+
+    it "keeps a clean read memoized and silent" do
+      klass = permittable_class { permit_params(:create) { required :name, :string } }
+      c = controller(klass, params: { name: "x" })
+      events = recording_notifications { expect(c.permitted_params).to be(c.permitted_params) }
+      expect(events).to be_empty
+    end
+
     it "renders the shared error envelope from render_invalid_parameters" do
       klass = permittable_class { permit_params(:create) { required :name, :string } }
       c = controller(klass, params: {})
@@ -1386,19 +1487,6 @@ RSpec.describe Permittable do
 
   describe "monitor mode" do
     after { Permittable.mode = :enforce }
-
-    def recording_notifications
-      events = []
-      subscription = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
-        events << payload
-      end
-      begin
-        yield
-      ensure
-        ActiveSupport::Notifications.unsubscribe(subscription)
-      end
-      events
-    end
 
     it "rejects an unknown :mode at class load, and an unknown global mode at assignment" do
       expect { permittable_class { permit_params(:create, mode: :report) { required :a } } }
@@ -1827,6 +1915,30 @@ RSpec.describe Permittable do
                                                                 params: { metadata: { nested: { deep: "1" } } })
       expect(result.status).to eq(200)
       expect(JSON.parse(result.body)["classes"]).to eq(["ActiveSupport::HashWithIndifferentAccess"])
+    end
+
+    it "instruments exactly once through the real rescue_from stack, however often the action reads" do
+      controller = IntegrationHarness.build_controller do
+        include Permittable
+
+        permit_params(:create, root: :user) do
+          required :name, :string
+          optional :note, :string
+        end
+
+        def create
+          # The documented "would this request fail?" pattern, then the read.
+          permittable_violations
+          render json: { received: permitted_params }
+        end
+      end
+      events = recording_notifications do
+        @result = IntegrationHarness.dispatch(controller, :create, method: "POST",
+                                                                   params: { user: { note: "hi" } })
+      end
+      expect(@result.status).to eq(422)
+      expect(events.length).to eq(1)
+      expect(events.first[:details]).to eq([{ param: "user.name", code: "missing" }])
     end
 
     it "rescues InvalidParameters into the 422 envelope with machine-readable details" do
