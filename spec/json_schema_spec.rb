@@ -106,6 +106,39 @@ RSpec.describe Permittable::JsonSchema do
     end
   end
 
+  describe "format: presets" do
+    it "emits the JSON Schema format keyword alongside the pattern it still asserts" do
+      schema = property("id") { required :id, :string, format: :uuid }
+      expect(schema).to eq(
+        "type" => "string", "format" => "uuid", "minLength" => 1,
+        "pattern" => "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+      )
+    end
+
+    it "maps :url onto uri and :hostname onto hostname" do
+      expect(property("site") { optional :site, :string, format: :url }["format"]).to eq("uri")
+      expect(property("host") { optional :host, :string, format: :hostname }["format"]).to eq("hostname")
+    end
+
+    it "emits a translated pattern with no format keyword for a preset JSON Schema has no name for" do
+      schema = property("slug") { optional :slug, :string, format: :slug }
+      expect(schema.key?("format")).to be(false)
+      expect(schema["pattern"]).to eq("^[a-z0-9]+(?:-[a-z0-9]+)*$")
+    end
+
+    it "emails export as a real pattern, not the extension a flagged regexp would need" do
+      schema = property("email") { optional :email, :string, format: :email }
+      expect(schema["format"]).to eq("email")
+      expect(schema["pattern"]).to start_with("^[a-zA-Z0-9")
+      expect(schema.key?("x-permittable-pattern")).to be(false)
+    end
+
+    it "says nothing extra for a hand-written Regexp" do
+      expect(property("code") { optional :code, :string, format: /\A[A-Z]{3}\z/ })
+        .to eq("type" => "string", "pattern" => "^[A-Z]{3}$")
+    end
+  end
+
   describe "documentation annotations" do
     it "emits default:, desc:, and example: as default / description / examples" do
       prop = property("plan") do

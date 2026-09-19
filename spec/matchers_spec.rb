@@ -118,6 +118,23 @@ RSpec.describe "Permittable RSpec matchers" do
       .to include("expected type :string, but the contract declares :json")
   end
 
+  it "checks a format: preset by name, and a Regexp by value" do
+    presets = Class.new(FakeController) do
+      include Permittable
+
+      permit_params(:create) do
+        required :email, :string, format: :email
+        required :code,  :string, format: /\A[A-Z]{3}\z/
+      end
+    end
+    expect(presets).to permit_param(:email).matching(:email)
+    expect(presets).to permit_param(:code).matching(/\A[A-Z]{3}\z/)
+    expect(failure_of { expect(presets).to permit_param(:email).matching(:uuid) })
+      .to include("expected format: :uuid, but the contract declares format: :email")
+    expect(failure_of { expect(presets).to permit_param(:code).matching(:uuid) })
+      .to include("expected format: :uuid, but the contract declares format: /\\A[A-Z]{3}\\z/")
+  end
+
   it "checks arrays with as_array and an element type" do
     expect(controller).to permit_param(:tags).for_action(:create).as_array
     expect(controller).to permit_param(:tags).for_action(:create).as_array(of: :string)
