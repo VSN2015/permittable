@@ -1,6 +1,11 @@
 <!-- CHANGELOG.md -->
 
-## Unreleased
+## 0.8.0 (2026-09-19)
+<!-- title: a no-op sensitive: cascade, an invalid OpenAPI export, and megabyte-scale rejections -->
+
+Thirteen fixes, every one of them the gem doing its job wrongly rather than not at all. `sensitive: true` on a nested block or array was a complete no-op, printing in the clear the very values it promised to redact. Every exported OpenAPI document containing a member route was invalid — the committed golden fixture included — because a templated `{id}` was never declared as a parameter. `:datetime` raised `NameError` in any host that had not loaded ActiveSupport's time extensions, and normalising a `Time` to UTC rewrote the caller's own object. `:decimal` accepted the literal string `"NaN"` where `:float` rejected it. A rejected request instrumented itself once per read, double-counting in every dashboard. And one request could write a megabyte of log line, or spend nine seconds and 9.5 MB rejecting an array its own `length:` bound had already refused.
+
+Minor rather than patch: nothing changes shape and the API is untouched, but three fixes are visible from outside. `:float` and `:decimal` now reject values they used to accept, a malformed `root:` reports `invalid_type` where it reported `missing`, and the `sensitive:` cascade widens redaction app-wide. Read **Upgrading** before deploying.
 
 ### Fixed
 - **A wildcard route exported an invalid OpenAPI path.** `OpenAPI.rails_routes` templated the `:id` form of a Rails path parameter but not the `*rest` wildcard, so `get "files/*path"` produced the path `/files/*path` — which is not a valid OpenAPI path template, and makes the whole exported document fail validation. Both forms are now templated: `/files/{path}`, including mixed routes like `/files/:bucket/*path` → `/files/{bucket}/{path}`.
