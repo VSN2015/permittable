@@ -387,10 +387,22 @@ module Permittable
       check_scalar_rules(field, value)
     end
 
+    # `length:` first, deliberately. It is an O(1) read of a String's size,
+    # while `format:` runs a regexp over the whole value and `validate:` runs
+    # arbitrary app code — so checking the cheap bound last meant a value the
+    # bound already excluded still paid for the expensive ones. A 5 MB string
+    # against `length: 1..80` scanned all 5 MB with the field's regexp before
+    # being rejected on its length, and an app regexp with poor worst-case
+    # behaviour turns that from waste into a lever.
+    #
+    # The only observable change is which code a value violating BOTH reports:
+    # `length` now, rather than `inclusion`/`format`. Reporting the structural
+    # failure first is the better answer anyway — a client cannot act on
+    # "wrong format" for a value that is also far too long.
     def check_scalar_rules(field, value)
+      return [:error, "length"] if field[:length] && !length_ok?(field[:length], value.length)
       return [:error, "inclusion"] if field[:in] && !included_in?(field[:in], value)
       return [:error, "format"] if field[:format] && !field[:format].match?(value)
-      return [:error, "length"] if field[:length] && !length_ok?(field[:length], value.length)
 
       check_custom(field[:validate], value)
     end
