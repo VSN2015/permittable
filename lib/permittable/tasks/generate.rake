@@ -1,6 +1,7 @@
 # Drafts Permittable contracts for controllers that don't declare one yet,
-# from each controller's model columns plus any params.permit calls in its
-# source. Drafts go to stdout (paste-ready); the summary goes to stderr.
+# from each controller's model columns plus any params.permit or Rails 8
+# params.expect calls in its source. Drafts go to stdout (paste-ready); the
+# summary goes to stderr.
 #
 #   bin/rails permittable:generate                      # every uncovered controller
 #   bin/rails "permittable:generate[UsersController]"   # one controller, even if covered
