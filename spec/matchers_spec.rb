@@ -77,6 +77,22 @@ RSpec.describe "Permittable RSpec matchers" do
     expect(controller).to permit_param(:ssn).for_action(:create).virtual.sensitive
   end
 
+  it "sees sensitive: on a child that inherited it from its container" do
+    cascaded = Class.new(FakeController) do
+      include Permittable
+
+      permit_params(:create) do
+        optional :payment, sensitive: true do
+          required :card_number, :string
+          optional :id, :string, sensitive: false
+        end
+      end
+    end
+    expect(cascaded).to permit_param("payment.card_number").sensitive
+    expect(failure_of { expect(cascaded).to permit_param("payment.id").sensitive })
+      .to include("expected the field to be sensitive")
+  end
+
   it "checks the nullable flag" do
     nullable = Class.new(FakeController) do
       include Permittable

@@ -133,6 +133,17 @@ RSpec.describe Permittable::JsonSchema do
       expect(props["slug"]).not_to have_key("pattern")
       expect(props["tags"]["x-permittable-transformed"]).to be(true)
     end
+
+    it "marks a child that inherited sensitive: from its container writeOnly too" do
+      props = schema_for do
+        optional :payment, sensitive: true do
+          required :card_number, :string
+          optional :id, :string, sensitive: false
+        end
+      end["properties"]["payment"]["properties"]
+      expect(props["card_number"]).to include("writeOnly" => true, "x-permittable-sensitive" => true)
+      expect(props["id"]).not_to have_key("writeOnly")
+    end
   end
 
   describe "nullable:" do
