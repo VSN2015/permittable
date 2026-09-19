@@ -196,6 +196,7 @@ module Permittable
   JSON_TYPE = :json
   UNKNOWN_MODES = %i[ignore log error].freeze
   MODES = %i[enforce monitor].freeze
+  ERROR_FORMATS = %i[envelope problem].freeze
   # Rails merges routing bookkeeping into params; a top-level (root: false)
   # unknown-keys check must not flag them.
   ROUTING_KEYS = %w[controller action format].freeze
@@ -352,6 +353,31 @@ module Permittable
 
       @mode = value
     end
+
+    # The shape of a rejection: :envelope (the default — the host's
+    # #render_error, or the gem's inline JSON) or :problem, which renders RFC
+    # 9457 Problem Details as application/problem+json. App-wide, because the
+    # error format of an API is a property of the API rather than of any one
+    # contract, and set from an initializer:
+    #
+    #   Permittable.error_format = :problem
+    #
+    # See ErrorEnvelope, including why :problem opts out of #render_error.
+    def error_format
+      @error_format || :envelope
+    end
+
+    def error_format=(value)
+      value = value.to_sym
+      raise ArgumentError, "#{LABEL}: error_format must be one of #{ERROR_FORMATS.join(', ')}" unless ERROR_FORMATS.include?(value)
+
+      @error_format = value
+    end
+
+    # Base URI for problem `type` members. Unset (the default) leaves the type
+    # as RFC 9457's "about:blank"; set it to where the app documents its
+    # problem types and each type gets its own URI under it.
+    attr_accessor :problem_base_uri
 
     # App-wide fallback copy for a violation code, looked up through I18n
     # under permittable.errors.<code> ("missing", "inclusion", or any Symbol
