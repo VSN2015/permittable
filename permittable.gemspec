@@ -25,8 +25,16 @@ Gem::Specification.new do |spec|
   # activesupport only: the concern itself is plain Ruby over a params-duck.
   # actionpack (rescue_from / before_action / Parameters) and activerecord
   # (the model: schema-drift guard) are optional — every touchpoint is
-  # respond_to?/defined?-guarded, so hosts bring what they already have.
-  spec.add_runtime_dependency "activesupport", ">= 5.0", "< 9"
+  # respond_to?/defined?-guarded, so hosts bring what they already have. The
+  # `runtime-deps` CI job installs this gem with nothing else and exercises
+  # every controller-free surface, so that claim is tested, not asserted.
+  #
+  # The 6.1 floor is the oldest activesupport the full suite is run against
+  # (see gemfiles/ and the CI matrix). It is not arbitrary: `class_attribute
+  # ... default:` — how the contract registry is declared — arrived in 5.2, so
+  # 5.0 and 5.1 cannot declare a contract at all, and 5.2/6.0 predate Ruby 3.x
+  # support, which this gem's own Ruby floor requires.
+  spec.add_runtime_dependency "activesupport", ">= 6.1", "< 9"
 
   spec.metadata = {
     "license" => "MIT",

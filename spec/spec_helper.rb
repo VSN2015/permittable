@@ -1,4 +1,11 @@
 require "bundler/setup"
+# Same reason as lib/permittable.rb: activerecord 6.1 is required here BEFORE
+# permittable, so the suite needs the stdlib logger loaded first too.
+require "logger"
+# RSpec's `be_in` calls Object#in?, which activesupport does not load by
+# default. Nothing else in this suite pulls it in, so on the 6.1 gemfile
+# the compatibility matrix failed on a matcher rather than on the gem.
+require "active_support/core_ext/object/inclusion"
 require "simplecov"
 
 SimpleCov.start do
