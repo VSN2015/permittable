@@ -144,6 +144,57 @@ RSpec.describe Permittable::OpenAPI do
       expect(doc["x-permittable-controllers"]["clones"]).to have_key("create")
     end
 
+    # OpenAPI requires operationId to be unique across the document, and
+    # generated clients name their methods after it. `resources` routes
+    # update as PATCH and PUT, so the one operation placed at both slots
+    # carried one id twice.
+    it "gives the second verb of a shared route its own operationId" do
+      klass = controller_class { permit_params(:update, root: :user) { required :name, :string } }
+      doc = described_class.document(
+        controllers: [klass],
+        routes: [{ controller: "users", action: "update", verb: "patch", path: "/users/{id}" },
+                 { controller: "users", action: "update", verb: "put", path: "/users/{id}" }]
+      )
+      expect(doc["paths"]["/users/{id}"]["patch"]["operationId"]).to eq("users_update")
+      expect(doc["paths"]["/users/{id}"]["put"]["operationId"]).to eq("users_update_put")
+    end
+
+    it "keeps ids unique when two controller paths flatten to the same id" do
+      nested = controller_class(path: "admin/users") { permit_params(:index) { optional :page, :integer } }
+      flat = controller_class(path: "admin_users") { permit_params(:index) { optional :page, :integer } }
+      doc = described_class.document(
+        controllers: [nested, flat],
+        routes: [{ controller: "admin/users", action: "index", verb: "get", path: "/admin/users" },
+                 { controller: "admin_users", action: "index", verb: "get", path: "/admin_users" }]
+      )
+      expect(doc["paths"]["/admin/users"]["get"]["operationId"]).to eq("admin_users_index")
+      expect(doc["paths"]["/admin_users"]["get"]["operationId"]).to eq("admin_users_index_get")
+    end
+
+    it "falls back to a numeric suffix when the verb-suffixed id is taken too" do
+      nested = controller_class(path: "admin/users") { permit_params(:index) { optional :page, :integer } }
+      flat = controller_class(path: "admin_users") { permit_params(:index) { optional :page, :integer } }
+      doc = described_class.document(
+        controllers: [nested, flat],
+        routes: [{ controller: "admin/users", action: "index", verb: "get", path: "/admin/users" },
+                 { controller: "admin/users", action: "index", verb: "get", path: "/admin/people" },
+                 { controller: "admin_users", action: "index", verb: "get", path: "/admin_users" }]
+      )
+      ids = doc["paths"].values.flat_map(&:values).map { |operation| operation["operationId"] }
+      expect(ids).to eq(%w[admin_users_index admin_users_index_get admin_users_index_get_2])
+    end
+
+    it "renames a per-slot copy, leaving the operation at the other slots untouched" do
+      klass = controller_class { permit_params(:create) { required :name, :string } }
+      doc = described_class.document(
+        controllers: [klass],
+        routes: [{ controller: "users", action: "create", verb: "post", path: "/users" },
+                 { controller: "users", action: "create", verb: "put", path: "/users" }]
+      )
+      expect(doc["paths"]["/users"]["post"]["operationId"]).to eq("users_create")
+      expect(doc["paths"]["/users"]["put"]["operationId"]).to eq("users_create_put")
+    end
+
     it "defaults info and omits x-permittable-controllers when everything is routed" do
       klass = controller_class { permit_params(:create) { required :name, :string } }
       doc = described_class.document(controllers: [klass],
@@ -275,10 +326,24 @@ RSpec.describe Permittable::OpenAPI do
         controllers: [klass],
         info: { "title" => "Golden API", "version" => "1.0.0" },
         routes: [{ controller: "users", action: "create", verb: "POST", path: "/users" },
-                 { controller: "users", action: "update", verb: "PATCH", path: "/users/{id}" }]
+                 { controller: "users", action: "update", verb: "PATCH", path: "/users/{id}" },
+                 { controller: "users", action: "update", verb: "PUT", path: "/users/{id}" }]
       )
       fixture = File.expand_path("fixtures/openapi.json", __dir__)
       expect("#{JSON.pretty_generate(doc)}\n").to eq(File.read(fixture))
+    end
+
+    # OpenAPI requires operationId to be unique among the operations under
+    # paths; a duplicate makes the document invalid and makes client
+    # generators emit two methods with one name. Asserted over the whole
+    # document, like the path-parameter invariant below.
+    it "never repeats an operationId under paths" do
+      fixture = JSON.parse(File.read(File.expand_path("fixtures/openapi.json", __dir__)))
+      verbs = fixture["paths"].values.flat_map(&:keys)
+      expect(verbs).to include("patch", "put"), "fixture no longer exercises a PATCH|PUT pair"
+
+      ids = fixture["paths"].values.flat_map(&:values).filter_map { |operation| operation["operationId"] }
+      expect(ids.tally.select { |_, count| count > 1 }).to be_empty
     end
 
     # OpenAPI 3.1 requires a path-template variable to be declared as a path

@@ -231,9 +231,44 @@ module Permittable
         if free.empty?
           (unrouted[key] ||= {})[action] = operation
         else
-          free.each { |route| (paths[route[:path]] ||= {})[verb_of(route)] = with_path_parameters(operation, route[:path]) }
+          free.each do |route|
+            placed = with_unique_operation_id(with_path_parameters(operation, route[:path]), verb_of(route), paths)
+            (paths[route[:path]] ||= {})[verb_of(route)] = placed
+          end
         end
       end
+    end
+
+    # OpenAPI requires operationId to be unique across the document, and
+    # client generators name a method after it — a duplicate is an invalid
+    # document and, in practice, two methods with one name. One operation is
+    # placed at every slot its routes reach (the PATCH|PUT pair `resources`
+    # generates), and `key.tr("/", "_")` folds admin/users and admin_users
+    # into one id. Renaming the scheme would rename every generated client
+    # method, so only a collision is renamed: the first slot to claim an id
+    # keeps it, a later one gets its verb appended (users_update_put), then a
+    # numeric suffix. Placement follows controller, action and route order,
+    # so the same app always exports the same ids.
+    #
+    # Only operations under `paths` take part: OpenAPI's uniqueness rule is
+    # over those, and an unrouted operation in x-permittable-controllers
+    # keeps its plain id rather than pushing a routed one onto a suffix.
+    #
+    # The ids already claimed are read back from `paths` itself, as occupied
+    # slots are, so there is no second record of placement to fall out of
+    # step with the document.
+    def with_unique_operation_id(operation, verb, paths)
+      id = operation["operationId"]
+      return operation if id.nil?
+
+      claimed = paths.each_value.flat_map { |slots| slots.each_value.map { |placed| placed["operationId"] } }.to_set
+      unique = [id, "#{id}_#{verb}"].find { |candidate| !claimed.include?(candidate) } ||
+               (2..).lazy.map { |n| "#{id}_#{verb}_#{n}" }.find { |candidate| !claimed.include?(candidate) }
+      return operation if unique == id
+
+      # The same operation object may sit at other slots under its own id,
+      # so the rename goes on a copy; merge keeps the key order.
+      operation.merge("operationId" => unique)
     end
 
     def verb_of(route)
