@@ -13,6 +13,16 @@ RSpec.describe Permittable::Generator do
     c
   end
 
+  # Evaluate a generated draft in a throwaway controller class, the way a
+  # developer pasting it would, and hand back the resolved create rule. A
+  # draft that raises here is a draft that breaks the controller it is pasted
+  # into.
+  def load_draft(draft)
+    expect(draft).to be_a(String)
+    klass = permittable_class { class_eval(draft) }
+    klass.permit_rule_for("create")
+  end
+
   describe ".scan" do
     it "extracts the root and scalar keys from a require().permit() call" do
       scan = described_class.scan("params.require(:user).permit(:name, :age)")
@@ -377,6 +387,156 @@ RSpec.describe Permittable::Generator do
       expect(draft).not_to include("model:")
       expect(draft).to match(/optional :q, :string\s+# TODO: confirm the type/)
       expect(draft).to match(/optional :page, :string\s+# TODO: confirm the type/)
+    end
+  end
+
+  describe ".scan across calls with different envelopes" do
+    it "keeps a Rails 8 scaffold's separate `expect(:id)` out of the envelope" do
+      scan = described_class.scan(<<~RUBY)
+        def set_post
+          @post = Post.find(params.expect(:id))
+        end
+
+        def post_params
+          params.expect(post: [:title, :body])
+        end
+      RUBY
+      expect(scan.root).to eq(:post)
+      expect(scan.scalars).to eq(%i[title body])
+      expect(scan.unparsed).to eq([":id"])
+    end
+
+    it "keeps a rootless permit call out of the envelope, wherever it appears" do
+      scan = described_class.scan(<<~RUBY)
+        def index
+          @posts = Post.page(params.permit(:page, :per_page))
+        end
+
+        def post_params
+          params.require(:post).permit(:title)
+        end
+      RUBY
+      expect(scan.root).to eq(:post)
+      expect(scan.scalars).to eq(%i[title])
+      expect(scan.unparsed).to eq([":page", ":per_page"])
+    end
+
+    it "keeps a second permit envelope visible rather than merging it into the first" do
+      scan = described_class.scan(<<~RUBY)
+        params.require(:post).permit(:title, :body)
+        params.require(:search).permit(:q, tags: [])
+      RUBY
+      expect(scan.root).to eq(:post)
+      expect(scan.scalars).to eq(%i[title body])
+      expect(scan.arrays).to eq([])
+      expect(scan.unparsed).to eq(["search: [:q, tags: []]"])
+    end
+
+    it "roots the draft at the envelope with the most fields, not a search form seen first" do
+      scan = described_class.scan(<<~RUBY)
+        def index = params.require(:search).permit(:q)
+        def post_params = params.expect(post: [:title, :body])
+      RUBY
+      expect(scan.root).to eq(:post)
+      expect(scan.scalars).to eq(%i[title body])
+      expect(scan.unparsed).to eq(["search: [:q]"])
+    end
+
+    it "breaks a tie between envelopes by taking the first seen" do
+      scan = described_class.scan("params.require(:post).permit(:title)\nparams.require(:search).permit(:q)")
+      expect(scan.root).to eq(:post)
+    end
+
+    it "still drafts a file of only rootless calls as scalars" do
+      scan = described_class.scan("params.permit(:q)\nparams.expect(:page)")
+      expect(scan.root).to be_nil
+      expect(scan.scalars).to eq(%i[q page])
+      expect(scan.unparsed).to eq([])
+    end
+
+    it "does not mistake a spaced `tag_names: [ ]` for an envelope" do
+      scan = described_class.scan("params.expect(tag_names: [ ])")
+      expect(scan.root).to be_nil
+      expect(scan.arrays).to eq(%i[tag_names])
+    end
+  end
+
+  describe ".scan of a key permitted in two shapes" do
+    it "keeps the richer shape and names the conflict" do
+      scan = described_class.scan(<<~RUBY)
+        params.require(:user).permit(:tags, :address, :items)
+        params.require(:user).permit(tags: [], address: [:city], items: [:sku])
+        params.expect(user: [items: [[:sku, :qty]]])
+      RUBY
+      expect(scan.scalars).to eq([])
+      expect(scan.arrays).to eq(%i[tags])
+      expect(scan.nested).to eq(address: %i[city])
+      expect(scan.nested_arrays).to eq(items: %i[sku qty])
+      expect(scan.conflicts).to contain_exactly(
+        "tags is permitted as both a scalar and an array — drafted as the array",
+        "address is permitted as both a scalar and a nested hash — drafted as the nested hash",
+        "items is permitted as a scalar, a nested hash and an array of hashes — drafted as the array of hashes"
+      )
+    end
+
+    it "drafts each key once, so the draft loads" do
+      draft = described_class.draft(scan: described_class.scan(<<~RUBY))
+        params.require(:user).permit(:tags, :address)
+        params.require(:user).permit(tags: [], address: [:city])
+      RUBY
+      rule = load_draft(draft)
+      expect(rule[:fields].map { |f| f[:name] }).to eq(%i[tags address])
+      expect(draft).to include("# TODO: tags is permitted as both a scalar and an array — drafted as the array")
+    end
+  end
+
+  describe ".draft when the scan found calls but no fields" do
+    before do
+      ActiveRecord::Schema.define do
+        create_table :gen_notes do |t|
+          t.string :title, null: false
+          t.text   :body
+        end
+      end
+      stub_const("GenNote", Class.new(TestModel) { self.table_name = "gen_notes" })
+    end
+
+    after { ActiveRecord::Base.connection.drop_table(:gen_notes, if_exists: true) }
+
+    it "falls back to the columns, keeps the TODO, and loads" do
+      scan = described_class.scan("params.require(:note).permit(*PERMITTED)")
+      draft = described_class.draft(model: GenNote, scan: scan)
+      expect(draft).to include("root: :note, model: GenNote")
+      expect(draft).to include("required :title, :string")
+      expect(draft).to include("optional :body, :string")
+      expect(draft).to include("# TODO: could not parse from the permit call: *PERMITTED")
+      expect(load_draft(draft)[:fields].map { |f| f[:name] }).to eq(%i[title body])
+    end
+
+    it "uses the model's root when the unparsable call had none" do
+      draft = described_class.draft(model: GenNote, scan: described_class.scan("params.permit(*KEYS)"))
+      expect(draft).to include("root: :gen_note, model: GenNote")
+      expect(load_draft(draft)[:root]).to eq(:gen_note)
+    end
+
+    it "returns nil when there are no columns to fall back to either" do
+      expect(described_class.draft(scan: described_class.scan("params.permit(*KEYS)"))).to be_nil
+    end
+  end
+
+  describe "every scan-driven draft loads" do
+    [
+      "params.require(:post).permit(:title, :body)",
+      "params.permit(:q, :page)",
+      "params.expect(post: [:title, tags: [], address: [:city], items: [[:sku]]])",
+      "@post = Post.find(params.expect(:id))\nparams.expect(post: [:title])",
+      "params.permit(:page)\nparams.require(:post).permit(:title)\nparams.require(:search).permit(:q)",
+      "params.require(:u).permit(:tags, :address)\nparams.require(:u).permit(tags: [], address: [:city])",
+      "params.expect(tag_names: [ ])"
+    ].each do |source|
+      it "loads the draft of #{source.inspect}" do
+        expect { load_draft(described_class.draft(scan: described_class.scan(source))) }.not_to raise_error
+      end
     end
   end
 
