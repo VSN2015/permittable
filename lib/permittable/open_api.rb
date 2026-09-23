@@ -272,8 +272,14 @@ module Permittable
     # without Rails; Rails path params become OpenAPI templates — both the
     # `:id` form and the `*rest` wildcard, which is a real route shape
     # (`get "files/*path"`) and is not a valid OpenAPI template left as-is.
+    #
+    # An optional group is expanded into the concrete paths it stands for:
+    # parentheses are not valid in an OpenAPI path template, so leaving
+    # `scope "(:locale)"` as `(/{locale})/posts` made the whole document fail
+    # validation. Each variant is its own descriptor, so each path's variables
+    # are required there — which, for that path, they are.
     def rails_routes(app)
-      app.routes.routes.flat_map do |route|
+      descriptors = app.routes.routes.flat_map do |route|
         requirements = route.requirements
         verb = route.verb.to_s
         next [] if requirements[:controller].nil? || requirements[:action].nil? || verb.empty?
@@ -287,6 +293,43 @@ module Permittable
             verb: single.downcase, path: path }
         end
       end
+      descriptors.flat_map do |descriptor|
+        optional_variants(descriptor[:path]).map { |variant| descriptor.merge(path: variant) }
+      end
+    end
+
+    # Every concrete path an optionally-grouped template stands for:
+    # `/archive(/{year}(/{month}))` → `/archive`, `/archive/{year}`,
+    # `/archive/{year}/{month}`. Rails fills groups left to right, so
+    # `/x(/{a})(/{b})` with one segment present is always `/x/{a}` — the
+    # `/x/{b}` variant is the same URL under another name, and OpenAPI forbids
+    # two templates differing only in variable names. Variants are built with
+    # each group present first, so the one Rails would match is the one kept;
+    # the list is then reversed to read shortest first.
+    def optional_variants(path)
+      variants, = expand_optional_groups(path, 0)
+      variants.map { |variant| variant.empty? ? "/" : variant }
+              .uniq { |variant| variant.gsub(/\{\w+\}/, "{}") }
+              .reverse
+    end
+
+    # Walks the template from `pos` to the matching `)` (or the end),
+    # returning the variants of that stretch and the position after it.
+    def expand_optional_groups(path, pos)
+      variants = [+""]
+      while pos < path.length
+        char = path[pos]
+        if char == "("
+          inner, pos = expand_optional_groups(path, pos + 1)
+          variants = variants.product(inner + [""]).map(&:join)
+        elsif char == ")"
+          return [variants, pos + 1]
+        else
+          variants.each { |variant| variant << char }
+          pos += 1
+        end
+      end
+      [variants, pos]
     end
 
     def controller_key(controller)

@@ -209,6 +209,70 @@ RSpec.describe Permittable::OpenAPI do
         ]
       )
     end
+
+    # A real route set rather than a Journey-shaped Struct: the bug was in
+    # the spec strings Rails actually generates, so the test reads those.
+    context "with optional segments" do
+      def app_with(&draw)
+        route_set = ActionDispatch::Routing::RouteSet.new
+        route_set.draw(&draw)
+        Struct.new(:routes).new(route_set)
+      end
+
+      it "expands an optional scope into the path without it and the path with it" do
+        app = app_with { scope("(:locale)") { resources :posts, only: %i[index show] } }
+        expect(described_class.rails_routes(app)).to eq(
+          [
+            { controller: "posts", action: "index", verb: "get", path: "/posts" },
+            { controller: "posts", action: "index", verb: "get", path: "/{locale}/posts" },
+            { controller: "posts", action: "show", verb: "get", path: "/posts/{id}" },
+            { controller: "posts", action: "show", verb: "get", path: "/{locale}/posts/{id}" }
+          ]
+        )
+      end
+
+      it "expands nested optional groups recursively" do
+        app = app_with { get "archive(/:year(/:month))", to: "archive#show" }
+        expect(described_class.rails_routes(app).map { |r| r[:path] })
+          .to eq(["/archive", "/archive/{year}", "/archive/{year}/{month}"])
+      end
+
+      it "keeps an optional root scope a valid path" do
+        app = app_with { scope("(:locale)") { root to: "home#index" } }
+        expect(described_class.rails_routes(app).map { |r| r[:path] }).to eq(["/", "/{locale}"])
+      end
+
+      # `x(/:a)(/:b)` with one segment present is always matched as :a — the
+      # :b-only variant is the same URL shape under another name, and OpenAPI
+      # forbids two templates that differ only in their variable names.
+      it "drops a variant that coincides with one already emitted" do
+        app = app_with { get "x(/:a)(/:b)", to: "x#y" }
+        expect(described_class.rails_routes(app).map { |r| r[:path] })
+          .to eq(["/x", "/x/{a}", "/x/{a}/{b}"])
+      end
+
+      it "exports a document with no parentheses and every templated variable declared" do
+        klass = controller_class(path: "posts") { permit_params(:create) { required :title, :string } }
+        app = app_with do
+          scope("(:locale)") { resources :posts, only: :create }
+          get "archive(/:year(/:month))", to: "posts#create"
+        end
+        doc = described_class.document(controllers: [klass], routes: described_class.rails_routes(app))
+
+        expect(doc["paths"].keys).to contain_exactly(
+          "/posts", "/{locale}/posts", "/archive", "/archive/{year}", "/archive/{year}/{month}"
+        )
+        expect(doc["paths"].keys.grep(/[()]/)).to be_empty
+        doc["paths"].each do |path, operations|
+          variables = path.scan(/\{(\w+)\}/).flatten
+          operations.each_value do |operation|
+            declared = operation.fetch("parameters", []).select { |p| p["in"] == "path" }
+            expect(declared.map { |p| p["name"] }).to match_array(variables), "#{path} declares #{declared.inspect}"
+            expect(declared).to all(include("required" => true))
+          end
+        end
+      end
+    end
   end
 
   describe "the documented error shape" do

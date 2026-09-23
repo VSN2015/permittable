@@ -112,6 +112,17 @@ RSpec.describe Permittable::Audit do
         actions: 5, enforced: 1, monitored: 1, uncovered: 3, uncovered_with_body: 2, unguarded_models: 2
       )
     end
+
+    # rails_routes expands `scope "(:locale)"` into one descriptor per URL.
+    # The table lists both — each is a real URL — but they are one routed
+    # action, and one unguarded POST must not count as two.
+    it "counts an action once however many paths reach it" do
+      localized = routes + [{ controller: "users", action: "create", verb: "post", path: "/{locale}/users" },
+                            { controller: "legacy", action: "create", verb: "post", path: "/{locale}/legacy" }]
+      expanded = described_class.entries(controllers: [users, bare_class("legacy")], routes: localized)
+      expect(expanded.length).to eq(7)
+      expect(described_class.summary(expanded)).to eq(described_class.summary(entries))
+    end
   end
 
   describe ".format" do

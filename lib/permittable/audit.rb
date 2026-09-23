@@ -97,7 +97,12 @@ module Permittable
     # The numbers worth putting in a CI log. `uncovered_with_body` is the one
     # that should be zero; `unguarded_models` counts covered actions whose
     # rule declares no `model:`, so no schema-drift guard runs for them.
+    #
+    # Counted per routed action — controller, action and verb — rather than
+    # per row: `scope "(:locale)"` gives one action two paths, both listed in
+    # the table, and one unguarded POST must not count as two.
     def summary(entries)
+      entries = entries.uniq { |e| [e.controller, e.action, e.verb.to_s.downcase] }
       {
         actions: entries.length,
         enforced: entries.count { |e| e.mode == :enforce },
