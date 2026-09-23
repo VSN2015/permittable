@@ -2442,6 +2442,68 @@ RSpec.describe Permittable do
       expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "rogue", "code" => "unknown" }])
     end
 
+    describe "unknown: :error on a rootless contract, with a real request" do
+      def build_rootless_controller(wrap: false, &fields)
+        IntegrationHarness.build_controller do
+          include Permittable
+
+          # A String, as Rails derives it from controller_name: ParamsWrapper
+          # compares it against the string-keyed params to decide whether the
+          # client already sent the key.
+          wrap_parameters "user", format: [:json] if wrap
+          permit_params(:update, unknown: :error, &fields)
+
+          def update
+            render json: permitted_params
+          end
+        end
+      end
+
+      it "does not flag the router's path parameters (PATCH /users/1 merges `id`)" do
+        controller = build_rootless_controller { optional :name, :string }
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", params: { name: "Jo" },
+                                                                  path_params: { id: "1" })
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)).to eq("name" => "Jo")
+      end
+
+      it "does not flag ParamsWrapper's copy of a JSON body under the wrapper key" do
+        controller = build_rootless_controller(wrap: true) { optional :name, :string }
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo" },
+                                                                  path_params: { id: "1" })
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)).to eq("name" => "Jo")
+      end
+
+      it "still flags a genuine extra key alongside the path and wrapper keys" do
+        controller = build_rootless_controller(wrap: true) { optional :name, :string }
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo", rogue: 1 },
+                                                                  path_params: { id: "1" })
+        expect(result.status).to eq(422)
+        expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "rogue", "code" => "unknown" }])
+      end
+
+      it "still flags a client-sent key that merely shares the wrapper's name" do
+        # ParamsWrapper leaves a body alone when it already carries the key,
+        # so here `user` is the client's own and is exempt from nothing.
+        controller = build_rootless_controller(wrap: true) { optional :name, :string }
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH",
+                                                                  json: { name: "Jo", user: { admin: true } })
+        expect(result.status).to eq(422)
+        expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "user", "code" => "unknown" }])
+      end
+
+      it "validates a declared field named like the wrapper key rather than exempting it" do
+        controller = build_rootless_controller(wrap: true) do
+          optional :name, :string
+          optional :user, :string
+        end
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo" })
+        expect(result.status).to eq(422)
+        expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "user", "code" => "invalid_type" }])
+      end
+    end
+
     it "transform + finalize replace a params-mutating before_action end to end" do
       controller = IntegrationHarness.build_controller do
         include Permittable

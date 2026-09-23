@@ -1415,6 +1415,24 @@ module Permittable
 
   private
 
+  # ParamsWrapper copies a JSON body under the controller's wrapper key
+  # (`user` for UsersController) — on by default in a Rails app — and a
+  # rootless contract then saw that copy as an unknown top-level key on every
+  # well-formed request. Whether the copy is Rails' own has to be read HERE,
+  # before ParamsWrapper#process_action (next in the chain) runs: once it has
+  # wrapped, `_wrapper_enabled?` answers false, because params now carry the
+  # key. Asking afterwards could not tell Rails' copy from a client that sent
+  # `user` itself, which is exactly the key the check must still flag.
+  # Private, like the method it wraps — a public one would become an action.
+  # A plain duck has no process_action and no ParamsWrapper, so this never
+  # runs there, and the guards keep an actionpack-free host inert.
+  def process_action(*)
+    if respond_to?(:_wrapper_enabled?, true) && respond_to?(:_wrapper_key, true) && _wrapper_enabled?
+      @permittable_wrapper_key = _wrapper_key.to_s
+    end
+    super
+  end
+
   # The value permitted_params memoizes: the validated params, or the
   # InvalidParameters that rejected them. ArgumentError is deliberately NOT
   # memoized — a contract that does not cover the action is a bug to fix, not
@@ -1715,7 +1733,7 @@ module Permittable
 
     declared = fields.map { |f| f[:name].to_s }
     extra = hash.keys.map(&:to_s) - declared
-    extra -= UNCHECKED_TOP_LEVEL_KEYS if top_level
+    extra -= UNCHECKED_TOP_LEVEL_KEYS + permittable_request_supplied_keys if top_level
     return if extra.empty?
 
     if unknown == :error
@@ -1724,6 +1742,21 @@ module Permittable
       listed = permittable_prose_list(extra) { |key| permittable_path(path, key) }
       logger.warn("#{LABEL}: unknown parameter(s) ignored by the ##{permittable_action_name} contract: #{listed}")
     end
+  end
+
+  # The top-level keys THIS request's framework put into params, beyond the
+  # fixed UNCHECKED_TOP_LEVEL_KEYS: whatever the router matched out of the
+  # URL (`PATCH /users/1` merges `id`, which the exported OpenAPI documents
+  # as a path parameter, not a body field), and ParamsWrapper's copy of the
+  # body when it made one (see process_action). A controller only — a plain
+  # params duck and a standalone Contract have no request, so they exempt
+  # nothing extra. Subtracted from the undeclared keys, so a contract that
+  # DECLARES `id` or `user` still has that field checked like any other.
+  def permittable_request_supplied_keys
+    keys = []
+    keys.concat(request.path_parameters.keys.map(&:to_s)) if respond_to?(:request) && request.respond_to?(:path_parameters)
+    keys << @permittable_wrapper_key if @permittable_wrapper_key
+    keys
   end
 
   def permittable_path(path, key)

@@ -20,8 +20,9 @@ module Permittable
   #   * A Contract always ENFORCES. Monitor mode is a request-rollout switch;
   #     standalone callers read the Result instead, so the app-wide
   #     `Permittable.mode` is ignored here.
-  #   * The router's bookkeeping keys (controller/action/format) get no
-  #     exemption from `unknown:` checking — standalone input has no router.
+  #   * The router's bookkeeping keys (controller/action/format), path
+  #     parameters and ParamsWrapper's key get no exemption from `unknown:`
+  #     checking — standalone input has no router and no request.
   #   * No memoization: every #call validates fresh, so one frozen Contract
   #     is safely reusable and shareable.
   #

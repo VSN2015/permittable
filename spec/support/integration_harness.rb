@@ -18,11 +18,25 @@ module IntegrationHarness
   module_function
 
   # `params:` (a Hash) is form-encoded into the request body — how the specs
-  # exercise real ActionController::Parameters bodies.
-  def dispatch(controller_class, action, method: "GET", query: "", params: nil)
+  # exercise real ActionController::Parameters bodies. `json:` sends the Hash
+  # as an application/json body instead (what ParamsWrapper acts on), and
+  # `path_params:` stands in for what the router would have matched out of
+  # the URL — Rails merges both into `params` exactly as a routed request
+  # would, with no route set needed.
+  def dispatch(controller_class, action, method: "GET", query: "", params: nil, json: nil, path_params: nil)
     opts = { method: method }
     opts[:params] = params if params
+    if json
+      opts[:input] = JSON.generate(json)
+      opts["CONTENT_TYPE"] = "application/json"
+    end
     env = Rack::MockRequest.env_for("/?#{query}", **opts)
+    # Pre-parsed, the way ActionDispatch caches a parsed body: the bundled
+    # activesupport calls JSON.parse(source, opts) positionally, which the
+    # locked json 3.x rejects, so letting Rails parse the input here would
+    # test that incompatibility instead of the contract.
+    env["action_dispatch.request.request_parameters"] = JSON.parse(JSON.generate(json)) if json
+    env["action_dispatch.request.path_parameters"] = path_params if path_params
     status, headers, body = controller_class.action(action).call(env)
     # Rack bodies only guarantee #each (RackBody has no #map).
     chunks = body.enum_for(:each).to_a
