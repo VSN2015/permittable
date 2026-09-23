@@ -32,9 +32,15 @@ module Permittable
     # One routed action, paired with the rule a request for it would resolve
     # through (nil when nothing covers it — including when the controller
     # never included the concern, which is exactly the case worth finding).
-    Entry = Struct.new(:controller, :action, :verb, :path, :rule, keyword_init: true) do
+    # `missing_action` marks a route to an action the controller does not
+    # define — see Audit.missing_action?.
+    Entry = Struct.new(:controller, :action, :verb, :path, :rule, :missing_action, keyword_init: true) do
       def covered?
         !rule.nil?
+      end
+
+      def missing_action?
+        missing_action == true
       end
 
       # The mode this action would actually run in, rule-level declaration
@@ -70,8 +76,20 @@ module Permittable
       routes.select { |route| route[:controller].to_s == key }.map do |route|
         action = route[:action].to_s
         Entry.new(controller: key, action: action, verb: route[:verb], path: route[:path],
-                  rule: rule_for(controller, action))
+                  rule: rule_for(controller, action), missing_action: missing_action?(controller, action))
       end
+    end
+
+    # `resources :posts` routes all seven actions whether or not the
+    # controller defines them, and Rails 404s the ones it does not — so an
+    # undefined `create` is no unguarded input, and failing a strict run over
+    # it was a false positive. Labelled rather than dropped: an action with
+    # only a template still renders implicitly, and the reader should see it.
+    # A controller that cannot list its actions is assumed to have them all.
+    def missing_action?(controller, action)
+      return false unless controller.respond_to?(:action_methods)
+
+      !controller.action_methods.include?(action)
     end
 
     def rule_for(controller, action)
@@ -97,14 +115,17 @@ module Permittable
     # The numbers worth putting in a CI log. `uncovered_with_body` is the one
     # that should be zero; `unguarded_models` counts covered actions whose
     # rule declares no `model:`, so no schema-drift guard runs for them.
+    # An action the controller does not define takes no body, so it is left
+    # out of the body count and reported as `missing_actions` instead.
     def summary(entries)
       {
         actions: entries.length,
         enforced: entries.count { |e| e.mode == :enforce },
         monitored: entries.count { |e| e.mode == :monitor },
         uncovered: entries.count { |e| !e.covered? },
-        uncovered_with_body: entries.count { |e| !e.covered? && e.body? },
-        unguarded_models: entries.count { |e| e.covered? && e.model.nil? }
+        uncovered_with_body: entries.count { |e| !e.covered? && e.body? && !e.missing_action? },
+        unguarded_models: entries.count { |e| e.covered? && e.model.nil? },
+        missing_actions: entries.count(&:missing_action?)
       }
     end
 
@@ -128,19 +149,28 @@ module Permittable
 
     # A covered action reads as its effective mode; an uncovered one says so,
     # and says whether that matters (a body-carrying verb with no contract is
-    # unvalidated input, not just a gap in the table).
+    # unvalidated input, not just a gap in the table). A route to an action
+    # the controller does not define says that instead of claiming a body.
     def status(entry)
-      return "no contract#{' — ACCEPTS A BODY' if entry.body?}" unless entry.covered?
+      return ["no contract", uncovered_note(entry)].compact.join(" — ") unless entry.covered?
 
       parts = [entry.mode.to_s]
       parts << "model: #{entry.model.name}" if entry.model.respond_to?(:name) && entry.model.name
       parts << "unknown: #{entry.unknown}" unless entry.unknown == :ignore
+      parts << "no action method" if entry.missing_action?
       parts.join("  ")
+    end
+
+    def uncovered_note(entry)
+      return "no action method" if entry.missing_action?
+
+      "ACCEPTS A BODY" if entry.body?
     end
 
     def summary_lines(counts)
       body = counts[:uncovered_with_body]
-      [
+      missing = counts[:missing_actions]
+      lines = [
         "",
         "#{counts[:actions]} routed action#{'s' unless counts[:actions] == 1}: " \
         "#{counts[:enforced]} enforced, #{counts[:monitored]} in monitor mode, " \
@@ -148,7 +178,12 @@ module Permittable
         "  #{body} of those accept a request body#{' — untrusted input reaches the action unchecked' unless body.zero?}",
         "  #{counts[:unguarded_models]} covered action#{'s' unless counts[:unguarded_models] == 1} " \
         "declare no model:, so no schema-drift guard runs for them"
-      ].join("\n")
+      ]
+      unless missing.zero?
+        lines << "  #{missing} routed action#{missing == 1 ? ' has' : 's have'} no action method " \
+                 "(Rails 404s them unless a template renders), so none count as accepting a body"
+      end
+      lines.join("\n")
     end
 
     def stale_lines(stale)

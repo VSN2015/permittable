@@ -92,6 +92,60 @@ RSpec.describe Permittable::Audit do
       expect(described_class.entries(controllers: [catch_all], routes: thing_routes).map(&:covered?))
         .to eq([true, true])
     end
+
+    it "counts a via: :all route as body-accepting when nothing covers it" do
+      hooks = bare_class("webhooks")
+      hook_routes = %w[get post put patch delete].map do |verb|
+        { controller: "webhooks", action: "receive", verb: verb, path: "/hooks" }
+      end
+      found = described_class.entries(controllers: [hooks], routes: hook_routes)
+      expect(found.map(&:verb)).to eq(%w[delete get patch post put])
+      expect(described_class.summary(found)[:uncovered_with_body]).to eq(3)
+    end
+
+    context "when a routed action has no action method" do
+      # `resources :posts` routes all seven actions whether or not the
+      # controller defines them; Rails 404s the ones it does not.
+      let(:posts) do
+        bare_class("posts").tap do |klass|
+          klass.define_singleton_method(:action_methods) { Set.new(%w[index show]) }
+        end
+      end
+      let(:post_routes) do
+        [{ controller: "posts", action: "index", verb: "get", path: "/posts" },
+         { controller: "posts", action: "create", verb: "post", path: "/posts" },
+         { controller: "posts", action: "show", verb: "get", path: "/posts/{id}" },
+         { controller: "posts", action: "update", verb: "patch", path: "/posts/{id}" }]
+      end
+      let(:found) { described_class.entries(controllers: [posts], routes: post_routes) }
+
+      it "labels the entry rather than dropping it" do
+        expect(found.map { |e| [e.action, e.missing_action?] }).to eq(
+          [["index", false], ["create", true], ["show", false], ["update", true]]
+        )
+      end
+
+      it "leaves it out of the strict count" do
+        expect(described_class.summary(found)).to include(uncovered: 4, uncovered_with_body: 0, missing_actions: 2)
+      end
+
+      it "says so in the report instead of flagging a body" do
+        report = described_class.format(found)
+        expect(report).to match(%r{POST\s+/posts\s+create\s+no contract — no action method$})
+        expect(report).not_to include("ACCEPTS A BODY")
+        expect(report).to include("0 of those accept a request body")
+        expect(report).to include("2 routed actions have no action method")
+      end
+
+      it "still counts the action once the controller defines it" do
+        posts.define_singleton_method(:action_methods) { Set.new(%w[index show create update]) }
+        expect(described_class.summary(found)[:uncovered_with_body]).to eq(2)
+      end
+
+      it "assumes the action exists when the controller cannot say" do
+        expect(entries.none?(&:missing_action?)).to be(true)
+      end
+    end
   end
 
   describe ".stale" do
@@ -109,7 +163,8 @@ RSpec.describe Permittable::Audit do
   describe ".summary" do
     it "counts coverage, with the body-accepting gap called out separately" do
       expect(described_class.summary(entries)).to eq(
-        actions: 5, enforced: 1, monitored: 1, uncovered: 3, uncovered_with_body: 2, unguarded_models: 2
+        actions: 5, enforced: 1, monitored: 1, uncovered: 3, uncovered_with_body: 2, unguarded_models: 2,
+        missing_actions: 0
       )
     end
   end
