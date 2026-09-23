@@ -252,8 +252,9 @@ RSpec.describe Permittable::Generator do
 
     let(:draft) { described_class.draft(model: GenArticle) }
 
-    it "wraps the fields in a monitor-mode permit_params call with root and model" do
-      expect(draft).to include("permit_params :create, :update, root: :gen_article, model: GenArticle, mode: :monitor do")
+    it "wraps the fields in monitor-mode permit_params calls with root and model" do
+      expect(draft).to include("permit_params :create, root: :gen_article, model: GenArticle, mode: :monitor do")
+      expect(draft).to include("permit_params :update, root: :gen_article, model: GenArticle, mode: :monitor do")
       expect(draft).to end_with("end\n")
     end
 
@@ -308,6 +309,172 @@ RSpec.describe Permittable::Generator do
 
       params = { gen_article: { title: "Hello", views: "3" } }
       expect(controller(klass, params: params).permitted_params).to eq("title" => "Hello", "views" => 3)
+    end
+  end
+
+  describe ".draft of a contract the model would actually accept" do
+    after do
+      %i[gen_blog_posts gen_orders gen_vehicles gen_oddities].each do |table|
+        ActiveRecord::Base.connection.drop_table(table, if_exists: true)
+      end
+    end
+
+    def load_draft(draft)
+      permittable_class { class_eval(draft) }
+    end
+
+    def violations(klass, params, action:)
+      controller(klass, params: params, action: action).permittable_violations
+    end
+
+    context "with a namespaced model" do
+      before do
+        ActiveRecord::Schema.define do
+          create_table(:gen_blog_posts) { |t| t.string :title }
+        end
+        stub_const("Blog::Post", Class.new(TestModel) { self.table_name = "gen_blog_posts" })
+      end
+
+      it "roots the draft at model_name.param_key, which is what Rails forms submit" do
+        draft = described_class.draft(model: Blog::Post)
+        expect(draft).to include("root: :blog_post, model: Blog::Post")
+        expect(violations(load_draft(draft), { blog_post: { title: "Hi" } }, action: "create")).to eq([])
+      end
+
+      it "keeps a single :create, :update rule when no column is required" do
+        draft = described_class.draft(model: Blog::Post)
+        expect(draft.scan("permit_params").length).to eq(1)
+        expect(draft).to include("permit_params :create, :update, root: :blog_post")
+      end
+    end
+
+    context "with NOT NULL columns and a partial update" do
+      before do
+        ActiveRecord::Schema.define do
+          create_table :gen_blog_posts do |t|
+            t.string :title, null: false
+            t.text   :body
+          end
+        end
+        stub_const("GenBlogPost", Class.new(TestModel) { self.table_name = "gen_blog_posts" })
+      end
+
+      let(:draft) { described_class.draft(model: GenBlogPost) }
+
+      it "drafts a :create rule that requires them and an :update rule that does not" do
+        create, update = draft.split("permit_params").drop(1)
+        expect(create).to start_with(" :create, ")
+        expect(create).to include("required :title, :string")
+        expect(update).to start_with(" :update, ")
+        expect(update).to include("optional :title, :string")
+        expect(update).not_to include("required")
+      end
+
+      it "lets a PATCH carrying only the edited field through, while create still insists" do
+        klass = load_draft(draft)
+        expect(violations(klass, { gen_blog_post: { body: "Edited" } }, action: "update")).to eq([])
+        expect(violations(klass, { gen_blog_post: { body: "New" } }, action: "create"))
+          .to eq([{ param: "gen_blog_post.title", code: "missing" }])
+      end
+
+      it "splits a scanned draft too, since its required fields come from the same columns" do
+        scan = described_class.scan("params.require(:gen_blog_post).permit(:title, :body)")
+        draft = described_class.draft(model: GenBlogPost, scan: scan)
+        expect(draft).to include("permit_params :create, ")
+        expect(draft).to include("permit_params :update, ")
+        expect(violations(load_draft(draft), { gen_blog_post: { body: "Edited" } }, action: "update")).to eq([])
+      end
+    end
+
+    context "with a Rails enum" do
+      before do
+        ActiveRecord::Schema.define do
+          create_table :gen_orders do |t|
+            t.integer :status, null: false, default: 0
+          end
+        end
+        stub_const("GenOrder", Class.new(TestModel) do
+          self.table_name = "gen_orders"
+          if ActiveRecord.version >= Gem::Version.new("7.0")
+            enum :status, { pending: 0, shipped: 1 }
+          else
+            enum status: { pending: 0, shipped: 1 }
+          end
+        end)
+      end
+
+      let(:draft) { described_class.draft(model: GenOrder) }
+
+      it "drafts the enum as the string keys a form sends, read from the model" do
+        expect(draft).to include('optional :status, :string, in: GenOrder.statuses.keys # database default: "pending"')
+      end
+
+      it "accepts an enum key and rejects anything else" do
+        klass = load_draft(draft)
+        expect(violations(klass, { gen_order: { status: "shipped" } }, action: "update")).to eq([])
+        expect(violations(klass, { gen_order: { status: "lost" } }, action: "update"))
+          .to eq([{ param: "gen_order.status", code: "inclusion" }])
+      end
+    end
+
+    context "with STI and optimistic locking" do
+      before do
+        ActiveRecord::Schema.define do
+          create_table :gen_vehicles do |t|
+            t.string  :type
+            t.string  :name
+            t.integer :lock_version, null: false, default: 0
+          end
+        end
+        stub_const("GenVehicle", Class.new(TestModel) { self.table_name = "gen_vehicles" })
+      end
+
+      let(:draft) { described_class.draft(model: GenVehicle) }
+
+      it "does not draft the inheritance or locking column as a client-writable field" do
+        expect(draft).not_to match(/^\s*(required|optional) :type\b/)
+        expect(draft).not_to match(/^\s*(required|optional) :lock_version\b/)
+        expect(draft).to include("optional :name, :string")
+      end
+
+      it "names each omitted column in a TODO saying why" do
+        expect(draft).to match(/# TODO: type is the STI inheritance column — .*changes the record's class/)
+        expect(draft).to match(/# TODO: lock_version is the optimistic-locking column — /)
+      end
+
+      it "leaves a plain `type` column alone when the model has turned STI off" do
+        stub_const("GenPlainVehicle", Class.new(TestModel) do
+          self.table_name = "gen_vehicles"
+          self.inheritance_column = nil
+        end)
+        expect(described_class.draft(model: GenPlainVehicle)).to include("optional :type, :string")
+      end
+
+      it "loads" do
+        expect(load_draft(draft).permit_rule_for("update")[:fields].map { |f| f[:name] }).to eq(%i[name])
+      end
+    end
+
+    context "with column names that are not symbol literals" do
+      before do
+        ActiveRecord::Schema.define do
+          create_table :gen_oddities do |t|
+            t.string  "first-name"
+            t.boolean "2fa_enabled"
+            t.string  "Email Address"
+          end
+        end
+        stub_const("GenOddity", Class.new(TestModel) { self.table_name = "gen_oddities" })
+      end
+
+      it "quotes them, so the draft is valid Ruby that loads and reads them" do
+        draft = described_class.draft(model: GenOddity)
+        expect(draft).to include('optional :"first-name", :string')
+        expect(draft).to include('optional :"2fa_enabled", :boolean')
+        expect(draft).to include('optional :"Email Address", :string')
+        params = { gen_oddity: { "first-name" => "Jo", "2fa_enabled" => "true", "Email Address" => "jo@x.io" } }
+        expect(violations(load_draft(draft), params, action: "create")).to eq([])
+      end
     end
   end
 

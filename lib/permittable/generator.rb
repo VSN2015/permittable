@@ -22,6 +22,13 @@ module Permittable
     DEFAULT_ACTIONS = %i[create update].freeze
     SKIPPED_COLUMNS = %w[created_at updated_at].freeze
 
+    # One column as the drafting code sees it: the database facts, plus what
+    # the MODEL layers on top — an enum accessor that changes what a client
+    # sends, or a reason the column must not be client-writable at all.
+    # Building these once in columns_for keeps every drafting path (columns
+    # alone, or a scan typed from columns) reading the same answers.
+    DraftColumn = Struct.new(:name, :type, :null, :default, :default_function, :enum, :omitted, keyword_init: true)
+
     # Column type => contract type. Document-shaped columns map onto the
     # opaque `:json` field — the shape stays undeclared, which is what a
     # jsonb column is for, and `max_depth:`/`length:` can bound it later.
@@ -143,7 +150,7 @@ module Permittable
 
       root = scan ? scan.root : default_root(model)
       body = scan ? scanned_lines(scan, columns) : column_lines(columns.values)
-      render(signature(root: root, model: columns && model), body)
+      render(root: root, model: columns && model, body: body)
     end
 
     def infer_model(controller)
@@ -163,9 +170,47 @@ module Permittable
       # Array() flattens a composite primary key (an Array in Rails 7.1+)
       # into its column names; a nil primary key becomes [].
       skipped = SKIPPED_COLUMNS + Array(model.primary_key).map(&:to_s)
-      model.columns.reject { |c| skipped.include?(c.name) }.to_h { |c| [c.name, c] }
+      model.columns.reject { |c| skipped.include?(c.name) }.to_h { |c| [c.name, draft_column(model, c)] }
     rescue StandardError
       nil
+    end
+
+    def draft_column(model, column)
+      enum = enum_for(model, column.name)
+      default = column.default
+      default = enum[:mapping].find { |_key, value| value.to_s == default.to_s }&.first || default if enum && default
+      DraftColumn.new(name: column.name, type: column.type, null: column.null, default: default,
+                      default_function: column.respond_to?(:default_function) && column.default_function,
+                      enum: enum && enum[:values], omitted: omitted_reason(model, column.name))
+    end
+
+    # A Rails enum stores an integer but is ASSIGNED its key: a form sends
+    # "shipped", never 1, so drafting the column type (:integer) would reject
+    # every legitimate request. The draft references the model's own
+    # accessor rather than inlining today's keys, so adding a value to the
+    # enum cannot leave the contract rejecting it.
+    def enum_for(model, name)
+      return nil unless model.respond_to?(:defined_enums)
+
+      mapping = model.defined_enums[name]
+      mapping && { mapping: mapping, values: "#{model.name}.#{name.pluralize}.keys" }
+    end
+
+    # Columns that exist but that no client should be able to write. Both are
+    # kept out of the fields and named in a TODO instead, so the omission is
+    # visible rather than silent.
+    def omitted_reason(model, name)
+      # Only a model that actually uses STI: the inheritance column is set
+      # (not nil) AND exists. Mass-assigning it changes which class the
+      # record is loaded as — `type: "Admin"` on a signup form.
+      if model.respond_to?(:inheritance_column) && model.inheritance_column.to_s == name
+        return "is the STI inheritance column — assigning it changes the record's class, so no client should send it; " \
+               "if clients really pick the subclass, declare it with in: the allowed class names"
+      end
+      return nil unless model.respond_to?(:locking_column) && model.locking_column.to_s == name
+
+      "is the optimistic-locking column — Rails increments it on every save; if your edit forms round-trip it " \
+        "as a hidden field for stale-update detection, declare `optional :#{name}, :integer` on the :update rule"
     end
 
     # -- scan parsing -------------------------------------------------------
@@ -236,12 +281,17 @@ module Permittable
 
     # -- drafting -----------------------------------------------------------
 
+    # model_name.param_key is the key Rails form helpers submit under and
+    # `params.require` reads — `blog_post` for Blog::Post, where demodulizing
+    # the class name gave `post` and an enforced draft 400'd every submit.
     def default_root(model)
+      return model.model_name.param_key.to_sym if model.respond_to?(:model_name)
+
       model.name.demodulize.underscore.to_sym
     end
 
-    def signature(root:, model:)
-      parts = ["permit_params #{DEFAULT_ACTIONS.map(&:inspect).join(', ')}"]
+    def signature(root:, model:, actions: DEFAULT_ACTIONS)
+      parts = ["permit_params #{actions.map(&:inspect).join(', ')}"]
       parts << "root: :#{root}" if root
       parts << "model: #{model.name}" if model
       parts << "mode: :monitor do"
@@ -252,11 +302,17 @@ module Permittable
       columns.map { |column| column_line(column) }
     end
 
+    # Names are emitted with Symbol#inspect, so a column called `first-name`
+    # or `2fa_enabled` drafts as `:"first-name"` rather than as Ruby that
+    # does not parse.
     def column_line(column)
-      type = COLUMN_TYPES[column.type]
+      return "# TODO: #{column.name} #{column.omitted}" if column.omitted
+
+      type = column.enum ? :string : COLUMN_TYPES[column.type]
       return "# TODO: #{column.name} (#{column.type}) has no contract type — declare it as a nested block or an array" unless type
 
-      line = "#{required_column?(column) ? 'required' : 'optional'} :#{column.name}, :#{type}"
+      line = "#{required_column?(column) ? 'required' : 'optional'} #{column.name.to_sym.inspect}, :#{type}"
+      line += ", in: #{column.enum}" if column.enum
       line += " # database default: #{column.default.inspect}" unless column.default.nil?
       line
     end
@@ -270,7 +326,7 @@ module Permittable
       return false if column.null
       return false unless column.default.nil?
 
-      column.respond_to?(:default_function) && column.default_function ? false : true
+      !column.default_function
     end
 
     def scanned_lines(scan, columns)
@@ -311,8 +367,25 @@ module Permittable
     HEADER = "# Drafted by permittable:generate — review the TODOs, then deploy: monitor\n" \
              "# mode reports violations (instrumentation + log) without rejecting requests.\n".freeze
 
-    def render(signature, body)
-      "#{HEADER}#{signature}\n#{body.map { |line| "  #{line}\n" }.join}end\n"
+    UPDATE_NOTE = "# :update has nothing required — a PATCH sends only the fields it changes.\n".freeze
+
+    # One rule, unless a column made something `required`: that is true of a
+    # create, but an update carrying only the edited field would be rejected
+    # for everything it left out. So the update gets its own rule — the same
+    # fields, every one optional — and only when both actions are drafted.
+    def render(root:, model:, body:, actions: DEFAULT_ACTIONS)
+      rules = split_rules(actions, body).map do |rule_actions, lines|
+        "#{signature(root: root, model: model, actions: rule_actions)}\n#{lines.map { |line| "  #{line}\n" }.join}end\n"
+      end
+      HEADER + rules.join("\n#{UPDATE_NOTE}")
+    end
+
+    REQUIRED_LINE = /\Arequired /
+
+    def split_rules(actions, body)
+      return [[actions, body]] unless body.any?(REQUIRED_LINE) && (%i[create update] - actions).empty?
+
+      [[actions - [:update], body], [[:update], body.map { |line| line.sub(REQUIRED_LINE, "optional ") }]]
     end
   end
 end
