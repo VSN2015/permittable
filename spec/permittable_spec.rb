@@ -858,6 +858,93 @@ RSpec.describe Permittable do
       end
       expect(result[:plan]).to eq("free")
     end
+
+    it "delivers a default: cast, exactly as a request sending the same value would get it" do
+      decl = proc do
+        permit_params(:create) do
+          optional :age, :integer, default: "18"
+          optional :opt_in, :boolean, default: "false"
+          optional :price, :decimal, default: 1.5
+          optional :day, :date, default: "2026-01-05"
+          array :ids, of: :integer, default: %w[1 2]
+          array :items, default: [{ "sku" => "a", "qty" => "2" }] do
+            required :sku, :string
+            optional :qty, :integer
+          end
+        end
+      end
+      defaulted = permit({}, &decl)
+      sent = permit({ age: "18", opt_in: "false", price: 1.5, day: "2026-01-05", ids: %w[1 2],
+                      items: [{ sku: "a", qty: "2" }] }, &decl)
+
+      expect(defaulted[:age]).to eq(18)
+      expect(defaulted[:opt_in]).to be(false)
+      expect(defaulted[:price]).to be_a(BigDecimal).and eq(BigDecimal("1.5"))
+      expect(defaulted[:day]).to eq(Date.new(2026, 1, 5))
+      expect(defaulted[:ids]).to eq([1, 2])
+      expect(defaulted[:items].map(&:to_h)).to eq([{ "sku" => "a", "qty" => 2 }])
+      expect(defaulted).to eq(sent)
+    end
+
+    it "casts an authored example: the same way, so docs publish the value a request would carry" do
+      klass = permittable_class do
+        permit_params(:create) do
+          optional :age, :integer, example: "21"
+          array :ids, of: :integer, example: %w[3]
+        end
+      end
+      fields = klass.permittable_contracts.last[:fields]
+      expect(fields.map { |f| f[:example] }).to eq([21, [3]])
+    end
+
+    it "hands out a default: with nothing frozen inside it, however deep" do
+      klass = permittable_class do
+        permit_params(:create) do
+          array :tags, of: :string, default: ["a"]
+          optional :meta, :json, default: { "k" => "v", "list" => ["x"], "deep" => { "d" => "e" } }
+          array :items, default: [{ "sku" => "a" }] do
+            required :sku, :string
+          end
+        end
+      end
+      first = controller(klass).permitted_params
+      expect { first[:tags].first << "!" }.not_to raise_error
+      expect { first[:meta]["k"] << "!" }.not_to raise_error
+      expect { first[:meta]["list"] << "y" }.not_to raise_error
+      expect { first[:meta]["deep"]["d"] << "!" }.not_to raise_error
+      expect { first[:items].first["sku"] << "!" }.not_to raise_error
+
+      second = controller(klass).permitted_params
+      expect(second[:tags]).to eq(["a"])
+      expect(second[:meta].to_h).to eq("k" => "v", "list" => ["x"], "deep" => { "d" => "e" })
+      expect(second[:items].map(&:to_h)).to eq([{ "sku" => "a" }])
+    end
+  end
+
+  describe "the result never aliases the request's own strings" do
+    it "copies a String value, so mutating the result leaves params untouched" do
+      params = { name: +"bob", tags: [+"a"], meta: { "note" => +"n" } }
+      result = permit(params) do
+        permit_params(:create) do
+          required :name, :string
+          array :tags, of: :string
+          optional :meta, :json
+        end
+      end
+      result[:name] << "!"
+      result[:tags].first << "!"
+      result[:meta]["note"] << "!"
+
+      expect(params).to eq(name: "bob", tags: ["a"], meta: { "note" => "n" })
+    end
+
+    it "hands transform: a copy, so a mutating transform cannot rewrite params" do
+      params = { name: +"  bob  " }
+      result = permit(params) { permit_params(:create) { required :name, :string, transform: ->(v) { v.strip! || v } } }
+
+      expect(result[:name]).to eq("bob")
+      expect(params[:name]).to eq("  bob  ")
+    end
   end
 
   describe "nullable:" do

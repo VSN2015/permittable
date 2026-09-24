@@ -148,6 +148,18 @@ RSpec.describe Permittable::JsonSchema do
                               "description" => "Billing plan", "examples" => ["pro"])
     end
 
+    it "publishes an authored default:/example: cast to the field's own type" do
+      props = schema_for do
+        optional :age, :integer, default: "18", example: "21"
+        optional :opt_in, :boolean, default: "false"
+        array :ids, of: :integer, default: %w[1 2]
+      end["properties"]
+
+      expect(props["age"]).to include("type" => "integer", "default" => 18, "examples" => [21])
+      expect(props["opt_in"]).to include("type" => "boolean", "default" => false)
+      expect(props["ids"]).to include("default" => [1, 2])
+    end
+
     it "re-encodes authored Date/Time/BigDecimal values as JSON scalars" do
       expect(property("day") { optional :day, :date, default: Date.new(2026, 1, 5) }["default"]).to eq("2026-01-05")
       expect(property("at") { optional :at, :datetime, example: Time.utc(2026, 1, 5, 10) }["examples"])

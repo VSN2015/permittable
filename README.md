@@ -296,7 +296,7 @@ Which options are legal depends on the field kind — anything else raises at cl
 | `format:` | ✅¹ | — | — | Regexp the value must match, or a [preset name](#format-presets): `:email`, `:uuid`, `:url`, `:slug`, `:hostname` |
 | `length:` | ✅¹ | ✅ | — | `Range` or `Integer`. Character count on strings, **element count** on arrays, where it short-circuits — see [the field DSL](#the-field-dsl) |
 | `normalize:` | ✅¹ | — | — | `:squish`, `:strip`, `:downcase`, `:upcase`, `:email`, or a Proc. Runs **first** — before the absence rule, so a value that normalizes to `""` is absent |
-| `default:` | ✅ | ✅ | — | Value used when the field is absent. Validated against the field's own contract at class load, then stored normalized and frozen (each request gets its own copy) |
+| `default:` | ✅ | ✅ | — | Value used when the field is absent. Validated against the field's own contract at class load, then stored normalized, cast (`default: "18"` on an `:integer` is `18`) and frozen (each request gets its own deep copy) |
 | `validate:` | ✅ | ✅ | — | Callable. Falsy fails as `"invalid"`; a returned `Symbol` becomes the violation code |
 | `transform:` | ✅ | ✅ | — | Callable applied **after** cast and validation — see [output reshaping](#output-reshaping-transform-and-finalize) |
 | `virtual:` | ✅ | ✅ | ✅ | Exempt this field from the schema-drift guard |
