@@ -2013,6 +2013,7 @@ RSpec.describe Permittable do
             t.date     :on
             t.json     :payload
             t.binary   :blob
+            t.integer  :status
           end
         end
       end
@@ -2076,6 +2077,45 @@ RSpec.describe Permittable do
           # improvised for them is left alone rather than second-guessed.
           expect(&declaring(typed) { optional :payload, :string }).not_to raise_error
           expect(&declaring(typed) { optional :blob, :string }).not_to raise_error
+        end
+
+        context "with a Rails enum over an integer column" do
+          # `enum` is spelled positionally from Rails 7.0 and by keyword before
+          # it; the keyword form is gone in 8.0, and the matrix covers both.
+          let(:enum_model) do
+            Class.new(TestModel) do
+              self.table_name = "typed_things"
+              if ActiveRecord.version >= Gem::Version.new("7.0")
+                enum :status, { pending: 0, shipped: 1 }
+              else
+                enum status: { pending: 0, shipped: 1 }
+              end
+            end
+          end
+
+          it "accepts the :string declaration an enum is actually submitted as" do
+            m = enum_model
+            expect(&declaring(m) { optional :status, :string, in: m.statuses.keys }).not_to raise_error
+          end
+
+          it "still accepts the column's own group" do
+            expect(&declaring(enum_model) { optional :status, :integer }).not_to raise_error
+          end
+
+          it "still catches a declaration that is neither text nor the column's group" do
+            expect(&declaring(enum_model) { optional :status, :datetime })
+              .to raise_error(ArgumentError, /'status' is declared :datetime but the column is :integer/)
+          end
+
+          it "leaves the same column without an enum checked as before" do
+            expect(&declaring(typed) { optional :status, :string })
+              .to raise_error(ArgumentError, /'status' is declared :string but the column is :integer/)
+          end
+
+          it "does not loosen the existence check" do
+            expect(&declaring(enum_model) { optional :statuses, :string })
+              .to raise_error(ArgumentError, /'statuses' does not exist/)
+          end
         end
 
         it "still skips virtual fields and a missing column still reports as missing" do

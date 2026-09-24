@@ -652,6 +652,8 @@ When enabled it compares **groups**, not exact types, so it fires on a genuine c
 
 Any column type **not** in that table — `json`, `jsonb`, `binary`, an adapter's own `inet` or `money` — is never checked. A contract has no faithful type for those, so whatever you improvised is left alone rather than guessed about.
 
+**A Rails `enum` is compared by what clients send, not what the column stores.** An enum is submitted by name — `status: "shipped"` — so `optional :status, :string, in: Order.statuses.keys` is the right contract for an integer-backed enum, and a text declaration on any attribute in the model's `defined_enums` passes. Other declarations are still held to the column's own group: `:integer` on an integer-backed enum passes, `:datetime` does not. The attribute API is **not** treated the same way: `attribute :starts_at, :datetime` over a string column is still compared against the string column, because the guard reads the schema and cannot tell a deliberate override from drift. Declare such a field to match its column, or leave the check off.
+
 
 - **Fields not backed by a column** — `password_confirmation`, terms checkboxes, search filters — opt out with `virtual: true`.
 - **Nested and array fields are implicitly virtual**, since only scalars map one-to-one onto columns.

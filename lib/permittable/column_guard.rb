@@ -68,12 +68,27 @@ module Permittable
       wanted = TYPE_GROUPS[declared.to_sym]
       actual = TYPE_GROUPS[column.type.to_sym]
       return if wanted.nil? || actual.nil? || wanted == actual
+      return if wanted == :text && enum_attribute?(klass, field)
 
       raise ArgumentError,
             "#{label}: '#{field}' is declared :#{declared} but the column is :#{column.type} " \
             "(table: #{klass.table_name}). Change the contract to match the column, migrate the " \
             "column to match the contract, or declare the field virtual: true if it is not " \
             "backed by this column."
+    end
+
+    # A Rails enum is submitted by its NAME — `status: "shipped"` — whatever
+    # the column stores, so `:string, in: Order.statuses.keys` is the correct
+    # contract for an integer-backed enum, not drift. The model's enum mapping
+    # is what casts between the two, so a text declaration on an enum column
+    # is accepted whatever the column's group; any other declaration is still
+    # held to the column's own group (`:integer` on an integer-backed enum
+    # passes, `:datetime` does not). Only `enum` is recognised: an
+    # `attribute :x, :datetime` over a string column is a deliberate override
+    # this guard cannot tell from drift, and stays the documented trade-off.
+    # `model:` is only duck-typed on column_names, hence the respond_to?.
+    def enum_attribute?(klass, field)
+      klass.respond_to?(:defined_enums) && klass.defined_enums.key?(field.to_s)
     end
 
     def column_migration_hint(klass, field, types)
