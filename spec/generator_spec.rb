@@ -23,6 +23,11 @@ RSpec.describe Permittable::Generator do
     klass.permit_rule_for("create")
   end
 
+  # A model known only by its name: all the root choice reads from it.
+  def named_model(name)
+    Class.new.tap { |klass| klass.define_singleton_method(:name) { name } }
+  end
+
   describe ".scan" do
     it "extracts the root and scalar keys from a require().permit() call" do
       scan = described_class.scan("params.require(:user).permit(:name, :age)")
@@ -124,7 +129,7 @@ RSpec.describe Permittable::Generator do
       scan = described_class.scan("params.expect(:id, user: [:name])")
       expect(scan.root).to eq(:user)
       expect(scan.scalars).to eq(%i[name])
-      expect(scan.rootless).to eq([":id"])
+      expect(scan.route_params).to eq([":id"])
       expect(scan.unparsed).to eq([])
     end
 
@@ -132,7 +137,7 @@ RSpec.describe Permittable::Generator do
       scan = described_class.scan("params.expect(user: [:name], address: [:city])")
       expect(scan.root).to eq(:user)
       expect(scan.scalars).to eq(%i[name])
-      expect(scan.other_envelopes).to eq(address: [":city"])
+      expect(scan.other_envelopes).to eq(address: ["address: [:city]"])
       expect(scan.unparsed).to eq([])
     end
 
@@ -405,7 +410,7 @@ RSpec.describe Permittable::Generator do
       RUBY
       expect(scan.root).to eq(:post)
       expect(scan.scalars).to eq(%i[title body])
-      expect(scan.rootless).to eq([":id"])
+      expect(scan.route_params).to eq([":id"])
       expect(scan.unparsed).to eq([])
     end
 
@@ -413,7 +418,7 @@ RSpec.describe Permittable::Generator do
       scan = described_class.scan("Post.find(params.expect(:id))\nparams.expect(post: [:title])")
       expect(scan.root).to eq(:post)
       expect(scan.scalars).to eq(%i[title])
-      expect(scan.rootless).to eq([":id"])
+      expect(scan.route_params).to eq([":id"])
     end
 
     it "keeps a rootless permit call out of the envelope, wherever it appears" do
@@ -431,15 +436,40 @@ RSpec.describe Permittable::Generator do
       expect(scan.rootless).to eq([":page", ":per_page"])
     end
 
-    it "roots nothing when the rootless calls carry the most fields" do
-      scan = described_class.scan(<<~RUBY)
+    it "roots nothing when the model is known and the rootless calls carry the most fields" do
+      scan = described_class.scan(<<~RUBY, model: named_model("Article"))
         def index = params.require(:filter).permit(:q)
         def create = params.permit(:title, :body, :published)
       RUBY
       expect(scan.root).to be_nil
       expect(scan.scalars).to eq(%i[title body published])
-      expect(scan.other_envelopes).to eq(filter: [":q"])
+      expect(scan.other_envelopes).to eq(filter: ["filter: [:q]"])
       expect(scan.rootless).to eq([])
+    end
+
+    it "prefers any envelope to rootless calls when the model is not known, as before" do
+      scan = described_class.scan("params.require(:post).permit(:title)
+params.permit(:page, :per_page)")
+      expect(scan.root).to eq(:post)
+      expect(scan.scalars).to eq(%i[title])
+      expect(scan.rootless).to eq([":page", ":per_page"])
+    end
+
+    it "does not call a losing rootless call's keys route params" do
+      source = "params.permit(:title, :body)\nparams.require(:filter).permit(:q)"
+      draft = described_class.draft(scan: described_class.scan(source))
+      expect(draft).to include("root: :filter")
+      expect(draft).to include("# TODO: outside the filter envelope, so not in this contract: :title")
+      expect(draft).not_to include("route or query param")
+      expect(load_draft(draft)[:fields].map { |f| f[:name] }).to eq(%i[q])
+    end
+
+    it "prefers an envelope with no parsed field to rootless calls when the model is not known" do
+      draft = described_class.draft(scan: described_class.scan("params.require(:post).permit(*PERMITTED)
+params.permit(:page)"))
+      expect(draft).to be_nil # no fields and no columns: nothing loadable to draft
+      expect(described_class.scan("params.require(:post).permit(*PERMITTED)
+params.permit(:page)").root).to eq(:post)
     end
 
     it "keeps a second permit envelope visible rather than merging it into the first" do
@@ -450,7 +480,7 @@ RSpec.describe Permittable::Generator do
       expect(scan.root).to eq(:post)
       expect(scan.scalars).to eq(%i[title body])
       expect(scan.arrays).to eq([])
-      expect(scan.other_envelopes).to eq(search: [":q", "tags: []"])
+      expect(scan.other_envelopes).to eq(search: ["search: [:q, tags: []]"])
     end
 
     it "roots the draft at the envelope with the most fields, not a search form seen first" do
@@ -460,19 +490,19 @@ RSpec.describe Permittable::Generator do
       RUBY
       expect(scan.root).to eq(:post)
       expect(scan.scalars).to eq(%i[title body])
-      expect(scan.other_envelopes).to eq(search: [":q"])
+      expect(scan.other_envelopes).to eq(search: ["search: [:q]"])
     end
 
     it "breaks a tie by source order, whichever call spelling comes first" do
       scan = described_class.scan("params.expect(post: [:title])\nparams.require(:search).permit(:q)")
       expect(scan.root).to eq(:post)
-      expect(scan.other_envelopes).to eq(search: [":q"])
+      expect(scan.other_envelopes).to eq(search: ["search: [:q]"])
     end
 
     it "counts only parsed fields, not arguments it could not read" do
       scan = described_class.scan("params.require(:search).permit(:q)\nparams.require(:post).permit(*PERMITTED, **opts)")
       expect(scan.root).to eq(:search)
-      expect(scan.other_envelopes).to eq(post: ["*PERMITTED", "**opts"])
+      expect(scan.other_envelopes).to eq(post: ["post: [*PERMITTED, **opts]"])
     end
 
     it "counts every envelope of an expect call, so a second one can be the chosen root" do
@@ -482,7 +512,7 @@ RSpec.describe Permittable::Generator do
       RUBY
       expect(scan.root).to eq(:comment)
       expect(scan.scalars).to eq(%i[body author])
-      expect(scan.other_envelopes).to eq(post: [":title"])
+      expect(scan.other_envelopes).to eq(post: ["post: [:title]"])
     end
 
     it "still drafts a file of only rootless calls as scalars" do
@@ -649,24 +679,38 @@ RSpec.describe Permittable::Generator do
       RUBY
       expect(scan.root).to eq(:post)
       expect(scan.scalars).to eq(%i[title])
-      expect(scan.rootless).to eq([":id", ":page"])
+      expect(scan.route_params).to eq([":id"])
+      expect(scan.rootless).to eq([":page"])
     end
 
     it "never drafts `:id` or a `*_id` lookup as a field, even when the rootless calls win" do
       scan = described_class.scan(<<~RUBY)
         @post = Post.find(params.expect(:id))
-        @user = User.find(params.permit(:user_id))
+        @user = User.find(params.expect(:user_id))
         params.permit(:q, :page)
       RUBY
       expect(scan.root).to be_nil
       expect(scan.scalars).to eq(%i[q page])
-      expect(scan.rootless).to eq([":id", ":user_id"])
+      expect(scan.route_params).to eq([":id", ":user_id"])
     end
 
     it "still counts `:id` inside a call with other keys" do
-      scan = described_class.scan("params.permit(:id, :q)\nparams.require(:search).permit(:q)")
+      scan = described_class.scan("params.expect(:id, :q)")
       expect(scan.root).to be_nil
       expect(scan.scalars).to eq(%i[id q])
+    end
+
+    it "drafts a single-key permit of a `*_id` key, which is a mass-assignment filter, as before" do
+      scan = described_class.scan("params.permit(:group_id)")
+      expect(scan.scalars).to eq(%i[group_id])
+      expect(scan.route_params).to eq([])
+      draft = described_class.draft(scan: scan)
+      expect(draft).to include("optional :group_id, :string # TODO: confirm the type")
+      expect(load_draft(draft)[:fields].map { |f| f[:name] }).to eq(%i[group_id])
+    end
+
+    it "returns nil for a model-less file of only route-param lookups" do
+      expect(described_class.draft(scan: described_class.scan("Post.find(params.expect(:id))"))).to be_nil
     end
   end
 
@@ -676,6 +720,12 @@ RSpec.describe Permittable::Generator do
       expect(scan.root).to eq(:post)
       expect(scan.unparsed).to eq(["PERMITTED_PARAMS"])
       expect(scan).not_to be_fields
+    end
+
+    it "quotes a losing constant envelope as the source spells it" do
+      draft = described_class.draft(scan: described_class.scan("params.expect(post: PERMITTED)\nparams.require(:search).permit(:q)"))
+      expect(draft).to include("# TODO: belongs to another envelope (post): post: PERMITTED")
+      expect(load_draft(draft)[:root]).to eq(:search)
     end
   end
 
@@ -690,7 +740,7 @@ RSpec.describe Permittable::Generator do
 
     it "says it was sent beside another envelope when the rootless calls won" do
       source = "params.expect(post: [:title], tag_names: [])\nparams.permit(:q, :page)"
-      draft = described_class.draft(scan: described_class.scan(source))
+      draft = described_class.draft(scan: described_class.scan(source, model: named_model("Article")))
       expect(draft).to include("# TODO: sent beside another envelope, so not in this contract: tag_names: []")
       expect(load_draft(draft)[:fields].map { |f| f[:name] }).to eq(%i[q page])
     end
@@ -728,8 +778,18 @@ RSpec.describe Permittable::Generator do
       expect(draft).to include("root: :gen_post, model: GenPost")
       expect(draft).to include("required :title, :string")
       expect(draft).to include("# TODO: could not parse from the permit call: *PERMITTED")
-      expect(draft).to include("# TODO: route or query param, not a body field: :page")
+      expect(draft).to include("# TODO: outside the gen_post envelope, so not in this contract: :page")
       expect(load_draft(draft)[:fields].map { |f| f[:name] }).to eq(%i[title body])
+    end
+
+    it "roots at the model when the only readable call is a route-param lookup" do
+      draft = described_class.for_controller(controller, source: <<~RUBY)
+        def set_post = @post = GenPost.find(params.expect(:id))
+        def gen_post_params = params.require(:gen_post).permit(policy(@post).permitted_attributes)
+      RUBY
+      expect(draft).to include("root: :gen_post, model: GenPost")
+      expect(draft).to include("# TODO: route or query param, not a body field: :id")
+      expect(load_draft(draft)[:root]).to eq(:gen_post)
     end
 
     it "falls back to the columns for a constant envelope" do
@@ -742,6 +802,46 @@ RSpec.describe Permittable::Generator do
     it "scores the envelopes as before when none is the model's" do
       source = "params.require(:search).permit(:q, :sort)\nparams.require(:post).permit(:title)"
       expect(described_class.scan(source, model: GenPost).root).to eq(:search)
+    end
+  end
+
+  describe ".draft falling back to the columns beside keys the scan did not draft" do
+    before do
+      ActiveRecord::Schema.define do
+        create_table :gen_tasks do |t|
+          t.string  :title
+          t.string  :tags
+          t.integer :project_id
+        end
+      end
+      stub_const("GenTask", Class.new(TestModel) { self.table_name = "gen_tasks" })
+    end
+
+    after { ActiveRecord::Base.connection.drop_table(:gen_tasks, if_exists: true) }
+
+    it "does not declare a column whose shape the scan could not decide" do
+      scan = described_class.scan("params.permit(tags: [])\nparams.permit(tags: [:a])")
+      draft = described_class.draft(model: GenTask, scan: scan)
+      expect(draft).to include("permit_params :create, :update, model: GenTask, mode: :monitor do")
+      expect(draft).to include("# TODO: tags is permitted as both an array and a nested hash")
+      expect(draft).not_to include("optional :tags")
+      expect(load_draft(draft)[:fields].map { |f| f[:name] }).to eq(%i[title project_id])
+    end
+
+    it "still declares a column for a key a losing rootless call permitted" do
+      scan = described_class.scan("params.require(:gen_task).permit(*PERMITTED)\nparams.permit(:title)", model: GenTask)
+      draft = described_class.draft(model: GenTask, scan: scan)
+      expect(draft).to include("root: :gen_task, model: GenTask")
+      expect(draft).to include("# TODO: outside the gen_task envelope, so not in this contract: :title")
+      expect(load_draft(draft)[:fields].map { |f| f[:name] }).to eq(%i[title tags project_id])
+    end
+
+    it "does not declare a column the scan read as a route param" do
+      draft = described_class.draft(model: GenTask, scan: described_class.scan("GenTask.where(project_id: params.expect(:project_id))"))
+      expect(draft).to include("root: :gen_task, model: GenTask")
+      expect(draft).to include("# TODO: route or query param, not a body field: :project_id")
+      expect(draft).not_to include("optional :project_id")
+      expect(load_draft(draft)[:fields].map { |f| f[:name] }).to eq(%i[title tags])
     end
   end
 
