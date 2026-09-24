@@ -41,10 +41,14 @@ module Permittable
     # onto its sub-keys, `nested_arrays` maps the `key: [[:a, :b]]` an
     # `expect` call spells an array of hashes with, and `unparsed` keeps
     # verbatim anything the conservative parser would otherwise have silently
-    # dropped. `conflicts` names each key permitted in more than one shape,
-    # which is drafted once, in its richest shape (see SHAPES).
-    Scan = Struct.new(:root, :scalars, :arrays, :nested, :nested_arrays, :unparsed, :conflicts, :calls,
-                      keyword_init: true) do
+    # dropped. `conflicts` names each key permitted in more than one shape
+    # (see resolve_conflicts). What parsed fine but belongs outside the
+    # chosen root's contract is kept apart from `unparsed`, so its TODO can
+    # say why: `rootless` holds the keys of a rootless call once an envelope
+    # won (a route or query param), `other_envelopes` maps each losing root
+    # onto its arguments. `calls` counts the params calls found.
+    Scan = Struct.new(:root, :scalars, :arrays, :nested, :nested_arrays, :unparsed, :conflicts,
+                      :rootless, :other_envelopes, :calls, keyword_init: true) do
       def found?
         calls.positive?
       end
@@ -88,16 +92,17 @@ module Permittable
     NESTED_ARRAY_ARG = /\A(\w+):\s*\[\s*\[([^\[\]]*)\]\s*\]\z/m
 
     # The shapes a scanned key can take, richest first, with how a conflict
-    # TODO names each. A key seen in two shapes across actions is declared
-    # once — a contract rejects a field declared twice — in the richest one,
-    # because that is the shape at least one action demonstrably accepts: a
-    # scalar declaration would reject the hash or array that action is sent,
-    # `key: [:a]` names sub-keys where `key: []` names none, and `key: [[:a]]`
-    # is expect's definitive spelling of the array of hashes that `key: [:a]`
-    # leaves ambiguous.
+    # TODO names each (see resolve_conflicts).
     SHAPES = {
       nested_arrays: "an array of hashes", nested: "a nested hash", arrays: "an array", scalars: "a scalar"
     }.freeze
+    HASH_SHAPES = %i[nested nested_arrays].freeze
+
+    # One params call, or one envelope of an expect call, at its offset in
+    # the source. `route_params` are the plain keys an expect call spells
+    # beside its envelope — never body fields, whichever root wins.
+    Call = Struct.new(:position, :root, :fields, :route_params)
+    private_constant :Call
 
     # Comment tokens. Ripper (stdlib) is used rather than a regexp because `#`
     # is only a comment sometimes — it also appears inside string literals and
@@ -140,19 +145,29 @@ module Permittable
     # root's calls become fields; another envelope, and a rootless call once
     # there is an envelope, stay visible as TODOs. A file of only rootless
     # calls is a filter contract and still drafts them as fields.
+    #
+    # The calls are read in SOURCE order, whichever spelling each uses:
+    # scanning every permit call before every expect call made "first seen"
+    # mean "first permit call", so a later search form could outrank the
+    # expect envelope above it.
     def scan(source)
-      result = Scan.new(root: nil, scalars: [], arrays: [], nested: {}, nested_arrays: {},
-                        unparsed: [], conflicts: [], calls: 0)
+      result = Scan.new(root: nil, scalars: [], arrays: [], nested: {}, nested_arrays: {}, unparsed: [],
+                        conflicts: [], rootless: [], other_envelopes: {}, calls: 0)
       source = executable_source(source.to_s)
-      calls = source.scan(PERMIT_CALL).map { |root, args| [root&.to_sym, split_args(args), []] }
-      # One capture group, so scan yields a one-element Array rather than
-      # auto-splatting the way PERMIT_CALL's two groups do.
-      calls += source.scan(EXPECT_CALL).map { |(args)| expect_call(split_args(args)) }
-      result.calls = calls.size
+      permits = matches(source, PERMIT_CALL).map do |match|
+        [Call.new(match.begin(0), match[1]&.to_sym, split_args(match[2]), [])]
+      end
+      expects = matches(source, EXPECT_CALL).map { |match| expect_calls(match.begin(0), split_args(match[1])) }
+      result.calls = permits.size + expects.size
+      calls = (permits + expects).flatten.sort_by(&:position)
       result.root = choose_root(calls)
-      calls.each { |root, fields, extras| merge_call(result, root, fields, extras) }
+      calls.each { |call| merge_call(result, call) }
       resolve_conflicts(result)
       result
+    end
+
+    def matches(source, pattern)
+      source.to_enum(:scan, pattern).map { Regexp.last_match }
     end
 
     # Draft a contract for one controller: model inferred from
@@ -180,14 +195,15 @@ module Permittable
     # call belonging to another envelope — drafted a contract with only TODO
     # lines, which raises `a contract must declare at least one field` the
     # moment it is pasted. The columns are the next best knowledge, so they
-    # are drafted instead, with the scan's TODOs kept beneath them and its
-    # root preferred to the model's. With no columns either there is nothing
-    # loadable to draft, so nil, as for no knowledge at all.
+    # are drafted instead, with the scan's TODOs kept beneath them. The scan's
+    # rootness is kept too: a rootless `params.permit(*KEYS)` controller
+    # drafted under the model's root would answer 400 to every request it
+    # already serves once the contract is enforced. With no columns either
+    # there is nothing loadable to draft, so nil, as for no knowledge at all.
     def fallback_draft(model, scan, columns)
       return nil unless columns
 
-      root = scan.root || default_root(model)
-      render(signature(root: root, model: model), column_lines(columns.values) + scan_todo_lines(scan))
+      render(signature(root: scan.root, model: model), column_lines(columns.values) + scan_todo_lines(scan))
     end
 
     def infer_model(controller)
@@ -229,57 +245,98 @@ module Permittable
       parts.map(&:strip).reject(&:empty?)
     end
 
-    # An expect call's arguments, as `[root, fields, extras]`. The bracketed
-    # argument is the required root envelope and its contents are the fields.
+    # An expect call's arguments, as one Call per envelope. The bracketed
+    # arguments are required root envelopes and their contents are fields.
     # Plain symbols are fields only when there is no envelope
     # (`params.expect(:q, :page)` is a rootless filter); alongside one they
     # are route params rather than body fields, so they stay visible instead
-    # of being drafted as contract fields — as does a second envelope, which
-    # belongs under a different root than one rooted contract can express.
-    def expect_call(args)
+    # of being drafted as contract fields. Each envelope is its own candidate
+    # root: `expect(post: [...], comment: [...])` can be where the comment
+    # contract's fields live, and reading only the first envelope hid them.
+    def expect_calls(position, args)
       envelopes, others = args.partition { |arg| EXPECT_ENVELOPE.match?(arg) }
-      return [nil, others, []] if envelopes.empty?
+      return [Call.new(position, nil, others, [])] if envelopes.empty?
 
-      match = EXPECT_ENVELOPE.match(envelopes.first)
-      [match[1].to_sym, split_args(match[2]), envelopes.drop(1) + others]
+      envelopes.each_with_index.map do |envelope, index|
+        match = EXPECT_ENVELOPE.match(envelope)
+        Call.new(position, match[1].to_sym, split_args(match[2]), index.zero? ? others : [])
+      end
     end
 
-    # The envelope declaring the most fields across its calls, the first seen
-    # on a tie. Now that the losing envelopes become TODOs rather than
-    # fields, "first seen" alone would let an index action's
-    # `require(:search).permit(:q)` win the root and push the real
-    # `expect(post: [...])` into a TODO.
+    # The candidate — an envelope, or the rootless calls together (root nil)
+    # — declaring the most distinct PARSED fields across its calls. Now that
+    # the losers become TODOs rather than fields, "first seen" alone let an
+    # index action's `require(:search).permit(:q)` win the root and push the
+    # real `expect(post: [...])` into a TODO; and considering envelopes only
+    # let that same search form beat a rootless `params.permit(:title, :body,
+    # :published)` carrying the whole create body. Unparsable arguments
+    # (`*PERMITTED`) count for nothing: they are not fields the draft can
+    # declare.
+    #
+    # A tie goes to an envelope, then to the first seen in the source. The
+    # envelope wins a tie because a rootless key beside one is usually a
+    # route or query param: a one-field Rails 8 scaffold calls
+    # `params.expect(:id)` in `set_post` above `params.expect(post: [:title])`.
     def choose_root(calls)
-      rooted = calls.select(&:first).group_by(&:first)
-      best = rooted.each_with_index.max_by { |(_, same), index| [same.sum { |call| call[1].size }, -index] }
+      candidates = calls.group_by(&:root)
+      best = candidates.each_with_index.max_by do |(root, same), index|
+        [same.flat_map { |call| call.fields.filter_map { |arg| parse_arg(arg)&.at(1) } }.uniq.size, root ? 1 : 0, -index]
+      end
       best&.first&.first
     end
 
     # Fold one call into the scan: its fields when it shares the scan's root
-    # (including both having none), a TODO otherwise. Another root's call is
-    # kept in expect's `root: [...]` spelling, so the TODO says which envelope
-    # its fields belong to.
-    def merge_call(result, root, fields, extras)
-      if root == result.root
-        fields.each { |arg| classify_arg(result, arg) }
+    # (including both having none), a TODO otherwise — its arguments filed
+    # under its own root, or as rootless keys, so the TODO says where they
+    # belong rather than that they could not be read.
+    def merge_call(result, call)
+      if call.root == result.root
+        call.fields.each { |arg| classify_arg(result, arg) }
+      elsif call.root
+        envelope = result.other_envelopes[call.root] || []
+        result.other_envelopes[call.root] = envelope | call.fields.map { |arg| unparsed_arg(arg) }
       else
-        extras = (root ? ["#{root}: [#{fields.join(', ')}]"] : fields) + extras
+        result.rootless |= call.fields.map { |arg| unparsed_arg(arg) }
       end
-      extras.each { |arg| result.unparsed |= [unparsed_arg(arg)] }
+      result.rootless |= call.route_params.map { |arg| unparsed_arg(arg) }
     end
 
-    # Keep each key in its richest shape only (SHAPES is ordered richest
-    # first) and name every key dropped from a poorer one.
+    # A key permitted in two shapes across actions is declared once — a
+    # contract rejects a field declared twice — and how depends on whether
+    # one shape accepts what the other is sent:
+    #
+    # - a nested hash and an array of hashes merge into the array of hashes,
+    #   with the sub-keys of both: `key: [[:a]]` is expect's definitive
+    #   spelling of the array of hashes that `key: [:a]` leaves ambiguous,
+    #   and dropping the loser's sub-keys would reject the ones its action
+    #   sends;
+    # - an array of scalars and either hash shape accept disjoint input, so
+    #   neither is drafted — picking one would reject what the other action
+    #   sends — and the TODO names both;
+    # - anything else goes to the richer shape (SHAPES is ordered richest
+    #   first), the one at least one action demonstrably accepts: a scalar
+    #   declaration would reject the hash or array that action is sent.
     def resolve_conflicts(result)
-      SHAPES.each_key.with_index do |winner, index|
-        shape_keys(result, winner).each do |key|
-          losers = SHAPES.keys.drop(index + 1).select { |shape| shape_keys(result, shape).include?(key) }
-          next if losers.empty?
+      SHAPES.keys.flat_map { |shape| shape_keys(result, shape) }.uniq.each do |key|
+        shapes = SHAPES.keys.select { |shape| shape_keys(result, shape).include?(key) }
+        next if shapes.size < 2
 
-          losers.each { |shape| result[shape].delete(key) }
-          result.conflicts << conflict_message(key, winner, losers)
-        end
+        result.conflicts << resolve_conflict(result, key, shapes)
       end
+    end
+
+    def resolve_conflict(result, key, shapes)
+      merged = (HASH_SHAPES - shapes).empty?
+      result.nested_arrays[key] |= result.nested[key] if merged
+      if shapes.include?(:arrays) && shapes.intersect?(HASH_SHAPES)
+        shapes.each { |shape| result[shape].delete(key) }
+        return "#{key} is permitted as #{listed_shapes(shapes)}, which accept different input — " \
+               "drafted as neither; declare the shape its actions share"
+      end
+
+      shapes.drop(1).each { |shape| result[shape].delete(key) }
+      "#{key} is permitted as #{listed_shapes(shapes)} — drafted as #{SHAPES[shapes.first].sub(/\Aan? /, 'the ')}" \
+        "#{', with the sub-keys of both' if merged}"
     end
 
     def shape_keys(result, shape)
@@ -287,33 +344,42 @@ module Permittable
       keys.is_a?(Hash) ? keys.keys : keys
     end
 
-    # "tags is permitted as both a scalar and an array — drafted as the array"
-    def conflict_message(key, winner, losers)
-      shapes = (losers.reverse + [winner]).map { |shape| SHAPES[shape] }
-      listed = shapes.size == 2 ? "both #{shapes.join(' and ')}" : "#{shapes[0..-2].join(', ')} and #{shapes.last}"
-      "#{key} is permitted as #{listed} — drafted as #{SHAPES[winner].sub(/\Aan? /, 'the ')}"
+    # "both a scalar and an array", "a scalar, a nested hash and an array of
+    # hashes" — poorest first.
+    def listed_shapes(shapes)
+      names = shapes.reverse.map { |shape| SHAPES[shape] }
+      names.size == 2 ? "both #{names.join(' and ')}" : "#{names[0..-2].join(', ')} and #{names.last}"
     end
 
     def classify_arg(result, arg)
-      if (key = scalar_key(arg))
-        result.scalars |= [key]
-      elsif (match = ARRAY_ARG.match(arg))
-        result.arrays |= [match[1].to_sym]
-      elsif (match = NESTED_ARRAY_ARG.match(arg))
-        classify_nested(result, match, arg, into: result.nested_arrays)
-      elsif (match = NESTED_ARG.match(arg))
-        classify_nested(result, match, arg, into: result.nested)
-      else
+      shape, key, sub_keys = parse_arg(arg)
+      if shape.nil?
         result.unparsed |= [unparsed_arg(arg)]
+      elsif sub_keys
+        result[shape][key] = (result[shape][key] || []) | sub_keys
+      else
+        result[shape] |= [key]
       end
     end
 
-    def classify_nested(result, match, arg, into:)
-      keys = split_args(match[2]).map { |part| scalar_key(part) }
-      return result.unparsed |= [unparsed_arg(arg)] if keys.any?(&:nil?)
+    # One permit argument as `[shape, key]`, or `[shape, key, sub_keys]` for
+    # the two hash shapes — nil when the conservative parser cannot read it,
+    # including a nested list with any sub-key it cannot read.
+    def parse_arg(arg)
+      if (key = scalar_key(arg))
+        [:scalars, key]
+      elsif (match = ARRAY_ARG.match(arg))
+        [:arrays, match[1].to_sym]
+      elsif (match = NESTED_ARRAY_ARG.match(arg))
+        nested_arg(:nested_arrays, match)
+      elsif (match = NESTED_ARG.match(arg))
+        nested_arg(:nested, match)
+      end
+    end
 
-      key = match[1].to_sym
-      into[key] = (into[key] || []) | keys
+    def nested_arg(shape, match)
+      sub_keys = split_args(match[2]).map { |part| scalar_key(part) }
+      [shape, match[1].to_sym, sub_keys] unless sub_keys.any?(&:nil?)
     end
 
     def unparsed_arg(arg)
@@ -364,32 +430,45 @@ module Permittable
       column.respond_to?(:default_function) && column.default_function ? false : true
     end
 
+    # Scanned names are emitted with Symbol#inspect, not as `:#{name}`: a
+    # string-keyed `permit("2fa")` scans to a name that is not a bare symbol
+    # literal, and `:2fa` would make the whole draft a SyntaxError.
     def scanned_lines(scan, columns)
       lines = scan.scalars.map { |name| scanned_scalar_line(name, columns) }
       lines += scan.arrays.map do |name|
-        "array :#{name}, of: :string # TODO: confirm the element type, and declare length: — an array without one is unbounded"
+        "array #{name.to_sym.inspect}, of: :string " \
+          "# TODO: confirm the element type, and declare length: — an array without one is unbounded"
       end
       scan.nested.each { |name, keys| lines += nested_lines(name, keys) }
       scan.nested_arrays.each { |name, keys| lines += nested_array_lines(name, keys) }
       lines + scan_todo_lines(scan)
     end
 
+    # Each TODO says why the scan did not draft it: a parsed argument that
+    # belongs outside this contract is not one the parser failed to read.
     def scan_todo_lines(scan)
-      # Array(): a Scan built by hand before `conflicts` existed leaves it nil.
+      # Array()/to_h: a Scan built by hand before these members existed leaves them nil.
       Array(scan.conflicts).map { |conflict| "# TODO: #{conflict}" } +
-        scan.unparsed.map { |arg| "# TODO: could not parse from the permit call: #{arg}" }
+        scan.unparsed.map { |arg| "# TODO: could not parse from the permit call: #{arg}" } +
+        scan.other_envelopes.to_h.map do |root, args|
+          "# TODO: belongs to another envelope (#{root}): #{root}: [#{args.join(', ')}]"
+        end +
+        Array(scan.rootless).map { |arg| "# TODO: route or query param, not a body field: #{arg}" }
     end
 
     def scanned_scalar_line(name, columns)
       column = columns && columns[name.to_s]
       return column_line(column) if column
-      return "optional :#{name}, :string, virtual: true # TODO: not a database column — confirm the type" if columns
 
-      "optional :#{name}, :string # TODO: confirm the type"
+      field = "optional #{name.to_sym.inspect}, :string"
+      return "#{field}, virtual: true # TODO: not a database column — confirm the type" if columns
+
+      "#{field} # TODO: confirm the type"
     end
 
     def nested_lines(name, keys)
-      ["optional :#{name} do # TODO: drafted from `#{name}: [...]` — if this is an array of hashes, use `array :#{name} do`"] +
+      ["optional #{name.to_sym.inspect} do # TODO: drafted from `#{name}: [...]` — " \
+       "if this is an array of hashes, use `array #{name.to_sym.inspect} do`"] +
         sub_field_lines(keys) +
         ["end"]
     end
@@ -398,11 +477,11 @@ module Permittable
     # array of hashes `#{name}: [[...]]`, which says definitively what the
     # equivalent permit call (`#{name}: [...]`) leaves ambiguous.
     def nested_array_lines(name, keys)
-      ["array :#{name} do"] + sub_field_lines(keys) + ["end"]
+      ["array #{name.to_sym.inspect} do"] + sub_field_lines(keys) + ["end"]
     end
 
     def sub_field_lines(keys)
-      keys.map { |key| "  optional :#{key}, :string # TODO: confirm the type" }
+      keys.map { |key| "  optional #{key.to_sym.inspect}, :string # TODO: confirm the type" }
     end
 
     HEADER = "# Drafted by permittable:generate — review the TODOs, then deploy: monitor\n" \

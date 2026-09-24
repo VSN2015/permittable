@@ -44,7 +44,7 @@ RSpec.describe Permittable::Generator do
       expect(scan.nested).to eq(address: %i[city zip])
     end
 
-    it "merges multiple permit calls, keeping the first root found" do
+    it "merges multiple permit calls for the same root" do
       source = <<~RUBY
         def create
           User.create!(params.require(:user).permit(:name))
@@ -124,14 +124,16 @@ RSpec.describe Permittable::Generator do
       scan = described_class.scan("params.expect(:id, user: [:name])")
       expect(scan.root).to eq(:user)
       expect(scan.scalars).to eq(%i[name])
-      expect(scan.unparsed).to eq([":id"])
+      expect(scan.rootless).to eq([":id"])
+      expect(scan.unparsed).to eq([])
     end
 
     it "keeps a second envelope visible rather than flattening it into the first" do
       scan = described_class.scan("params.expect(user: [:name], address: [:city])")
       expect(scan.root).to eq(:user)
       expect(scan.scalars).to eq(%i[name])
-      expect(scan.unparsed).to eq(["address: [:city]"])
+      expect(scan.other_envelopes).to eq(address: [":city"])
+      expect(scan.unparsed).to eq([])
     end
 
     it "does not mistake an array-of-scalars root for an envelope" do
@@ -156,7 +158,7 @@ RSpec.describe Permittable::Generator do
         end
       RUBY
       expect(scan.root).to eq(:user)
-      expect(scan.scalars).to eq(%i[email name])
+      expect(scan.scalars).to eq(%i[name email])
       expect(scan.calls).to eq(2)
     end
 
@@ -403,7 +405,15 @@ RSpec.describe Permittable::Generator do
       RUBY
       expect(scan.root).to eq(:post)
       expect(scan.scalars).to eq(%i[title body])
-      expect(scan.unparsed).to eq([":id"])
+      expect(scan.rootless).to eq([":id"])
+      expect(scan.unparsed).to eq([])
+    end
+
+    it "gives the envelope a tie with a rootless call, so a one-field scaffold keeps its root" do
+      scan = described_class.scan("Post.find(params.expect(:id))\nparams.expect(post: [:title])")
+      expect(scan.root).to eq(:post)
+      expect(scan.scalars).to eq(%i[title])
+      expect(scan.rootless).to eq([":id"])
     end
 
     it "keeps a rootless permit call out of the envelope, wherever it appears" do
@@ -413,12 +423,23 @@ RSpec.describe Permittable::Generator do
         end
 
         def post_params
-          params.require(:post).permit(:title)
+          params.require(:post).permit(:title, :body, :published)
         end
       RUBY
       expect(scan.root).to eq(:post)
-      expect(scan.scalars).to eq(%i[title])
-      expect(scan.unparsed).to eq([":page", ":per_page"])
+      expect(scan.scalars).to eq(%i[title body published])
+      expect(scan.rootless).to eq([":page", ":per_page"])
+    end
+
+    it "roots nothing when the rootless calls carry the most fields" do
+      scan = described_class.scan(<<~RUBY)
+        def index = params.require(:filter).permit(:q)
+        def create = params.permit(:title, :body, :published)
+      RUBY
+      expect(scan.root).to be_nil
+      expect(scan.scalars).to eq(%i[title body published])
+      expect(scan.other_envelopes).to eq(filter: [":q"])
+      expect(scan.rootless).to eq([])
     end
 
     it "keeps a second permit envelope visible rather than merging it into the first" do
@@ -429,22 +450,39 @@ RSpec.describe Permittable::Generator do
       expect(scan.root).to eq(:post)
       expect(scan.scalars).to eq(%i[title body])
       expect(scan.arrays).to eq([])
-      expect(scan.unparsed).to eq(["search: [:q, tags: []]"])
+      expect(scan.other_envelopes).to eq(search: [":q", "tags: []"])
     end
 
     it "roots the draft at the envelope with the most fields, not a search form seen first" do
       scan = described_class.scan(<<~RUBY)
         def index = params.require(:search).permit(:q)
-        def post_params = params.expect(post: [:title, :body])
+        def create = params.require(:post).permit(:title, :body)
       RUBY
       expect(scan.root).to eq(:post)
       expect(scan.scalars).to eq(%i[title body])
-      expect(scan.unparsed).to eq(["search: [:q]"])
+      expect(scan.other_envelopes).to eq(search: [":q"])
     end
 
-    it "breaks a tie between envelopes by taking the first seen" do
-      scan = described_class.scan("params.require(:post).permit(:title)\nparams.require(:search).permit(:q)")
+    it "breaks a tie by source order, whichever call spelling comes first" do
+      scan = described_class.scan("params.expect(post: [:title])\nparams.require(:search).permit(:q)")
       expect(scan.root).to eq(:post)
+      expect(scan.other_envelopes).to eq(search: [":q"])
+    end
+
+    it "counts only parsed fields, not arguments it could not read" do
+      scan = described_class.scan("params.require(:search).permit(:q)\nparams.require(:post).permit(*PERMITTED, **opts)")
+      expect(scan.root).to eq(:search)
+      expect(scan.other_envelopes).to eq(post: ["*PERMITTED", "**opts"])
+    end
+
+    it "counts every envelope of an expect call, so a second one can be the chosen root" do
+      scan = described_class.scan(<<~RUBY)
+        params.expect(post: [:title], comment: [:body])
+        params.expect(comment: [:body, :author])
+      RUBY
+      expect(scan.root).to eq(:comment)
+      expect(scan.scalars).to eq(%i[body author])
+      expect(scan.other_envelopes).to eq(post: [":title"])
     end
 
     it "still drafts a file of only rootless calls as scalars" do
@@ -458,6 +496,34 @@ RSpec.describe Permittable::Generator do
       scan = described_class.scan("params.expect(tag_names: [ ])")
       expect(scan.root).to be_nil
       expect(scan.arrays).to eq(%i[tag_names])
+    end
+  end
+
+  describe ".draft of calls kept out of the contract" do
+    let(:draft) do
+      described_class.draft(scan: described_class.scan(<<~RUBY))
+        Post.find(params.expect(:id))
+        params.require(:search).permit(:q)
+        params.require(:post).permit(:title, :body, *EXTRA)
+      RUBY
+    end
+
+    it "says why each one is a TODO, and does not call parsed arguments unparsable" do
+      expect(draft).to include("# TODO: belongs to another envelope (search): search: [:q]")
+      expect(draft).to include("# TODO: route or query param, not a body field: :id")
+      expect(draft).to include("# TODO: could not parse from the permit call: *EXTRA")
+      expect(draft.scan("could not parse").size).to eq(1)
+      expect(load_draft(draft)[:root]).to eq(:post)
+    end
+  end
+
+  describe ".draft of a scanned key that is not a bare symbol" do
+    it "quotes it, so the draft is valid Ruby" do
+      draft = described_class.draft(scan: described_class.scan('params.require(:user).permit("2fa", codes: ["2fa"])'))
+      expect(draft).to include(%(optional :"2fa", :string # TODO: confirm the type))
+      expect(draft).to include("optional :codes do")
+      expect(draft).to include(%(  optional :"2fa", :string))
+      expect(load_draft(draft)[:fields].map { |f| f[:name] }).to eq(%i[2fa codes])
     end
   end
 
@@ -475,8 +541,35 @@ RSpec.describe Permittable::Generator do
       expect(scan.conflicts).to contain_exactly(
         "tags is permitted as both a scalar and an array — drafted as the array",
         "address is permitted as both a scalar and a nested hash — drafted as the nested hash",
-        "items is permitted as a scalar, a nested hash and an array of hashes — drafted as the array of hashes"
+        "items is permitted as a scalar, a nested hash and an array of hashes — " \
+        "drafted as the array of hashes, with the sub-keys of both"
       )
+    end
+
+    it "merges the sub-keys of a nested hash into the array of hashes that wins" do
+      scan = described_class.scan("params.require(:u).permit(items: [:sku, :name])\nparams.expect(u: [items: [[:qty]]])")
+      expect(scan.nested).to eq({})
+      expect(scan.nested_arrays).to eq(items: %i[qty sku name])
+    end
+
+    it "drafts neither of an array and a nested hash, which accept different input" do
+      source = "params.require(:u).permit(:name, tags: [])\nparams.require(:u).permit(tags: [:a])"
+      scan = described_class.scan(source)
+      expect(scan.arrays).to eq([])
+      expect(scan.nested).to eq({})
+      expect(scan.conflicts).to contain_exactly(
+        "tags is permitted as both an array and a nested hash, which accept different input — " \
+        "drafted as neither; declare the shape its actions share"
+      )
+      draft = described_class.draft(scan: scan)
+      expect(load_draft(draft)[:fields].map { |f| f[:name] }).to eq(%i[name])
+    end
+
+    it "drafts neither of an array of scalars and an array of hashes" do
+      scan = described_class.scan("params.expect(u: [:name, tags: []])\nparams.expect(u: [tags: [[:a]]])")
+      expect(scan.arrays).to eq([])
+      expect(scan.nested_arrays).to eq({})
+      expect(scan.conflicts.first).to start_with("tags is permitted as both an array and an array of hashes")
     end
 
     it "drafts each key once, so the draft loads" do
@@ -513,10 +606,12 @@ RSpec.describe Permittable::Generator do
       expect(load_draft(draft)[:fields].map { |f| f[:name] }).to eq(%i[title body])
     end
 
-    it "uses the model's root when the unparsable call had none" do
+    it "keeps a rootless scan rootless, with the columns at the top level" do
       draft = described_class.draft(model: GenNote, scan: described_class.scan("params.permit(*KEYS)"))
-      expect(draft).to include("root: :gen_note, model: GenNote")
-      expect(load_draft(draft)[:root]).to eq(:gen_note)
+      expect(draft).to include("permit_params :create, :update, model: GenNote, mode: :monitor do")
+      rule = load_draft(draft)
+      expect(rule[:root]).to be(false) # a rule stores "no envelope" as root: false
+      expect(rule[:fields].map { |f| f[:name] }).to eq(%i[title body])
     end
 
     it "returns nil when there are no columns to fall back to either" do
@@ -531,7 +626,12 @@ RSpec.describe Permittable::Generator do
       "params.expect(post: [:title, tags: [], address: [:city], items: [[:sku]]])",
       "@post = Post.find(params.expect(:id))\nparams.expect(post: [:title])",
       "params.permit(:page)\nparams.require(:post).permit(:title)\nparams.require(:search).permit(:q)",
+      "params.permit(:title, :body)\nparams.require(:filter).permit(:q)",
+      "params.expect(post: [:title], comment: [:body, :author])",
       "params.require(:u).permit(:tags, :address)\nparams.require(:u).permit(tags: [], address: [:city])",
+      "params.require(:u).permit(:name, items: [:sku])\nparams.expect(u: [items: [[:qty]]])",
+      "params.require(:u).permit(:name, tags: [])\nparams.require(:u).permit(tags: [:a])",
+      'params.permit("2fa", codes: ["2fa"])',
       "params.expect(tag_names: [ ])"
     ].each do |source|
       it "loads the draft of #{source.inspect}" do
