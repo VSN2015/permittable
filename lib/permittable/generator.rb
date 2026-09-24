@@ -156,7 +156,8 @@ module Permittable
     end
 
     # The core: knowledge in (columns and/or a scan), snippet out. Returns a
-    # String of valid Ruby, or nil when neither source of knowledge exists.
+    # String of valid Ruby, or nil when neither source of knowledge exists
+    # or neither yields a field to declare (see render).
     def draft(model: nil, scan: nil)
       columns = columns_for(model)
       scan = nil unless scan&.found?
@@ -556,8 +557,17 @@ module Permittable
     # each rule is drafted rather than edited from another's text. The
     # single-rule body and the :update body differ exactly when some column
     # was drafted `required`, which is the test for splitting.
+    #
+    # Every drafted line is a declaration or a `# TODO` comment. A body of
+    # comments only — a model whose sole columns are `type` and
+    # `lock_version`, or have no contract type — would be a rule declaring
+    # no field, which raises `a contract must declare at least one field`
+    # when pasted. There is then nothing loadable to draft: nil, as for no
+    # knowledge at all, which the rake task already skips.
     def render(root:, model:, &lines)
       shared = lines.call(:shared)
+      return nil if shared.all? { |line| line.start_with?("#") }
+
       update = lines.call(:update)
       rules = shared == update ? [[DEFAULT_ACTIONS, shared]] : [[%i[create], lines.call(:create)], [%i[update], update]]
       bodies = rules.map do |actions, body|

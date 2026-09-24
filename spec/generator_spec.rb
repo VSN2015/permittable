@@ -644,6 +644,50 @@ RSpec.describe Permittable::Generator do
       end
     end
 
+    context "with no column a client should write" do
+      after { ActiveRecord::Base.connection.drop_table(:gen_empties, if_exists: true) }
+
+      def model_on(&columns)
+        ActiveRecord::Schema.define { create_table(:gen_empties, &columns) }
+        stub_const("GenEmpty", Class.new(TestModel) { self.table_name = "gen_empties" })
+      end
+
+      # A rule with no field raises `a contract must declare at least one
+      # field` when pasted, so there is nothing loadable to draft: nil, which
+      # the rake task already skips.
+      it "drafts nothing for a model whose only columns are the STI and locking ones" do
+        model_on do |t|
+          t.string  :type
+          t.integer :lock_version, null: false, default: 0
+        end
+        expect(described_class.draft(model: GenEmpty)).to be_nil
+      end
+
+      it "drafts nothing when the rest has no contract type" do
+        model_on do |t|
+          t.string :type
+          t.binary :thumbnail
+        end
+        expect(described_class.draft(model: GenEmpty)).to be_nil
+      end
+
+      it "drafts nothing for a model with only a primary key and timestamps" do
+        model_on(&:timestamps)
+        expect(described_class.draft(model: GenEmpty)).to be_nil
+        expect(described_class.for_controller(Class.new { def self.controller_name = "gen_empties" })).to be_nil
+      end
+
+      it "still drafts, and loads, once the permit call lists one of them" do
+        model_on do |t|
+          t.string  :type
+          t.integer :lock_version, null: false, default: 0
+        end
+        scan = described_class.scan("params.require(:gen_empty).permit(:lock_version)")
+        draft = described_class.draft(model: GenEmpty, scan: scan)
+        expect(load_draft(draft).permit_rule_for("update")[:fields].map { |f| f[:name] }).to eq(%i[lock_version])
+      end
+    end
+
     context "with column names that are not symbol literals" do
       before do
         ActiveRecord::Schema.define do
