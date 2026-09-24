@@ -162,6 +162,75 @@ RSpec.describe "Permittable RSpec matchers" do
     expect(message).to include("not to permit")
   end
 
+  describe "the negated form" do
+    let(:with_admin) do
+      Class.new(FakeController) do
+        include Permittable
+
+        permit_params(:create) { optional :admin, :boolean }
+      end
+    end
+
+    it "refuses a negated qualifier instead of passing on a field it does permit" do
+      expect { expect(with_admin).not_to permit_param(:admin).for_action(:create).required }
+        .to raise_error(ArgumentError, /here: required.*ambiguous.*`to permit_param\(:admin\)\.optional`/m)
+      expect { expect(with_admin).not_to permit_param(:admin).for_action(:create).as(:string) }
+        .to raise_error(ArgumentError, /here: as :string.*ambiguous/m)
+    end
+
+    it "refuses every narrowing chain, not only required and type" do
+      chains = {
+        as_array: ->(m) { m.as_array(of: :string) },
+        optional: ->(m) { m.optional },
+        within: ->(m) { m.within(1..2) },
+        matching: ->(m) { m.matching(/x/) },
+        with_length: ->(m) { m.with_length(1..2) },
+        with_default: ->(m) { m.with_default(1) },
+        virtual: ->(m) { m.virtual },
+        sensitive: ->(m) { m.sensitive },
+        nullable: ->(m) { m.nullable }
+      }
+      chains.each do |name, chain|
+        expect { expect(with_admin).not_to chain.call(permit_param(:admin).for_action(:create)) }
+          .to raise_error(ArgumentError, /ambiguous/), "expected not_to ...#{name} to raise"
+      end
+    end
+
+    it "fails, rather than passing silently, when the action resolves to no rule" do
+      message = failure_of { expect(with_admin).not_to permit_param(:admin).for_action(:craete) }
+      expect(message).to include("not to permit :admin for #craete")
+      expect(message).to include("no contract covering #craete")
+    end
+
+    it "fails when the subject declares no contracts at all" do
+      empty = Class.new(FakeController) { include Permittable }
+      message = failure_of { expect(empty).not_to permit_param(:admin) }
+      expect(message).to include("declares no contracts")
+    end
+
+    it "still passes for an undeclared field on a resolved rule, and fails for a declared one" do
+      expect(with_admin).not_to permit_param(:owner).for_action(:create)
+      expect(failure_of { expect(with_admin).not_to permit_param(:admin).for_action(:create) })
+        .to include("but the contract declares it")
+    end
+  end
+
+  it "says an array of hashes is one, instead of printing an empty of:" do
+    message = failure_of { expect(controller).to permit_param(:line_items).for_action(:create).as_array(of: :string) }
+    expect(message).to include("expected an array of :string, but :line_items is an array of hashes")
+    expect(message).not_to include("of: :\n")
+    expect(message).not_to end_with("of: :")
+
+    message = failure_of { expect(controller).to permit_param(:line_items).for_action(:create).as(:string) }
+    expect(message).to include(":line_items is an array of hashes")
+  end
+
+  it "reports a non-array field once, not also as an empty of:" do
+    message = failure_of { expect(controller).to permit_param(:email).for_action(:create).as_array(of: :string) }
+    expect(message).to include("expected an array field")
+    expect(message).not_to include("of: :")
+  end
+
   it "uses the action's matching rule, so different actions see different contracts" do
     expect(controller).to permit_param(:reason).for_action(:destroy)
     expect(controller).not_to permit_param(:email).for_action(:destroy)

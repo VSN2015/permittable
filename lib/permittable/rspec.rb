@@ -14,6 +14,12 @@ module Permittable
   #   expect(UsersController).to permit_param("address.zip").as(:string).optional
   #   expect(UsersController).not_to permit_param(:admin).for_action(:create)
   #
+  # The negated form takes no qualifiers: `not_to permit_param(:admin)
+  # .required` would pass both when :admin is undeclared and when it is
+  # declared optional, which is a false positive in exactly the assertion
+  # most likely to guard a security property. It raises instead, and
+  # names the positive form to write.
+  #
   # `for_action` picks the rule exactly like a request would
   # (`permit_rule_for`); it may be omitted only when the controller declares
   # a single contract, so an ambiguous expectation fails loudly instead of
@@ -122,7 +128,27 @@ module Permittable
         "expected #{subject_name} to permit #{path_label}#{action_label}, but:\n  #{@mismatches.join("\n  ")}"
       end
 
+      # Negation is only unambiguous without qualifiers ("not permitted at
+      # all"), and only meaningful against a rule that exists: a mistyped
+      # `for_action(:craete)` resolves to no rule, which permits nothing, so
+      # a lenient not_to would pass for any param whatsoever.
+      def does_not_match?(subject) # rubocop:disable Naming/PredicatePrefix -- the RSpec protocol name
+        raise ArgumentError, negated_qualifier_message unless @expected.empty?
+
+        @subject = resolve_subject(subject)
+        rule = resolve_rule(@subject)
+        return false unless rule
+
+        @field = resolve_field(rule[:fields], @path.split("."))
+        @field.nil?
+      end
+
       def failure_message_when_negated
+        if @problem
+          return "expected #{subject_name} not to permit #{path_label}#{action_label}, but it #{@problem}, " \
+                 "so there is no rule to check the param against"
+        end
+
         "expected #{subject_name} not to permit #{path_label}#{action_label}, but the contract declares it"
       end
 
@@ -194,7 +220,7 @@ module Permittable
         case key
         when :type then type_mismatch(field, value)
         when :array then "expected an array field, but it is declared with `#{field[:kind]}`" unless field[:kind] == :array
-        when :of then "expected an array of :#{value}, but it is of: :#{field[:of]}" unless field[:of] == value
+        when :of then of_mismatch(field, value)
         when :required then required_mismatch(field, value)
         when :format then format_mismatch(field, value)
         when :virtual, :sensitive, :nullable then "expected the field to be #{key}, but it is not" unless field[key]
@@ -202,8 +228,20 @@ module Permittable
         end
       end
 
+      # A non-array field is already reported by the :array check that
+      # as_array always chains alongside :of, so this stays silent for it;
+      # an array of hashes has sub-fields rather than an element type.
+      def of_mismatch(field, type)
+        return if field[:kind] != :array || field[:of] == type
+        return "expected an array of :#{type}, but :#{field[:name]} is an array of hashes" if field[:fields]
+
+        "expected an array of :#{type}, but it is of: :#{field[:of]}"
+      end
+
       def type_mismatch(field, type)
-        if field[:kind] == :array
+        if field[:kind] == :array && field[:fields]
+          "expected type :#{type}, but :#{field[:name]} is an array of hashes — assert it with as_array"
+        elsif field[:kind] == :array
           "expected type :#{type}, but :#{field[:name]} is an array — assert it with as_array(of: ...)"
         elsif field[:kind] == :nested
           "expected type :#{type}, but :#{field[:name]} is a nested hash"
@@ -240,6 +278,26 @@ module Permittable
         label = OPTION_LABELS.fetch(key)
         declared = field.key?(key) ? "declares #{label} #{field[key].inspect}" : "does not declare #{label}"
         "expected #{label} #{value.inspect}, but the contract #{declared}"
+      end
+
+      def negated_qualifier_message
+        qualifiers = @expected.filter_map { |key, value| describe_check(key, value) }.join(", ")
+        "#{LABEL}: `not_to permit_param(#{path_label})` cannot take qualifiers (here: #{qualifiers}) — " \
+          "negating one is ambiguous, since it would pass both when #{path_label} is not permitted and " \
+          "when it is permitted but declared differently. Assert what the contract does declare with " \
+          "the positive form, e.g. #{positive_example}, or drop the qualifiers to assert that " \
+          "#{path_label} is not permitted at all."
+      end
+
+      # required/optional is the one qualifier with an obvious opposite;
+      # for any other the declared value is not known until the rule is
+      # read, so the example stays generic rather than guessing it.
+      def positive_example
+        case @expected
+        when { required: true } then "`to permit_param(#{path_label}).optional`"
+        when { required: false } then "`to permit_param(#{path_label}).required`"
+        else "`to permit_param(#{path_label})` chained with the qualifiers it should have"
+        end
       end
 
       def describe_check(key, value)

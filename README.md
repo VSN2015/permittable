@@ -854,7 +854,9 @@ RSpec.describe UsersController do
 end
 ```
 
-Chains: `for_action`, `as`, `as_array(of:)`, `required` / `optional`, `within` (`in:`), `matching` (`format:`), `with_length`, `with_default`, `virtual`, `sensitive`. Dotted paths walk nested blocks and array-of-hash blocks alike (`"line_items.sku"`).
+Chains: `for_action`, `as`, `as_array(of:)`, `required` / `optional`, `within` (`in:`), `matching` (`format:`), `with_length`, `with_default`, `virtual`, `sensitive`, `nullable`. Dotted paths walk nested blocks and array-of-hash blocks alike (`"line_items.sku"`).
+
+The negated form asserts one thing: **the param is not permitted at all**. It therefore takes no qualifiers — `not_to permit_param(:admin).required` would pass both when `:admin` is undeclared and when it is declared optional, a false positive in exactly the kind of assertion that guards a security property, so it raises and names the positive form to write instead (`to permit_param(:admin).optional`). And it needs a rule to check against: a mistyped `for_action(:craete)` resolves to no contract, which permits nothing, so rather than passing for any param whatsoever it fails and says the action has no contract.
 
 `for_action` picks the rule exactly like a request would (`permit_rule_for`), and may be omitted only when the controller declares a single contract — an ambiguous expectation raises instead of silently checking the wrong rule. Failure messages name what the contract actually declares.
 
