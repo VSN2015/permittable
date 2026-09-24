@@ -22,13 +22,34 @@ RSpec.describe "the exported schema against what the contract enforces" do
   #     that: `type: integer` reads null as a present value of the wrong type.
   #     (A `nullable:` field is not this case: there the null IS a value, the
   #     exporter widens `type` to say so, and the two agree.)
-  #   :extension_only — the one divergence that runs the OTHER way, so it is
-  #     labelled separately rather than waved through: the contract enforces a
-  #     bound JSON Schema has no keyword for (`max_depth:`), so the schema is
-  #     LOOSER than the server and a client following it can still be
-  #     surprised by a 422. The exporter does not drop the bound — it emits it
-  #     as `x-permittable-max-depth` — so this asserts both the direction and
-  #     that the extension is present to be read.
+  #   :normalized_encoding — the runtime runs `normalize:` BEFORE it checks,
+  #     so a padded value whose normalized form fits ("  abcdefghij  " under
+  #     squish and maxLength 10) is accepted though its raw form is too long.
+  #
+  # The rest run the OTHER way — the schema is LOOSER than the server, and a
+  # client following it can still be surprised by a 422 — so each is labelled
+  # separately rather than waved through, and LOOSER names what the exported
+  # schema must still carry for a tool that wants to close the gap:
+  #
+  #   :extension_only — the contract enforces a bound JSON Schema has no
+  #     keyword for (`max_depth:`). The exporter does not drop the bound — it
+  #     emits it as `x-permittable-max-depth`.
+  #   :normalized_first — the same `normalize:` step, the unsafe way round:
+  #     "   " passes a minLength of 3 and then squishes to "" (absent), " a  "
+  #     passes it and squishes to "a" (too short). JSON Schema has no
+  #     keyword for "transform, then check", so the step is exported as
+  #     `x-permittable-normalize`.
+  #   :string_decimal — a `:decimal` is documented as string OR number,
+  #     because the string is its precision-safe encoding, but
+  #     minimum/maximum only ever constrain numbers: "5000" sails past a
+  #     `maximum` of 999.99 that the server enforces on the parsed value. The
+  #     bound is still published, as a number, for a client that parses first.
+  LOOSER = {
+    extension_only: "x-permittable-max-depth",
+    normalized_first: "x-permittable-normalize",
+    string_decimal: "maximum"
+  }.freeze
+
   CASES = {
     "scalars and bounds" => {
       contract: proc {
@@ -132,6 +153,31 @@ RSpec.describe "the exported schema against what the contract enforces" do
         [{ "metadata" => { "a" => { "b" => { "c" => 1 } } } }, :extension_only]
       ]
     },
+    "a normalized string" => {
+      contract: proc { required :name, :string, length: 3..10, normalize: :squish },
+      payloads: [
+        [{ "name" => "Jo Jo" }, :agree],
+        [{ "name" => "ab" }, :agree],
+        [{ "name" => "waaaaytoolong" }, :agree],
+        [{ "name" => "  abcdefghij  " }, :normalized_encoding],
+        [{ "name" => "   " }, :normalized_first],
+        [{ "name" => " a  " }, :normalized_first]
+      ]
+    },
+    "a decimal bounded by BigDecimals" => {
+      # The natural way to bound a price — and the bounds must come out as
+      # JSON numbers, or the validator has nothing to compare against.
+      contract: proc { optional :price, :decimal, in: BigDecimal("0.01")..BigDecimal("999.99") },
+      payloads: [
+        [{ "price" => 5 }, :agree],
+        [{ "price" => 0.01 }, :agree],
+        [{ "price" => 999.99 }, :agree],
+        [{ "price" => 0.001 }, :agree],
+        [{ "price" => 1000 }, :agree],
+        [{ "price" => "5.00" }, :agree],
+        [{ "price" => "5000" }, :string_decimal]
+      ]
+    },
     "arrays" => {
       contract: proc { array :tags, of: :string, length: 1..3 },
       payloads: [
@@ -219,14 +265,14 @@ RSpec.describe "the exported schema against what the contract enforces" do
             expect(documented).to eq(runtime),
                                   "contract said #{runtime}, its own schema said #{documented} " \
                                   "(#{TinyJsonSchema.errors(schema, payload).inspect}); schema: #{schema.inspect}"
-          elsif expectation == :extension_only
+          elsif LOOSER.key?(expectation)
             # The unsafe direction, allowed only where JSON Schema has no
-            # keyword at all — and only with the bound still visible as an
-            # extension, so a tool that wants it can find it.
+            # keyword that says it — and only with the rule still visible in
+            # the schema, so a tool that wants it can find it.
             expect([runtime, documented]).to eq(%i[reject accept]),
-                                             "extension_only is for a bound the schema cannot carry; " \
+                                             "#{expectation} is for a rule the schema cannot carry; " \
                                              "got runtime=#{runtime}, documented=#{documented}"
-            expect(extensions_in(schema)).to include("x-permittable-max-depth")
+            expect(keywords_in(schema)).to include(LOOSER.fetch(expectation))
           else
             # Only ever in the safe direction: a client following the docs is
             # conservative, never surprised by a 422.
@@ -255,10 +301,6 @@ RSpec.describe "the exported schema against what the contract enforces" do
     ]
     expect(unchecked.grep_v(/\Ax-permittable-/)).to be_empty,
                                                     "the exporter emits #{unchecked.inspect}, which TinyJsonSchema does not check"
-  end
-
-  def extensions_in(schema)
-    keywords_in(schema).grep(/\Ax-permittable-/)
   end
 
   def keywords_in(node)

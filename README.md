@@ -920,9 +920,11 @@ Where they legitimately differ, the spec names the reason and asserts the **dire
 - **Non-canonical encodings.** Coercion accepts `"30"` for an `:integer` and `1` for a `:string`, because form and query payloads are all strings. The schema documents the canonical JSON encoding only.
 - **`null` as absence.** The runtime reads `{"age": null}` as `{}` ([absence](#absence-defaults-and-partial-updates)); JSON Schema cannot express that, so `type: integer` rejects a null the server would accept and ignore. A [`nullable:`](#explicit-nulls-nullable) field is not this case — there the null is a value, the exported `type` widens to say so, and the two agree.
 
-One case goes the other way, and is worth knowing before you hand the document to a client:
+Three cases go the other way, and are worth knowing before you hand the document to a client:
 
 - **Bounds JSON Schema has no keyword for.** A `:json` field's `max_depth:` is enforced by the server but cannot be written as a JSON Schema keyword, so the published document is **looser** there and an over-nested payload still earns a 422. The bound is not dropped — it is exported as `x-permittable-max-depth` — so a generator or linter that wants it can read it.
+- **`normalize:` runs before the checks.** The server validates the *normalized* string, and JSON Schema has no keyword for "transform, then check". With `required :name, :string, length: 3..10, normalize: :squish`, `"   "` passes the docs' `minLength: 3` and then squishes to `""` — absent, so `missing` — and `" a  "` passes them and squishes to `"a"`, which is too short. (It also goes the safe way: `"  abcdefghij  "` is too long for the docs and fine once squished.) The step is exported as `x-permittable-normalize` — the preset's name (`"squish"`, `"email"`, …), which a client can apply before validating, or `true` for a custom proc.
+- **A bounded `:decimal` sent as a string.** A `:decimal` is documented as `["string", "number"]`, because the string is its precision-safe encoding, but `minimum`/`maximum` constrain only numbers — so `"5000"` passes the docs for `in: BigDecimal("0.01")..BigDecimal("999.99")` and the server answers `inclusion`. The bound is still published, as a JSON number, for a client that parses the string first.
 
 Everything else the exporter cannot translate stays visible as an `x-permittable-*` extension rather than being guessed at.
 

@@ -23,6 +23,14 @@ module Permittable
   # never surprised by a 422. spec/schema_conformance_spec.rb holds that line,
   # asserting the direction of every divergence it permits.
   #
+  # Three rules have no JSON Schema keyword at all, and there the schema is
+  # LOOSER: a `:json` field's `max_depth:`, a `normalize:` step the server
+  # runs before it checks, and the string encoding of a bounded `:decimal`
+  # (minimum/maximum only constrain numbers). Each stays visible in the
+  # document — `x-permittable-max-depth`, `x-permittable-normalize`, the
+  # numeric bound itself — and the conformance spec labels each one rather
+  # than letting it pass as agreement.
+  #
   # Emission is deterministic (fixed key insertion order, declaration-order
   # properties) so generated documents are committable and diff-stable.
   module JsonSchema
@@ -171,8 +179,38 @@ module Permittable
         schema["x-permittable-range"] = allowed.inspect
         return
       end
-      schema["minimum"] = json_value(allowed.begin) if allowed.begin
-      schema[allowed.exclude_end? ? "exclusiveMaximum" : "maximum"] = json_value(allowed.end) if allowed.end
+      schema["minimum"] = json_bound(allowed.begin, round: :up) if allowed.begin
+      schema[allowed.exclude_end? ? "exclusiveMaximum" : "maximum"] = json_bound(allowed.end, round: :down) if allowed.end
+    end
+
+    # minimum/maximum must be JSON numbers — the metaschema says so — so a
+    # bound is NOT an authored value for json_value, which renders a
+    # BigDecimal as its precision-safe string and made `in:
+    # BigDecimal("0.01")..BigDecimal("999.99")` publish an invalid document.
+    # Integer and Float pass through; any other Numeric (BigDecimal,
+    # Rational) becomes an Integer when it is one, else a Float.
+    #
+    # A Float cannot hold every decimal. to_f rounds to the NEAREST double,
+    # which can land on the wrong side of the bound: 0.1000000000000000001
+    # becomes 0.1, and a client sending 0.1 passes `minimum: 0.1` while the
+    # server — which reads that number back as BigDecimal("0.1") and compares
+    # exactly — refuses it. So when the double's own shortest spelling (what
+    # Float#to_s gives, and what coercion parses) falls outside the bound,
+    # the bound moves one double INWARD: a minimum up, a maximum down. The
+    # published range can then only be narrower than the enforced one, the
+    # safe direction. A bound a double holds exactly enough to round-trip —
+    # any decimal of up to 15 significant digits, so every price — is emitted
+    # as written.
+    def json_bound(value, round:)
+      return value if value.is_a?(Integer) || value.is_a?(Float)
+      return value.to_i if value == value.to_i
+
+      float = value.to_f
+      spelled = BigDecimal(float.to_s)
+      return float.next_float if round == :up && spelled < value
+      return float.prev_float if round == :down && spelled > value
+
+      float
     end
 
     def apply_string_bounds!(schema, field)
@@ -242,7 +280,25 @@ module Permittable
       end
       schema["x-permittable-custom-validation"] = true if field[:validate]
       schema["x-permittable-transformed"] = true if field[:transform]
+      apply_normalize!(schema, field)
       schema
+    end
+
+    # The server checks the NORMALIZED string, so minLength/maxLength/pattern
+    # describe a value the client never sends: under `normalize: :squish`,
+    # "   " satisfies a minLength of 3 and then squishes to "" (absent), and
+    # " a  " satisfies it and squishes to "a". JSON Schema has no keyword for
+    # "transform, then check", so the step is flagged rather than dropped —
+    # by the preset's name, which a client can apply itself, or `true` for a
+    # host proc, which is as opaque as `transform:`. The preset is recovered
+    # by identity from the resolved callable, because the contract stores the
+    # lambda it runs rather than the name it was declared by.
+    def apply_normalize!(schema, field)
+      normalizer = field[:normalize]
+      return unless normalizer
+
+      preset = NORMALIZERS.key(normalizer)
+      schema["x-permittable-normalize"] = preset ? preset.to_s : true
     end
 
     def json_value(value)

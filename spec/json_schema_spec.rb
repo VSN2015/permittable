@@ -69,6 +69,37 @@ RSpec.describe Permittable::JsonSchema do
       expect(property("pct") { optional :pct, :integer, in: 0...100 }).to include("minimum" => 0, "exclusiveMaximum" => 100)
     end
 
+    it "emits BigDecimal bounds as JSON numbers, which is all minimum/maximum may be" do
+      # The natural way to bound a price. Routed through the authored-value
+      # re-encoding, the bounds came out as the strings "0.01" / "999.99" —
+      # which the metaschema forbids, so the whole document was invalid.
+      prop = property("price") { optional :price, :decimal, in: BigDecimal("0.01")..BigDecimal("999.99") }
+      expect(prop).to include("minimum" => 0.01, "maximum" => 999.99)
+      expect(prop.values_at("minimum", "maximum")).to all(be_a(Float))
+
+      exact = property("qty") { optional :qty, :decimal, in: BigDecimal("1")...BigDecimal("100") }
+      expect(exact).to include("minimum" => 1, "exclusiveMaximum" => 100)
+      expect(exact.values_at("minimum", "exclusiveMaximum")).to all(be_a(Integer))
+
+      endless = property("tip") { optional :tip, :decimal, in: BigDecimal("0.5").. }
+      expect(endless).to include("minimum" => 0.5)
+      expect(endless.keys.grep(/maximum/i)).to be_empty
+    end
+
+    it "rounds a bound a double cannot hold INWARD, so the docs never admit what the server refuses" do
+      # 0.1000000000000000001 has no double; to_f rounds it to 0.1, and a
+      # client sending 0.1 would pass a published `minimum: 0.1` and then be
+      # refused by the server's exact BigDecimal comparison. The minimum is
+      # nudged up and the maximum down to the neighbouring double instead.
+      bound = BigDecimal("0.1000000000000000001")
+      low = property("x") { optional :x, :decimal, in: bound.. }["minimum"]
+      high = property("x") { optional :x, :decimal, in: ..bound }["maximum"]
+      expect(BigDecimal(low.to_s)).to be >= bound
+      expect(low).to eq(0.1.next_float)
+      expect(high).to eq(0.1)
+      expect(BigDecimal(high.to_s)).to be <= bound
+    end
+
     it "carries a non-numeric Range as an extension instead of guessing" do
       prop = property("code") { optional :code, :string, in: "a".."m" }
       expect(prop["x-permittable-range"]).to eq('"a".."m"')
@@ -165,6 +196,22 @@ RSpec.describe Permittable::JsonSchema do
       expect(props["slug"]["x-permittable-custom-validation"]).to be(true)
       expect(props["slug"]).not_to have_key("pattern")
       expect(props["tags"]["x-permittable-transformed"]).to be(true)
+    end
+
+    it "exports normalize: as x-permittable-normalize — the preset's name, or true for a custom proc" do
+      # The server checks the NORMALIZED value, so minLength/maxLength/pattern
+      # describe a string the client never sends. The step is not a keyword
+      # JSON Schema has; it is flagged so a client can apply it first.
+      props = schema_for do
+        required :name,  :string, length: 3..10, normalize: :squish
+        optional :email, :string, normalize: "email"
+        optional :code,  :string, normalize: ->(v) { v.delete("-") }
+        optional :plain, :string
+      end["properties"]
+      expect(props["name"]).to include("minLength" => 3, "maxLength" => 10, "x-permittable-normalize" => "squish")
+      expect(props["email"]["x-permittable-normalize"]).to eq("email")
+      expect(props["code"]["x-permittable-normalize"]).to be(true)
+      expect(props["plain"]).not_to have_key("x-permittable-normalize")
     end
 
     it "marks a child that inherited sensitive: from its container writeOnly too" do
