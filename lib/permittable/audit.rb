@@ -83,13 +83,37 @@ module Permittable
     # `resources :posts` routes all seven actions whether or not the
     # controller defines them, and Rails 404s the ones it does not — so an
     # undefined `create` is no unguarded input, and failing a strict run over
-    # it was a false positive. Labelled rather than dropped: an action with
-    # only a template still renders implicitly, and the reader should see it.
-    # A controller that cannot list its actions is assumed to have them all.
+    # it was a false positive. Labelled rather than dropped, so the reader
+    # still sees the route. A controller that cannot list its actions is
+    # assumed to have them all. Normalised like OpenAPI.documented_actions: a
+    # duck listing Symbols would otherwise be missing every action, and strict
+    # would pass everything.
     def missing_action?(controller, action)
       return false unless controller.respond_to?(:action_methods)
+      return false if controller.action_methods.map(&:to_s).include?(action)
 
-      !controller.action_methods.include?(action)
+      !dispatchable?(controller, action)
+    end
+
+    # action_methods is not all Rails dispatches: an `action_missing` handler
+    # takes every unlisted action, and ImplicitRender renders a template with
+    # no method behind it — both with the body parsed, so both are input.
+    # Rather than re-derive that, ask Rails's own resolver: method_for_action
+    # is nil exactly when dispatch would raise ActionNotFound (the same
+    # private method, unchanged from 6.1 to 8.1). It needs no request. A
+    # plain-Ruby duck has no resolver, so its action list is the answer; a
+    # resolver that raises is inconclusive, so assume the action exists: for
+    # a gate, a false alarm beats a missed endpoint.
+    def dispatchable?(controller, action)
+      return false unless controller.is_a?(Class) &&
+                          (controller.method_defined?(:method_for_action) ||
+                           controller.private_method_defined?(:method_for_action))
+
+      begin
+        !controller.new.send(:method_for_action, action).nil?
+      rescue StandardError
+        true
+      end
     end
 
     def rule_for(controller, action)
@@ -115,17 +139,19 @@ module Permittable
     # The numbers worth putting in a CI log. `uncovered_with_body` is the one
     # that should be zero; `unguarded_models` counts covered actions whose
     # rule declares no `model:`, so no schema-drift guard runs for them.
-    # An action the controller does not define takes no body, so it is left
-    # out of the body count and reported as `missing_actions` instead.
+    # An action the controller does not define takes no body, and a contract
+    # left on one guards nothing, so it is counted as `missing_actions` and in
+    # no other bucket — the buckets stay disjoint and still add up to `actions`.
     def summary(entries)
+      found, missing = entries.partition { |e| !e.missing_action? }
       {
         actions: entries.length,
-        enforced: entries.count { |e| e.mode == :enforce },
-        monitored: entries.count { |e| e.mode == :monitor },
-        uncovered: entries.count { |e| !e.covered? },
-        uncovered_with_body: entries.count { |e| !e.covered? && e.body? && !e.missing_action? },
-        unguarded_models: entries.count { |e| e.covered? && e.model.nil? },
-        missing_actions: entries.count(&:missing_action?)
+        enforced: found.count { |e| e.mode == :enforce },
+        monitored: found.count { |e| e.mode == :monitor },
+        uncovered: found.count { |e| !e.covered? },
+        uncovered_with_body: found.count { |e| !e.covered? && e.body? },
+        unguarded_models: found.count { |e| e.covered? && e.model.nil? },
+        missing_actions: missing.length
       }
     end
 
@@ -157,12 +183,12 @@ module Permittable
       parts = [entry.mode.to_s]
       parts << "model: #{entry.model.name}" if entry.model.respond_to?(:name) && entry.model.name
       parts << "unknown: #{entry.unknown}" unless entry.unknown == :ignore
-      parts << "no action method" if entry.missing_action?
+      parts << "action not found" if entry.missing_action?
       parts.join("  ")
     end
 
     def uncovered_note(entry)
-      return "no action method" if entry.missing_action?
+      return "action not found" if entry.missing_action?
 
       "ACCEPTS A BODY" if entry.body?
     end
@@ -170,20 +196,17 @@ module Permittable
     def summary_lines(counts)
       body = counts[:uncovered_with_body]
       missing = counts[:missing_actions]
-      lines = [
+      # Its own bucket, so the head line still adds up to the route count.
+      not_found = ", #{missing} not found (Rails 404s #{missing == 1 ? 'it' : 'them'})" unless missing.zero?
+      [
         "",
         "#{counts[:actions]} routed action#{'s' unless counts[:actions] == 1}: " \
         "#{counts[:enforced]} enforced, #{counts[:monitored]} in monitor mode, " \
-        "#{counts[:uncovered]} without a contract",
+        "#{counts[:uncovered]} without a contract#{not_found}",
         "  #{body} of those accept a request body#{' — untrusted input reaches the action unchecked' unless body.zero?}",
         "  #{counts[:unguarded_models]} covered action#{'s' unless counts[:unguarded_models] == 1} " \
         "declare no model:, so no schema-drift guard runs for them"
-      ]
-      unless missing.zero?
-        lines << "  #{missing} routed action#{missing == 1 ? ' has' : 's have'} no action method " \
-                 "(Rails 404s them unless a template renders), so none count as accepting a body"
-      end
-      lines.join("\n")
+      ].join("\n")
     end
 
     def stale_lines(stale)

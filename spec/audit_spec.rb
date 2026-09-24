@@ -126,15 +126,16 @@ RSpec.describe Permittable::Audit do
       end
 
       it "leaves it out of the strict count" do
-        expect(described_class.summary(found)).to include(uncovered: 4, uncovered_with_body: 0, missing_actions: 2)
+        expect(described_class.summary(found)).to include(uncovered: 2, uncovered_with_body: 0, missing_actions: 2)
       end
 
       it "says so in the report instead of flagging a body" do
         report = described_class.format(found)
-        expect(report).to match(%r{POST\s+/posts\s+create\s+no contract — no action method$})
+        expect(report).to match(%r{POST\s+/posts\s+create\s+no contract — action not found$})
         expect(report).not_to include("ACCEPTS A BODY")
+        expect(report).to include("4 routed actions: 0 enforced, 0 in monitor mode, 2 without a contract, " \
+                                  "2 not found (Rails 404s them)")
         expect(report).to include("0 of those accept a request body")
-        expect(report).to include("2 routed actions have no action method")
       end
 
       it "still counts the action once the controller defines it" do
@@ -144,6 +145,87 @@ RSpec.describe Permittable::Audit do
 
       it "assumes the action exists when the controller cannot say" do
         expect(entries.none?(&:missing_action?)).to be(true)
+      end
+
+      # A duck listing Symbols once marked EVERY action missing, and strict
+      # passed everything.
+      it "normalises an action list of Symbols" do
+        posts.define_singleton_method(:action_methods) { Set.new(%i[index show create update]) }
+        expect(found.none?(&:missing_action?)).to be(true)
+      end
+
+      # A contract left on an action that no longer exists guards nothing, so
+      # it must not read as coverage: the buckets stay disjoint and add up.
+      it "counts a covered but missing action only as missing" do
+        covered = controller_class("posts") { permit_params(:create) { required :title, :string } }
+        covered.define_singleton_method(:action_methods) { Set.new(%w[index show]) }
+        counts = described_class.summary(described_class.entries(controllers: [covered], routes: post_routes))
+        expect(counts).to include(actions: 4, enforced: 0, monitored: 0, uncovered: 2, unguarded_models: 0,
+                                  missing_actions: 2)
+      end
+    end
+
+    # Rails dispatches more than action_methods: an inherited method, an
+    # `action_missing` handler, and a template with no method behind it all
+    # run with the body parsed. Only an action none of them answers 404s.
+    context "with a real ActionController" do
+      around do |example|
+        Dir.mktmpdir do |views|
+          FileUtils.mkdir_p(File.join(views, "audit_pages"))
+          File.write(File.join(views, "audit_pages", "preview.html.erb"), "preview")
+          @views = views
+          example.run
+        end
+      end
+
+      let(:pages) do
+        views = @views
+        stub_const("AuditPagesController", Class.new(ActionController::Base) do
+          prepend_view_path views
+
+          def create
+            head :created
+          end
+        end)
+      end
+      let(:child) { stub_const("AuditChildPagesController", Class.new(pages)) }
+      let(:catch_all) do
+        stub_const("AuditCatchAllController", Class.new(ActionController::Base) do
+          def action_missing(_name, *)
+            head :ok
+          end
+        end)
+      end
+
+      def missing?(controller, action)
+        route = { controller: controller.controller_path, action: action, verb: "post", path: "/x" }
+        described_class.entries(controllers: [controller], routes: [route]).first.missing_action?
+      end
+
+      it "finds an action inherited from a parent controller" do
+        expect(missing?(child, "create")).to be(false)
+      end
+
+      it "finds every action of a controller that defines action_missing" do
+        expect(missing?(catch_all, "anything")).to be(false)
+      end
+
+      it "finds a template-only action, which renders implicitly" do
+        expect(missing?(pages, "preview")).to be(false)
+        expect(missing?(child, "preview")).to be(false)
+      end
+
+      it "reports an action with no method, no action_missing and no template" do
+        expect(missing?(pages, "destroy")).to be(true)
+      end
+
+      it "assumes the action exists when Rails's resolver cannot be asked" do
+        unbuildable = stub_const("AuditUnbuildableController", Class.new(ActionController::Base) do
+          def initialize(*) # rubocop:disable Lint/MissingSuper -- raising is the point
+            raise ArgumentError, "needs collaborators"
+          end
+        end)
+        expect(missing?(unbuildable, "create")).to be(false)
       end
     end
   end
