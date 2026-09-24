@@ -297,7 +297,7 @@ Which options are legal depends on the field kind — anything else raises at cl
 | `length:` | ✅¹ | ✅ | — | `Range` or `Integer`. Character count on strings, **element count** on arrays, where it short-circuits — see [the field DSL](#the-field-dsl) |
 | `normalize:` | ✅¹ | — | — | `:squish`, `:strip`, `:downcase`, `:upcase`, `:email`, or a Proc. Runs **first** — before the absence rule, so a value that normalizes to `""` is absent |
 | `default:` | ✅ | ✅ | — | Value used when the field is absent. Validated against the field's own contract at class load, then stored normalized and frozen (each request gets its own copy) |
-| `validate:` | ✅ | ✅ | — | Callable. Falsy fails as `"invalid"`; a returned `Symbol` becomes the violation code |
+| `validate:` | ✅ | ✅ | — | Callable. Falsy fails as `"invalid"`; a returned `Symbol` becomes the violation code. On an array it runs only when every element is valid, like `transform:` |
 | `transform:` | ✅ | ✅ | — | Callable applied **after** cast and validation — see [output reshaping](#output-reshaping-transform-and-finalize) |
 | `virtual:` | ✅ | ✅ | ✅ | Exempt this field from the schema-drift guard |
 | `sensitive:` | ✅ | ✅ | ✅ | Register the field name for [log redaction](#sensitive-parameters-and-log-redaction) |
@@ -357,8 +357,8 @@ Coercion is **deliberately strict**, and deliberately *not* `ActiveModel::Type`.
 
 | Type | Accepts | Rejects (`invalid_type`) |
 |---|---|---|
-| `:string` | `String`; `Numeric`/`true`/`false` are stringified | Arrays, hashes |
-| `:integer` | `Integer`; whole `Float`s (`4.0`); base-10 numeric strings | `"4.5"`, `"abc"`, `4.5` |
+| `:string` | `String`; `Numeric`/`true`/`false` are stringified | Arrays, hashes, a `String` with bytes invalid in its encoding (`"caf\xC3"`) — rejected before `normalize:` or `format:` sees it, for every scalar type |
+| `:integer` | `Integer`; whole `Float`s (`4.0`); base-10 numeric strings | `"4.5"`, `"abc"`, `4.5`, NaN/Infinity |
 | `:float` | `Numeric`; any `Float()`-parseable string | `"abc"` |
 | `:decimal` | `Numeric` or `String` → `BigDecimal` | Unparseable strings |
 | `:boolean` | `true`/`false`, `"true"`/`"false"`, `"1"`/`"0"`, `1`/`0` | `"yes"`, `"on"`, `2` |

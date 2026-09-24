@@ -487,6 +487,107 @@ RSpec.describe Permittable do
     end
   end
 
+  # Every case here is CLIENT input that used to raise out of the contract —
+  # a 500 where the request deserved a 422. Each must produce a violation.
+  describe "client input is a violation, never an exception" do
+    # Valid-looking text with a truncated UTF-8 sequence: "caf" + the first
+    # byte of "é". A literal, so its encoding is UTF-8 and it is not valid.
+    let(:malformed) { "caf\xC3" }
+
+    it "does not run an array's validate: over the nils of elements that failed to cast" do
+      decl = proc { permit_params(:create) { array :ids, of: :integer, validate: ->(a) { a.sum < 100 } } }
+      expect(violations_for({ ids: ["x", 2] }, &decl).details).to eq([{ param: "ids[0]", code: "invalid_type" }])
+      # Still runs over a fully-cast array.
+      expect(violations_for({ ids: [1, 200] }, &decl).details).to eq([{ param: "ids", code: "invalid" }])
+      expect(permit({ ids: %w[1 2] }, &decl)[:ids]).to eq([1, 2])
+    end
+
+    it "does not run an array-of-hashes validate: over elements that violated" do
+      decl = proc do
+        permit_params(:create) do
+          array :items, validate: ->(a) { a.sum { |i| i.fetch(:qty) } < 10 } do
+            required :qty, :integer
+          end
+        end
+      end
+      expect(violations_for({ items: [{ qty: "x" }, { qty: 1 }] }, &decl).details)
+        .to eq([{ param: "items[0].qty", code: "invalid_type" }])
+    end
+
+    it "rejects a non-finite Float given to an :integer" do
+      decl = proc do
+        permit_params(:create) do
+          optional :n, :integer
+          array :ns, of: :integer
+        end
+      end
+      [Float::NAN, Float::INFINITY, -Float::INFINITY].each do |value|
+        expect(violations_for({ n: value, ns: [value] }, &decl).details)
+          .to eq([{ param: "n", code: "invalid_type" }, { param: "ns[0]", code: "invalid_type" }]), "for #{value}"
+      end
+      expect(permit({ n: 3.0 }, &decl)[:n]).to eq(3)
+    end
+
+    it "rejects a String that is not valid in its encoding as invalid_type" do
+      expect(violations_for({ s: malformed }) { permit_params(:create) { required :s, :string } }.details)
+        .to eq([{ param: "s", code: "invalid_type" }])
+    end
+
+    it "rejects it before any normalize: preset runs" do
+      Permittable::NORMALIZERS.each_key do |preset|
+        e = violations_for({ s: malformed }) { permit_params(:create) { required :s, :string, normalize: preset } }
+        expect(e.details).to eq([{ param: "s", code: "invalid_type" }]), "for normalize: :#{preset}"
+      end
+    end
+
+    it "never hands it to an app's own normalize: proc" do
+      decl = proc { permit_params(:create) { required :s, :string, normalize: ->(_v) { raise "must not run" } } }
+      expect(violations_for({ s: malformed }, &decl).details).to eq([{ param: "s", code: "invalid_type" }])
+    end
+
+    it "rejects it before format: runs, for a Regexp and a preset alike" do
+      [/\Acaf/, :email].each do |format|
+        e = violations_for({ s: malformed }) { permit_params(:create) { required :s, :string, format: format } }
+        expect(e.details).to eq([{ param: "s", code: "invalid_type" }]), "for format: #{format.inspect}"
+      end
+    end
+
+    it "rejects it as an array element and as a sub-field of an array of hashes" do
+      decl = proc do
+        permit_params(:create) do
+          array :tags, of: :string
+          array :people do
+            required :name, :string, normalize: :squish
+          end
+        end
+      end
+      expect(violations_for({ tags: ["ok", malformed], people: [{ name: malformed }] }, &decl).details)
+        .to eq([{ param: "tags[1]", code: "invalid_type" }, { param: "people[0].name", code: "invalid_type" }])
+    end
+
+    it "rejects it for every other scalar type too" do
+      %i[integer float decimal boolean date datetime].each do |type|
+        e = violations_for({ v: malformed }) { permit_params(:create) { required :v, type } }
+        expect(e.details).to eq([{ param: "v", code: "invalid_type" }]), "for :#{type}"
+      end
+    end
+
+    it "leaves well-formed non-ASCII text alone" do
+      decl = proc { permit_params(:create) { required :s, :string, normalize: :squish, format: /\Acafé\z/ } }
+      expect(permit({ s: "  café " }, &decl)[:s]).to eq("café")
+    end
+
+    it "refuses a malformed authored default: at class load, like any other contract violation" do
+      expect { permittable_class { permit_params(:create) { optional :s, :string, normalize: :strip, default: "caf\xC3" } } }
+        .to raise_error(ArgumentError, /:default for field :s violates its own contract \(invalid_type\)/)
+    end
+
+    it "passes a :json field's contents through unexamined — the gem runs no string operation on them" do
+      decl = proc { permit_params(:create) { optional :meta, :json, max_depth: 3 } }
+      expect(permit({ meta: { "note" => malformed, "list" => [malformed] } }, &decl)[:meta][:note]).to eq(malformed)
+    end
+  end
+
   describe "validations" do
     it "checks in: as Range (cover) and as Array (inclusion)" do
       decl = proc { permit_params(:create) { required :age, :integer, in: 18..120 } }

@@ -542,8 +542,25 @@ module Permittable
 
     def cast(type, value)
       return [:error, "invalid_type"] unless scalar_shaped?(value)
+      return [:error, "invalid_type"] if malformed_string?(value)
 
       public_send("cast_#{type}", value)
+    end
+
+    # A String whose bytes are not valid in its own encoding is not text, so
+    # no text type can hold it — and every String operation after the cast
+    # raises on it rather than answering: `format:`'s Regexp#match?, the
+    # squish/strip/downcase presets, an app's own `validate:`. Rails' params
+    # builder refuses invalid UTF-8 before a controller runs, but a standalone
+    # Contract#call (a webhook payload) has nothing in front of it, so
+    # `"caf\xC3"` was a 500 where it deserved a 422.
+    #
+    # Checked HERE because `cast` is the one door every scalar value goes
+    # through — a field, an `of:` element, a sub-field of an array of hashes,
+    # an authored `default:`. `normalize:` runs earlier, so apply_normalize
+    # steps aside for the same test and leaves the rejection to this line.
+    def malformed_string?(value)
+      value.is_a?(String) && !value.valid_encoding?
     end
 
     # Arrays, hashes, and nested ActionController::Parameters
@@ -566,7 +583,10 @@ module Permittable
     def cast_integer(value)
       case value
       when Integer then [:ok, value]
-      when Float then value == value.truncate ? [:ok, value.to_i] : [:error, "invalid_type"]
+      # NaN and Infinity first: `truncate` raises FloatDomainError on them (a
+      # RangeError, which the ArgumentError rescue below does not catch), and
+      # no integer is what either one sent. Same rule as finite_float.
+      when Float then value.finite? && value == value.truncate ? [:ok, value.to_i] : [:error, "invalid_type"]
       when String then [:ok, Integer(value, 10)]
       else [:error, "invalid_type"]
       end
@@ -693,8 +713,13 @@ module Permittable
 
     # Presets only make sense on String input; a non-String value (JSON
     # numbers, booleans) skips normalization and goes straight to the cast.
+    # So does a malformed String — every preset raises on invalid bytes, and
+    # an app's own proc would be handed input it never agreed to see — which
+    # the cast then rejects (see malformed_string?). It is not empty, so the
+    # absence rule in between cannot mistake it for a missing value.
     def apply_normalize(normalizer, value)
       return value unless normalizer && value.is_a?(String)
+      return value if malformed_string?(value)
 
       normalizer.call(value)
     end
@@ -1648,13 +1673,19 @@ module Permittable
     out = value.each_with_index.map do |element, index|
       permittable_check_element(field, element, "#{path}[#{index}]", unknown: unknown, violations: violations)
     end
-    if field[:validate]
+    # validate: and transform: see only a fully-valid array. A partially-nil
+    # one (element violations) would hand user code garbage it never agreed
+    # to see — and for validate: that was a crash, not just garbage:
+    # `validate: ->(a) { a.sum < 100 }` sent `["x", 2]` raised TypeError on
+    # the nil where "x" failed to cast, turning the element's 422 into a 500.
+    # The element violations already reject the request, so skipping the
+    # whole-array check loses nothing the client could act on.
+    elements_valid = violations.length == before
+    if field[:validate] && elements_valid
       status, code = Coercion.check_custom(field[:validate], out)
       violations << permittable_violation(field, path, code) unless status == :ok
     end
-    # Transform only a fully-valid array — a partially-nil one (element
-    # violations) would hand user code garbage it never agreed to see.
-    out = field[:transform].call(out) if field[:transform] && violations.length == before
+    out = field[:transform].call(out) if field[:transform] && elements_valid
     out
   end
 

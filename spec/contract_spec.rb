@@ -96,6 +96,29 @@ RSpec.describe Permittable::Contract do
       )
     end
 
+    # The documented promise. A webhook payload has no Rails params builder in
+    # front of it, so it reaches the contract with whatever a client sent —
+    # malformed UTF-8 and non-finite Floats included.
+    it "never raises on client input it cannot use — every case is a violation" do
+      malformed = "caf\xC3"
+      cases = {
+        described_class.define { array :ids, of: :integer, validate: ->(a) { a.sum < 100 } } =>
+          [{ ids: ["x", 2] }, "ids[0]"],
+        described_class.define { required :n, :integer } => [{ n: Float::NAN }, "n"],
+        described_class.define { required :n, :integer } => [{ n: Float::INFINITY }, "n"],
+        described_class.define { required :s, :string, normalize: :squish } => [{ s: malformed }, "s"],
+        described_class.define { required :s, :string, normalize: :strip } => [{ s: malformed }, "s"],
+        described_class.define { required :s, :string, format: /\Acaf/ } => [{ s: malformed }, "s"],
+        described_class.define { required :s, :string, format: :email } => [{ s: malformed }, "s"],
+        described_class.define { array :tags, of: :string } => [{ tags: [malformed] }, "tags[0]"]
+      }
+      cases.each do |c, (input, param)|
+        result = nil
+        expect { result = c.call(input) }.not_to raise_error, "for #{input.inspect}"
+        expect(result.violations).to eq([{ param: param, code: "invalid_type" }]), "for #{input.inspect}"
+      end
+    end
+
     it "stays enforce-semantics even when the app-wide mode is monitor" do
       Permittable.mode = :monitor
       begin
