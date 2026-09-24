@@ -909,6 +909,16 @@ Every operation references shared components for the [error envelope](#violation
 
 **What is honestly unrepresentable stays visible instead of guessed.** A `format:` regexp using a Ruby-only construct (or flags) is exported as `x-permittable-pattern` rather than a mistranslated `pattern` — including one anchored with `^`/`$`, which in Ruby anchor a **line** and in ECMA-262 anchor the whole string, so `/^\d{5}$/` accepts `"evil\n12345"` at runtime and publishing that source would promise a stricter rule than the server enforces (use `\A`/`\z`, which translate exactly); `validate:`/`transform:` are flagged `x-permittable-custom-validation`/`x-permittable-transformed`; actions covered only by a catch-all rule on a plain-Ruby host appear under `"*"` with `x-permittable-catch-all`; operations whose rule runs in [monitor mode](#monitor-mode-roll-out-without-rejecting) carry `x-permittable-mode: "monitor"`; operations with no matching route — or whose path-and-verb slot another controller already claimed, which one document cannot represent twice — land in `x-permittable-controllers` instead of being dropped. A templated path segment is declared as a path `parameter` of type `string`, because the route set doesn't say what an `:id` is and the exporter won't invent it. The schema documents the canonical JSON encoding — the runtime additionally accepts string-encoded scalars (`"42"`, `"true"`) for form/query payloads.
 
+**Every `operationId` is unique across the document, and only a collision is ever renamed.** An operation's id is its controller path with `/` folded to `_`, then its action: `users_create`, `admin_users_index`. Client generators name a method after the id, so the scheme itself never changes. Where two places in the document would carry one id, the exporter renames all but one of them:
+
+| Collision | Ids |
+| --- | --- |
+| One operation under several verbs (the `PATCH\|PUT` pair `resources` generates, `via: :all`) | `users_update` on PATCH, `users_update_put` on PUT; `webhooks_receive`, `webhooks_receive_post`, … |
+| One operation at several paths under one verb (an optional segment, `(/:locale)/posts`) | `posts_create`, `posts_create_2` |
+| Two controllers that fold to one id (`admin/users` and `admin_users`) | `admin_users_index`, `admin_users_index_2` |
+
+The first place in controller, action and route order keeps the plain id. For a PATCH/PUT pair, PATCH keeps it whichever verb the route lists first. A routed operation keeps it ahead of one under `x-permittable-controllers`, which takes part too because it is in the same document. The others get their verb appended when the colliding verbs differ, and a number otherwise. A candidate that is already taken keeps counting up (`admin_users_index_post_2`). **The stability rule:** an id that only one operation would carry never changes, even when a suffix elsewhere would spell it. So a change to routes or controllers can rename only operations that collide, never one that stands alone. A route declared twice is placed once and does not collide with itself.
+
 Output is deterministic (fixed key order, declaration-order properties), so the generated file can be committed and reviewed as a diff — a contract change shows up in the same PR as its documentation change.
 
 #### What the schema deliberately does not say

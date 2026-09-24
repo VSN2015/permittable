@@ -204,12 +204,14 @@ module Permittable
     def document(controllers:, info: {}, routes: nil)
       paths = {}
       unrouted = {}
+      slots = []
       controllers.each do |controller|
         operations = operations_for(controller)
         next if operations.empty?
 
-        place_operations(controller, operations, routes, paths, unrouted)
+        slots.concat(place_operations(controller, operations, routes, paths, unrouted))
       end
+      assign_unique_operation_ids(slots)
       doc = {
         "openapi" => "3.1.0",
         "info" => { "title" => "Permittable contracts", "version" => VERSION }.merge(info),
@@ -220,20 +222,33 @@ module Permittable
       doc
     end
 
+    # Where one operation sits in the document: a path+verb slot under
+    # `paths`, or an action under x-permittable-controllers (verb nil).
+    # `holder[field]` is the placed operation; `id` its natural operationId.
+    OperationSlot = Struct.new(:holder, :field, :verb, :id)
+
+    # Places every operation and returns the slots it filled, in placement
+    # order (controller, action, route), for assign_unique_operation_ids.
     def place_operations(controller, operations, routes, paths, unrouted)
       key = controller_key(controller) || controller.inspect
-      operations.each do |action, operation|
+      operations.each_with_object([]) do |(action, operation), slots|
         # A path+verb pair carries exactly one operation, so a slot another
         # controller already claimed is not written over: the loser stays
         # visible under x-permittable-controllers, where an operation with no
         # route at all lands, rather than disappearing from the document.
-        free = routes_for(routes, key, action).reject { |route| paths.dig(route[:path], verb_of(route)) }
+        # A route declared twice names one slot, so it is placed once — not
+        # counted as an operation colliding with itself.
+        free = routes_for(routes, key, action).uniq { |route| [route[:path], verb_of(route)] }
+                                              .reject { |route| paths.dig(route[:path], verb_of(route)) }
         if free.empty?
-          (unrouted[key] ||= {})[action] = operation
+          holder = (unrouted[key] ||= {})
+          slots << OperationSlot.new(holder, action, nil, operation["operationId"]) unless holder.key?(action)
+          holder[action] = operation
         else
           free.each do |route|
-            placed = with_unique_operation_id(with_path_parameters(operation, route[:path]), verb_of(route), paths)
-            (paths[route[:path]] ||= {})[verb_of(route)] = placed
+            holder = (paths[route[:path]] ||= {})
+            holder[verb_of(route)] = with_path_parameters(operation, route[:path])
+            slots << OperationSlot.new(holder, verb_of(route), verb_of(route), operation["operationId"])
           end
         end
       end
@@ -243,32 +258,56 @@ module Permittable
     # client generators name a method after it — a duplicate is an invalid
     # document and, in practice, two methods with one name. One operation is
     # placed at every slot its routes reach (the PATCH|PUT pair `resources`
-    # generates), and `key.tr("/", "_")` folds admin/users and admin_users
-    # into one id. Renaming the scheme would rename every generated client
-    # method, so only a collision is renamed: the first slot to claim an id
-    # keeps it, a later one gets its verb appended (users_update_put), then a
-    # numeric suffix. Placement follows controller, action and route order,
-    # so the same app always exports the same ids.
+    # generates, an optional segment's two paths, `via: :all`'s five verbs),
+    # and `key.tr("/", "_")` folds admin/users and admin_users into one id.
     #
-    # Only operations under `paths` take part: OpenAPI's uniqueness rule is
-    # over those, and an unrouted operation in x-permittable-controllers
-    # keeps its plain id rather than pushing a routed one onto a suffix.
+    # Renaming the scheme would rename every generated client method, so an
+    # id that is already unique never changes. Every slot's natural id is
+    # known before any is renamed and all of them are reserved, so a suffix
+    # can never take a name that is another operation's own id — that
+    # operation would otherwise be renamed for a collision it never had.
+    # Within a colliding group the first slot keeps the plain id and the
+    # rest take their verb when verbs differ in the group (users_update_put),
+    # otherwise a number (posts_create_2); a candidate that is taken is
+    # numbered on until free.
     #
-    # The ids already claimed are read back from `paths` itself, as occupied
-    # slots are, so there is no second record of placement to fall out of
-    # step with the document.
-    def with_unique_operation_id(operation, verb, paths)
-      id = operation["operationId"]
-      return operation if id.nil?
+    # Unrouted operations take part: x-permittable-controllers is in the same
+    # document and feeds the same generators. They yield the plain id to a
+    # routed operation, though, since `paths` is what a client calls.
+    def assign_unique_operation_ids(slots)
+      slots = slots.select(&:id)
+      taken = slots.to_set(&:id)
+      next_number = Hash.new(2)
+      slots.group_by(&:id).each_value do |group|
+        next if group.one?
 
-      claimed = paths.each_value.flat_map { |slots| slots.each_value.map { |placed| placed["operationId"] } }.to_set
-      unique = [id, "#{id}_#{verb}"].find { |candidate| !claimed.include?(candidate) } ||
-               (2..).lazy.map { |n| "#{id}_#{verb}_#{n}" }.find { |candidate| !claimed.include?(candidate) }
-      return operation if unique == id
+        verbs_differ = group.filter_map(&:verb).uniq.size > 1
+        collision_order(group).drop(1).each do |slot|
+          stem = verbs_differ && slot.verb ? "#{slot.id}_#{slot.verb}" : slot.id
+          unique = stem != slot.id && !taken.include?(stem) ? stem : numbered_id(stem, taken, next_number)
+          taken << unique
+          # The same operation object may sit at other slots under its own
+          # id, so the rename goes on a copy; merge keeps the key order.
+          slot.holder[slot.field] = slot.holder[slot.field].merge("operationId" => unique)
+        end
+      end
+    end
 
-      # The same operation object may sit at other slots under its own id,
-      # so the rename goes on a copy; merge keeps the key order.
-      operation.merge("operationId" => unique)
+    # Placement order, routed before unrouted. `match via: [:put, :patch]`
+    # lists PUT first where `resources` lists PATCH first; without the swap
+    # the same pair of routes would name the PATCH method two ways.
+    def collision_order(group)
+      ordered = group.each_with_index.sort_by { |slot, index| [slot.verb ? 0 : 1, index] }.map(&:first)
+      ordered.map(&:verb) == %w[put patch] ? ordered.reverse : ordered
+    end
+
+    # The next free "#{stem}_n", n from 2. The counter per stem keeps the
+    # whole pass linear: no number is tried twice for one stem.
+    def numbered_id(stem, taken, next_number)
+      number = next_number[stem]
+      number += 1 while taken.include?("#{stem}_#{number}")
+      next_number[stem] = number + 1
+      "#{stem}_#{number}"
     end
 
     def verb_of(route)
