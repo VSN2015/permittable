@@ -154,14 +154,43 @@ RSpec.describe Permittable::Audit do
         expect(found.none?(&:missing_action?)).to be(true)
       end
 
-      # A contract left on an action that no longer exists guards nothing, so
-      # it must not read as coverage: the buckets stay disjoint and add up.
-      it "counts a covered but missing action only as missing" do
-        covered = controller_class("posts") { permit_params(:create) { required :title, :string } }
-        covered.define_singleton_method(:action_methods) { Set.new(%w[index show]) }
-        counts = described_class.summary(described_class.entries(controllers: [covered], routes: post_routes))
-        expect(counts).to include(actions: 4, enforced: 0, monitored: 0, uncovered: 2, unguarded_models: 0,
-                                  missing_actions: 2)
+      # The README quotes the singular form.
+      it "says it, not them, for a single missing action" do
+        posts.define_singleton_method(:action_methods) { Set.new(%w[index show update]) }
+        expect(described_class.format(found)).to include("3 without a contract, 1 not found (Rails 404s it)")
+      end
+
+      it "reads the action list once per controller, however many routes it has" do
+        allow(posts).to receive(:action_methods).and_call_original
+        found
+        expect(posts).to have_received(:action_methods).once
+      end
+
+      context "when a contract is left on it" do
+        let(:covered) do
+          controller_class("posts") { permit_params(:create) { required :title, :string } }.tap do |klass|
+            klass.define_singleton_method(:action_methods) { Set.new(%w[index show]) }
+          end
+        end
+        let(:found) { described_class.entries(controllers: [covered], routes: post_routes) }
+
+        # A contract left on an action that no longer exists guards nothing, so
+        # it must not read as coverage: the buckets stay disjoint and add up.
+        it "counts it only as missing" do
+          expect(described_class.summary(found)).to include(actions: 4, enforced: 0, monitored: 0, uncovered: 2,
+                                                            unguarded_models: 0, missing_actions: 2)
+        end
+
+        it "shows the mode and that the action is not found" do
+          expect(described_class.format(found)).to match(%r{POST\s+/posts\s+create\s+enforce  action not found$})
+        end
+
+        # Out of every bucket, it would otherwise vanish from the report's
+        # conclusions — and a routed action Rails 404s is exactly the renamed
+        # or deleted one the stale list exists for.
+        it "lists the contract as stale" do
+          expect(described_class.stale(controllers: [covered], routes: post_routes)).to eq("posts" => ["create"])
+        end
       end
     end
 
@@ -217,6 +246,26 @@ RSpec.describe Permittable::Audit do
 
       it "reports an action with no method, no action_missing and no template" do
         expect(missing?(pages, "destroy")).to be(true)
+      end
+
+      it "reports a missing action on an API controller, which has no template fallback" do
+        api = stub_const("AuditApiThingsController", Class.new(ActionController::API) do
+          def index
+            head :ok
+          end
+        end)
+        expect([missing?(api, "index"), missing?(api, "create")]).to eq([false, true])
+      end
+
+      # A via: :all route is five entries for one action; Rails need only be
+      # asked once.
+      it "asks Rails's resolver once per action, not once per verb" do
+        allow(catch_all).to receive(:new).and_call_original
+        verb_routes = %w[get post put patch delete].map do |verb|
+          { controller: catch_all.controller_path, action: "anything", verb: verb, path: "/x" }
+        end
+        described_class.entries(controllers: [catch_all], routes: verb_routes)
+        expect(catch_all).to have_received(:new).once
       end
 
       it "assumes the action exists when Rails's resolver cannot be asked" do

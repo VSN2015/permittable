@@ -73,11 +73,27 @@ module Permittable
 
     def controller_entries(controller, routes)
       key = OpenAPI.controller_key(controller) || controller.inspect
+      missing = missing_lookup(controller)
       routes.select { |route| route[:controller].to_s == key }.map do |route|
         action = route[:action].to_s
         Entry.new(controller: key, action: action, verb: route[:verb], path: route[:path],
-                  rule: rule_for(controller, action), missing_action: missing_action?(controller, action))
+                  rule: rule_for(controller, action), missing_action: missing[action])
       end
+    end
+
+    # action => missing?, answered once per action: a `via: :all` route is
+    # five entries for one action, and each resolver call builds a controller.
+    # The action list is read once per controller, not once per route.
+    def missing_lookup(controller)
+      listed = listed_actions(controller)
+      Hash.new { |memo, action| memo[action] = missing_action?(controller, action, listed) }
+    end
+
+    # Normalised like OpenAPI.documented_actions: a duck listing Symbols would
+    # otherwise be missing every action, and strict would pass everything.
+    # nil when the controller cannot list its actions.
+    def listed_actions(controller)
+      controller.action_methods.to_set(&:to_s) if controller.respond_to?(:action_methods)
     end
 
     # `resources :posts` routes all seven actions whether or not the
@@ -85,12 +101,9 @@ module Permittable
     # undefined `create` is no unguarded input, and failing a strict run over
     # it was a false positive. Labelled rather than dropped, so the reader
     # still sees the route. A controller that cannot list its actions is
-    # assumed to have them all. Normalised like OpenAPI.documented_actions: a
-    # duck listing Symbols would otherwise be missing every action, and strict
-    # would pass everything.
-    def missing_action?(controller, action)
-      return false unless controller.respond_to?(:action_methods)
-      return false if controller.action_methods.map(&:to_s).include?(action)
+    # assumed to have them all.
+    def missing_action?(controller, action, listed = listed_actions(controller))
+      return false if listed.nil? || listed.include?(action)
 
       !dispatchable?(controller, action)
     end
@@ -121,8 +134,11 @@ module Permittable
     end
 
     # { controller => [action, ...] } for contracts declared against actions
-    # no route reaches — a renamed or deleted action leaving its contract
-    # behind. Catch-all rules declare no actions, so they never appear here.
+    # no route reaches, or that a route reaches but Rails would 404 — either
+    # way a renamed or deleted action leaving its contract behind. The second
+    # kind is in no summary bucket, so without this it would vanish from the
+    # report's conclusions. Catch-all rules declare no actions, so they never
+    # appear here.
     def stale(controllers:, routes:)
       routes = routes.to_a
       controllers.each_with_object({}) do |controller, found|
@@ -131,8 +147,9 @@ module Permittable
         key = OpenAPI.controller_key(controller) || controller.inspect
         routed = routes.select { |route| route[:controller].to_s == key }.map { |route| route[:action].to_s }
         declared = controller.permittable_contracts.flat_map { |rule| rule[:actions] }.uniq
-        missing = declared - routed
-        found[key] = missing unless missing.empty?
+        missing = missing_lookup(controller)
+        left = declared.select { |action| !routed.include?(action) || missing[action] }
+        found[key] = left unless left.empty?
       end
     end
 
@@ -183,14 +200,17 @@ module Permittable
       parts = [entry.mode.to_s]
       parts << "model: #{entry.model.name}" if entry.model.respond_to?(:name) && entry.model.name
       parts << "unknown: #{entry.unknown}" unless entry.unknown == :ignore
-      parts << "action not found" if entry.missing_action?
-      parts.join("  ")
+      parts << not_found_note(entry)
+      parts.compact.join("  ")
     end
 
     def uncovered_note(entry)
-      return "action not found" if entry.missing_action?
+      not_found_note(entry) || ("ACCEPTS A BODY" if entry.body?)
+    end
 
-      "ACCEPTS A BODY" if entry.body?
+    # The one wording for a route Rails would 404, covered or not.
+    def not_found_note(entry)
+      "action not found" if entry.missing_action?
     end
 
     def summary_lines(counts)
@@ -211,7 +231,7 @@ module Permittable
 
     def stale_lines(stale)
       pairs = stale.flat_map { |key, actions| actions.map { |action| "#{key}##{action}" } }
-      "\nContracts declared for actions no route reaches (renamed or deleted?):\n" \
+      "\nContracts declared for actions no route reaches or Rails would 404 (renamed or deleted?):\n" \
         "#{pairs.map { |pair| "  #{pair}" }.join("\n")}"
     end
   end

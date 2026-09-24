@@ -819,7 +819,7 @@ users
   2 of those accept a request body — untrusted input reaches the action unchecked
   2 covered actions declare no model:, so no schema-drift guard runs for them
 
-Contracts declared for actions no route reaches (renamed or deleted?):
+Contracts declared for actions no route reaches or Rails would 404 (renamed or deleted?):
   users#archive
 ```
 
@@ -827,9 +827,18 @@ Three things it tells you that nothing else does:
 
 - **Which write actions are unguarded.** A `GET` without a contract is usually fine; a `POST` without one is untrusted input reaching the action unchecked. That count is the number `[strict]` fails on, which makes the task a CI gate: *no new unguarded write endpoint*.
 - **Which contracts aren't enforcing yet.** The audit runs inside the app, so unlike the exported OpenAPI it resolves the **effective** mode — a rule's own `mode:` first, then your app-wide `Permittable.mode`. This is the [monitor-mode](#monitor-mode-roll-out-without-rejecting) rollout dashboard.
-- **Which contracts have gone stale.** A contract declared for an action no route reaches is a renamed or deleted action that left its contract behind.
+- **Which contracts have gone stale.** A contract declared for an action no route reaches, or for a routed action Rails would 404, is a renamed or deleted action that left its contract behind.
 
-Every verb a route answers is audited, including a `match ... via: :all` route, which is listed once per verb. `resources` routes all seven actions whether or not they exist. A route that Rails would 404 reads `action not found`: no method (inherited ones count), no `action_missing`, and no template to render implicitly. It is not counted against `[strict]` or as coverage. It stays in the table rather than disappearing. A catch-all 404 route (`match "*path", to: "application#not_found", via: :all`) shows its POST, PUT and PATCH rows as accepting a body. Declare `permit_params(:not_found) { optional :path, :string }` to cover it. The contract changes nothing at runtime, and the request still 404s.
+Every verb a route answers is audited, including a `match ... via: :all` route, which is listed once per verb. `resources` routes all seven actions whether or not they exist. A route that Rails would 404 reads `action not found`: no method (inherited ones count), no `action_missing`, and no template to render implicitly. It is not counted against `[strict]` or as coverage. It stays in the table rather than disappearing.
+
+A catch-all 404 route (`match "*path", to: "application#not_found", via: :all`) shows its POST, PUT and PATCH rows as accepting a body. They do accept one: every stray body reaches the controller. Route only GET to the controller (Rails answers HEAD from it). Send the other verbs to a plain Rack endpoint, which never parses the body and which the audit does not list:
+
+```ruby
+match "*path", to: "application#not_found", via: :get
+match "*path", to: ->(_env) { [404, { "content-type" => "text/plain" }, ["Not Found"]] }, via: :all
+```
+
+Or accept the rows until the ignore list ([#69](https://github.com/VSN2015/permittable/issues/69)) lands. Don't declare a contract on the catch-all to silence the gate. Under monitor mode it validates eagerly, so a malformed JSON POST answers 400 instead of 404. The OpenAPI export would also gain a fake `/{path}` endpoint.
 
 Controllers that never included `Permittable` are audited too — those are the ones worth finding. Everything is plain Ruby over the frozen registry plus route descriptors, so `Permittable::Audit.entries(controllers:, routes:)` works without Rails.
 
