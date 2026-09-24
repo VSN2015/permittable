@@ -104,6 +104,49 @@ RSpec.describe Permittable::JsonSchema do
         expect(prop["x-permittable-pattern"]).to eq(regexp.inspect)
       end
     end
+
+    # Each of these is a SyntaxError under the `u` flag Ajv compiles with, or
+    # means something else in ECMA-262 — {,3} is a literal there without the
+    # flag, && two ampersands, a backreference to a group that took no part
+    # matches the empty string — so none may be published as `pattern`.
+    it "falls back for constructs ECMA-262 lacks or reads differently" do
+      [/\A(?>a+)b\z/, /a(?#note)b/, /(?'n'a)\k'n'/, /\Aa{,3}\z/, /\A\e\z/, /\A[a-z&&[^q]]\z/,
+       /\A\101\z/, /\A\01\z/, /\A[a\S]\z/, /\Aa{2}?\z/, /\A+a/, /a{2}{3}/, /(?=a)*b/, /\x7/,
+       /(?<n>a)\g<n>/, /[a-z[0-9]]/, /[]a]/, /(?<a>x)|(?<a>y)/,
+       /\A(a)?\1b\z/, /\A(?<y>\d)\k<y>\z/].each do |regexp|
+        prop = property("a") { optional :a, :string, format: regexp }
+        expect(prop).not_to have_key("pattern"), "expected #{regexp.inspect} to be untranslatable"
+        expect(prop["x-permittable-pattern"]).to eq(regexp.inspect)
+      end
+    end
+
+    # rubocop:disable-next Style/RedundantRegexpEscape -- the redundant escapes are what is under test
+    it "un-escapes the identity escapes Unicode mode rejects, but keeps \\- inside a class" do
+      expect(described_class.ecma_pattern(/\A\d{3}\-\d{4}\z/)).to eq('^\d{3}-\d{4}$')
+      expect(described_class.ecma_pattern(/\A\#\ \z/)).to eq("^# $")
+      expect(described_class.ecma_pattern(/\A[\w\-\#]+\z/)).to eq('^[\w\-#]+$')
+      expect(described_class.ecma_pattern(%r{\A\$\.\/\z})).to eq('^\$\.\/$')
+    end
+
+    it "spells out Ruby's ASCII-only \\s, which ECMA-262 widens to every Unicode space" do
+      expect(described_class.ecma_pattern(/\A\s\z/)).to eq('^[ \t\n\v\f\r]$')
+      expect(described_class.ecma_pattern(/\A\S\z/)).to eq('^[^ \t\n\v\f\r]$')
+      expect(described_class.ecma_pattern(/\A[^@\s]+\z/)).to eq('^[^@ \t\n\v\f\r]+$')
+    end
+
+    it "spells out Ruby's dot, which ECMA-262 without the s flag also refuses at \\r, U+2028 and U+2029" do
+      expect(described_class.ecma_pattern(/\A.+\z/)).to eq('^[^\n]+$')
+      expect(described_class.ecma_pattern(/\A[.]\z/)).to eq("^[.]$")
+    end
+
+    it "rewrites only real \\A and \\z anchors, never an escaped backslash followed by A or z" do
+      expect(described_class.ecma_pattern(/\A\\A\z/)).to eq('^\\\\A$')
+      expect(described_class.ecma_pattern(/\A\\z\z/)).to eq('^\\\\z$')
+    end
+
+    it "escapes a brace Ruby reads as a literal, which Unicode mode rejects bare" do
+      expect(described_class.ecma_pattern(/\A{\d}\z/)).to eq('^\{\d\}$')
+    end
   end
 
   describe "format: presets" do

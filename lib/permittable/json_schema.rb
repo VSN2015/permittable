@@ -1,3 +1,5 @@
+require "permittable/json_schema/ecma_pattern"
+
 module Permittable
   # Converts frozen contract data — the rule and field hashes built by
   # ContractBuilder — into JSON Schema (draft 2020-12, the dialect OpenAPI 3.1
@@ -39,27 +41,6 @@ module Permittable
       date: { "type" => "string", "format" => "date" },
       datetime: { "type" => "string", "format" => "date-time" }
     }.freeze
-
-    # Ruby regexp constructs with no ECMA-262 equivalent (\Z, \h, \K, \R, \G,
-    # inline flag groups, absence operator, conditionals, POSIX classes,
-    # possessive quantifiers) — and Ruby's ^ and $, which anchor a LINE where
-    # ECMA-262 without the m flag anchors the whole string. /^\d{5}$/ accepts
-    # "evil\n12345" at runtime, so emitting its source as `pattern` would
-    # publish a rule stricter than the server enforces, and an export from
-    # contract data is supposed to make that impossible. Straight after a [
-    # neither is an anchor — ^ is class negation and $ is a literal — so both
-    # stay translatable there. Otherwise the scan is deliberately over-eager
-    # on escaped lookalikes, because a wrong pattern in published docs is
-    # worse than a missing one.
-    UNTRANSLATABLE = /
-      \\[ZhHKRG]          |
-      \(\?[a-z-]+[:)]     |
-      \(\?~               |
-      \(\?\(              |
-      \[\[:               |
-      [*+?]\+             |
-      (?<![\\\[])[\^$]
-    /x
 
     # Request-body schema for one rule from `permittable_contracts` /
     # `permit_rule_for`: the object schema of its fields, wrapped in the
@@ -119,9 +100,7 @@ module Permittable
       apply_format_name!(schema, field)
       apply_in!(schema, field[:in])
       apply_string_bounds!(schema, field)
-      # A preset's pattern is authored by this gem rather than by the app, so
-      # it needs no heuristic — see apply_pattern!.
-      apply_pattern!(schema, field[:format], vouched: !field[:format_name].nil?)
+      apply_pattern!(schema, field[:format])
       schema
     end
 
@@ -186,16 +165,10 @@ module Permittable
       schema["maxLength"] = max if max
     end
 
-    # `vouched:` marks a pattern this gem authored (a `format:` preset), which
-    # is known translatable and so skips the conservative scan. It has to:
-    # the RFC-derived :email pattern contains `*+` inside a character class,
-    # which UNTRANSLATABLE reads — deliberately over-eagerly — as a
-    # possessive quantifier, and the most common format in Rails would
-    # otherwise publish no pattern at all.
-    def apply_pattern!(schema, regexp, vouched: false)
+    def apply_pattern!(schema, regexp)
       return unless regexp
 
-      pattern = ecma_pattern(regexp, vouched: vouched)
+      pattern = ecma_pattern(regexp)
       if pattern
         schema["pattern"] = pattern
       else
@@ -203,17 +176,19 @@ module Permittable
       end
     end
 
-    # Conservative Ruby → ECMA-262 translation: \A/\z anchors become ^/$.
-    # Flagged regexps bail entirely (JSON Schema's `pattern` has no flag
-    # slot, and /x//m/i all change semantics), as does any source containing
-    # an untranslatable construct.
-    def ecma_pattern(regexp, vouched: false)
+    # Ruby → ECMA-262 translation, conservative by construction — see
+    # EcmaPattern. Flagged regexps bail entirely (JSON Schema's `pattern` has
+    # no flag slot, and /x//m/i all change semantics).
+    #
+    # A `format:` preset goes through the same translation as an app's own
+    # regexp and needs no exemption: the tokenizer reads a class as a unit,
+    # so the `*+` inside :email's class is two literals rather than a
+    # possessive quantifier, and :email's `\#` is written as the bare `#`
+    # Unicode mode requires.
+    def ecma_pattern(regexp)
       return nil unless regexp.options.zero?
 
-      source = regexp.source
-      return nil if !vouched && source.match?(UNTRANSLATABLE)
-
-      source.gsub('\A', "^").gsub('\z', "$")
+      EcmaPattern.translate(regexp.source)
     end
 
     # length: reasons about characters on strings and element count on
