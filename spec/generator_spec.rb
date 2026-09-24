@@ -314,7 +314,7 @@ RSpec.describe Permittable::Generator do
 
   describe ".draft of a contract the model would actually accept" do
     after do
-      %i[gen_blog_posts gen_orders gen_vehicles gen_oddities].each do |table|
+      %i[gen_blog_posts gen_orders gen_shipments gen_vehicles gen_fleet_cars gen_oddities].each do |table|
         ActiveRecord::Base.connection.drop_table(table, if_exists: true)
       end
     end
@@ -325,6 +325,12 @@ RSpec.describe Permittable::Generator do
 
     def violations(klass, params, action:)
       controller(klass, params: params, action: action).permittable_violations
+    end
+
+    # The schema's own spelling of lock_version's `default: 0`, which the
+    # draft echoes: "0" from the sqlite adapter through Rails 8.0, 0 in 8.1.
+    def lock_default
+      ActiveRecord::Base.connection.columns(:gen_vehicles).find { |c| c.name == "lock_version" }.default.inspect
     end
 
     context "with a namespaced model" do
@@ -415,6 +421,82 @@ RSpec.describe Permittable::Generator do
         expect(violations(klass, { gen_order: { status: "lost" } }, action: "update"))
           .to eq([{ param: "gen_order.status", code: "inclusion" }])
       end
+
+      it "leaves a TODO for the stored integers, which Rails also assigns but :string passes on as text" do
+        expect(draft).to match(
+          /optional :status, .*; TODO: Rails also assigns the stored integers \(status: 1\).*GenOrder\.statuses\.values/
+        )
+      end
+    end
+
+    context "with defaults the model declares rather than the database" do
+      before do
+        ActiveRecord::Schema.define do
+          create_table :gen_shipments do |t|
+            t.integer :status, null: false
+            t.string  :carrier, null: false
+            t.string  :token, null: false
+          end
+        end
+        stub_const("GenShipment", Class.new(TestModel) do
+          self.table_name = "gen_shipments"
+          if ActiveRecord.version >= Gem::Version.new("7.0")
+            enum :status, { pending: 0, shipped: 1 }, default: :pending
+          else
+            enum status: { pending: 0, shipped: 1 }, _default: "pending"
+          end
+          attribute :carrier, :string, default: "post"
+          # Calling this would be a side effect of drafting (and its value
+          # today says nothing about tomorrow's), so the draft must not.
+          attribute :token, :string, default: -> { raise "a Proc default was called while drafting" }
+        end)
+      end
+
+      let(:draft) { described_class.draft(model: GenShipment) }
+
+      it "does not require a NOT NULL column the model fills in, and shows an enum's default as its key" do
+        expect(draft).to include('optional :status, :string, in: GenShipment.statuses.keys # model default: "pending"')
+        expect(draft).to include('optional :carrier, :string # model default: "post"')
+        expect(draft).to include("optional :token, :string # model default: computed by a Proc")
+        expect(draft).not_to include("required")
+      end
+
+      it "keeps one rule, which loads and accepts a create that omits them" do
+        expect(draft.scan("permit_params").length).to eq(1)
+        expect(violations(load_draft(draft), { gen_shipment: { carrier: "ups" } }, action: "create")).to eq([])
+      end
+    end
+
+    context "when the model raises while it is being read" do
+      before do
+        ActiveRecord::Schema.define do
+          create_table :gen_vehicles do |t|
+            t.string  :name, null: false
+            t.integer :lock_version, null: false, default: 0
+          end
+        end
+      end
+
+      it "degrades only the column it could not read, and says so in a TODO" do
+        stub_const("GenBrokenVehicle", Class.new(TestModel) { self.table_name = "gen_vehicles" })
+        # Rails reads lock_optimistically while loading the schema, so load
+        # it first: the error has to come from the introspection on top.
+        GenBrokenVehicle.columns
+        allow(GenBrokenVehicle).to receive(:lock_optimistically).and_raise(ArgumentError, "misconfigured\nsecond line")
+        draft = described_class.draft(model: GenBrokenVehicle)
+        expect(draft).to include("required :name, :string\n")
+        expect(draft).to include(
+          "optional :lock_version, :integer # database default: #{lock_default}; TODO: could not read what the model adds to " \
+          "lock_version (ArgumentError: misconfigured second line) — check its enum, default and STI/locking role by hand"
+        )
+        expect(load_draft(draft).permit_rule_for("update")[:fields].map { |f| f[:name] }).to eq(%i[name lock_version])
+      end
+
+      it "still drafts nothing from the model when the schema itself cannot be read" do
+        stub_const("GenUnreachable", Class.new(TestModel) { self.table_name = "gen_vehicles" })
+        allow(GenUnreachable).to receive(:columns).and_raise(ActiveRecord::StatementInvalid, "no such table")
+        expect(described_class.draft(model: GenUnreachable)).to be_nil
+      end
     end
 
     context "with STI and optimistic locking" do
@@ -452,6 +534,50 @@ RSpec.describe Permittable::Generator do
 
       it "loads" do
         expect(load_draft(draft).permit_rule_for("update")[:fields].map { |f| f[:name] }).to eq(%i[name])
+      end
+
+      it "says to declare lock_version here when the draft is one :create, :update rule" do
+        expect(draft.scan("permit_params").length).to eq(1)
+        expect(draft).to include("declare `optional :lock_version, :integer` here")
+        expect(draft).not_to include(":update rule")
+      end
+
+      it "points the :create rule at the :update rule when the draft splits" do
+        ActiveRecord::Schema.define do
+          create_table :gen_fleet_cars do |t|
+            t.string  :vin, null: false
+            t.integer :lock_version, null: false, default: 0
+          end
+        end
+        stub_const("GenFleetCar", Class.new(TestModel) { self.table_name = "gen_fleet_cars" })
+        create, update = described_class.draft(model: GenFleetCar).split("permit_params").drop(1)
+        expect(create).to include("declare `optional :lock_version, :integer` in the :update rule below")
+        expect(update).to include("declare `optional :lock_version, :integer` here")
+      end
+
+      it "keeps them as fields, with a TODO, when the controller's own permit call lists them" do
+        scan = described_class.scan("params.require(:gen_vehicle).permit(:name, :type, :lock_version)")
+        draft = described_class.draft(model: GenVehicle, scan: scan)
+        expect(draft).to match(
+          /^\s*optional :lock_version, :integer # database default: #{lock_default}; TODO: lock_version is the optimistic-locking/
+        )
+        expect(draft).to match(/^\s*optional :type, :string # TODO: type is the STI inheritance column — kept because/)
+
+        klass = load_draft(draft)
+        params = { gen_vehicle: { name: "Van", lock_version: "3" } }
+        expect(violations(klass, params, action: "update")).to eq([])
+        expect(controller(klass, params: params, action: "update").permitted_params)
+          .to eq("name" => "Van", "lock_version" => 3)
+      end
+
+      it "treats lock_version as an ordinary column when the model has turned optimistic locking off" do
+        stub_const("GenUnlockedVehicle", Class.new(TestModel) do
+          self.table_name = "gen_vehicles"
+          self.lock_optimistically = false
+        end)
+        draft = described_class.draft(model: GenUnlockedVehicle)
+        expect(draft).to include("optional :lock_version, :integer # database default: #{lock_default}")
+        expect(draft).not_to include("optimistic-locking")
       end
     end
 

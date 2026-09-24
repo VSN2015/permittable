@@ -772,7 +772,7 @@ For each controller the task infers the model from `controller_name` (columns gi
 permit_params :create, root: :user, model: User, mode: :monitor do
   required :name, :string
   optional :age, :integer
-  optional :status, :string, in: User.statuses.keys # database default: "active"
+  optional :status, :string, in: User.statuses.keys # database default: "active"; TODO: Rails also assigns the stored integers (status: 1) — if API clients send them, add User.statuses.values.map(&:to_s) to in: and map them back to keys with transform:
   optional :password_confirmation, :string, virtual: true # TODO: not a database column — confirm the type
   array :tag_names, of: :string # TODO: confirm the element type, and declare length: — an array without one is unbounded
 end
@@ -781,22 +781,22 @@ end
 permit_params :update, root: :user, model: User, mode: :monitor do
   optional :name, :string
   optional :age, :integer
-  optional :status, :string, in: User.statuses.keys # database default: "active"
+  optional :status, :string, in: User.statuses.keys # database default: "active"; TODO: Rails also assigns the stored integers (status: 1) — if API clients send them, add User.statuses.values.map(&:to_s) to in: and map them back to keys with transform:
   optional :password_confirmation, :string, virtual: true # TODO: not a database column — confirm the type
   array :tag_names, of: :string # TODO: confirm the element type, and declare length: — an array without one is unbounded
 end
 ```
 
-Without a scanned `root:`, the draft uses `User.model_name.param_key` — the key Rails forms submit under, so a namespaced `Blog::Post` is rooted at `:blog_post`.
+A scanned draft keeps the root its permit call names (a rootless `params.permit(...)` stays rootless). Only a draft with no permit call to scan — drafted from the columns alone — takes its root from the model: `User.model_name.param_key`, the key Rails forms submit under, so a namespaced `Blog::Post` is rooted at `:blog_post`.
 
 The generator's one rule is **draft, don't guess** — everything it cannot know for sure stays visible instead of silently decided:
 
 - Drafts come out in **monitor mode**, so pasting one changes nothing until you flip it.
 - A permitted key that isn't a column becomes `virtual: true` with a TODO; a column type with no faithful representation (`binary`, geometry types) becomes a TODO comment; a permit argument the conservative parser can't read (`*dynamic_keys`) is kept verbatim in a TODO instead of dropped.
 - **Comments are not code.** A commented-out `params.require(:admin).permit(:superuser)` kept for reference is skipped, so it can't contribute a root or a field to the draft. The source is tokenised with `Ripper` for this, because `#` is only sometimes a comment — a permit call inside `#{'#{...}'}` interpolation is live code and is still read, and quoted keys like `permit("name")` still work.
-- NOT NULL is only true of a **create**. When a column makes a field `required`, the draft splits into a `:create` rule and an `:update` rule with every field optional, so a PATCH carrying only the edited field is not rejected for what it left out. With nothing required it stays one `:create, :update` rule.
-- A Rails `enum` drafts as the keys a form sends (`:string, in: User.statuses.keys`), not the integer it is stored as — and reads them from the model, so a new enum value cannot leave the contract behind.
-- The STI inheritance column (`type`, when the model actually uses STI) and the optimistic-locking column (`lock_version`) are **not** drafted as fields: assigning `type` changes the record's class. Each is named in a TODO saying why, so the omission is visible.
+- NOT NULL is only true of a **create**. When a column makes a field `required`, the draft splits into a `:create` rule and an `:update` rule with every field optional, so a PATCH carrying only the edited field is not rejected for what it left out. With nothing required it stays one `:create, :update` rule. A default the **model** declares (`attribute :plan, default: "free"`, `enum ..., default: :pending`) keeps a NOT NULL column optional just as a database default does, and is shown as `# model default:` — a `Proc` default is named, never called.
+- A Rails `enum` drafts as the keys a form sends (`:string, in: User.statuses.keys`), not the integer it is stored as — and reads them from the model, so a new enum value cannot leave the contract behind. Rails also accepts the stored integer (`status: 1`), which JSON clients sometimes send; a TODO on the line says how to admit it.
+- The STI inheritance column (`type`, when the model actually uses STI) and the optimistic-locking column (`lock_version`, when `lock_optimistically` is on) are **not** drafted from the columns alone: assigning `type` changes the record's class. Each is named in a TODO saying why, so the omission is visible. When the controller's own permit call lists one, it **stays a field**, with a TODO — an edit form that round-trips `lock_version` is how Rails detects a stale update, and dropping it would switch that off the day the draft is enforced.
 - A database default is noted in a comment but **not** copied into `default:` — a contract default is injected on every request that omits the field, which would overwrite columns on partial updates. The database already handles creation.
 - `key: [:a, :b]` in a permit call drafts as a nested block, with a TODO noting it may be an array of hashes. In a `params.expect` call the two shapes are distinguishable — `key: [:a]` is a nested hash, `key: [[:a]]` is an array of hashes — so that draft carries no TODO at all.
 - In a `params.expect` call, a route param sitting next to the envelope (`params.expect(:id, user: [:name])`) is **not** drafted as a field; it stays visible in a TODO, because a routing key is not body input. Neither is a second envelope, which belongs under a different `root:` than one contract can express.

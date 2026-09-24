@@ -24,10 +24,23 @@ module Permittable
 
     # One column as the drafting code sees it: the database facts, plus what
     # the MODEL layers on top — an enum accessor that changes what a client
-    # sends, or a reason the column must not be client-writable at all.
+    # sends, a default the model fills in, or a `sensitive` role (:sti,
+    # :locking) that makes the column dangerous to leave client-writable.
+    # `default` is the comment describing whichever default applies, and
+    # `unread` the error that stopped the model's side from being read.
     # Building these once in columns_for keeps every drafting path (columns
     # alone, or a scan typed from columns) reading the same answers.
-    DraftColumn = Struct.new(:name, :type, :null, :default, :default_function, :enum, :omitted, keyword_init: true)
+    #
+    # `rule` and `listed` are how column_line is told what it is drafting
+    # for: the rule (see render) and whether the controller's permit call
+    # lists the column. They ride on the column, set by in_rule, so the scan
+    # path hands them to column_line without its own methods changing.
+    DraftColumn = Struct.new(:name, :type, :null, :default, :default_function, :enum, :sensitive, :unread,
+                             :rule, :listed, keyword_init: true) do
+      def in_rule(rule, listed: false)
+        self.class.new(**to_h, rule: rule, listed: listed)
+      end
+    end
 
     # Column type => contract type. Document-shaped columns map onto the
     # opaque `:json` field — the shape stays undeclared, which is what a
@@ -149,8 +162,13 @@ module Permittable
       return nil unless columns || scan
 
       root = scan ? scan.root : default_root(model)
-      body = scan ? scanned_lines(scan, columns) : column_lines(columns.values)
-      render(root: root, model: columns && model, body: body)
+      render(root: root, model: columns && model) do |rule|
+        if scan
+          scanned_lines(scan, columns&.transform_values { |column| column.in_rule(rule, listed: true) })
+        else
+          column_lines(columns.values.map { |column| column.in_rule(rule) })
+        end
+      end
     end
 
     def infer_model(controller)
@@ -164,24 +182,83 @@ module Permittable
     # is no model or its schema is unreachable (same philosophy as the drift
     # guard: never let generation crash on a half-migrated database).
     def columns_for(model)
+      columns = schema_columns(model)
+      columns&.to_h { |column| [column.name, draft_column(model, column)] }
+    end
+
+    # Only schema access is rescued here. The model introspection layered on
+    # top (draft_column) must not share this rescue: an error there would
+    # otherwise discard EVERY column — the draft silently falls back to a
+    # scan alone, or to nothing — for what is one column's problem.
+    def schema_columns(model)
       return nil unless model.respond_to?(:columns)
       return nil unless model.table_exists?
 
       # Array() flattens a composite primary key (an Array in Rails 7.1+)
       # into its column names; a nil primary key becomes [].
       skipped = SKIPPED_COLUMNS + Array(model.primary_key).map(&:to_s)
-      model.columns.reject { |c| skipped.include?(c.name) }.to_h { |c| [c.name, draft_column(model, c)] }
+      model.columns.reject { |c| skipped.include?(c.name) }
     rescue StandardError
       nil
     end
 
     def draft_column(model, column)
-      enum = enum_for(model, column.name)
-      default = column.default
-      default = enum[:mapping].find { |_key, value| value.to_s == default.to_s }&.first || default if enum && default
-      DraftColumn.new(name: column.name, type: column.type, null: column.null, default: default,
+      DraftColumn.new(name: column.name, type: column.type, null: column.null,
                       default_function: column.respond_to?(:default_function) && column.default_function,
-                      enum: enum && enum[:values], omitted: omitted_reason(model, column.name))
+                      **model_facts(model, column))
+    end
+
+    # What the model adds to one column. An error reading it degrades THAT
+    # column to its database facts, with the error in a TODO — rather than
+    # raising, which would abort permittable:generate for every controller
+    # over one odd model, or dropping the column, which would hide it. The
+    # message is squished because it lands in a one-line comment, where a
+    # newline would end the comment and leave the draft unparseable.
+    def model_facts(model, column)
+      enum = enum_for(model, column.name)
+      { enum: enum && enum[:accessor], default: default_note(model, column, enum),
+        sensitive: sensitive_role(model, column.name) }
+    rescue StandardError => e
+      { default: database_default_note(column, nil), unread: "#{e.class}: #{e.message}".squish }
+    end
+
+    # The default Rails actually applies, as a comment. One the MODEL
+    # declares — `attribute :carrier, default: "post"`, `enum ..., default:
+    # :pending` — never reaches the schema, yet it fills the field on create
+    # just as a database default does, so it too keeps a NOT NULL column
+    # from being `required`. It wins over the database's, as it does in
+    # Rails.
+    def default_note(model, column, enum)
+      declared = model_default(model, column.name)
+      declared ? "model default: #{declared}" : database_default_note(column, enum)
+    end
+
+    # An enum's database default is its stored integer; shown as its key
+    # (`"pending"`, not `0`), which is what the drafted field accepts.
+    def database_default_note(column, enum)
+      default = column.default
+      return nil if default.nil?
+
+      default = enum[:mapping].find { |_key, value| value.to_s == default.to_s }&.first || default if enum
+      "database default: #{default.inspect}"
+    end
+
+    # `_default_attributes` (nodoc, but what `column_defaults` is built from
+    # in every supported Rails, 6.1–8.1) holds a UserProvidedDefault for each
+    # default the model declares; the rest came from the database. Read per
+    # attribute rather than through column_defaults, which evaluates every
+    # Proc default at once. A Proc is not called at all — drafting must not
+    # run app code with side effects, and today's value says nothing about
+    # tomorrow's. Its value is cast the way the model reads it, so an enum's
+    # comes back as its key.
+    def model_default(model, name)
+      return nil unless model.respond_to?(:_default_attributes) && defined?(ActiveModel::Attribute::UserProvidedDefault)
+
+      attribute = model._default_attributes[name]
+      return nil unless attribute.is_a?(ActiveModel::Attribute::UserProvidedDefault)
+      return "computed by a Proc" if attribute.send(:user_provided_value).is_a?(Proc)
+
+      attribute.value&.inspect
     end
 
     # A Rails enum stores an integer but is ASSIGNED its key: a form sends
@@ -193,24 +270,28 @@ module Permittable
       return nil unless model.respond_to?(:defined_enums)
 
       mapping = model.defined_enums[name]
-      mapping && { mapping: mapping, values: "#{model.name}.#{name.pluralize}.keys" }
+      mapping && { mapping: mapping, accessor: "#{model.name}.#{name.pluralize}" }
     end
 
-    # Columns that exist but that no client should be able to write. Both are
-    # kept out of the fields and named in a TODO instead, so the omission is
-    # visible rather than silent.
-    def omitted_reason(model, name)
+    # The role that makes a column dangerous for a client to write — :sti,
+    # :locking, or nil. What the draft then does with it is column_line's
+    # call, since that depends on whether the permit call lists it.
+    def sensitive_role(model, name)
       # Only a model that actually uses STI: the inheritance column is set
       # (not nil) AND exists. Mass-assigning it changes which class the
       # record is loaded as — `type: "Admin"` on a signup form.
-      if model.respond_to?(:inheritance_column) && model.inheritance_column.to_s == name
-        return "is the STI inheritance column — assigning it changes the record's class, so no client should send it; " \
-               "if clients really pick the subclass, declare it with in: the allowed class names"
-      end
-      return nil unless model.respond_to?(:locking_column) && model.locking_column.to_s == name
+      return :sti if model.respond_to?(:inheritance_column) && model.inheritance_column.to_s == name
 
-      "is the optimistic-locking column — Rails increments it on every save; if your edit forms round-trip it " \
-        "as a hidden field for stale-update detection, declare `optional :#{name}, :integer` on the :update rule"
+      :locking if locking_column?(model, name)
+    end
+
+    # Mirrors the STI check's respect for `inheritance_column = nil`: with
+    # `self.lock_optimistically = false` Rails never reads or bumps the
+    # column, so it is an ordinary integer and drafts as one.
+    def locking_column?(model, name)
+      return false unless model.respond_to?(:locking_column) && model.locking_column.to_s == name
+
+      !model.respond_to?(:lock_optimistically) || model.lock_optimistically
     end
 
     # -- scan parsing -------------------------------------------------------
@@ -302,19 +383,76 @@ module Permittable
       columns.map { |column| column_line(column) }
     end
 
+    # One column's line in one rule — `column.rule` is :shared (a single
+    # :create, :update rule), :create, or :update, which never requires
+    # anything (see render). `column.listed` says the controller's own
+    # permit call lists the column, which decides what a sensitive column
+    # becomes.
+    #
     # Names are emitted with Symbol#inspect, so a column called `first-name`
     # or `2fa_enabled` drafts as `:"first-name"` rather than as Ruby that
     # does not parse.
     def column_line(column)
-      return "# TODO: #{column.name} #{column.omitted}" if column.omitted
+      return "# TODO: #{column.name} #{omitted_note(column)}" if column.sensitive && !column.listed
 
       type = column.enum ? :string : COLUMN_TYPES[column.type]
       return "# TODO: #{column.name} (#{column.type}) has no contract type — declare it as a nested block or an array" unless type
 
-      line = "#{required_column?(column) ? 'required' : 'optional'} #{column.name.to_sym.inspect}, :#{type}"
-      line += ", in: #{column.enum}" if column.enum
-      line += " # database default: #{column.default.inspect}" unless column.default.nil?
-      line
+      required = column.rule != :update && required_column?(column)
+      line = "#{required ? 'required' : 'optional'} #{column.name.to_sym.inspect}, :#{type}"
+      line += ", in: #{column.enum}.keys" if column.enum
+      notes = [column.default, *column_todos(column)].compact
+      notes.empty? ? line : "#{line} # #{notes.join('; ')}"
+    end
+
+    # Drafting from columns alone, a sensitive column is left out of the
+    # fields — nothing says any client sends it — and named here instead.
+    # The lock_version note says where to declare it in the rules actually
+    # drafted: stale-update detection is an update's concern, so a split
+    # :create rule points at the :update rule rather than at itself.
+    def omitted_note(column)
+      return STI_OMITTED if column.sensitive == :sti
+
+      where = column.rule == :create ? "in the :update rule below" : "here"
+      "is the optimistic-locking column — Rails increments it on every save; if your edit forms round-trip it " \
+        "as a hidden field for stale-update detection, declare `optional #{column.name.to_sym.inspect}, :integer` #{where}"
+    end
+
+    STI_OMITTED = "is the STI inheritance column — assigning it changes the record's class, so no client should " \
+                  "send it; if clients really pick the subclass, declare it with in: the allowed class names".freeze
+
+    # The TODOs a drafted column line carries. A sensitive column the permit
+    # call lists stays a field — omitting lock_version there would silently
+    # switch off the stale-update detection the app wired up, the moment the
+    # draft is enforced — but says why it deserves a second look.
+    def column_todos(column)
+      todos = []
+      todos << "TODO: #{column.name} #{SCANNED_SENSITIVE.fetch(column.sensitive)}" if column.sensitive
+      todos << enum_todo(column) if column.enum
+      todos << unread_todo(column) if column.unread
+      todos
+    end
+
+    SCANNED_SENSITIVE = {
+      locking: "is the optimistic-locking column — kept because the permit call lists it: an edit form that " \
+               "round-trips it is how Rails detects a stale update; never give it a default:",
+      sti: "is the STI inheritance column — kept because the permit call lists it, but assigning it changes the " \
+           "record's class: restrict it with in: the subclass names a client may pick"
+    }.freeze
+
+    # Rails assigns an enum its stored integer too (`status: 1` from a JSON
+    # client), but a :string field passes that on as "1" — which in: rejects,
+    # and which Rails' enum rejects as well, so admitting it also means mapping
+    # it back to its key. Left as a TODO rather than drafted: forms, the
+    # common client, send the key.
+    def enum_todo(column)
+      "TODO: Rails also assigns the stored integers (#{column.name}: 1) — if API clients send them, add " \
+        "#{column.enum}.values.map(&:to_s) to in: and map them back to keys with transform:"
+    end
+
+    def unread_todo(column)
+      "TODO: could not read what the model adds to #{column.name} (#{column.unread}) — check its enum, " \
+        "default and STI/locking role by hand"
     end
 
     # NOT NULL without a database default is the only case a client truly
@@ -372,20 +510,20 @@ module Permittable
     # One rule, unless a column made something `required`: that is true of a
     # create, but an update carrying only the edited field would be rejected
     # for everything it left out. So the update gets its own rule — the same
-    # fields, every one optional — and only when both actions are drafted.
-    def render(root:, model:, body:, actions: DEFAULT_ACTIONS)
-      rules = split_rules(actions, body).map do |rule_actions, lines|
-        "#{signature(root: root, model: model, actions: rule_actions)}\n#{lines.map { |line| "  #{line}\n" }.join}end\n"
+    # fields, every one optional.
+    #
+    # `lines` drafts the body for one rule (see DraftColumn#in_rule), so
+    # each rule is drafted rather than edited from another's text. The
+    # single-rule body and the :update body differ exactly when some column
+    # was drafted `required`, which is the test for splitting.
+    def render(root:, model:, &lines)
+      shared = lines.call(:shared)
+      update = lines.call(:update)
+      rules = shared == update ? [[DEFAULT_ACTIONS, shared]] : [[%i[create], lines.call(:create)], [%i[update], update]]
+      bodies = rules.map do |actions, body|
+        "#{signature(root: root, model: model, actions: actions)}\n#{body.map { |line| "  #{line}\n" }.join}end\n"
       end
-      HEADER + rules.join("\n#{UPDATE_NOTE}")
-    end
-
-    REQUIRED_LINE = /\Arequired /
-
-    def split_rules(actions, body)
-      return [[actions, body]] unless body.any?(REQUIRED_LINE) && (%i[create update] - actions).empty?
-
-      [[actions - [:update], body], [[:update], body.map { |line| line.sub(REQUIRED_LINE, "optional ") }]]
+      HEADER + bodies.join("\n#{UPDATE_NOTE}")
     end
   end
 end
