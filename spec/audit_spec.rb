@@ -113,15 +113,39 @@ RSpec.describe Permittable::Audit do
       )
     end
 
-    # rails_routes expands `scope "(:locale)"` into one descriptor per URL.
-    # The table lists both — each is a real URL — but they are one routed
-    # action, and one unguarded POST must not count as two.
-    it "counts an action once however many paths reach it" do
-      localized = routes + [{ controller: "users", action: "create", verb: "post", path: "/{locale}/users" },
-                            { controller: "legacy", action: "create", verb: "post", path: "/{locale}/legacy" }]
+    # rails_routes expands `scope "(:locale)"` into one descriptor per URL,
+    # each tagged with the route it came from. The table lists both — each is
+    # a real URL — but they are one route, and one unguarded POST must not
+    # count as two.
+    it "counts the paths expanded from one route once" do
+      sourced = routes.each_with_index.map { |route, index| route.merge(route: index) }
+      localized = sourced + [{ controller: "users", action: "create", verb: "post", path: "/{locale}/users", route: 1 },
+                             { controller: "legacy", action: "create", verb: "post", path: "/{locale}/legacy", route: 4 }]
       expanded = described_class.entries(controllers: [users, bare_class("legacy")], routes: localized)
       expect(expanded.length).to eq(7)
       expect(described_class.summary(expanded)).to eq(described_class.summary(entries))
+    end
+
+    # Two routes to the same action are two ways in, not one: each unguarded
+    # POST is its own gap, and `[strict]` must count both. A hand-built
+    # descriptor with no `route:` is its own route.
+    it "counts distinct routes to the same action separately" do
+      admin = routes + [{ controller: "legacy", action: "create", verb: "post", path: "/admin/legacy" }]
+      counts = described_class.summary(described_class.entries(controllers: [users, bare_class("legacy")],
+                                                               routes: admin))
+      expect(counts).to include(actions: 6, uncovered: 4, uncovered_with_body: 3)
+    end
+
+    it "tells a route's expanded paths from a second route, reading a real route set" do
+      route_set = ActionDispatch::Routing::RouteSet.new
+      route_set.draw do
+        scope("(:locale)") { post "legacy", to: "legacy#create" }
+        post "admin/legacy", to: "legacy#create"
+      end
+      descriptors = Permittable::OpenAPI.rails_routes(Struct.new(:routes).new(route_set))
+      found = described_class.entries(controllers: [bare_class("legacy")], routes: descriptors)
+      expect(found.map(&:path)).to contain_exactly("/legacy", "/{locale}/legacy", "/admin/legacy")
+      expect(described_class.summary(found)).to include(actions: 2, uncovered_with_body: 2)
     end
   end
 
@@ -136,6 +160,17 @@ RSpec.describe Permittable::Audit do
       expect(report).to include("3 without a contract")
       expect(report).to include("2 of those accept a request body")
       expect(report).to include("users#archive")
+    end
+
+    # The summary counts routes, the table lists paths; when an optional
+    # segment makes the two differ, the report says which number is which.
+    it "says how many paths the table lists when one route expands to several" do
+      sourced = routes.each_with_index.map { |route, index| route.merge(route: index) }
+      localized = sourced + [{ controller: "legacy", action: "create", verb: "post", path: "/{locale}/legacy", route: 4 }]
+      expanded = described_class.entries(controllers: [users, bare_class("legacy")], routes: localized)
+      report = described_class.format(expanded)
+      expect(report).to include("5 routed actions across 6 paths (an optional segment's paths count once): ")
+      expect(described_class.format(entries)).to include("5 routed actions: ")
     end
 
     it "says so plainly when there is nothing to report" do

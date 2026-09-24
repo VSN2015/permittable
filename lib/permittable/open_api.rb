@@ -278,8 +278,13 @@ module Permittable
     # `scope "(:locale)"` as `(/{locale})/posts` made the whole document fail
     # validation. Each variant is its own descriptor, so each path's variables
     # are required there — which, for that path, they are.
+    #
+    # Each descriptor also carries `route:`, the index of the route it came
+    # from, so a reader counting routes rather than paths (Audit.summary) can
+    # tell one route's expanded variants from a second route that happens to
+    # reach the same action. The exporter ignores it.
     def rails_routes(app)
-      descriptors = app.routes.routes.flat_map do |route|
+      descriptors = app.routes.routes.each_with_index.flat_map do |route, index|
         requirements = route.requirements
         verb = route.verb.to_s
         next [] if requirements[:controller].nil? || requirements[:action].nil? || verb.empty?
@@ -290,7 +295,7 @@ module Permittable
         # dropped the others from the export entirely.
         verb.split("|").map do |single|
           { controller: requirements[:controller], action: requirements[:action],
-            verb: single.downcase, path: path }
+            verb: single.downcase, path: path, route: index }
         end
       end
       descriptors.flat_map do |descriptor|

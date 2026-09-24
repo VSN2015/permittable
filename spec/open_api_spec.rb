@@ -168,8 +168,8 @@ RSpec.describe Permittable::OpenAPI do
       app = Struct.new(:routes).new(route_set)
       expect(described_class.rails_routes(app)).to eq(
         [
-          { controller: "users", action: "show", verb: "get", path: "/users/{id}" },
-          { controller: "users", action: "create", verb: "post", path: "/users" }
+          { controller: "users", action: "show", verb: "get", path: "/users/{id}", route: 0 },
+          { controller: "users", action: "create", verb: "post", path: "/users", route: 1 }
         ]
       )
     end
@@ -184,8 +184,8 @@ RSpec.describe Permittable::OpenAPI do
       app = Struct.new(:routes).new(route_set)
       expect(described_class.rails_routes(app)).to eq(
         [
-          { controller: "users", action: "update", verb: "patch", path: "/users/{id}" },
-          { controller: "users", action: "update", verb: "put", path: "/users/{id}" }
+          { controller: "users", action: "update", verb: "patch", path: "/users/{id}", route: 0 },
+          { controller: "users", action: "update", verb: "put", path: "/users/{id}", route: 0 }
         ]
       )
     end
@@ -204,8 +204,8 @@ RSpec.describe Permittable::OpenAPI do
       app = Struct.new(:routes).new(route_set)
       expect(described_class.rails_routes(app)).to eq(
         [
-          { controller: "files", action: "show", verb: "get", path: "/files/{rest}" },
-          { controller: "files", action: "nested", verb: "get", path: "/files/{bucket}/{path}" }
+          { controller: "files", action: "show", verb: "get", path: "/files/{rest}", route: 0 },
+          { controller: "files", action: "nested", verb: "get", path: "/files/{bucket}/{path}", route: 1 }
         ]
       )
     end
@@ -223,10 +223,10 @@ RSpec.describe Permittable::OpenAPI do
         app = app_with { scope("(:locale)") { resources :posts, only: %i[index show] } }
         expect(described_class.rails_routes(app)).to eq(
           [
-            { controller: "posts", action: "index", verb: "get", path: "/posts" },
-            { controller: "posts", action: "index", verb: "get", path: "/{locale}/posts" },
-            { controller: "posts", action: "show", verb: "get", path: "/posts/{id}" },
-            { controller: "posts", action: "show", verb: "get", path: "/{locale}/posts/{id}" }
+            { controller: "posts", action: "index", verb: "get", path: "/posts", route: 0 },
+            { controller: "posts", action: "index", verb: "get", path: "/{locale}/posts", route: 0 },
+            { controller: "posts", action: "show", verb: "get", path: "/posts/{id}", route: 1 },
+            { controller: "posts", action: "show", verb: "get", path: "/{locale}/posts/{id}", route: 1 }
           ]
         )
       end
