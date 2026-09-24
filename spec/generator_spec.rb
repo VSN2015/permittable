@@ -542,7 +542,7 @@ RSpec.describe Permittable::Generator do
         "tags is permitted as both a scalar and an array — drafted as the array",
         "address is permitted as both a scalar and a nested hash — drafted as the nested hash",
         "items is permitted as a scalar, a nested hash and an array of hashes — " \
-        "drafted as the array of hashes, with the sub-keys of both"
+        "drafted as the array of hashes with the nested hash's sub-keys merged in, dropping the scalar"
       )
     end
 
@@ -550,6 +550,27 @@ RSpec.describe Permittable::Generator do
       scan = described_class.scan("params.require(:u).permit(items: [:sku, :name])\nparams.expect(u: [items: [[:qty]]])")
       expect(scan.nested).to eq({})
       expect(scan.nested_arrays).to eq(items: %i[qty sku name])
+      expect(scan.conflicts).to contain_exactly(
+        "items is permitted as both a nested hash and an array of hashes — " \
+        "drafted as the array of hashes with the nested hash's sub-keys merged in"
+      )
+    end
+
+    it "names every shape when a scalar joins shapes that accept different input" do
+      scan = described_class.scan("params.require(:u).permit(:name, :tags, tags: [])\nparams.require(:u).permit(tags: [:a])")
+      expect(scan.scalars).to eq(%i[name])
+      expect(scan.conflicts).to contain_exactly(
+        "tags is permitted as a scalar, an array and a nested hash, which accept different input — " \
+        "drafted as none of them; declare the shape its actions share"
+      )
+    end
+
+    it "reads an empty nested list as unparsable, never as an empty block" do
+      scan = described_class.scan("params.require(:u).permit(:name, meta: [ , ])\nparams.expect(u: [opts: [[ ]]])")
+      expect(scan.nested).to eq({})
+      expect(scan.nested_arrays).to eq({})
+      expect(scan.unparsed).to eq(["meta: [ , ]", "opts: [[ ]]"])
+      expect(load_draft(described_class.draft(scan: scan))[:fields].map { |f| f[:name] }).to eq(%i[name])
     end
 
     it "drafts neither of an array and a nested hash, which accept different input" do
@@ -619,6 +640,147 @@ RSpec.describe Permittable::Generator do
     end
   end
 
+  describe ".scan of single-key route-param lookups" do
+    it "keeps the scaffold's root beside a rootless filter call" do
+      scan = described_class.scan(<<~RUBY)
+        def set_post = @post = Post.find(params.expect(:id))
+        def index = Post.page(params.permit(:page))
+        def post_params = params.expect(post: [:title])
+      RUBY
+      expect(scan.root).to eq(:post)
+      expect(scan.scalars).to eq(%i[title])
+      expect(scan.rootless).to eq([":id", ":page"])
+    end
+
+    it "never drafts `:id` or a `*_id` lookup as a field, even when the rootless calls win" do
+      scan = described_class.scan(<<~RUBY)
+        @post = Post.find(params.expect(:id))
+        @user = User.find(params.permit(:user_id))
+        params.permit(:q, :page)
+      RUBY
+      expect(scan.root).to be_nil
+      expect(scan.scalars).to eq(%i[q page])
+      expect(scan.rootless).to eq([":id", ":user_id"])
+    end
+
+    it "still counts `:id` inside a call with other keys" do
+      scan = described_class.scan("params.permit(:id, :q)\nparams.require(:search).permit(:q)")
+      expect(scan.root).to be_nil
+      expect(scan.scalars).to eq(%i[id q])
+    end
+  end
+
+  describe ".scan of an expect envelope spelled with a constant" do
+    it "reads `post: PERMITTED_PARAMS` as the post envelope, with fields it cannot parse" do
+      scan = described_class.scan("params.expect(post: PERMITTED_PARAMS)")
+      expect(scan.root).to eq(:post)
+      expect(scan.unparsed).to eq(["PERMITTED_PARAMS"])
+      expect(scan).not_to be_fields
+    end
+  end
+
+  describe ".scan of a body shape beside an expect envelope" do
+    it "says it is outside the envelope rather than calling it a route param" do
+      draft = described_class.draft(scan: described_class.scan("params.expect(:id, post: [:title], tag_names: [])"))
+      expect(draft).to include("# TODO: route or query param, not a body field: :id")
+      expect(draft).to include("# TODO: outside the post envelope, so not in this contract: tag_names: []")
+      expect(draft).not_to include("route or query param, not a body field: tag_names")
+      expect(load_draft(draft)[:root]).to eq(:post)
+    end
+
+    it "says it was sent beside another envelope when the rootless calls won" do
+      source = "params.expect(post: [:title], tag_names: [])\nparams.permit(:q, :page)"
+      draft = described_class.draft(scan: described_class.scan(source))
+      expect(draft).to include("# TODO: sent beside another envelope, so not in this contract: tag_names: []")
+      expect(load_draft(draft)[:fields].map { |f| f[:name] }).to eq(%i[q page])
+    end
+  end
+
+  describe ".for_controller when an envelope is the model's own" do
+    before do
+      ActiveRecord::Schema.define do
+        create_table :gen_posts do |t|
+          t.string :title, null: false
+          t.text   :body
+        end
+      end
+      stub_const("GenPost", Class.new(TestModel) { self.table_name = "gen_posts" })
+    end
+
+    after { ActiveRecord::Base.connection.drop_table(:gen_posts, if_exists: true) }
+
+    let(:controller) { Class.new { def self.controller_name = "gen_posts" } }
+
+    it "roots the draft at the model's envelope, whatever the scores say" do
+      source = "params.require(:search).permit(:q, :sort, :page)\nparams.expect(gen_post: [:title])"
+      expect(described_class.scan(source, model: GenPost).root).to eq(:gen_post)
+      draft = described_class.for_controller(controller, source: source)
+      expect(draft).to include("root: :gen_post, model: GenPost")
+      expect(draft).to include("# TODO: belongs to another envelope (search): search: [:q, :sort, :page]")
+      expect(load_draft(draft)[:root]).to eq(:gen_post)
+    end
+
+    it "roots at the model's envelope even with no parsed fields, and falls back to the columns" do
+      draft = described_class.for_controller(controller, source: <<~RUBY)
+        def index = Post.page(params.permit(:page))
+        def gen_post_params = params.require(:gen_post).permit(*PERMITTED)
+      RUBY
+      expect(draft).to include("root: :gen_post, model: GenPost")
+      expect(draft).to include("required :title, :string")
+      expect(draft).to include("# TODO: could not parse from the permit call: *PERMITTED")
+      expect(draft).to include("# TODO: route or query param, not a body field: :page")
+      expect(load_draft(draft)[:fields].map { |f| f[:name] }).to eq(%i[title body])
+    end
+
+    it "falls back to the columns for a constant envelope" do
+      draft = described_class.for_controller(controller, source: "params.expect(gen_post: PERMITTED_PARAMS)")
+      expect(draft).to include("root: :gen_post, model: GenPost")
+      expect(draft).to include("# TODO: could not parse from the permit call: PERMITTED_PARAMS")
+      expect(load_draft(draft)[:fields].map { |f| f[:name] }).to eq(%i[title body])
+    end
+
+    it "scores the envelopes as before when none is the model's" do
+      source = "params.require(:search).permit(:q, :sort)\nparams.require(:post).permit(:title)"
+      expect(described_class.scan(source, model: GenPost).root).to eq(:search)
+    end
+  end
+
+  describe ".draft when no line would declare a field" do
+    before do
+      ActiveRecord::Schema.define do
+        create_table(:gen_blobs) { |t| t.binary :data }
+        create_table :gen_files do |t|
+          t.string :name
+          t.binary :data
+        end
+      end
+      stub_const("GenBlob", Class.new(TestModel) { self.table_name = "gen_blobs" })
+      stub_const("GenFile", Class.new(TestModel) { self.table_name = "gen_files" })
+    end
+
+    after do
+      ActiveRecord::Base.connection.drop_table(:gen_blobs, if_exists: true)
+      ActiveRecord::Base.connection.drop_table(:gen_files, if_exists: true)
+    end
+
+    it "falls back to the columns when every scanned key is a column with no contract type" do
+      draft = described_class.draft(model: GenFile, scan: described_class.scan("params.require(:upload).permit(:data)"))
+      expect(draft).to include("root: :upload, model: GenFile")
+      expect(draft).to include("optional :name, :string")
+      expect(draft).to include("# TODO: data (binary) has no contract type")
+      expect(load_draft(draft)[:fields].map { |f| f[:name] }).to eq(%i[name])
+    end
+
+    it "returns nil when the columns cannot declare a field either" do
+      expect(described_class.draft(model: GenBlob, scan: described_class.scan("params.require(:upload).permit(:data)")))
+        .to be_nil
+    end
+
+    it "returns nil for a model whose only columns have no contract type" do
+      expect(described_class.draft(model: GenBlob)).to be_nil
+    end
+  end
+
   describe "every scan-driven draft loads" do
     [
       "params.require(:post).permit(:title, :body)",
@@ -632,7 +794,11 @@ RSpec.describe Permittable::Generator do
       "params.require(:u).permit(:name, items: [:sku])\nparams.expect(u: [items: [[:qty]]])",
       "params.require(:u).permit(:name, tags: [])\nparams.require(:u).permit(tags: [:a])",
       'params.permit("2fa", codes: ["2fa"])',
-      "params.expect(tag_names: [ ])"
+      "params.expect(tag_names: [ ])",
+      "Post.find(params.expect(:id))\nparams.permit(:page)\nparams.expect(post: [:title])",
+      "params.permit(:page)\nparams.expect(post: [:title], tag_names: [])",
+      "params.require(:u).permit(:name, meta: [ , ], opts: [[ ]])",
+      "params.expect(u: [:name, meta: [[ ]]])"
     ].each do |source|
       it "loads the draft of #{source.inspect}" do
         expect { load_draft(described_class.draft(scan: described_class.scan(source))) }.not_to raise_error

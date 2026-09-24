@@ -53,6 +53,9 @@ module Permittable
         calls.positive?
       end
 
+      # Whether the chosen root's calls parsed into any field. A draft checks
+      # its lines instead (Generator.declares_field?): a scanned key whose
+      # column has no contract type is a field here but only a TODO there.
       def fields?
         [scalars, arrays, nested, nested_arrays].any? { |shape| !shape.empty? }
       end
@@ -83,6 +86,17 @@ module Permittable
     # with no fields.
     EXPECT_ENVELOPE = /\A(\w+):\s*\[(?!\s*[\[\]])\s*(.*?)\s*\]\z/m
 
+    # An envelope whose fields live in a constant: `post: PERMITTED_PARAMS`.
+    # The fields cannot be read, but the root can, and read as a rootless
+    # argument it let a `params.permit(:page)` beside it take the root.
+    EXPECT_CONSTANT_ENVELOPE = /\A(\w+):\s*((?:::)?[A-Z]\w*(?:::[A-Z]\w*)*)\z/
+
+    # The key of a single-key rootless lookup that is a route param, not
+    # input: the Rails 8 scaffold's `Post.find(params.expect(:id))`, or a
+    # nested resource's `params.expect(:post_id)`. Only a call with that one
+    # key counts — `params.permit(:id, :q)` is a filter that names an id.
+    ROUTE_PARAM_KEY = /\A(?:id|\w+_id)\z/
+
     # A permit key: `:name`, `"name"`, or `'name'` (quotes must match —
     # anything else stays unparsed rather than guessed).
     SCALAR_KEY = /\A(?::(\w+)|"(\w+)"|'(\w+)')\z/
@@ -99,8 +113,9 @@ module Permittable
     HASH_SHAPES = %i[nested nested_arrays].freeze
 
     # One params call, or one envelope of an expect call, at its offset in
-    # the source. `route_params` are the plain keys an expect call spells
-    # beside its envelope — never body fields, whichever root wins.
+    # the source. `route_params` are never body fields, whichever root wins:
+    # the arguments an expect call spells beside its envelope, and the key of
+    # a single-key route-param lookup (ROUTE_PARAM_KEY).
     Call = Struct.new(:position, :root, :fields, :route_params)
     private_constant :Call
 
@@ -149,18 +164,21 @@ module Permittable
     # The calls are read in SOURCE order, whichever spelling each uses:
     # scanning every permit call before every expect call made "first seen"
     # mean "first permit call", so a later search form could outrank the
-    # expect envelope above it.
-    def scan(source)
+    # expect envelope above it. The sort is made stable by the index, because
+    # the envelopes of one expect call share a position and `sort_by` alone
+    # may reorder them.
+    #
+    # `model:` names the envelope a Rails form for that model sends; see
+    # choose_root.
+    def scan(source, model: nil)
       result = Scan.new(root: nil, scalars: [], arrays: [], nested: {}, nested_arrays: {}, unparsed: [],
                         conflicts: [], rootless: [], other_envelopes: {}, calls: 0)
       source = executable_source(source.to_s)
-      permits = matches(source, PERMIT_CALL).map do |match|
-        [Call.new(match.begin(0), match[1]&.to_sym, split_args(match[2]), [])]
-      end
+      permits = matches(source, PERMIT_CALL).map { |match| permit_call(match) }
       expects = matches(source, EXPECT_CALL).map { |match| expect_calls(match.begin(0), split_args(match[1])) }
       result.calls = permits.size + expects.size
-      calls = (permits + expects).flatten.sort_by(&:position)
-      result.root = choose_root(calls)
+      calls = (permits + expects).flatten.sort_by.with_index { |call, index| [call.position, index] }
+      result.root = choose_root(calls, model&.name && default_root(model))
       calls.each { |call| merge_call(result, call) }
       resolve_conflicts(result)
       result
@@ -174,21 +192,32 @@ module Permittable
     # controller_name (or passed explicitly), permit calls scanned from
     # `source:` when given. Returns nil when there is nothing to draft from.
     def for_controller(controller, source: nil, model: nil)
-      draft(model: model || infer_model(controller), scan: scan(source))
+      model ||= infer_model(controller)
+      draft(model: model, scan: scan(source, model: model))
     end
 
     # The core: knowledge in (columns and/or a scan), snippet out. Returns a
-    # String of valid Ruby, or nil when neither source of knowledge exists.
+    # String of valid Ruby, or nil when neither source of knowledge exists —
+    # or when neither can declare a single field, since a contract of only
+    # TODO lines raises `a contract must declare at least one field` the
+    # moment it is pasted.
     def draft(model: nil, scan: nil)
       columns = columns_for(model)
       scan = nil unless scan&.found?
       return nil unless columns || scan
+      return column_draft(model, columns.values, []) unless scan
 
-      return fallback_draft(model, scan, columns) if scan && !scan.fields?
+      body = scanned_lines(scan, columns)
+      return fallback_draft(model, scan, columns) unless declares_field?(body)
 
-      root = scan ? scan.root : default_root(model)
-      body = scan ? scanned_lines(scan, columns) : column_lines(columns.values)
-      render(signature(root: root, model: columns && model), body)
+      render(signature(root: scan.root, model: columns && model), body)
+    end
+
+    # Whether any line declares a field. Scan#fields? cannot answer this
+    # alone: a scanned key whose column has no contract type (binary,
+    # geometry) drafts only a TODO.
+    def declares_field?(lines)
+      lines.any? { |line| !line.start_with?("#") }
     end
 
     # A scan that found calls but no fields — `permit(*PERMITTED)`, or every
@@ -203,7 +232,14 @@ module Permittable
     def fallback_draft(model, scan, columns)
       return nil unless columns
 
-      render(signature(root: scan.root, model: model), column_lines(columns.values) + scan_todo_lines(scan))
+      column_draft(model, columns.values, scan_todo_lines(scan), root: scan.root)
+    end
+
+    # A draft from the columns, or nil when none of them has a contract type
+    # to declare it with.
+    def column_draft(model, columns, todos, root: default_root(model))
+      lines = column_lines(columns)
+      declares_field?(lines) ? render(signature(root: root, model: model), lines + todos) : nil
     end
 
     def infer_model(controller)
@@ -254,13 +290,37 @@ module Permittable
     # root: `expect(post: [...], comment: [...])` can be where the comment
     # contract's fields live, and reading only the first envelope hid them.
     def expect_calls(position, args)
-      envelopes, others = args.partition { |arg| EXPECT_ENVELOPE.match?(arg) }
-      return [Call.new(position, nil, others, [])] if envelopes.empty?
+      envelopes, others = args.partition { |arg| envelope(arg) }
+      return [rootless_call(position, others)] if envelopes.empty?
 
-      envelopes.each_with_index.map do |envelope, index|
-        match = EXPECT_ENVELOPE.match(envelope)
-        Call.new(position, match[1].to_sym, split_args(match[2]), index.zero? ? others : [])
+      envelopes.each_with_index.map do |arg, index|
+        root, fields = envelope(arg)
+        Call.new(position, root, fields, index.zero? ? others : [])
       end
+    end
+
+    # An expect argument as `[root, fields]` when it is an envelope, else nil.
+    # A constant envelope's one "field" is the constant, kept as unparsable.
+    def envelope(arg)
+      if (match = EXPECT_ENVELOPE.match(arg))
+        [match[1].to_sym, split_args(match[2])]
+      elsif (match = EXPECT_CONSTANT_ENVELOPE.match(arg))
+        [match[1].to_sym, [match[2]]]
+      end
+    end
+
+    def permit_call(match)
+      args = split_args(match[2])
+      match[1] ? Call.new(match.begin(0), match[1].to_sym, args, []) : rootless_call(match.begin(0), args)
+    end
+
+    # A rootless call — or, when its one key is a route param
+    # (ROUTE_PARAM_KEY), a lookup with no fields at all, so it can neither
+    # score toward the root nor be drafted as a field when the rootless calls
+    # win.
+    def rootless_call(position, args)
+      route = args.size == 1 && (key = scalar_key(args.first)) && ROUTE_PARAM_KEY.match?(key.to_s)
+      route ? Call.new(position, nil, [], args) : Call.new(position, nil, args, [])
     end
 
     # The candidate — an envelope, or the rootless calls together (root nil)
@@ -277,7 +337,14 @@ module Permittable
     # envelope wins a tie because a rootless key beside one is usually a
     # route or query param: a one-field Rails 8 scaffold calls
     # `params.expect(:id)` in `set_post` above `params.expect(post: [:title])`.
-    def choose_root(calls)
+    #
+    # Before any of that, the model's own envelope wins outright when one of
+    # the calls uses it (`preferred`, derived like default_root): it is the
+    # envelope a Rails form for the model sends, and the only way to root a
+    # `require(:post).permit(*PERMITTED)` that has no field to score with.
+    def choose_root(calls, preferred = nil)
+      return preferred if preferred && calls.any? { |call| call.root == preferred }
+
       candidates = calls.group_by(&:root)
       best = candidates.each_with_index.max_by do |(root, same), index|
         [same.flat_map { |call| call.fields.filter_map { |arg| parse_arg(arg)&.at(1) } }.uniq.size, root ? 1 : 0, -index]
@@ -331,12 +398,21 @@ module Permittable
       if shapes.include?(:arrays) && shapes.intersect?(HASH_SHAPES)
         shapes.each { |shape| result[shape].delete(key) }
         return "#{key} is permitted as #{listed_shapes(shapes)}, which accept different input — " \
-               "drafted as neither; declare the shape its actions share"
+               "drafted as #{shapes.size == 2 ? 'neither' : 'none of them'}; declare the shape its actions share"
       end
 
       shapes.drop(1).each { |shape| result[shape].delete(key) }
-      "#{key} is permitted as #{listed_shapes(shapes)} — drafted as #{SHAPES[shapes.first].sub(/\Aan? /, 'the ')}" \
-        "#{', with the sub-keys of both' if merged}"
+      "#{key} is permitted as #{listed_shapes(shapes)} — drafted as #{the_shape(shapes.first)}" \
+        "#{merge_note(shapes) if merged}"
+    end
+
+    # A merge keeps the nested hash's sub-keys, so only a scalar is dropped.
+    def merge_note(shapes)
+      " with the nested hash's sub-keys merged in#{', dropping the scalar' if shapes.include?(:scalars)}"
+    end
+
+    def the_shape(shape)
+      SHAPES[shape].sub(/\Aan? /, "the ")
     end
 
     def shape_keys(result, shape)
@@ -377,9 +453,11 @@ module Permittable
       end
     end
 
+    # An empty list (`meta: [[ ]]`, `meta: [ , ]`) is unparsable too: it
+    # would draft a `do end` block, which the DSL rejects.
     def nested_arg(shape, match)
       sub_keys = split_args(match[2]).map { |part| scalar_key(part) }
-      [shape, match[1].to_sym, sub_keys] unless sub_keys.any?(&:nil?)
+      [shape, match[1].to_sym, sub_keys] unless sub_keys.empty? || sub_keys.any?(&:nil?)
     end
 
     def unparsed_arg(arg)
@@ -453,7 +531,16 @@ module Permittable
         scan.other_envelopes.to_h.map do |root, args|
           "# TODO: belongs to another envelope (#{root}): #{root}: [#{args.join(', ')}]"
         end +
-        Array(scan.rootless).map { |arg| "# TODO: route or query param, not a body field: #{arg}" }
+        Array(scan.rootless).map { |arg| rootless_todo(scan, arg) }
+    end
+
+    # Only a bare key outside the envelope is a route or query param; an
+    # array or hash there is body input this contract's root cannot reach.
+    def rootless_todo(scan, arg)
+      return "# TODO: route or query param, not a body field: #{arg}" if scalar_key(arg)
+      return "# TODO: outside the #{scan.root} envelope, so not in this contract: #{arg}" if scan.root
+
+      "# TODO: sent beside another envelope, so not in this contract: #{arg}"
     end
 
     def scanned_scalar_line(name, columns)
