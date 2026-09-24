@@ -24,10 +24,11 @@ module Permittable
 
     # One column as the drafting code sees it: the database facts, plus what
     # the MODEL layers on top — an enum accessor that changes what a client
-    # sends, a default the model fills in, or a `sensitive` role (:sti,
-    # :locking) that makes the column dangerous to leave client-writable.
-    # `default` is the comment describing whichever default applies, and
-    # `unread` the error that stopped the model's side from being read.
+    # sends (`enum_integers` when it stores Integers), a default the model
+    # fills in, or a `sensitive` role (:sti, :locking) that makes the column
+    # dangerous to leave client-writable. `default` is the comment describing
+    # whichever default applies, and `unread` the error that stopped the
+    # model's enum and default from being read.
     # Building these once in columns_for keeps every drafting path (columns
     # alone, or a scan typed from columns) reading the same answers.
     #
@@ -35,8 +36,8 @@ module Permittable
     # for: the rule (see render) and whether the controller's permit call
     # lists the column. They ride on the column, set by in_rule, so the scan
     # path hands them to column_line without its own methods changing.
-    DraftColumn = Struct.new(:name, :type, :null, :default, :default_function, :enum, :sensitive, :unread,
-                             :rule, :listed, keyword_init: true) do
+    DraftColumn = Struct.new(:name, :type, :null, :default, :default_function, :enum, :enum_integers, :sensitive,
+                             :unread, :rule, :listed, keyword_init: true) do
       def in_rule(rule, listed: false)
         self.class.new(**to_h, rule: rule, listed: listed)
       end
@@ -202,10 +203,14 @@ module Permittable
       nil
     end
 
+    # The sensitive role is read OUTSIDE model_facts' rescue: it only
+    # compares the column's name with the model's STI and locking settings,
+    # and a failed enum or default read must not also make `type` or
+    # `lock_version` client-writable.
     def draft_column(model, column)
       DraftColumn.new(name: column.name, type: column.type, null: column.null,
                       default_function: column.respond_to?(:default_function) && column.default_function,
-                      **model_facts(model, column))
+                      sensitive: sensitive_role(model, column.name), **model_facts(model, column))
     end
 
     # What the model adds to one column. An error reading it degrades THAT
@@ -216,8 +221,8 @@ module Permittable
     # newline would end the comment and leave the draft unparseable.
     def model_facts(model, column)
       enum = enum_for(model, column.name)
-      { enum: enum && enum[:accessor], default: default_note(model, column, enum),
-        sensitive: sensitive_role(model, column.name) }
+      { enum: enum && enum[:accessor], enum_integers: enum && enum[:mapping].values.all?(Integer),
+        default: default_note(model, column, enum) }
     rescue StandardError => e
       { default: database_default_note(column, nil), unread: "#{e.class}: #{e.message}".squish }
     end
@@ -229,7 +234,7 @@ module Permittable
     # from being `required`. It wins over the database's, as it does in
     # Rails.
     def default_note(model, column, enum)
-      declared = model_default(model, column.name)
+      declared = model_default(model, column.name, enum)
       declared ? "model default: #{declared}" : database_default_note(column, enum)
     end
 
@@ -247,18 +252,40 @@ module Permittable
     # in every supported Rails, 6.1–8.1) holds a UserProvidedDefault for each
     # default the model declares; the rest came from the database. Read per
     # attribute rather than through column_defaults, which evaluates every
-    # Proc default at once. A Proc is not called at all — drafting must not
-    # run app code with side effects, and today's value says nothing about
-    # tomorrow's. Its value is cast the way the model reads it, so an enum's
-    # comes back as its key.
-    def model_default(model, name)
+    # Proc default at once.
+    #
+    # The note is written from the default AS DECLARED (its private
+    # `user_provided_value`, the same in 6.1–8.1), never from `value`:
+    # casting runs the attribute type's code, which is the app's, and can
+    # raise — `attribute :prefs, :json, default: {}` does. A Proc is not
+    # called either: drafting must not run app code with side effects, and
+    # today's value says nothing about tomorrow's. An enum default declared
+    # by its stored value is shown as its key, like a database one.
+    def model_default(model, name, enum)
       return nil unless model.respond_to?(:_default_attributes) && defined?(ActiveModel::Attribute::UserProvidedDefault)
 
       attribute = model._default_attributes[name]
       return nil unless attribute.is_a?(ActiveModel::Attribute::UserProvidedDefault)
-      return "computed by a Proc" if attribute.send(:user_provided_value).is_a?(Proc)
 
-      attribute.value&.inspect
+      declared = attribute.send(:user_provided_value)
+      return "computed by a Proc" if declared.is_a?(Proc)
+      return nil if declared.nil?
+
+      declared = enum[:mapping].key(declared) || declared if enum
+      default_literal(declared)
+    end
+
+    # How a declared default reads in a comment: strings and Symbols (an
+    # enum key given as `:pending`) quoted, numbers and times as people
+    # write them — `1.5` rather than BigDecimal's `0.15e1`. Anything else is
+    # inspected and squished, since the note must stay on one line.
+    def default_literal(value)
+      case value
+      when String, Symbol then value.to_s.inspect
+      when BigDecimal then value.to_s("F")
+      when Numeric then value.to_s
+      else value.respond_to?(:strftime) ? value.to_s : value.inspect.squish
+      end
     end
 
     # A Rails enum stores an integer but is ASSIGNED its key: a form sends
@@ -266,12 +293,24 @@ module Permittable
     # every legitimate request. The draft references the model's own
     # accessor rather than inlining today's keys, so adding a value to the
     # enum cannot leave the contract rejecting it.
+    #
+    # Rails defines the accessor for any enum name, but only an identifier
+    # can be CALLED as `Model.name`: a `first-status` enum's
+    # `Order.first-statuses.keys` parses as `Order.first - statuses.keys`,
+    # which runs a query when the draft loads. defined_enums reaches the
+    # same mapping by name.
     def enum_for(model, name)
       return nil unless model.respond_to?(:defined_enums)
 
       mapping = model.defined_enums[name]
-      mapping && { mapping: mapping, accessor: "#{model.name}.#{name.pluralize}" }
+      return nil unless mapping
+
+      plural = name.pluralize
+      accessor = METHOD_NAME.match?(plural) ? "#{model.name}.#{plural}" : "#{model.name}.defined_enums[#{name.inspect}]"
+      { mapping: mapping, accessor: accessor }
     end
+
+    METHOD_NAME = /\A[a-z_][a-zA-Z0-9_]*\z/
 
     # The role that makes a column dangerous for a client to write — :sti,
     # :locking, or nil. What the draft then does with it is column_line's
@@ -428,7 +467,7 @@ module Permittable
     def column_todos(column)
       todos = []
       todos << "TODO: #{column.name} #{SCANNED_SENSITIVE.fetch(column.sensitive)}" if column.sensitive
-      todos << enum_todo(column) if column.enum
+      todos << enum_todo(column) if column.enum_integers
       todos << unread_todo(column) if column.unread
       todos
     end
@@ -444,15 +483,16 @@ module Permittable
     # client), but a :string field passes that on as "1" — which in: rejects,
     # and which Rails' enum rejects as well, so admitting it also means mapping
     # it back to its key. Left as a TODO rather than drafted: forms, the
-    # common client, send the key.
+    # common client, send the key. Only for an enum that stores Integers — a
+    # string-backed one has no second spelling to admit.
     def enum_todo(column)
       "TODO: Rails also assigns the stored integers (#{column.name}: 1) — if API clients send them, add " \
         "#{column.enum}.values.map(&:to_s) to in: and map them back to keys with transform:"
     end
 
     def unread_todo(column)
-      "TODO: could not read what the model adds to #{column.name} (#{column.unread}) — check its enum, " \
-        "default and STI/locking role by hand"
+      "TODO: could not read what the model adds to #{column.name} (#{column.unread}) — check its enum and " \
+        "default by hand"
     end
 
     # NOT NULL without a database default is the only case a client truly

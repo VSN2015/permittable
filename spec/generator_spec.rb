@@ -397,14 +397,17 @@ RSpec.describe Permittable::Generator do
         ActiveRecord::Schema.define do
           create_table :gen_orders do |t|
             t.integer :status, null: false, default: 0
+            t.string  :kind
           end
         end
         stub_const("GenOrder", Class.new(TestModel) do
           self.table_name = "gen_orders"
           if ActiveRecord.version >= Gem::Version.new("7.0")
             enum :status, { pending: 0, shipped: 1 }
+            enum :kind, { retail: "retail", wholesale: "wholesale" }
           else
             enum status: { pending: 0, shipped: 1 }
+            enum kind: { retail: "retail", wholesale: "wholesale" }
           end
         end)
       end
@@ -427,6 +430,32 @@ RSpec.describe Permittable::Generator do
           /optional :status, .*; TODO: Rails also assigns the stored integers \(status: 1\).*GenOrder\.statuses\.values/
         )
       end
+
+      it "leaves no stored-integer TODO on an enum whose stored values are strings" do
+        expect(draft.lines.grep(/:kind\b/)).to eq(["  optional :kind, :string, in: GenOrder.kinds.keys\n"])
+      end
+
+      it "reaches an enum whose accessor is not a method name through defined_enums, so the draft loads" do
+        ActiveRecord::Schema.define do
+          create_table(:gen_oddities) { |t| t.integer "first-status" }
+        end
+        stub_const("GenOddEnum", Class.new(TestModel) do
+          self.table_name = "gen_oddities"
+          if ActiveRecord.version >= Gem::Version.new("7.0")
+            enum :'first-status', { open: 0, closed: 1 }, prefix: true
+          else
+            enum "first-status" => { open: 0, closed: 1 }, _prefix: true
+          end
+        end)
+        draft = described_class.draft(model: GenOddEnum)
+        expect(draft).to include('optional :"first-status", :string, in: GenOddEnum.defined_enums["first-status"].keys')
+        expect(draft).to include('add GenOddEnum.defined_enums["first-status"].values.map(&:to_s) to in:')
+
+        klass = load_draft(draft)
+        expect(violations(klass, { gen_odd_enum: { "first-status" => "closed" } }, action: "update")).to eq([])
+        expect(violations(klass, { gen_odd_enum: { "first-status" => "ajar" } }, action: "update"))
+          .to eq([{ param: "gen_odd_enum.first-status", code: "inclusion" }])
+      end
     end
 
     context "with defaults the model declares rather than the database" do
@@ -436,7 +465,17 @@ RSpec.describe Permittable::Generator do
             t.integer :status, null: false
             t.string  :carrier, null: false
             t.string  :token, null: false
+            t.json    :prefs
+            t.decimal :fee
+            t.float   :weight
+            t.datetime :ships_at
           end
+        end
+        # A type whose cast is app code that must not run while drafting —
+        # the note is written from the default as declared, never cast.
+        loud = Class.new(ActiveModel::Type::String) do
+          def cast(_value) = raise("a type cast ran while drafting")
+          def deserialize(_value) = raise("a type deserialize ran while drafting")
         end
         stub_const("GenShipment", Class.new(TestModel) do
           self.table_name = "gen_shipments"
@@ -445,7 +484,11 @@ RSpec.describe Permittable::Generator do
           else
             enum status: { pending: 0, shipped: 1 }, _default: "pending"
           end
-          attribute :carrier, :string, default: "post"
+          attribute :carrier, loud.new, default: "post"
+          attribute :prefs, :json, default: {}
+          attribute :fee, :decimal, default: BigDecimal("1.5")
+          attribute :weight, :float, default: 2.5
+          attribute :ships_at, :datetime, default: Time.utc(2026, 1, 1)
           # Calling this would be a side effect of drafting (and its value
           # today says nothing about tomorrow's), so the draft must not.
           attribute :token, :string, default: -> { raise "a Proc default was called while drafting" }
@@ -461,6 +504,13 @@ RSpec.describe Permittable::Generator do
         expect(draft).not_to include("required")
       end
 
+      it "writes each default as declared, without casting it, in a readable form" do
+        expect(draft).to include("optional :prefs, :json # model default: {}")
+        expect(draft).to include("optional :fee, :decimal # model default: 1.5\n")
+        expect(draft).to include("optional :weight, :float # model default: 2.5\n")
+        expect(draft).to include("optional :ships_at, :datetime # model default: 2026-01-01 00:00:00 UTC\n")
+      end
+
       it "keeps one rule, which loads and accepts a create that omits them" do
         expect(draft.scan("permit_params").length).to eq(1)
         expect(violations(load_draft(draft), { gen_shipment: { carrier: "ups" } }, action: "create")).to eq([])
@@ -471,25 +521,38 @@ RSpec.describe Permittable::Generator do
       before do
         ActiveRecord::Schema.define do
           create_table :gen_vehicles do |t|
+            t.string  :type
             t.string  :name, null: false
+            t.string  :colour
             t.integer :lock_version, null: false, default: 0
           end
         end
+        stub_const("GenBrokenVehicle", Class.new(TestModel) { self.table_name = "gen_vehicles" })
+        # Break reading two columns' defaults — an ordinary one and the
+        # locking column — after the schema has loaded, so the error comes
+        # from the introspection on top of it.
+        defaults = GenBrokenVehicle._default_attributes
+        allow(defaults).to receive(:[]).and_call_original
+        %w[name lock_version].each do |name|
+          allow(defaults).to receive(:[]).with(name).and_raise(ArgumentError, "misconfigured\nsecond line")
+        end
       end
 
+      let(:draft) { described_class.draft(model: GenBrokenVehicle) }
+
       it "degrades only the column it could not read, and says so in a TODO" do
-        stub_const("GenBrokenVehicle", Class.new(TestModel) { self.table_name = "gen_vehicles" })
-        # Rails reads lock_optimistically while loading the schema, so load
-        # it first: the error has to come from the introspection on top.
-        GenBrokenVehicle.columns
-        allow(GenBrokenVehicle).to receive(:lock_optimistically).and_raise(ArgumentError, "misconfigured\nsecond line")
-        draft = described_class.draft(model: GenBrokenVehicle)
-        expect(draft).to include("required :name, :string\n")
         expect(draft).to include(
-          "optional :lock_version, :integer # database default: #{lock_default}; TODO: could not read what the model adds to " \
-          "lock_version (ArgumentError: misconfigured second line) — check its enum, default and STI/locking role by hand"
+          "required :name, :string # TODO: could not read what the model adds to name " \
+          "(ArgumentError: misconfigured second line) — check its enum and default by hand\n"
         )
-        expect(load_draft(draft).permit_rule_for("update")[:fields].map { |f| f[:name] }).to eq(%i[name lock_version])
+        expect(draft).to include("optional :colour, :string\n")
+        expect(load_draft(draft).permit_rule_for("update")[:fields].map { |f| f[:name] }).to eq(%i[name colour])
+      end
+
+      it "still keeps the STI and locking columns out of the fields" do
+        expect(draft).not_to match(/^\s*(required|optional) :(type|lock_version)\b/)
+        expect(draft).to include("# TODO: type is the STI inheritance column")
+        expect(draft).to include("# TODO: lock_version is the optimistic-locking column")
       end
 
       it "still drafts nothing from the model when the schema itself cannot be read" do
