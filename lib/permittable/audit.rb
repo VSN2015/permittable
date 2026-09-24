@@ -120,11 +120,13 @@ module Permittable
       }
     end
 
-    # One entry per route and verb. An entry with no `route` (a hand-built
-    # descriptor) is its own route.
+    # One entry per route and verb, in the entries' own order. `route` is a
+    # position within ONE rails_routes call, so it is keyed with the
+    # controller and action: an app's list concatenated with an engine's
+    # reuses the same small integers for unrelated routes. An entry with no
+    # `route` (a hand-built descriptor) is its own route.
     def routed(entries)
-      sourced, own = entries.partition(&:route)
-      own + sourced.uniq { |e| [e.route, e.verb.to_s.downcase] }
+      entries.uniq { |e| e.route.nil? ? e.object_id : [e.controller, e.action, e.route, e.verb.to_s.downcase] }
     end
 
     # The human-readable report: one block per controller, then the summary,
@@ -157,14 +159,16 @@ module Permittable
       parts.join("  ")
     end
 
-    # The table lists paths and the summary counts routes; when an optional
-    # segment makes the two numbers differ, the line says which is which.
+    # The table lists rows (a verb on a path) and the summary counts routes;
+    # when an optional segment makes the two numbers differ, the line says
+    # which is which. Rows, not distinct paths: PATCH and PUT on one path are
+    # two rows.
     def summary_lines(counts, rows: counts[:actions])
       body = counts[:uncovered_with_body]
-      paths = " across #{rows} paths (an optional segment's paths count once)" unless rows == counts[:actions]
+      listed = " in #{rows} rows (an optional segment lists each path it expands to)" unless rows == counts[:actions]
       [
         "",
-        "#{counts[:actions]} routed action#{'s' unless counts[:actions] == 1}#{paths}: " \
+        "#{counts[:actions]} routed action#{'s' unless counts[:actions] == 1}#{listed}: " \
         "#{counts[:enforced]} enforced, #{counts[:monitored]} in monitor mode, " \
         "#{counts[:uncovered]} without a contract",
         "  #{body} of those accept a request body#{' — untrusted input reaches the action unchecked' unless body.zero?}",
