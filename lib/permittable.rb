@@ -216,6 +216,10 @@ module Permittable
   # rather than leaving a bare ROUTING_KEYS to read like an oversight.
   UNCHECKED_TOP_LEVEL_KEYS = (ROUTING_KEYS + FORM_KEYS).freeze
   MONITOR_DROPPED_KEYS = ROUTING_KEYS
+  # The field kinds that can hold ParamsWrapper's copy of a body — a hash. A
+  # rootless contract declaring the wrapper key as one of these reads the
+  # copy deliberately, so it is kept (see permittable_without_wrapper_copy).
+  WRAPPER_CONTAINER_KINDS = [:nested, JSON_TYPE].freeze
   # A log line and an exception message are PROSE, written for a person. They
   # list at most this many names and count the rest, so one request cannot
   # write a megabyte of them. The machine-readable channels — a violation's
@@ -1430,9 +1434,22 @@ module Permittable
   # dispatched twice would otherwise carry one request's exemption into the
   # next, where a `user` the client did send would pass as Rails' copy.
   def process_action(*)
-    wraps = respond_to?(:_wrapper_enabled?, true) && respond_to?(:_wrapper_key, true) && _wrapper_enabled?
-    @permittable_wrapper_key = wraps ? _wrapper_key.to_s : nil
+    @permittable_wrapper_key = permittable_wrapper_copy_key
     super
+  end
+
+  # The wrapper key, if ParamsWrapper is about to copy the body under it;
+  # nil otherwise. `_wrapper_enabled?` alone is not enough: it asks the
+  # string-keyed params for the key AS CONFIGURED, so `wrap_parameters :user`
+  # — the form the Rails docs use — answers "not sent" even when the client
+  # sent `user` itself, and Rails wraps anyway. Asking the same params for
+  # the String keeps that client's key the client's, whichever spelling the
+  # host chose.
+  def permittable_wrapper_copy_key
+    return unless respond_to?(:_wrapper_enabled?, true) && respond_to?(:_wrapper_key, true) && _wrapper_enabled?
+
+    key = _wrapper_key.to_s
+    key unless request.parameters.key?(key)
   end
 
   # The value permitted_params memoizes: the validated params, or the
@@ -1453,7 +1470,7 @@ module Permittable
     source = permittable_root_hash(rule, violations)
     result = ActiveSupport::HashWithIndifferentAccess.new
     if source
-      checked = rule[:root] ? source : permittable_without_wrapper_copy(source)
+      checked = rule[:root] ? source : permittable_without_wrapper_copy(rule[:fields], source)
       result = permittable_check_hash(rule[:fields], checked, path: rule[:root] ? rule[:root].to_s : nil,
                                                               unknown: rule[:unknown], top_level: !rule[:root], violations: violations)
     end
@@ -1764,17 +1781,25 @@ module Permittable
   # A rootless contract's input without ParamsWrapper's copy of the body,
   # when Rails made one (see process_action). Removed rather than merely
   # exempted from the unknown-keys check, because the client never sent that
-  # key: a contract that happens to declare a field of the wrapper's name
-  # (`optional :feedback, :string` on FeedbackController) would otherwise
-  # validate Rails' copy of the whole body as that field — a false 422
-  # invalid_type for a well-formed request, or, for a hash-typed field, the
-  # entire body silently landing in permitted_params under a key nobody sent.
-  # Top level only, where the copy lives; a rooted contract reads that copy
-  # as its root, which is exactly what ParamsWrapper is for. What is checked
-  # changes, not what monitor mode hands back: its raw pass-through still
-  # carries the copy, as the pre-contract app's params did.
-  def permittable_without_wrapper_copy(source)
-    @permittable_wrapper_key ? source.except(@permittable_wrapper_key) : source
+  # key: a contract that happens to declare a scalar or array field of the
+  # wrapper's name (`optional :feedback, :string` on FeedbackController)
+  # would otherwise validate Rails' copy of the whole body as that field — a
+  # false 422 invalid_type for a well-formed request.
+  #
+  # Kept, though, when the contract declares that key as a hash container (a
+  # nested block or :json): that rootless contract is reading the copy ON
+  # PURPOSE, a root: spelled as a field, and it worked that way before the
+  # copy was ever dropped — dropping it would turn every such request into
+  # `user missing`. Top level only, where the copy lives; a rooted contract
+  # reads the copy as its root, which is exactly what ParamsWrapper is for.
+  # What is checked changes, not what monitor mode hands back: its raw
+  # pass-through still carries the copy, as the pre-contract app's params did.
+  def permittable_without_wrapper_copy(fields, source)
+    key = @permittable_wrapper_key
+    return source unless key
+    return source if fields.any? { |f| f[:name].to_s == key && WRAPPER_CONTAINER_KINDS.include?(f[:kind]) }
+
+    source.except(key)
   end
 
   def permittable_path(path, key)

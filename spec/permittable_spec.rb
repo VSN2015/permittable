@@ -2444,14 +2444,14 @@ RSpec.describe Permittable do
 
     describe "unknown: :error on a rootless contract, with a real request" do
       # `wrap:` names the wrapper key: a String, as Rails derives it from
-      # controller_name — ParamsWrapper compares it against the string-keyed
-      # params to decide whether the client already sent the key.
-      def build_rootless_controller(wrap: nil, &fields)
+      # controller_name, or a Symbol, as the Rails docs write
+      # `wrap_parameters :user`. `rule` overrides the permit_params options.
+      def build_rootless_controller(wrap: nil, **rule, &fields)
         IntegrationHarness.build_controller do
           include Permittable
 
           wrap_parameters wrap, format: [:json] if wrap
-          permit_params(:create, :update, unknown: :error, &fields)
+          permit_params(:create, :update, unknown: :error, **rule, &fields)
 
           def create
             render json: permitted_params
@@ -2497,12 +2497,28 @@ RSpec.describe Permittable do
         expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "user", "code" => "unknown" }])
       end
 
-      # A declared field that shares the wrapper key's name is ABSENT when Rails
+      it "still flags a client-sent key that shares a Symbol wrapper name" do
+        # `wrap_parameters :user` makes ParamsWrapper ask the string-keyed
+        # params for :user, so it answers "not sent" and wraps anyway. Whether
+        # the client sent the key must not hang on that spelling.
+        controller = build_rootless_controller(wrap: :user) { optional :name, :string }
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH",
+                                                                  json: { name: "Jo", user: { admin: true } })
+        expect(result.status).to eq(422)
+        expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "user", "code" => "unknown" }])
+      end
+
+      it "does not flag the copy under a Symbol wrapper name either" do
+        controller = build_rootless_controller(wrap: :user) { optional :name, :string }
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo" })
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)).to eq("name" => "Jo")
+      end
+
+      # A scalar field that shares the wrapper key's name is ABSENT when Rails
       # made the copy: the client never sent it. Validating the copy instead
-      # rejected a well-formed body as that field's invalid_type, or — for a
-      # hash-typed field — slipped the whole body into permitted_params under
-      # a key the client never used.
-      it "treats a declared field named like the wrapper key as absent when Rails made the copy" do
+      # rejected a well-formed body as that field's invalid_type.
+      it "treats a declared scalar field named like the wrapper key as absent when Rails made the copy" do
         controller = build_rootless_controller(wrap: "feedback") do
           optional :rating, :integer
           optional :feedback, :string
@@ -2512,16 +2528,28 @@ RSpec.describe Permittable do
         expect(JSON.parse(result.body)).to eq("rating" => 5)
       end
 
-      it "does not let the wrapper's copy land in a hash-typed field of the same name" do
-        controller = build_rootless_controller(wrap: "user") do
-          optional :name, :string
-          optional :user do
-            optional :name, :string
+      # A rootless contract that declares the wrapper key as a hash container
+      # is reading Rails' copy ON PURPOSE — a root: spelled as a field — and
+      # did so before the copy was ever dropped. It keeps the copy.
+      it "keeps the copy for a rootless contract that reads it through a nested field" do
+        controller = build_rootless_controller(wrap: "user", unknown: :ignore) do
+          required :user do
+            required :name, :string
           end
         end
         result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo" })
         expect(result.status).to eq(200)
-        expect(JSON.parse(result.body)).to eq("name" => "Jo")
+        expect(JSON.parse(result.body)).to eq("user" => { "name" => "Jo" })
+      end
+
+      it "keeps the copy for a rootless contract that reads it as :json" do
+        controller = build_rootless_controller(wrap: "user") do
+          optional :name, :string
+          optional :user, :json
+        end
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo" })
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)).to eq("name" => "Jo", "user" => { "name" => "Jo" })
       end
 
       it "still validates that declared field when the client sent the key itself" do
@@ -2540,22 +2568,38 @@ RSpec.describe Permittable do
         expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "user", "code" => "invalid_type" }])
       end
 
-      it "does not carry one request's wrapper exemption into the next on a reused controller" do
-        # Rails builds a controller per request, but nothing stops a host (or
-        # a test) from dispatching twice on one instance. The second request
-        # is a form POST, which ParamsWrapper does not wrap, so its `user` is
-        # the client's own and must still be flagged.
+      it "resets the recorded wrapper key on every dispatch of a reused controller" do
+        # Rails builds a controller per request, so this pins down only the
+        # one piece of state this concern records before ParamsWrapper runs:
+        # a request ParamsWrapper does not wrap (a form POST) must leave no
+        # key behind from the one before. It does not claim a reused instance
+        # is otherwise fresh — Metal#dispatch keeps @_params, for one.
         controller = build_rootless_controller(wrap: "user") { optional :name, :string }
         instance = controller.new
-        first = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo" },
-                                                                 instance: instance)
-        expect(first.status).to eq(200)
+        IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo" }, instance: instance)
+        expect(instance.instance_variable_get(:@permittable_wrapper_key)).to eq("user")
 
-        second = IntegrationHarness.dispatch(controller, :create, method: "POST",
-                                                                  params: { name: "Jo", user: { admin: "1" } },
-                                                                  instance: instance)
-        expect(second.status).to eq(422)
-        expect(JSON.parse(second.body)["error"]["details"]).to eq([{ "param" => "user", "code" => "unknown" }])
+        IntegrationHarness.dispatch(controller, :create, method: "POST", params: { name: "Jo" }, instance: instance)
+        expect(instance.instance_variable_get(:@permittable_wrapper_key)).to be_nil
+      end
+
+      it "still validates a declared path parameter" do
+        controller = build_rootless_controller { required :id, :integer }
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", path_params: { id: "abc" })
+        expect(result.status).to eq(422)
+        expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "id", "code" => "invalid_type" }])
+      end
+
+      it "leaves the path parameters and the wrapper's copy in monitor mode's pass-through" do
+        # Only the CHECK changes: a legacy action being monitored still reads
+        # params[:id] and params[:user] exactly as before the contract.
+        controller = build_rootless_controller(wrap: "user", mode: :monitor) { optional :name, :string }
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo", rogue: 1 },
+                                                                  path_params: { id: "1" })
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)).to eq(
+          "name" => "Jo", "rogue" => 1, "id" => "1", "user" => { "name" => "Jo", "rogue" => 1 }
+        )
       end
     end
 
