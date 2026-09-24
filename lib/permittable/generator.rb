@@ -175,8 +175,9 @@ module Permittable
     # may reorder them.
     #
     # `model:` names the envelope a Rails form for that model sends; see
-    # choose_root.
-    def scan(source, model: nil)
+    # choose_root. `exclude:` lists roots (nil for the rootless calls) that
+    # may not be chosen — see for_controller.
+    def scan(source, model: nil, exclude: [])
       result = Scan.new(root: nil, scalars: [], arrays: [], nested: {}, nested_arrays: {}, unparsed: [],
                         conflicts: [], undecided: [], route_params: [], rootless: [], other_envelopes: {}, calls: 0)
       source = executable_source(source.to_s)
@@ -184,9 +185,10 @@ module Permittable
       expects = matches(source, EXPECT_CALL).map { |match| expect_calls(match.begin(0), split_args(match[1])) }
       result.calls = permits.size + expects.size
       calls = (permits + expects).flatten.sort_by.with_index { |call, index| [call.position, index] }
-      result.root = choose_root(calls, model&.name && default_root(model))
+      result.root = choose_root(calls, model&.name && default_root(model), exclude)
       calls.each { |call| merge_call(result, call) }
       resolve_conflicts(result)
+      drop_drafted_todos(result)
       result
     end
 
@@ -197,9 +199,23 @@ module Permittable
     # Draft a contract for one controller: model inferred from
     # controller_name (or passed explicitly), permit calls scanned from
     # `source:` when given. Returns nil when there is nothing to draft from.
+    #
+    # When the chosen root cannot be drafted at all — the model's envelope
+    # permits only a binary column, and the model has no column a contract
+    # can declare — the next candidate root is tried rather than returning
+    # nil, until one drafts or none is left: a draft rooted at the other
+    # envelope in the file is a better starting point than no draft, and it
+    # is what master drafted.
     def for_controller(controller, source: nil, model: nil)
       model ||= infer_model(controller)
-      draft(model: model, scan: scan(source, model: model))
+      excluded = []
+      loop do
+        scan = scan(source, model: model, exclude: excluded)
+        result = draft(model: model, scan: scan)
+        return result if result || !scan.found? || excluded.include?(scan.root)
+
+        excluded << scan.root
+      end
     end
 
     # The core: knowledge in (columns and/or a scan), snippet out. Returns a
@@ -247,7 +263,11 @@ module Permittable
 
       root = scan.root || (rootless_body?(scan) ? nil : default_root(model))
       undrafted = (Array(scan.undecided) + Array(scan.route_params).filter_map { |arg| scalar_key(arg) }).map(&:to_s)
-      column_draft(model, columns.except(*undrafted).values, scan_todo_lines(scan), root: root)
+      drafted = columns.except(*undrafted)
+      # As in drop_drafted_todos: a rootless key the columns now declare is
+      # not also a "not in this contract" TODO.
+      scan = scan.dup.tap { |copy| copy.rootless = Array(scan.rootless).reject { |arg| drafted.key?(scalar_key(arg).to_s) } }
+      column_draft(model, drafted.values, scan_todo_lines(scan), root: root)
     end
 
     # Whether a rootless scan's calls carried at least one body field —
@@ -331,13 +351,14 @@ module Permittable
       end
     end
 
-    # A rooted permit call is quoted in expect's `root: [...]` spelling, so
-    # its TODO says which envelope its fields belong to.
+    # A rooted permit call is quoted as the call itself, on one line, so its
+    # TODO can be found in the source it came from.
     def permit_call(match)
       args = split_args(match[2])
       return Call.new(match.begin(0), nil, args, []) unless match[1]
 
-      Call.new(match.begin(0), match[1].to_sym, args, [], unparsed_arg("#{match[1]}: [#{args.join(', ')}]"))
+      spelling = unparsed_arg(match[0]).gsub(/\(\s+/, "(").gsub(/\s+\)/, ")")
+      Call.new(match.begin(0), match[1].to_sym, args, [], spelling)
     end
 
     # A rootless expect call — or, when its one key is a route param
@@ -354,10 +375,13 @@ module Permittable
     # form for the model sends, and the only way to root a
     # `require(:post).permit(*PERMITTED)` that has no field to score with.
     #
-    # With no model to say which envelope is the form's, any envelope beats
-    # the rootless calls, as it always did: an index action's
-    # `params.permit(:page, :per_page)` must not take the root from a
-    # one-field `post_params` on a guess.
+    # With no model to say which envelope is the form's, an envelope with a
+    # parsed field beats the rootless calls, as any envelope always did: an
+    # index action's `params.permit(:page, :per_page)` must not take the root
+    # from a one-field `post_params` on a guess. An envelope with NO parsed
+    # field — `expect(search: FILTERS)` — only beats rootless calls that have
+    # none either: beside `params.permit(:title, :body)` it would root a draft
+    # with nothing to declare, where master drafted title and body.
     #
     # Otherwise the candidate — an envelope, or, with a model that no
     # envelope matches, the rootless calls together (root nil) — declaring
@@ -374,15 +398,25 @@ module Permittable
     # envelope wins a tie because a rootless key beside one is usually a
     # route or query param: a one-field Rails 8 scaffold calls
     # `params.expect(:id)` in `set_post` above `params.expect(post: [:title])`.
-    def choose_root(calls, preferred = nil)
+    def choose_root(calls, preferred = nil, exclude = [])
+      calls = calls.reject { |call| exclude.include?(call.root) }
       return preferred if preferred && calls.any? { |call| call.root == preferred }
 
-      candidates = calls.group_by(&:root)
-      candidates.delete(nil) if preferred.nil? && candidates.size > 1
-      best = candidates.each_with_index.max_by do |(root, same), index|
-        [same.flat_map { |call| call.fields.filter_map { |arg| parse_arg(arg)&.at(1) } }.uniq.size, root ? 1 : 0, -index]
+      scores = calls.group_by(&:root).transform_values do |same|
+        same.flat_map { |call| call.fields.filter_map { |arg| parse_arg(arg)&.at(1) } }.uniq.size
       end
+      scores = envelopes_first(scores) unless preferred
+      best = scores.each_with_index.max_by { |(root, score), index| [score, root ? 1 : 0, -index] }
       best&.first&.first
+    end
+
+    # The model-less rule above: the rootless candidate is dropped when an
+    # envelope has a parsed field, or when it has none itself.
+    def envelopes_first(scores)
+      envelopes = scores.except(nil)
+      return scores if envelopes.empty?
+
+      envelopes.values.max.positive? || scores.fetch(nil, 0).zero? ? envelopes : scores
     end
 
     # Fold one call into the scan: its fields when it shares the scan's root
@@ -398,6 +432,20 @@ module Permittable
         result.rootless |= call.fields.map { |arg| unparsed_arg(arg) }
       end
       result.route_params |= call.route_params.map { |arg| unparsed_arg(arg) }
+    end
+
+    # A key the winning root drafts as a field is not also a TODO: beside
+    # `expect(post: [:title, :group_id])`, a `Group.find(params.expect(:group_id))`
+    # lookup or a rootless `params.permit(:group_id)` would otherwise say
+    # "not a body field" about a field the draft declares. Only a bare key is
+    # dropped: a shaped copy (`tags: [:z]` beside the envelope's `tags: [:a]`)
+    # may carry sub-keys the drafted field lacks, and dropping its TODO would
+    # lose them.
+    def drop_drafted_todos(result)
+      drafted = SHAPES.keys.flat_map { |shape| shape_keys(result, shape) }
+      %i[route_params rootless].each do |member|
+        result[member] = result[member].reject { |arg| drafted.include?(scalar_key(arg)) }
+      end
     end
 
     # A key permitted in two shapes across actions is declared once — a
