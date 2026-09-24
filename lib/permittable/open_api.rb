@@ -205,11 +205,14 @@ module Permittable
       paths = {}
       unrouted = {}
       slots = []
-      controllers.each do |controller|
+      targets = route_targets(routes)
+      # A class listed twice would find every slot its first pass claimed and
+      # land under x-permittable-controllers, colliding with itself there.
+      controllers.uniq(&:object_id).each do |controller|
         operations = operations_for(controller)
         next if operations.empty?
 
-        slots.concat(place_operations(controller, operations, routes, paths, unrouted))
+        slots.concat(place_operations(controller, operations, targets, paths, unrouted))
       end
       assign_unique_operation_ids(slots)
       doc = {
@@ -224,31 +227,42 @@ module Permittable
 
     # Where one operation sits in the document: a path+verb slot under
     # `paths`, or an action under x-permittable-controllers (verb nil).
-    # `holder[field]` is the placed operation; `id` its natural operationId.
-    OperationSlot = Struct.new(:holder, :field, :verb, :id)
+    # `holder[field]` is the placed operation; `id` its natural operationId;
+    # `owner` the [controller key, action] it documents.
+    OperationSlot = Struct.new(:holder, :field, :verb, :id, :owner)
+
+    # { [controller, action] => [[path, verb], ...] }, in route order. Built
+    # once, with each verb normalised once: matching every operation against
+    # every route made placement quadratic in the size of the route set. A
+    # route declared twice names one slot, so it is kept once — not counted
+    # as an operation colliding with itself.
+    def route_targets(routes)
+      return {} if routes.nil?
+
+      routes.group_by { |route| [route[:controller].to_s, route[:action].to_s] }
+            .transform_values { |matching| matching.map { |route| [route[:path], verb_of(route)] }.uniq }
+    end
 
     # Places every operation and returns the slots it filled, in placement
     # order (controller, action, route), for assign_unique_operation_ids.
-    def place_operations(controller, operations, routes, paths, unrouted)
+    def place_operations(controller, operations, targets, paths, unrouted)
       key = controller_key(controller) || controller.inspect
       operations.each_with_object([]) do |(action, operation), slots|
+        owner = [key, action]
         # A path+verb pair carries exactly one operation, so a slot another
         # controller already claimed is not written over: the loser stays
         # visible under x-permittable-controllers, where an operation with no
         # route at all lands, rather than disappearing from the document.
-        # A route declared twice names one slot, so it is placed once — not
-        # counted as an operation colliding with itself.
-        free = routes_for(routes, key, action).uniq { |route| [route[:path], verb_of(route)] }
-                                              .reject { |route| paths.dig(route[:path], verb_of(route)) }
+        free = action == "*" ? [] : targets.fetch(owner, []).reject { |path, verb| paths.dig(path, verb) }
         if free.empty?
           holder = (unrouted[key] ||= {})
-          slots << OperationSlot.new(holder, action, nil, operation["operationId"]) unless holder.key?(action)
+          slots << OperationSlot.new(holder, action, nil, operation["operationId"], owner) unless holder.key?(action)
           holder[action] = operation
         else
-          free.each do |route|
-            holder = (paths[route[:path]] ||= {})
-            holder[verb_of(route)] = with_path_parameters(operation, route[:path])
-            slots << OperationSlot.new(holder, verb_of(route), verb_of(route), operation["operationId"])
+          free.each do |path, verb|
+            holder = (paths[path] ||= {})
+            holder[verb] = with_path_parameters(operation, path)
+            slots << OperationSlot.new(holder, verb, verb, operation["operationId"], owner)
           end
         end
       end
@@ -266,10 +280,12 @@ module Permittable
     # known before any is renamed and all of them are reserved, so a suffix
     # can never take a name that is another operation's own id — that
     # operation would otherwise be renamed for a collision it never had.
-    # Within a colliding group the first slot keeps the plain id and the
-    # rest take their verb when verbs differ in the group (users_update_put),
-    # otherwise a number (posts_create_2); a candidate that is taken is
-    # numbered on until free.
+    # Within a colliding group the first slot keeps the plain id. Another
+    # takes its verb (users_update_put) when that verb differs from the plain
+    # id's and the suffixed id is free; otherwise it is numbered
+    # (posts_create_2 for a second POST, users_update_2 for a second PATCH).
+    # The suffix names how the slot differs from the plain one, so a verb
+    # the two share would say nothing true.
     #
     # Unrouted operations take part: x-permittable-controllers is in the same
     # document and feeds the same generators. They yield the plain id to a
@@ -281,10 +297,11 @@ module Permittable
       slots.group_by(&:id).each_value do |group|
         next if group.one?
 
-        verbs_differ = group.filter_map(&:verb).uniq.size > 1
-        collision_order(group).drop(1).each do |slot|
-          stem = verbs_differ && slot.verb ? "#{slot.id}_#{slot.verb}" : slot.id
-          unique = stem != slot.id && !taken.include?(stem) ? stem : numbered_id(stem, taken, next_number)
+        plain, *renamed = collision_order(group)
+        renamed.each do |slot|
+          by_verb = "#{slot.id}_#{slot.verb}"
+          by_verb = nil if slot.verb.nil? || slot.verb == plain.verb || taken.include?(by_verb)
+          unique = by_verb || numbered_id(slot.id, taken, next_number)
           taken << unique
           # The same operation object may sit at other slots under its own
           # id, so the rename goes on a copy; merge keeps the key order.
@@ -293,21 +310,29 @@ module Permittable
       end
     end
 
-    # Placement order, routed before unrouted. `match via: [:put, :patch]`
-    # lists PUT first where `resources` lists PATCH first; without the swap
-    # the same pair of routes would name the PATCH method two ways.
+    # Routed before unrouted, then placement order: controller, action, route.
+    # Within one operation a PUT sorts after its PATCH, because
+    # `match via: [:put, :patch]` lists PUT first where `resources` lists
+    # PATCH first, and without this one pair of routes would name the PATCH
+    # method two ways. Across operations the order alone decides: a PATCH in
+    # a later controller does not take the plain id from an earlier PUT.
     def collision_order(group)
-      ordered = group.each_with_index.sort_by { |slot, index| [slot.verb ? 0 : 1, index] }.map(&:first)
-      ordered.map(&:verb) == %w[put patch] ? ordered.reverse : ordered
+      patched = group.select { |slot| slot.verb == "patch" }.to_set(&:owner)
+      first_at = {}
+      group.each_with_index { |slot, index| first_at[slot.owner] ||= index }
+      group.each_with_index.sort_by do |slot, index|
+        put_after_patch = slot.verb == "put" && patched.include?(slot.owner) ? 1 : 0
+        [slot.verb ? 0 : 1, first_at[slot.owner], put_after_patch, index]
+      end.map(&:first)
     end
 
-    # The next free "#{stem}_n", n from 2. The counter per stem keeps the
-    # whole pass linear: no number is tried twice for one stem.
-    def numbered_id(stem, taken, next_number)
-      number = next_number[stem]
-      number += 1 while taken.include?("#{stem}_#{number}")
-      next_number[stem] = number + 1
-      "#{stem}_#{number}"
+    # The next free "#{id}_n", n from 2. The counter per id means no number
+    # is tried twice for one id, which keeps the pass linear.
+    def numbered_id(id, taken, next_number)
+      number = next_number[id]
+      number += 1 while taken.include?("#{id}_#{number}")
+      next_number[id] = number + 1
+      "#{id}_#{number}"
     end
 
     def verb_of(route)
@@ -332,12 +357,6 @@ module Permittable
         out["parameters"] = parameters if key == "requestBody"
         out[key] = value
       end
-    end
-
-    def routes_for(routes, controller_key, action)
-      return [] if routes.nil? || action == "*"
-
-      routes.select { |r| r[:controller].to_s == controller_key && r[:action].to_s == action }
     end
 
     # { controller:, action:, verb:, path: } descriptors from a Rails

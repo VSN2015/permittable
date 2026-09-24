@@ -1,4 +1,5 @@
 require "json"
+require "action_dispatch"
 
 RSpec.describe Permittable::OpenAPI do
   def controller_class(path: "users", &declaration)
@@ -8,6 +9,14 @@ RSpec.describe Permittable::OpenAPI do
       define_singleton_method(:controller_path) { path }
       class_eval(&declaration) if declaration
     end
+  end
+
+  # Every operationId in the document, the unrouted ones included: the
+  # whole document is one namespace to a client generator.
+  def operation_ids(doc)
+    routed = doc["paths"].values.flat_map(&:values)
+    unrouted = doc.fetch("x-permittable-controllers", {}).values.flat_map(&:values)
+    (routed + unrouted).filter_map { |operation| operation["operationId"] }
   end
 
   after { Permittable.filter_parameter_registry.reset! }
@@ -158,14 +167,6 @@ RSpec.describe Permittable::OpenAPI do
         { controller: controller, action: action, verb: verb, path: path }
       end
 
-      # Every operationId in the document, the unrouted ones included: the
-      # whole document is one namespace to a client generator.
-      def operation_ids(doc)
-        routed = doc["paths"].values.flat_map(&:values)
-        unrouted = doc.fetch("x-permittable-controllers", {}).values.flat_map(&:values)
-        (routed + unrouted).filter_map { |operation| operation["operationId"] }
-      end
-
       it "gives the second verb of a shared route its own operationId" do
         klass = controller_class { permit_params(:update, root: :user) { required :name, :string } }
         doc = described_class.document(
@@ -223,7 +224,7 @@ RSpec.describe Permittable::OpenAPI do
         expect(doc["paths"]["/admin_users/all"]["get"]["operationId"]).to eq("admin_users_index_get")
       end
 
-      it "numbers a verb-suffixed id that is some other operation's own id" do
+      it "numbers a slot whose verb suffix is some other operation's own id" do
         doc = described_class.document(
           controllers: [index_controller("admin/users", :index), index_controller("admin_users", :index, :index_post)],
           routes: [route("admin/users", "index", "get", "/admin/users"),
@@ -231,8 +232,87 @@ RSpec.describe Permittable::OpenAPI do
                    route("admin_users", "index_post", "post", "/admin_users/bulk")]
         )
         expect(doc["paths"]["/admin/users"]["get"]["operationId"]).to eq("admin_users_index")
-        expect(doc["paths"]["/admin_users"]["post"]["operationId"]).to eq("admin_users_index_post_2")
+        expect(doc["paths"]["/admin_users"]["post"]["operationId"]).to eq("admin_users_index_2")
         expect(doc["paths"]["/admin_users/bulk"]["post"]["operationId"]).to eq("admin_users_index_post")
+      end
+
+      # The suffix names how a slot differs from the one holding the plain
+      # id. A second POST beside a POST differs by path, not verb, so
+      # `posts_create_post` would say nothing true.
+      it "suffixes the verb only where it differs from the plain id's verb" do
+        klass = controller_class(path: "posts") { permit_params(:create) { required :title, :string } }
+        doc = described_class.document(
+          controllers: [klass],
+          routes: [route("posts", "create", "post", "/posts"), route("posts", "create", "get", "/posts/new"),
+                   route("posts", "create", "post", "/{locale}/posts")]
+        )
+        expect(doc["paths"]["/posts"]["post"]["operationId"]).to eq("posts_create")
+        expect(doc["paths"]["/posts/new"]["get"]["operationId"]).to eq("posts_create_get")
+        expect(doc["paths"]["/{locale}/posts"]["post"]["operationId"]).to eq("posts_create_2")
+      end
+
+      # A PATCH|PUT pair at more than one path (a member route plus its
+      # nested copy): PATCH keeps the plain id at every size of group, not
+      # only when the group is exactly one pair.
+      it "keeps the plain id on PATCH when the PATCH|PUT pair sits at two paths, PUT first" do
+        klass = controller_class { permit_params(:update) { required :name, :string } }
+        doc = described_class.document(
+          controllers: [klass],
+          routes: [route("users", "update", "put", "/users/{id}"),
+                   route("users", "update", "patch", "/users/{id}"),
+                   route("users", "update", "put", "/orgs/{org_id}/users/{id}"),
+                   route("users", "update", "patch", "/orgs/{org_id}/users/{id}")]
+        )
+        expect(doc["paths"]["/users/{id}"]["patch"]["operationId"]).to eq("users_update")
+        expect(doc["paths"]["/orgs/{org_id}/users/{id}"]["patch"]["operationId"]).to eq("users_update_2")
+        expect(doc["paths"]["/users/{id}"]["put"]["operationId"]).to eq("users_update_put")
+        expect(doc["paths"]["/orgs/{org_id}/users/{id}"]["put"]["operationId"]).to eq("users_update_3")
+      end
+
+      # PATCH-over-PUT is about one operation's two verbs. Between two
+      # operations, controller order decides, whichever verbs they carry.
+      it "does not let a PATCH in one operation take the plain id from a PUT in another" do
+        doc = described_class.document(
+          controllers: [controller_class(path: "admin/users") { permit_params(:update) { required :name, :string } },
+                        controller_class(path: "admin_users") { permit_params(:update) { required :name, :string } }],
+          routes: [route("admin/users", "update", "put", "/admin/users/{id}"),
+                   route("admin_users", "update", "patch", "/admin_users/{id}")]
+        )
+        expect(doc["paths"]["/admin/users/{id}"]["put"]["operationId"]).to eq("admin_users_update")
+        expect(doc["paths"]["/admin_users/{id}"]["patch"]["operationId"]).to eq("admin_users_update_patch")
+      end
+
+      # Passed twice, a controller's routes are all taken by its first pass,
+      # so the second landed under x-permittable-controllers as a phantom
+      # collision (users_index_2).
+      it "documents a controller passed twice once" do
+        klass = index_controller("users", :index)
+        doc = described_class.document(controllers: [klass, klass], routes: [route("users", "index", "get", "/users")])
+        expect(doc).not_to have_key("x-permittable-controllers")
+        expect(operation_ids(doc)).to eq(["users_index"])
+      end
+
+      # The shapes a real app produces, through the real route set rather than
+      # hand-built descriptors: `resources` routes update as PATCH and PUT, and
+      # nesting it repeats the pair at a second path.
+      it "assigns sensible, unique ids to the routes resources and nested resources generate" do
+        route_set = ActionDispatch::Routing::RouteSet.new
+        route_set.draw do
+          resources :users, only: %i[create update]
+          resources(:orgs, only: []) { resources :users, only: %i[update] }
+        end
+        klass = controller_class do
+          permit_params(:create, :update) { required :name, :string }
+        end
+        doc = described_class.document(controllers: [klass],
+                                       routes: described_class.rails_routes(Struct.new(:routes).new(route_set)))
+
+        ids = doc["paths"].to_h { |path, operations| [path, operations.transform_values { |op| op["operationId"] }] }
+        expect(ids).to eq(
+          "/users" => { "post" => "users_create" },
+          "/users/{id}" => { "patch" => "users_update", "put" => "users_update_put" },
+          "/orgs/{org_id}/users/{id}" => { "patch" => "users_update_2", "put" => "users_update_3" }
+        )
       end
 
       # An optional segment (`(/:locale)/posts`) documents one operation at
@@ -305,6 +385,7 @@ RSpec.describe Permittable::OpenAPI do
           index_controller("admin/users_v2", :index),
           controller_class(path: "webhooks") { permit_params(:receive) { optional :event, :string } }
         ]
+        controllers << controllers.first
         routes = [
           route("admin/users", "index", "get", "/admin/users"),
           route("admin/users", "index", "get", "/admin/users"),
@@ -476,8 +557,7 @@ RSpec.describe Permittable::OpenAPI do
       verbs = doc["paths"].values.flat_map(&:keys)
       expect(verbs).to include("patch", "put"), "golden document no longer exercises a PATCH|PUT pair"
 
-      ids = doc["paths"].values.flat_map(&:values).filter_map { |operation| operation["operationId"] }
-      expect(ids.tally.select { |_, count| count > 1 }).to be_empty
+      expect(operation_ids(doc).tally.select { |_, count| count > 1 }).to be_empty
     end
 
     # OpenAPI 3.1 requires a path-template variable to be declared as a path

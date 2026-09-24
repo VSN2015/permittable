@@ -913,11 +913,13 @@ Every operation references shared components for the [error envelope](#violation
 
 | Collision | Ids |
 | --- | --- |
-| One operation under several verbs (the `PATCH\|PUT` pair `resources` generates, `via: :all`) | `users_update` on PATCH, `users_update_put` on PUT; `webhooks_receive`, `webhooks_receive_post`, … |
-| One operation at several paths under one verb (an optional segment, `(/:locale)/posts`) | `posts_create`, `posts_create_2` |
-| Two controllers that fold to one id (`admin/users` and `admin_users`) | `admin_users_index`, `admin_users_index_2` |
+| One operation under two verbs (the `PATCH\|PUT` pair `resources` generates) | `users_update` on PATCH, `users_update_put` on PUT |
+| The pair again at a second path (`resources :orgs { resources :users }`) | `users_update_2` on the second PATCH, `users_update_3` on the second PUT |
+| One operation under every verb (`via: :all`) | `webhooks_receive` on GET, then `webhooks_receive_post`, `_put`, `_patch`, `_delete` |
+| One operation at two paths under one verb (an optional segment, `(/:locale)/posts`) | `posts_create` on the first path in route order, `posts_create_2` on the other |
+| Two controllers that fold to one id (`admin/users` and `admin_users`, both GET) | `admin_users_index` on the first controller, `admin_users_index_2` on the second |
 
-The first place in controller, action and route order keeps the plain id. For a PATCH/PUT pair, PATCH keeps it whichever verb the route lists first. A routed operation keeps it ahead of one under `x-permittable-controllers`, which takes part too because it is in the same document. The others get their verb appended when the colliding verbs differ, and a number otherwise. A candidate that is already taken keeps counting up (`admin_users_index_post_2`). **The stability rule:** an id that only one operation would carry never changes, even when a suffix elsewhere would spell it. So a change to routes or controllers can rename only operations that collide, never one that stands alone. A route declared twice is placed once and does not collide with itself.
+One place keeps the plain id. A routed operation comes before one under `x-permittable-controllers`, which takes part because it is in the same document. After that, controller, action and route order decide. Within one operation, PATCH comes before PUT whichever the route lists first, so `match via: [:put, :patch]` and `resources` name the PATCH method the same way. Between two operations only the order counts, whatever the verbs. Every other place gets its verb appended when that verb differs from the plain id's verb and the result is free. Otherwise it gets the next free number, from `_2`. So a second PATCH is `users_update_2`, not `users_update_patch`, and a second POST is `posts_create_2`. **The stability rule:** an id that only one operation would carry never changes, even when a suffix elsewhere would spell it; that suffix is numbered instead. So a change to routes or controllers can rename only operations that collide, never one that stands alone. A route declared twice is placed once, and a controller passed twice is documented once, so neither collides with itself.
 
 Output is deterministic (fixed key order, declaration-order properties), so the generated file can be committed and reviewed as a diff — a contract change shows up in the same PR as its documentation change.
 
