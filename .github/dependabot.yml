@@ -28,6 +28,13 @@ updates:
       - dependency-name: "activerecord"
         update-types:
           - "version-update:semver-major"
+      # activesupport 8.1.3.1 cannot decode JSON with json 3, so the Gemfile
+      # pins json < 3. Drop this with that pin, once an activesupport release
+      # carries rails/rails#58601:
+      # https://github.com/VSN2015/permittable/issues/58
+      - dependency-name: "json"
+        versions:
+          - ">= 3"
     groups:
       bundler-minor-patch:
         update-types:

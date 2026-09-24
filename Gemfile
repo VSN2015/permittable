@@ -10,6 +10,11 @@ gem "rake"
 gem "actionpack", ">= 6.1", "< 9"
 gem "activerecord", ">= 6.1", "< 9"
 gem "benchmark-ips", "~> 2.13", require: false
+# activesupport 8.1.3.1 calls JSON.parse(source, opts) positionally, which json 3
+# rejects, so Rails cannot parse a JSON request body. Dev-only; remove once an
+# activesupport release carries rails/rails#58601.
+# https://github.com/VSN2015/permittable/issues/58
+gem "json", "< 3"
 gem "railties", ">= 5.0", "< 9"
 gem "rspec", "~> 3.12"
 gem "simplecov", "~> 1.2"
