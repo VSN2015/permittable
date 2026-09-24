@@ -225,6 +225,21 @@ module Permittable
   # ...and each name it does list is truncated. Capping the COUNT alone still
   # let ONE 1 MB key name write the 1 MB log line the cap exists to prevent.
   PROSE_ITEM_LIMIT = 120
+  # ...and a name that could break the sentence out of its line is escaped.
+  # The names are client-sent, and bounding their length escaped nothing: a
+  # key of "x\nE, [...] ERROR -- : ..." wrote a second, forged log entry.
+  # The set is every control character (\p{Cc}: C0, DEL and C1 — C1 because
+  # U+0085 is NEL, a line break to many readers, and U+009B is the 8-bit
+  # CSI that starts a terminal escape) plus U+2028/U+2029, the two Unicode
+  # separators a JSON-lines or JavaScript reader splits a line on. Format
+  # characters such as the bidi overrides are left alone: they can reorder
+  # how a line displays, but not start a new one.
+  PROSE_UNSAFE = /[\p{Cc}\u2028\u2029]/
+  # \n, \r and \t, which a person recognises, get their short escape; any
+  # other unsafe character is \uXXXX, which JSON, JavaScript and Ruby all
+  # read the same way. The quote and backslash are escaped too, but only
+  # inside an escaped (quoted) name, where they would otherwise be ambiguous.
+  PROSE_ESCAPES = { "\n" => '\n', "\r" => '\r', "\t" => '\t', '"' => '\"', "\\" => '\\\\' }.freeze
 
   # The single proc Permittable::Railtie appends to config.filter_parameters.
   # Declared with an optional third parameter so its own arity is -3 and Rails
@@ -1501,8 +1516,58 @@ module Permittable
     "#{shown}, and #{items.length - PROSE_LIST_LIMIT} more"
   end
 
+  # See PROSE_ITEM_LIMIT and PROSE_UNSAFE. Only a name that needs it is
+  # escaped, so every ordinary name — non-ASCII and backslashes included —
+  # prints byte-for-byte as before. An escaped name is always quoted, and a
+  # raw name that happens to START with a quote is escaped too: otherwise a
+  # literal `"a\nb"` sent as a key would print exactly like the escaped
+  # rendering of a real newline, and a reader could not tell them apart.
   def permittable_prose_item(item)
+    text = permittable_prose_utf8(item)
+    return permittable_prose_escaped(text) if !text.valid_encoding? || text.start_with?('"') || text.match?(PROSE_UNSAFE)
+
     item.length <= PROSE_ITEM_LIMIT ? item : "#{item[0, PROSE_ITEM_LIMIT - 3]}..."
+  end
+
+  # The item is truncated by whole escapes, never through one: cutting the
+  # escaped text at a fixed width could print a dangling backslash, or half
+  # of a \uXXXX. The "..." goes outside the closing quote, so the quotes
+  # still delimit exactly what is shown. Only as many characters are escaped
+  # as can be shown, so a 1 MB name costs no more than a short one.
+  def permittable_prose_escaped(text)
+    budget = PROSE_ITEM_LIMIT - 2 # the two quotes
+    pieces = []
+    length = 0
+    text.each_char do |char|
+      pieces << permittable_prose_escape(char)
+      length += pieces.last.length
+      break if length > budget
+    end
+    return "\"#{pieces.join}\"" if length <= budget
+
+    length -= pieces.pop.length while length > budget - 3
+    "\"#{pieces.join}\"..."
+  end
+
+  # A byte that is not valid UTF-8 is shown as \xNN rather than passed
+  # through: it is not a character a person can read, and a lone 0x85 or
+  # 0x9B is NEL or CSI to a Latin-1 terminal.
+  def permittable_prose_escape(char)
+    return char.bytes.map { |byte| format('\x%02X', byte) }.join unless char.valid_encoding?
+
+    PROSE_ESCAPES.fetch(char) { char.match?(PROSE_UNSAFE) ? format('\u%04X', char.ord) : char }
+  end
+
+  # PROSE_UNSAFE is a UTF-8 pattern, and matching it against a binary key
+  # with high bytes raises Encoding::CompatibilityError — a log line must
+  # never be what fails a request. A key that will not transcode is read
+  # as UTF-8 bytes, and whatever is invalid is then escaped byte by byte.
+  def permittable_prose_utf8(item)
+    return item if item.encoding == Encoding::UTF_8
+
+    item.encode(Encoding::UTF_8)
+  rescue EncodingError
+    item.dup.force_encoding(Encoding::UTF_8)
   end
 
   # One violation detail entry. A field's `message:` (String, or Hash keyed

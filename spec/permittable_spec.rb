@@ -1822,6 +1822,119 @@ RSpec.describe Permittable do
     end
   end
 
+  describe "escaped prose: control characters in client-sent names" do
+    def logging_controller(klass, params:, action: "create")
+      c = controller(klass, params: params, action: action)
+      lines = []
+      logger = Object.new
+      logger.define_singleton_method(:warn) { |message| lines << message }
+      c.define_singleton_method(:logger) { logger }
+      [c, lines]
+    end
+
+    def rejection(klass, params)
+      controller(klass, params: params).permitted_params
+      raise "expected InvalidParameters"
+    rescue described_class::InvalidParameters => e
+      e
+    end
+
+    let(:forged) { "evil\nE, [2026-09-23] ERROR -- : forged admin login" }
+    let(:log_klass) { permittable_class { permit_params(:create, unknown: :log) { required :a, :string } } }
+    let(:error_klass) { permittable_class { permit_params(:create, unknown: :error) { required :a, :string } } }
+    let(:unsafe) { /[\p{Cc}\u2028\u2029]/ }
+
+    it "cannot forge a second entry through the :log warn line" do
+      c, lines = logging_controller(log_klass, params: { "a" => "x", forged => "v" })
+      c.permitted_params
+      expect(lines.length).to eq(1)
+      expect(lines.first).not_to include("\n")
+      expect(lines.first).to end_with('contract: "evil\nE, [2026-09-23] ERROR -- : forged admin login"')
+    end
+
+    it "cannot forge one through the exception message, while details keeps the name as sent" do
+      e = rejection(error_klass, { "a" => "x", forged => "v" })
+      expect(e.message).not_to include("\n")
+      expect(e.message).to eq('Invalid parameters: "evil\nE, [2026-09-23] ERROR -- : forged admin login (unknown)"')
+      # details is data, not prose: the offending name arrives byte-for-byte.
+      expect(e.details).to eq([{ param: forged, code: "unknown" }])
+    end
+
+    it "escapes the monitor-mode warn line too, and instruments the name as sent" do
+      klass = permittable_class { permit_params(:create, unknown: :error, mode: :monitor) { required :a, :string } }
+      c, lines = logging_controller(klass, params: { "a" => "x", forged => "v" })
+      events = []
+      subscription = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
+        events << payload
+      end
+      begin
+        c.permitted_params
+      ensure
+        ActiveSupport::Notifications.unsubscribe(subscription)
+      end
+      expect(lines.first).not_to include("\n")
+      expect(lines.first).to include('"evil\nE, [2026-09-23]')
+      expect(events.first[:details]).to eq([{ param: forged, code: "unknown" }])
+    end
+
+    it "escapes every C0 and C1 control, DEL, and the Unicode line and paragraph separators" do
+      name = "k\u0000\u0007\b\t\n\v\f\r\e\u001F\u007F\u0080\u0085\u009B\u009F\u2028\u2029"
+      c, lines = logging_controller(log_klass, params: { "a" => "x", name => "v" })
+      c.permitted_params
+      expect(lines.first).not_to match(unsafe)
+      expect(lines.first).to end_with(
+        'contract: "k\u0000\u0007\u0008\t\n\u000B\u000C\r\u001B\u001F\u007F\u0080\u0085\u009B\u009F\u2028\u2029"'
+      )
+    end
+
+    it "leaves ordinary names byte-identical, non-ASCII and backslashes included" do
+      c, lines = logging_controller(log_klass, params: { "a" => "x", "café" => 1, "名前" => 2, 'a\nb' => 3, 'x"y' => 4 })
+      c.permitted_params
+      expect(lines.first).to end_with('contract: café, 名前, a\nb, x"y')
+    end
+
+    it "quotes a name that begins with a quote, so a raw name can never pass for an escaped one" do
+      # Unescaped, this literal backslash-n name would print exactly like the
+      # escaped rendering of a real newline.
+      lookalike = '"evil\nE"'
+      c, lines = logging_controller(log_klass, params: { "a" => "x", lookalike => "v" })
+      c.permitted_params
+      expect(lines.first).to end_with('contract: "\"evil\\\\nE\""')
+    end
+
+    it "escapes the quote and backslash inside an escaped name, so the rendering stays unambiguous" do
+      c, lines = logging_controller(log_klass, params: { "a" => "x", "q\"b\\\n" => "v" })
+      c.permitted_params
+      expect(lines.first).to end_with('contract: "q\"b\\\\\n"')
+    end
+
+    it "truncates an escaped name between escapes, never through one, and outside the closing quote" do
+      # Cutting the escaped text at a fixed width would land inside the first
+      # "\n" and print a dangling backslash; the cut backs off to a whole escape.
+      name = ("x" * 114) + ("\n" * 50)
+      c, lines = logging_controller(log_klass, params: { "a" => "x", name => "v" })
+      c.permitted_params
+      shown = lines.first.split("contract: ").last
+      expect(shown).to eq("\"#{'x' * 114}\"...")
+      expect(shown.length).to be <= 120
+    end
+
+    it "bounds an enormous escaped name like any other" do
+      c, lines = logging_controller(log_klass, params: { "a" => "x", ("\n" * 100_000) => "v" })
+      c.permitted_params
+      expect(lines.first.bytesize).to be < 300
+      expect(lines.first).to end_with("#{'\n' * 57}\"...")
+    end
+
+    it "shows the bytes of a name that is not valid UTF-8 instead of raising" do
+      invalid = "bad\xFF\xFEkey".dup.force_encoding(Encoding::UTF_8)
+      binary = "raw\xC0".b
+      c, lines = logging_controller(log_klass, params: { "a" => "x", invalid => 1, binary => 2 })
+      c.permitted_params
+      expect(lines.first).to end_with('contract: "bad\xFF\xFEkey", "raw\xC0"')
+    end
+  end
+
   describe "monitor mode" do
     after { Permittable.mode = :enforce }
 
