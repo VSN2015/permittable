@@ -2443,15 +2443,19 @@ RSpec.describe Permittable do
     end
 
     describe "unknown: :error on a rootless contract, with a real request" do
-      def build_rootless_controller(wrap: false, &fields)
+      # `wrap:` names the wrapper key: a String, as Rails derives it from
+      # controller_name — ParamsWrapper compares it against the string-keyed
+      # params to decide whether the client already sent the key.
+      def build_rootless_controller(wrap: nil, &fields)
         IntegrationHarness.build_controller do
           include Permittable
 
-          # A String, as Rails derives it from controller_name: ParamsWrapper
-          # compares it against the string-keyed params to decide whether the
-          # client already sent the key.
-          wrap_parameters "user", format: [:json] if wrap
-          permit_params(:update, unknown: :error, &fields)
+          wrap_parameters wrap, format: [:json] if wrap
+          permit_params(:create, :update, unknown: :error, &fields)
+
+          def create
+            render json: permitted_params
+          end
 
           def update
             render json: permitted_params
@@ -2468,7 +2472,7 @@ RSpec.describe Permittable do
       end
 
       it "does not flag ParamsWrapper's copy of a JSON body under the wrapper key" do
-        controller = build_rootless_controller(wrap: true) { optional :name, :string }
+        controller = build_rootless_controller(wrap: "user") { optional :name, :string }
         result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo" },
                                                                   path_params: { id: "1" })
         expect(result.status).to eq(200)
@@ -2476,7 +2480,7 @@ RSpec.describe Permittable do
       end
 
       it "still flags a genuine extra key alongside the path and wrapper keys" do
-        controller = build_rootless_controller(wrap: true) { optional :name, :string }
+        controller = build_rootless_controller(wrap: "user") { optional :name, :string }
         result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo", rogue: 1 },
                                                                   path_params: { id: "1" })
         expect(result.status).to eq(422)
@@ -2486,21 +2490,72 @@ RSpec.describe Permittable do
       it "still flags a client-sent key that merely shares the wrapper's name" do
         # ParamsWrapper leaves a body alone when it already carries the key,
         # so here `user` is the client's own and is exempt from nothing.
-        controller = build_rootless_controller(wrap: true) { optional :name, :string }
+        controller = build_rootless_controller(wrap: "user") { optional :name, :string }
         result = IntegrationHarness.dispatch(controller, :update, method: "PATCH",
                                                                   json: { name: "Jo", user: { admin: true } })
         expect(result.status).to eq(422)
         expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "user", "code" => "unknown" }])
       end
 
-      it "validates a declared field named like the wrapper key rather than exempting it" do
-        controller = build_rootless_controller(wrap: true) do
+      # A declared field that shares the wrapper key's name is ABSENT when Rails
+      # made the copy: the client never sent it. Validating the copy instead
+      # rejected a well-formed body as that field's invalid_type, or — for a
+      # hash-typed field — slipped the whole body into permitted_params under
+      # a key the client never used.
+      it "treats a declared field named like the wrapper key as absent when Rails made the copy" do
+        controller = build_rootless_controller(wrap: "feedback") do
+          optional :rating, :integer
+          optional :feedback, :string
+        end
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { rating: 5 })
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)).to eq("rating" => 5)
+      end
+
+      it "does not let the wrapper's copy land in a hash-typed field of the same name" do
+        controller = build_rootless_controller(wrap: "user") do
+          optional :name, :string
+          optional :user do
+            optional :name, :string
+          end
+        end
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo" })
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)).to eq("name" => "Jo")
+      end
+
+      it "still validates that declared field when the client sent the key itself" do
+        # The body already carries `user`, so ParamsWrapper stays out of it
+        # and the value is the client's own.
+        controller = build_rootless_controller(wrap: "user") do
           optional :name, :string
           optional :user, :string
         end
-        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo" })
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo", user: "x" })
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)).to eq("name" => "Jo", "user" => "x")
+
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo", user: { a: 1 } })
         expect(result.status).to eq(422)
         expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "user", "code" => "invalid_type" }])
+      end
+
+      it "does not carry one request's wrapper exemption into the next on a reused controller" do
+        # Rails builds a controller per request, but nothing stops a host (or
+        # a test) from dispatching twice on one instance. The second request
+        # is a form POST, which ParamsWrapper does not wrap, so its `user` is
+        # the client's own and must still be flagged.
+        controller = build_rootless_controller(wrap: "user") { optional :name, :string }
+        instance = controller.new
+        first = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo" },
+                                                                 instance: instance)
+        expect(first.status).to eq(200)
+
+        second = IntegrationHarness.dispatch(controller, :create, method: "POST",
+                                                                  params: { name: "Jo", user: { admin: "1" } },
+                                                                  instance: instance)
+        expect(second.status).to eq(422)
+        expect(JSON.parse(second.body)["error"]["details"]).to eq([{ "param" => "user", "code" => "unknown" }])
       end
     end
 

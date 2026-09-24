@@ -1426,10 +1426,12 @@ module Permittable
   # Private, like the method it wraps — a public one would become an action.
   # A plain duck has no process_action and no ParamsWrapper, so this never
   # runs there, and the guards keep an actionpack-free host inert.
+  # Assigned on every request, never only when true: a controller instance
+  # dispatched twice would otherwise carry one request's exemption into the
+  # next, where a `user` the client did send would pass as Rails' copy.
   def process_action(*)
-    if respond_to?(:_wrapper_enabled?, true) && respond_to?(:_wrapper_key, true) && _wrapper_enabled?
-      @permittable_wrapper_key = _wrapper_key.to_s
-    end
+    wraps = respond_to?(:_wrapper_enabled?, true) && respond_to?(:_wrapper_key, true) && _wrapper_enabled?
+    @permittable_wrapper_key = wraps ? _wrapper_key.to_s : nil
     super
   end
 
@@ -1451,8 +1453,9 @@ module Permittable
     source = permittable_root_hash(rule, violations)
     result = ActiveSupport::HashWithIndifferentAccess.new
     if source
-      result = permittable_check_hash(rule[:fields], source, path: rule[:root] ? rule[:root].to_s : nil,
-                                                             unknown: rule[:unknown], top_level: !rule[:root], violations: violations)
+      checked = rule[:root] ? source : permittable_without_wrapper_copy(source)
+      result = permittable_check_hash(rule[:fields], checked, path: rule[:root] ? rule[:root].to_s : nil,
+                                                              unknown: rule[:unknown], top_level: !rule[:root], violations: violations)
     end
     # finalize only sees a hash every field vouched for — never garbage.
     result = permittable_run_finalize(rule[:finalize], result, violations) if violations.empty? && rule[:finalize]
@@ -1744,19 +1747,34 @@ module Permittable
     end
   end
 
-  # The top-level keys THIS request's framework put into params, beyond the
-  # fixed UNCHECKED_TOP_LEVEL_KEYS: whatever the router matched out of the
-  # URL (`PATCH /users/1` merges `id`, which the exported OpenAPI documents
-  # as a path parameter, not a body field), and ParamsWrapper's copy of the
-  # body when it made one (see process_action). A controller only — a plain
-  # params duck and a standalone Contract have no request, so they exempt
-  # nothing extra. Subtracted from the undeclared keys, so a contract that
-  # DECLARES `id` or `user` still has that field checked like any other.
+  # The top-level keys THIS request's router put into params, beyond the
+  # fixed UNCHECKED_TOP_LEVEL_KEYS: whatever it matched out of the URL
+  # (`PATCH /users/1` merges `id`, which the exported OpenAPI documents as a
+  # path parameter, not a body field). A controller only — a plain params
+  # duck and a standalone Contract have no request, so they exempt nothing
+  # extra. Subtracted from the undeclared keys, so a contract that DECLARES
+  # `id` still has that field checked like any other: the value is real, the
+  # URL carried it.
   def permittable_request_supplied_keys
-    keys = []
-    keys.concat(request.path_parameters.keys.map(&:to_s)) if respond_to?(:request) && request.respond_to?(:path_parameters)
-    keys << @permittable_wrapper_key if @permittable_wrapper_key
-    keys
+    return [] unless respond_to?(:request) && request.respond_to?(:path_parameters)
+
+    request.path_parameters.keys.map(&:to_s)
+  end
+
+  # A rootless contract's input without ParamsWrapper's copy of the body,
+  # when Rails made one (see process_action). Removed rather than merely
+  # exempted from the unknown-keys check, because the client never sent that
+  # key: a contract that happens to declare a field of the wrapper's name
+  # (`optional :feedback, :string` on FeedbackController) would otherwise
+  # validate Rails' copy of the whole body as that field — a false 422
+  # invalid_type for a well-formed request, or, for a hash-typed field, the
+  # entire body silently landing in permitted_params under a key nobody sent.
+  # Top level only, where the copy lives; a rooted contract reads that copy
+  # as its root, which is exactly what ParamsWrapper is for. What is checked
+  # changes, not what monitor mode hands back: its raw pass-through still
+  # carries the copy, as the pre-contract app's params did.
+  def permittable_without_wrapper_copy(source)
+    @permittable_wrapper_key ? source.except(@permittable_wrapper_key) : source
   end
 
   def permittable_path(path, key)

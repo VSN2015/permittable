@@ -22,8 +22,11 @@ module IntegrationHarness
   # as an application/json body instead (what ParamsWrapper acts on), and
   # `path_params:` stands in for what the router would have matched out of
   # the URL — Rails merges both into `params` exactly as a routed request
-  # would, with no route set needed.
-  def dispatch(controller_class, action, method: "GET", query: "", params: nil, json: nil, path_params: nil)
+  # would, with no route set needed. `instance:` dispatches on that controller
+  # object instead of a fresh one per request, to pin down state that must
+  # not survive from one request to the next.
+  def dispatch(controller_class, action, method: "GET", query: "", params: nil, json: nil, path_params: nil,
+               instance: nil)
     opts = { method: method }
     opts[:params] = params if params
     if json
@@ -37,7 +40,13 @@ module IntegrationHarness
     # test that incompatibility instead of the contract.
     env["action_dispatch.request.request_parameters"] = JSON.parse(JSON.generate(json)) if json
     env["action_dispatch.request.path_parameters"] = path_params if path_params
-    status, headers, body = controller_class.action(action).call(env)
+    status, headers, body =
+      if instance
+        request = ActionDispatch::Request.new(env)
+        instance.dispatch(action, request, controller_class.make_response!(request))
+      else
+        controller_class.action(action).call(env)
+      end
     # Rack bodies only guarantee #each (RackBody has no #map).
     chunks = body.enum_for(:each).to_a
     body.close if body.respond_to?(:close)
