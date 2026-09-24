@@ -311,9 +311,12 @@ module Permittable
     # two templates differing only in variable names. Variants are built with
     # each group present first, so the one Rails would match is the one kept;
     # the list is then reversed, which puts every group's ABSENT variant
-    # first at every nesting level. That order matters downstream: colliding
-    # operationIds are numbered in route order, so `/posts` keeps
-    # `posts_create` and `/{locale}/posts` takes the suffix.
+    # first at every nesting level. That order matters to the operationId
+    # dedupe (assign_unique_operation_ids, which numbers colliding ids in
+    # route order): the variants of one route share an operation, and it is
+    # that dedupe, not this expansion, that makes their ids unique. Absent
+    # first means `/posts` keeps `posts_create` and `/{locale}/posts` takes
+    # the suffix.
     def optional_variants(path)
       variants, = expand_optional_groups(path, 0)
       variants.map { |variant| variant.empty? ? "/" : variant }

@@ -251,9 +251,10 @@ RSpec.describe Permittable::OpenAPI do
           .to eq(["/x", "/x/{a}", "/x/{a}/{b}"])
       end
 
-      # Order is part of the contract: the exporter numbers colliding
-      # operationIds in route order, so the path without the segment must come
-      # first to keep the plain id (`/posts` is `posts_create`, not `_2`).
+      # Order is part of the contract: the operationId dedupe
+      # (assign_unique_operation_ids) numbers colliding ids in route order, so
+      # the path without the segment must come first to keep the plain id
+      # (`/posts` is `posts_create`, not `_2`).
       # Each group reads absent-before-present, outer groups before inner, and
       # the order does not change which coinciding variant survives
       # (`/p/{q}`, not `/p/{s}`).

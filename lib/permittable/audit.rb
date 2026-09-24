@@ -160,12 +160,14 @@ module Permittable
     end
 
     # The table lists rows (a verb on a path) and the summary counts routes;
-    # when an optional segment makes the two numbers differ, the line says
-    # which is which. Rows, not distinct paths: PATCH and PUT on one path are
-    # two rows.
+    # when the two numbers differ, the line gives both and names each. Rows,
+    # not distinct paths: PATCH and PUT on one path are two rows. It does not
+    # say WHY they differ: an optional segment's variants are the usual
+    # reason, but two concatenated route lists sharing a controller, action
+    # and index collapse the same way.
     def summary_lines(counts, rows: counts[:actions])
       body = counts[:uncovered_with_body]
-      listed = " in #{rows} rows (an optional segment lists each path it expands to)" unless rows == counts[:actions]
+      listed = " in #{rows} rows" unless rows == counts[:actions]
       [
         "",
         "#{counts[:actions]} routed action#{'s' unless counts[:actions] == 1}#{listed}: " \

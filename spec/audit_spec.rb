@@ -173,14 +173,14 @@ RSpec.describe Permittable::Audit do
       expect(report).to include("users#archive")
     end
 
-    # The summary counts routes, the table lists rows; when an optional
-    # segment makes the two differ, the report says which number is which.
+    # The summary counts routes, the table lists rows; when the two differ,
+    # the report gives both numbers and names each.
     it "says how many rows the table lists when one route expands to several" do
       sourced = routes.each_with_index.map { |route, index| route.merge(route: index) }
       localized = sourced + [{ controller: "legacy", action: "create", verb: "post", path: "/{locale}/legacy", route: 4 }]
       expanded = described_class.entries(controllers: [users, bare_class("legacy")], routes: localized)
       report = described_class.format(expanded)
-      expect(report).to include("5 routed actions in 6 rows (an optional segment lists each path it expands to): ")
+      expect(report).to include("5 routed actions in 6 rows: ")
       expect(described_class.format(entries)).to include("5 routed actions: ")
     end
 
@@ -193,7 +193,7 @@ RSpec.describe Permittable::Audit do
       descriptors = Permittable::OpenAPI.rails_routes(Struct.new(:routes).new(route_set))
       found = described_class.entries(controllers: [bare_class("posts")], routes: descriptors)
       expect(found.map(&:path).uniq.length).to eq(2)
-      expect(described_class.format(found)).to include("2 routed actions in 4 rows ")
+      expect(described_class.format(found)).to include("2 routed actions in 4 rows: ")
     end
 
     it "says so plainly when there is nothing to report" do
