@@ -76,6 +76,22 @@ RSpec.describe "the exported schema against what the contract enforces" do
         [{ "plan" => nil }, :null_is_absence]
       ]
     },
+    "enums authored in another type than the field's" => {
+      # Symbols on a :string field and Strings on an :integer field. Both used
+      # to reject EVERY request while the exported enum advertised values
+      # the server refused — the exact disagreement this spec exists to catch.
+      contract: proc {
+        optional :status, :string, in: %i[draft published]
+        optional :n, :integer, in: %w[1 2 3]
+      },
+      payloads: [
+        [{ "status" => "draft" }, :agree],
+        [{ "status" => "archived" }, :agree],
+        [{ "n" => 2 }, :agree],
+        [{ "n" => 4 }, :agree],
+        [{ "n" => "2" }, :coerced_encoding]
+      ]
+    },
     "an exclusive range" => {
       contract: proc { optional :pct, :integer, in: 0...100 },
       payloads: [[{ "pct" => 0 }, :agree], [{ "pct" => 99 }, :agree], [{ "pct" => 100 }, :agree]]

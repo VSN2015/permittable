@@ -707,6 +707,32 @@ module Permittable
       value.nil? || (value.is_a?(String) && value.empty?)
     end
 
+    # An `in:` list as the runtime holds it: every member cast by the field's
+    # own type, because included_in? compares the CAST request value against
+    # it. Comparing against the members as authored meant `in: %i[draft
+    # published]` on a :string field (and `in: %w[1 2 3]` on an :integer one)
+    # held values no cast could ever produce, and rejected every request.
+    #
+    # A Symbol is read as its String first: it is how Ruby spells a constant
+    # string, and a request never carries one, so no cast accepts it as is.
+    # `normalize:` is deliberately not applied — it rewrites what a client
+    # sent, not what the contract author wrote. Duplicates the cast collapses
+    # ("1" and 1 on an :integer) are dropped, and a Set stays a Set, so an
+    # author who chose one for its O(1) include? keeps it.
+    #
+    # Returns [:ok, members] or [:error, offending_member, code], shared by
+    # ContractBuilder and the RSpec matcher's `within` chain so the two
+    # cannot read the same list differently.
+    def cast_in_members(type, members)
+      cast_members = members.map do |member|
+        status, value = cast(type, member.is_a?(Symbol) ? member.to_s : member)
+        return [:error, member, value] unless status == :ok
+
+        value
+      end.uniq
+      [:ok, members.is_a?(Set) ? cast_members.to_set : cast_members]
+    end
+
     # Range#include? walks discrete ranges; cover? is the O(1) bounds check
     # and the right semantics for validation.
     def included_in?(allowed, value)
@@ -729,6 +755,13 @@ module Permittable
                      nullable].freeze
     ARRAY_OPTS  = %i[of length default validate virtual sensitive required transform message desc example
                      nullable].freeze
+
+    # One value of each scalar type as a cast produces it, for asking whether
+    # an `in:` Range's endpoints can be compared with that type at all.
+    RANGE_PROBES = {
+      string: "", integer: 0, float: 0.0, decimal: BigDecimal("0"), boolean: true,
+      date: Date.new(2000, 1, 1), datetime: Time.utc(2000)
+    }.freeze
 
     attr_reader :finalizer
 
@@ -892,14 +925,7 @@ module Permittable
         raise ArgumentError, "#{LABEL}: field :#{name} is required and cannot have a :default (default implies optional)"
       end
 
-      if field.key?(:in)
-        unless field[:in].respond_to?(:include?)
-          raise ArgumentError, "#{LABEL}: :in for field :#{name} must respond to include? (Range or Array)"
-        end
-
-        assert_satisfiable!(name, :in, field[:in])
-      end
-
+      resolve_in!(field) if field.key?(:in)
       validate_string_only_opts!(field)
       validate_length!(name, field[:length]) if field.key?(:length)
       validate_required_length!(field)
@@ -910,6 +936,71 @@ module Permittable
       validate_authored_value!(field, :default)
       validate_authored_value!(field, :example)
       validate_message!(field)
+    end
+
+    # `in:` is a Range (bounds-checked with cover?) or a list of values. It
+    # used to be anything answering include?, which let a String through —
+    # and String#include? is a SUBSTRING test, so `in: "free pro"` accepted
+    # "e", "fr" and "ee p". A Hash answers include? too, about its keys.
+    # Both are refused here, along with anything else that is not a list.
+    #
+    # A list is stored cast by the field's type (see
+    # Coercion.cast_in_members), so request-time matching, the exported
+    # enum and the RSpec matcher all read the members the runtime compares
+    # against. A member no request value could ever equal is a contract
+    # mistake, and fails here rather than as an `inclusion` on every request.
+    def resolve_in!(field)
+      name = field[:name]
+      allowed = field[:in]
+      if allowed.is_a?(Range)
+        assert_comparable_range!(field, allowed)
+      elsif allowed.is_a?(Enumerable) && !allowed.is_a?(Hash)
+        field[:in] = cast_in_members!(field, allowed)
+      else
+        raise ArgumentError, "#{LABEL}: :in for field :#{name} must be a Range or a list of values " \
+                             "such as an Array or Set (got #{allowed.inspect})"
+      end
+      assert_satisfiable!(name, :in, field[:in])
+    end
+
+    def cast_in_members!(field, allowed)
+      status, members, code = Coercion.cast_in_members(field[:type], allowed)
+      return freeze_in_members(members) if status == :ok
+
+      # nil is the one member written on purpose, meaning "null is allowed" —
+      # but an absent value never reaches in:, so the fix is worth naming.
+      hint = members.nil? ? " — an absent value never reaches in:; declare nullable: true to accept an explicit null" : ""
+      raise ArgumentError, "#{LABEL}: :in for field :#{field[:name]} contains #{members.inspect}, " \
+                           "which is not a valid :#{field[:type]} (#{code})#{hint}"
+    end
+
+    def freeze_in_members(members)
+      members.is_a?(Set) ? members.to_set { |member| freeze_authored(member) }.freeze : freeze_authored(members)
+    end
+
+    # A Range is kept exactly as written, unlike a list: casting its
+    # endpoints would change what it means. `0..Float::INFINITY` on a :float
+    # and `1.5..3` on an :integer are real bounds whose endpoints no cast
+    # accepts, and a :decimal's `0..100` would become BigDecimal endpoints
+    # that export as the STRING "0.0" where `minimum` needs a number.
+    #
+    # What does fail every request is an endpoint the cast value cannot be
+    # compared with — `"1".."5"` on an :integer, `1..5` on a :string,
+    # `.."9.99"` on a :decimal. cover? then answers false for every value, so
+    # that is caught here. The probe asks exactly what cover? will — begin
+    # <=> value, then value <=> end — so whatever the host's own <=> allows
+    # (ActiveSupport lets a Date range bound a :datetime) is allowed here too.
+    def assert_comparable_range!(field, range)
+      probe = RANGE_PROBES.fetch(field[:type])
+      # Wrapped in an Array so a `false` endpoint still reads as found.
+      stray = if !range.begin.nil? && (range.begin <=> probe).nil? then [range.begin]
+              elsif !range.end.nil? && (probe <=> range.end).nil? then [range.end]
+              end
+      return unless stray
+
+      raise ArgumentError, "#{LABEL}: :in for field :#{field[:name]} is a Range of #{stray.first.class} " \
+                           "(#{range.inspect}), which a :#{field[:type]} value cannot be compared with — " \
+                           "no value could satisfy it; write the bounds as :#{field[:type]} values"
     end
 
     def validate_json_opts!(field)

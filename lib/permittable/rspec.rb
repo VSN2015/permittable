@@ -197,6 +197,8 @@ module Permittable
         when :of then "expected an array of :#{value}, but it is of: :#{field[:of]}" unless field[:of] == value
         when :required then required_mismatch(field, value)
         when :format then format_mismatch(field, value)
+        # Compared cast, but reported as written.
+        when :in then option_mismatch(field, :in, value) unless field.key?(:in) && field[:in] == cast_in(field, value)
         when :virtual, :sensitive, :nullable then "expected the field to be #{key}, but it is not" unless field[key]
         else option_mismatch(field, key, value)
         end
@@ -225,6 +227,19 @@ module Permittable
         return if field[:format_name] == expected
 
         "expected format: :#{expected}, but the contract #{declared_format(field)}"
+      end
+
+      # A contract stores an `in:` list cast by the field's type, so
+      # `within(%i[draft published])` — the declaration repeated as written —
+      # is cast the same way before comparing, by the same function. A list
+      # that does not cast (or a Range, kept as written by the contract too)
+      # is compared as given, and the failure shows both sides.
+      def cast_in(field, expected)
+        return expected unless field[:kind] == :scalar && expected.is_a?(Enumerable) &&
+                               !expected.is_a?(Range) && !expected.is_a?(Hash)
+
+        status, members = Coercion.cast_in_members(field[:type], expected)
+        status == :ok ? members : expected
       end
 
       def declared_format(field)

@@ -87,9 +87,53 @@ RSpec.describe Permittable do
       end
     end
 
-    it "rejects :in that does not respond to include?" do
+    it "rejects an :in that is neither a Range nor a list of values" do
       expect { permittable_class { permit_params(:create) { required :a, :integer, in: 5 } } }
-        .to raise_error(ArgumentError, /:in for field :a must respond to include\?/)
+        .to raise_error(ArgumentError, /:in for field :a must be a Range or a list of values .*\(got 5\)/)
+      # A Hash is Enumerable, but include? asks about its KEYS — not a list.
+      expect { permittable_class { permit_params(:create) { required :a, :string, in: { "x" => 1 } } } }
+        .to raise_error(ArgumentError, /:in for field :a must be a Range or a list of values/)
+    end
+
+    # String#include? is a substring test: in: "free pro" accepted "e", "fr"
+    # and "ee p" as plans.
+    it "rejects a String :in, which would have matched any substring" do
+      expect { permittable_class { permit_params(:create) { optional :plan, :string, in: "free pro" } } }
+        .to raise_error(ArgumentError, /:in for field :plan must be a Range or a list of values .*\(got "free pro"\)/)
+    end
+
+    it "rejects an :in member that the field's own type cannot cast" do
+      expect { permittable_class { permit_params(:create) { optional :n, :integer, in: %w[1 two] } } }
+        .to raise_error(ArgumentError, /:in for field :n contains "two", which is not a valid :integer \(invalid_type\)/)
+      expect { permittable_class { permit_params(:create) { optional :day, :date, in: ["2026-02-30"] } } }
+        .to raise_error(ArgumentError, /:in for field :day contains "2026-02-30", which is not a valid :date/)
+      expect { permittable_class { permit_params(:create) { optional :tier, :string, in: [nil, "pro"] } } }
+        .to raise_error(ArgumentError, /:in for field :tier contains nil.*declare nullable: true/)
+    end
+
+    it "rejects an :in Range whose endpoints the field's values cannot be compared with" do
+      expect { permittable_class { permit_params(:create) { optional :n, :integer, in: "1".."5" } } }
+        .to raise_error(ArgumentError, /:in for field :n is a Range of String \("1"\.\."5"\), which a :integer value cannot be compared/)
+      expect { permittable_class { permit_params(:create) { optional :s, :string, in: 1..5 } } }
+        .to raise_error(ArgumentError, /:in for field :s is a Range of Integer/)
+      expect { permittable_class { permit_params(:create) { optional :price, :decimal, in: .."9.99" } } }
+        .to raise_error(ArgumentError, /:in for field :price is a Range of String/)
+    end
+
+    it "accepts a Range whose endpoints compare with the field's values, without rewriting it" do
+      decl = proc do
+        permit_params(:create) do
+          optional :ratio, :float,   in: 0..Float::INFINITY
+          optional :price, :decimal, in: 0..100
+          optional :n,     :integer, in: 1.5..3
+          optional :day,   :date,    in: (Date.new(2026, 1, 1)..)
+          # ActiveSupport teaches Date#<=> to compare with a Time.
+          optional :at,    :datetime, in: (Date.new(2026, 1, 1)..)
+        end
+      end
+      fields = permittable_class(&decl).permit_rule_for(:create)[:fields]
+      expect(fields.map { |f| f[:in] })
+        .to eq([0..Float::INFINITY, 0..100, 1.5..3, (Date.new(2026, 1, 1)..), (Date.new(2026, 1, 1)..)])
     end
 
     it "rejects a bound no value could satisfy, rather than failing every request" do
@@ -495,6 +539,41 @@ RSpec.describe Permittable do
 
       e = violations_for({ plan: "gold" }) { permit_params(:create) { required :plan, :string, in: %w[free pro] } }
       expect(e.details.first[:code]).to eq("inclusion")
+    end
+
+    # The members used to be compared as authored against the CAST value, so
+    # a :string field listing Symbols rejected every request — while its
+    # exported enum, which stringifies Symbols, advertised the very values it
+    # refused.
+    it "casts in: members with the field's own type, so Symbols work on a :string field" do
+      decl = proc { permit_params(:create) { optional :status, :string, in: %i[draft published], default: "draft" } }
+      expect(permit({ status: "published" }, &decl)[:status]).to eq("published")
+      expect(permit({}, &decl)[:status]).to eq("draft")
+      expect(violations_for({ status: "archived" }, &decl).details).to eq([{ param: "status", code: "inclusion" }])
+    end
+
+    it "casts String in: members on an :integer field, and any listed spelling on a :date field" do
+      decl = proc { permit_params(:create) { optional :n, :integer, in: %w[1 2 3] } }
+      expect(permit({ n: "2" }, &decl)[:n]).to eq(2)
+      expect(permit({ n: 3 }, &decl)[:n]).to eq(3)
+      expect(violations_for({ n: "4" }, &decl).details).to eq([{ param: "n", code: "inclusion" }])
+
+      decl = proc { permit_params(:create) { optional :day, :date, in: ["2026-09-05", Date.new(2026, 9, 6)] } }
+      expect(permit({ day: "Sep 5, 2026" }, &decl)[:day]).to eq(Date.new(2026, 9, 5))
+      expect(permit({ day: "2026-09-06" }, &decl)[:day]).to eq(Date.new(2026, 9, 6))
+    end
+
+    it "stores the cast members frozen, deduplicated, and in the container they were given in" do
+      decl = proc do
+        permit_params(:create) do
+          optional :n,    :integer, in: ["1", 1, "01", 2]
+          optional :tier, :string,  in: Set[:free, :pro]
+        end
+      end
+      n, tier = permittable_class(&decl).permit_rule_for(:create)[:fields]
+      expect(n[:in]).to eq([1, 2]).and be_frozen
+      expect(tier[:in]).to eq(Set["free", "pro"]).and be_frozen
+      expect(tier[:in]).to all(be_frozen)
     end
 
     it "checks format on strings" do

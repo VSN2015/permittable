@@ -69,6 +69,15 @@ RSpec.describe Permittable::JsonSchema do
       expect(property("pct") { optional :pct, :integer, in: 0...100 }).to include("minimum" => 0, "exclusiveMaximum" => 100)
     end
 
+    # The enum is built from the members as the RUNTIME holds them — cast by
+    # the field's own type at class load — so it cannot advertise a value the
+    # server refuses, nor publish "1" for a field whose JSON type is integer.
+    it "exports the cast members, in the field's own JSON type" do
+      expect(property("status") { optional :status, :string, in: %i[draft published] }["enum"]).to eq(%w[draft published])
+      expect(property("n") { optional :n, :integer, in: %w[1 2 3] }["enum"]).to eq([1, 2, 3])
+      expect(property("day") { optional :day, :date, in: ["Sep 5, 2026"] }["enum"]).to eq(["2026-09-05"])
+    end
+
     it "carries a non-numeric Range as an extension instead of guessing" do
       prop = property("code") { optional :code, :string, in: "a".."m" }
       expect(prop["x-permittable-range"]).to eq('"a".."m"')
