@@ -251,6 +251,20 @@ RSpec.describe Permittable::OpenAPI do
           .to eq(["/x", "/x/{a}", "/x/{a}/{b}"])
       end
 
+      # Order is part of the contract: the exporter numbers colliding
+      # operationIds in route order, so the path without the segment must come
+      # first to keep the plain id (`/posts` is `posts_create`, not `_2`).
+      # Each group reads absent-before-present, outer groups before inner, and
+      # the order does not change which coinciding variant survives
+      # (`/p/{q}`, not `/p/{s}`).
+      it "emits the path without each optional segment first, at every nesting level" do
+        app = app_with { get "(:l)/p(/:q(/:r))(/:s)", to: "m#n" }
+        expect(described_class.rails_routes(app).map { |r| r[:path] }).to eq(
+          ["/p", "/p/{q}", "/p/{q}/{r}", "/p/{q}/{r}/{s}",
+           "/{l}/p", "/{l}/p/{q}", "/{l}/p/{q}/{r}", "/{l}/p/{q}/{r}/{s}"]
+        )
+      end
+
       it "exports a document with no parentheses and every templated variable declared" do
         klass = controller_class(path: "posts") { permit_params(:create) { required :title, :string } }
         app = app_with do

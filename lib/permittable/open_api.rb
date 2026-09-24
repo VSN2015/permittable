@@ -310,7 +310,10 @@ module Permittable
     # `/x/{b}` variant is the same URL under another name, and OpenAPI forbids
     # two templates differing only in variable names. Variants are built with
     # each group present first, so the one Rails would match is the one kept;
-    # the list is then reversed to read shortest first.
+    # the list is then reversed, which puts every group's ABSENT variant
+    # first at every nesting level. That order matters downstream: colliding
+    # operationIds are numbered in route order, so `/posts` keeps
+    # `posts_create` and `/{locale}/posts` takes the suffix.
     def optional_variants(path)
       variants, = expand_optional_groups(path, 0)
       variants.map { |variant| variant.empty? ? "/" : variant }
