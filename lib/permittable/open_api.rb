@@ -271,9 +271,11 @@ module Permittable
     # OpenAPI requires operationId to be unique across the document, and
     # client generators name a method after it — a duplicate is an invalid
     # document and, in practice, two methods with one name. One operation is
-    # placed at every slot its routes reach (the PATCH|PUT pair `resources`
-    # generates, an optional segment's two paths, `via: :all`'s five verbs),
-    # and `key.tr("/", "_")` folds admin/users and admin_users into one id.
+    # placed at every slot its routes reach: the separate PATCH and PUT
+    # routes `resources` draws to update, or one `via: [:patch, :put]` route;
+    # with the optional-segment expansion, one route's several paths; with
+    # `via: :all` routes, which are documented under each verb, five verbs.
+    # And `key.tr("/", "_")` folds admin/users and admin_users into one id.
     #
     # Renaming the scheme would rename every generated client method, so an
     # id that is already unique never changes. Every slot's natural id is
