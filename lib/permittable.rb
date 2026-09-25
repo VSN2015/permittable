@@ -1091,6 +1091,10 @@ module Permittable
       required = opts.delete(:required) ? true : false
 
       field = { name: name, kind: :array, required: required, **opts }
+      if field[:required] && field.key?(:default)
+        raise ArgumentError, "#{LABEL}: field :#{name} is required and cannot have a :default (default implies optional)"
+      end
+
       if block
         raise ArgumentError, "#{LABEL}: array :#{name} takes of: OR a block, not both" if opts.key?(:of)
 
