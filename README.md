@@ -292,7 +292,7 @@ Which options are legal depends on the field kind — anything else raises at cl
 
 | Option | Scalar | Array | Nested | Meaning |
 |---|:---:|:---:|:---:|---|
-| `in:` | ✅ | — | — | Allowed values: a `Range` (bounds-checked with `cover?`) or a list (`Array`, `Set`). List members are cast with the field's own type at class load, so `in: %i[draft published]` on a `:string` and `in: %w[1 2 3]` on an `:integer` match what a request casts to |
+| `in:` | ✅ | — | — | Allowed values: a `Range` (bounds-checked with `cover?`), a list (`Array`, `Set`, or a `Hash` read as its keys — so `in: Post.statuses` works), or your own object answering `include?` (used as given). List members are cast with the field's own type at class load, so `in: %i[draft published]` on a `:string` and `in: %w[1 2 3]` on an `:integer` match what a request casts to; a `nil` member is dropped on a `nullable:` field |
 | `format:` | ✅¹ | — | — | Regexp the value must match, or a [preset name](#format-presets): `:email`, `:uuid`, `:url`, `:slug`, `:hostname` |
 | `length:` | ✅¹ | ✅ | — | `Range` or `Integer`. Character count on strings, **element count** on arrays, where it short-circuits — see [the field DSL](#the-field-dsl) |
 | `normalize:` | ✅¹ | — | — | `:squish`, `:strip`, `:downcase`, `:upcase`, `:email`, or a Proc. Runs **first** — before the absence rule, so a value that normalizes to `""` is absent |
@@ -1004,7 +1004,7 @@ Everything else the exporter cannot translate stays visible as an `x-permittable
 | `:string` `:integer` `:float` `:boolean` | `string` / `integer` / `number` / `boolean` |
 | `:date` / `:datetime` | `string` + `format: date` / `date-time` |
 | `:decimal` | `type: ["string", "number"]` + `format: decimal` (string is the precision-safe encoding) |
-| `in:` list / numeric Range | `enum` of the cast members / `minimum` + `maximum` (exclusive ends honoured) |
+| `in:` list / numeric Range | `enum` of the cast members (a `:date`/`:datetime` member written as a String is published as written) / `minimum` + `maximum` (exclusive ends honoured). An `in:` object that only answers `include?` is flagged `x-permittable-custom-validation` |
 | `length:` | `minLength`/`maxLength` on strings, `minItems`/`maxItems` on arrays |
 | `format:` | `pattern`, with `\A`/`\z` translated to `^`/`$` |
 | `default:` / `desc:` / `example:` | `default` / `description` / `examples` |
@@ -1072,8 +1072,8 @@ A bad contract is a programmer error, so it fails when the class loads — never
 - An unknown `normalize:` or `format:` preset, listing the presets
 - A `format:` that is neither a `Regexp` nor a preset name
 - `format:`, `length:`, or `normalize:` on a non-`:string` field
-- `length:` that isn't a non-negative `Integer` or a `Range`; `in:` that isn't a `Range` or a list of values — a `String` is refused, since `String#include?` would match any substring (`in: "free pro"` accepted `"e"`), and so is a `Hash`
-- An `in:` member the field's own type can't cast (`in: %w[1 two]` on an `:integer`), or an `in:` `Range` whose endpoints a value of the field's type can't be compared with (`in: "1".."5"` on an `:integer`) — either would reject every request as `inclusion`
+- `length:` that isn't a non-negative `Integer` or a `Range`; an `in:` that is a `String` (`String#include?` would match any substring — `in: "free pro"` accepted `"e"`), or that answers neither `cover?` nor `include?`
+- An `in:` member the field's own type can't cast (`in: %w[1 two]` on an `:integer`, or `nil` on a field that isn't `nullable:`), or an `in:` `Range` whose endpoints a value of the field's type can't be compared with (`in: "1".."5"` on an `:integer`) — either would reject every request as `inclusion`
 - A bound **no value could satisfy**: a reversed or empty `Range` (`in: 65..18`, `length: 5..2`, `length: 3...3`), an empty `in:` set, or a `length:` of 0 on a `required` field (where `""` already violates as `missing`)
 - `validate:` or `transform:` that isn't callable
 - A `default:` or `example:` that violates its own field's contract, or an array `default:`/`example:` whose elements violate `of:` — or, for an array declared with a **block**, an element that isn't a hash the block would accept

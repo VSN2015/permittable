@@ -75,7 +75,35 @@ RSpec.describe Permittable::JsonSchema do
     it "exports the cast members, in the field's own JSON type" do
       expect(property("status") { optional :status, :string, in: %i[draft published] }["enum"]).to eq(%w[draft published])
       expect(property("n") { optional :n, :integer, in: %w[1 2 3] }["enum"]).to eq([1, 2, 3])
-      expect(property("day") { optional :day, :date, in: ["Sep 5, 2026"] }["enum"]).to eq(["2026-09-05"])
+      expect(property("day") { optional :day, :date, in: [Date.new(2026, 9, 5)] }["enum"]).to eq(["2026-09-05"])
+      expect(property("status") { optional :status, :string, in: { draft: 0, published: 1 } }["enum"]).to eq(%w[draft published])
+    end
+
+    # Re-encoding a cast Time drops what iso8601 does not print: a member
+    # written with fractional seconds exported as the whole second, which
+    # the server then refused. A String member is therefore published as
+    # written, and every published member must be one the server accepts.
+    it "exports a String-authored :date/:datetime member as written, and the server accepts each one" do
+      contract = Permittable::Contract.define do
+        optional :at,  :datetime, in: ["2026-09-05T10:00:00.25Z", "2026-09-05T15:00:00+05:00", Time.utc(2026, 1, 1)]
+        optional :day, :date,     in: ["Sep 5, 2026", Date.new(2026, 9, 6)]
+      end
+      props = described_class.rule(contract.permittable_contracts.first)["properties"]
+      expect(props["at"]["enum"]).to eq(["2026-09-05T10:00:00.25Z", "2026-09-05T15:00:00+05:00", "2026-01-01T00:00:00Z"])
+      expect(props["day"]["enum"]).to eq(["Sep 5, 2026", "2026-09-06"])
+      props.each do |name, schema|
+        schema["enum"].each do |member|
+          expect(contract.call(name => member).violations).to be_empty, "#{name}: #{member.inspect} was refused"
+        end
+      end
+    end
+
+    it "exports an :in that only answers include? as custom validation, not as an enum" do
+      allowlist = Object.new
+      def allowlist.include?(_value) = true
+      prop = property("sku") { optional :sku, :string, in: allowlist }
+      expect(prop).not_to have_key("enum")
+      expect(prop["x-permittable-custom-validation"]).to be(true)
     end
 
     it "carries a non-numeric Range as an extension instead of guessing" do

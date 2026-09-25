@@ -92,6 +92,15 @@ RSpec.describe "the exported schema against what the contract enforces" do
         [{ "n" => "2" }, :coerced_encoding]
       ]
     },
+    "a :datetime enum written with fractional seconds" => {
+      # Re-encoding the cast Time printed whole seconds, publishing a member
+      # the server refused; the String is now published as written.
+      contract: proc { optional :at, :datetime, in: ["2026-09-05T10:00:00.25Z"] },
+      payloads: [
+        [{ "at" => "2026-09-05T10:00:00.25Z" }, :agree],
+        [{ "at" => "2026-09-05T10:00:00Z" }, :agree]
+      ]
+    },
     "an exclusive range" => {
       contract: proc { optional :pct, :integer, in: 0...100 },
       payloads: [[{ "pct" => 0 }, :agree], [{ "pct" => 99 }, :agree], [{ "pct" => 100 }, :agree]]

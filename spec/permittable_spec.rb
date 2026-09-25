@@ -87,19 +87,76 @@ RSpec.describe Permittable do
       end
     end
 
-    it "rejects an :in that is neither a Range nor a list of values" do
+    it "rejects an :in that answers neither cover? nor include?" do
       expect { permittable_class { permit_params(:create) { required :a, :integer, in: 5 } } }
-        .to raise_error(ArgumentError, /:in for field :a must be a Range or a list of values .*\(got 5\)/)
-      # A Hash is Enumerable, but include? asks about its KEYS — not a list.
-      expect { permittable_class { permit_params(:create) { required :a, :string, in: { "x" => 1 } } } }
-        .to raise_error(ArgumentError, /:in for field :a must be a Range or a list of values/)
+        .to raise_error(ArgumentError, /:in for field :a must be a Range, a list of values .*\(got 5\)/)
     end
 
     # String#include? is a substring test: in: "free pro" accepted "e", "fr"
     # and "ee p" as plans.
     it "rejects a String :in, which would have matched any substring" do
       expect { permittable_class { permit_params(:create) { optional :plan, :string, in: "free pro" } } }
-        .to raise_error(ArgumentError, /:in for field :plan must be a Range or a list of values .*\(got "free pro"\)/)
+        .to raise_error(ArgumentError, /:in for field :plan must be a Range, a list of values .*\(got "free pro"\).*substring/)
+    end
+
+    # The Rails enum idiom: `in: Post.statuses` is a HashWithIndifferentAccess
+    # of name => stored value, and Hash#include? asks about its keys.
+    it "reads a Hash :in as its keys, cast like any list" do
+      statuses = ActiveSupport::HashWithIndifferentAccess.new(draft: 0, published: 1)
+      decl = proc do
+        permit_params(:create) do
+          optional :status, :string, in: statuses
+          optional :tier,   :string, in: { free: "f", pro: "p" }
+        end
+      end
+      expect(permit({ status: "published", tier: "pro" }, &decl).to_h).to eq("status" => "published", "tier" => "pro")
+      expect(violations_for({ status: "0", tier: "f" }, &decl).details)
+        .to eq([{ param: "status", code: "inclusion" }, { param: "tier", code: "inclusion" }])
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].map { |f| f[:in] })
+        .to eq([%w[draft published], %w[free pro]])
+    end
+
+    it "keeps an :in that only answers include? exactly as given, uncast" do
+      allowlist = Object.new
+      def allowlist.include?(value) = value.to_s.start_with?("sku-")
+      decl = proc { permit_params(:create) { optional :sku, :string, in: allowlist } }
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in]).to be(allowlist)
+      expect(permit({ sku: "sku-1" }, &decl)[:sku]).to eq("sku-1")
+      expect(violations_for({ sku: "abc" }, &decl).details).to eq([{ param: "sku", code: "inclusion" }])
+    end
+
+    # A lazy list left lazy was cast per request, and the cast's early return
+    # escaped its block there as a LocalJumpError — a 500.
+    it "forces a lazy :in to a list once, at class load" do
+      decl = proc { permit_params(:create) { optional :n, :integer, in: %w[1 2 3].lazy.map(&:itself) } }
+      field = permittable_class(&decl).permit_rule_for(:create)[:fields].first
+      expect(field[:in]).to eq([1, 2, 3]).and be_frozen
+      expect(permit({ n: "2" }, &decl)[:n]).to eq(2)
+      expect(violations_for({ n: "4" }, &decl).details).to eq([{ param: "n", code: "inclusion" }])
+      expect { permittable_class { permit_params(:create) { optional :n, :integer, in: %w[1 x].lazy.map(&:itself) } } }
+        .to raise_error(ArgumentError, /:in for field :n contains "x"/)
+    end
+
+    it "reads a Time or DateTime member of a :date field as its date" do
+      decl = proc do
+        permit_params(:create) { optional :day, :date, in: [Time.utc(2026, 9, 5, 10), DateTime.new(2026, 9, 6, 23)] }
+      end
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in])
+        .to eq([Date.new(2026, 9, 5), Date.new(2026, 9, 6)])
+      expect(permit({ day: "2026-09-05" }, &decl)[:day]).to eq(Date.new(2026, 9, 5))
+      expect(permit({ day: "2026-09-06" }, &decl)[:day]).to eq(Date.new(2026, 9, 6))
+    end
+
+    # On a nullable field an explicit null is accepted before in: is ever
+    # consulted, so a nil member only restates that; elsewhere it is a member
+    # no request could equal.
+    it "drops a nil :in member on a nullable field, and refuses it on any other" do
+      decl = proc { permit_params(:create) { optional :tier, :string, in: [nil, "pro"], nullable: true } }
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in]).to eq(["pro"])
+      expect(permit({ tier: "pro" }, &decl)[:tier]).to eq("pro")
+      expect(permit({ tier: nil }, &decl).to_h).to eq("tier" => nil)
+      expect { permittable_class { permit_params(:create) { optional :tier, :string, in: [nil, "pro"] } } }
+        .to raise_error(ArgumentError, /:in for field :tier contains nil.*declare nullable: true/)
     end
 
     it "rejects an :in member that the field's own type cannot cast" do
@@ -107,8 +164,6 @@ RSpec.describe Permittable do
         .to raise_error(ArgumentError, /:in for field :n contains "two", which is not a valid :integer \(invalid_type\)/)
       expect { permittable_class { permit_params(:create) { optional :day, :date, in: ["2026-02-30"] } } }
         .to raise_error(ArgumentError, /:in for field :day contains "2026-02-30", which is not a valid :date/)
-      expect { permittable_class { permit_params(:create) { optional :tier, :string, in: [nil, "pro"] } } }
-        .to raise_error(ArgumentError, /:in for field :tier contains nil.*declare nullable: true/)
     end
 
     it "rejects an :in Range whose endpoints the field's values cannot be compared with" do
@@ -2201,6 +2256,15 @@ RSpec.describe Permittable do
             m = enum_model
             expect(&declaring(m) { optional :status, :string, in: m.statuses.keys }).not_to raise_error
             expect(&declaring(m) { optional :status, :string, in: %w[pending] }).not_to raise_error
+          end
+
+          # The guard reads the in: the contract stores — a Hash already read
+          # as its keys, Symbols already cast to the Strings a request sends —
+          # so it agrees with what the field will actually accept.
+          it "accepts the enum's own mapping, or its names as Symbols, as the in:" do
+            m = enum_model
+            expect(&declaring(m) { optional :status, :string, in: m.statuses }).not_to raise_error
+            expect(&declaring(m) { optional :status, :string, in: %i[pending shipped] }).not_to raise_error
           end
 
           it "requires the in: — without it, an unknown name would pass and then raise on assignment" do

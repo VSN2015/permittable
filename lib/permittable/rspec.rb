@@ -231,15 +231,16 @@ module Permittable
 
       # A contract stores an `in:` list cast by the field's type, so
       # `within(%i[draft published])` — the declaration repeated as written —
-      # is cast the same way before comparing, by the same function. A list
-      # that does not cast (or a Range, kept as written by the contract too)
-      # is compared as given, and the failure shows both sides.
+      # is read the same way before comparing, by the same two functions the
+      # contract uses: what counts as a list (a Hash as its keys), then the
+      # cast. Anything that is not a list, or does not cast, is compared as
+      # given — a Range and a host's own allowlist are stored as given too.
       def cast_in(field, expected)
-        return expected unless field[:kind] == :scalar && expected.is_a?(Enumerable) &&
-                               !expected.is_a?(Range) && !expected.is_a?(Hash)
+        members = field[:kind] == :scalar && Coercion.in_list(expected)
+        return expected unless members
 
-        status, members = Coercion.cast_in_members(field[:type], expected)
-        status == :ok ? members : expected
+        status, cast = Coercion.cast_in_members(field[:type], members, nullable: field[:nullable])
+        status == :ok ? cast : expected
       end
 
       def declared_format(field)

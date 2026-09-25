@@ -84,6 +84,20 @@ RSpec.describe "Permittable RSpec matchers" do
     expect(message).to include("declares in: [1, 2, 3]")
   end
 
+  it "reads within's argument exactly as the contract reads in: — a Hash as its keys, an allowlist as itself" do
+    allowlist = Object.new
+    def allowlist.include?(_value) = true
+    contract = Permittable::Contract.define do
+      optional :status, :string, in: { draft: 0, published: 1 }
+      optional :sku,    :string, in: allowlist
+      optional :tier,   :string, in: [nil, "pro"], nullable: true
+    end
+    expect(contract).to permit_param(:status).within({ draft: 0, published: 1 })
+    expect(contract).to permit_param(:status).within(%w[draft published])
+    expect(contract).to permit_param(:sku).within(allowlist)
+    expect(contract).to permit_param(:tier).within([nil, "pro"])
+  end
+
   it "checks required and optional" do
     expect(controller).to permit_param(:email).for_action(:create).required
     expect(controller).to permit_param(:age).for_action(:create).optional

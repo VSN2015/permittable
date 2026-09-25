@@ -717,24 +717,66 @@ module Permittable
     # published]` on a :string field (and `in: %w[1 2 3]` on an :integer one)
     # held values no cast could ever produce, and rejected every request.
     #
-    # A Symbol is read as its String first: it is how Ruby spells a constant
-    # string, and a request never carries one, so no cast accepts it as is.
     # `normalize:` is deliberately not applied — it rewrites what a client
     # sent, not what the contract author wrote. Duplicates the cast collapses
     # ("1" and 1 on an :integer) are dropped, and a Set stays a Set, so an
-    # author who chose one for its O(1) include? keeps it.
+    # author who chose one for its O(1) include? keeps it. A nil member is
+    # dropped on a nullable field, where an explicit null is accepted before
+    # in: is ever consulted; anywhere else it is a member no value can equal,
+    # and is an error like any other.
     #
-    # Returns [:ok, members] or [:error, offending_member, code], shared by
-    # ContractBuilder and the RSpec matcher's `within` chain so the two
-    # cannot read the same list differently.
-    def cast_in_members(type, members)
-      cast_members = members.map do |member|
-        status, value = cast(type, member.is_a?(Symbol) ? member.to_s : member)
+    # `members` is what in_list returned. Returns [:ok, cast, published] —
+    # `published` being what an exported enum lists, see published_in_member
+    # — or [:error, offending_member, code]. Shared by ContractBuilder and the
+    # RSpec matcher's `within` chain so the two cannot read a list differently.
+    def cast_in_members(type, members, nullable: false)
+      pairs = []
+      members.each do |member|
+        next if member.nil? && nullable
+
+        status, value = cast_in_member(type, member)
         return [:error, member, value] unless status == :ok
 
-        value
-      end.uniq
-      [:ok, members.is_a?(Set) ? cast_members.to_set : cast_members]
+        pairs << [value, published_in_member(type, member, value)]
+      end
+      pairs = pairs.uniq(&:first)
+      cast_members = pairs.map(&:first)
+      [:ok, members.is_a?(Set) ? cast_members.to_set : cast_members, pairs.map(&:last)]
+    end
+
+    # The members of an `in:` that is a LIST, or nil when it is not one: a
+    # Range bounds rather than lists, and an object that merely answers
+    # include? (a host's own allowlist) is kept as given. A Hash lists its
+    # KEYS, which is what Hash#include? asks about — the Rails enum idiom,
+    # `in: Post.statuses`. Anything else Enumerable is forced to an Array
+    # here, once: an Enumerator::Lazy left lazy would be cast on every
+    # request instead of at class load.
+    def in_list(allowed)
+      return nil if allowed.is_a?(Range) || !allowed.is_a?(Enumerable)
+      return allowed.keys if allowed.is_a?(Hash)
+
+      allowed.is_a?(Set) ? allowed : allowed.to_a
+    end
+
+    # A Symbol is read as its String: it is how Ruby spells a constant
+    # string, and a request never carries one, so no cast accepts it as is.
+    # A Time or DateTime on a :date field is read as its date — cast_date
+    # would keep a DateTime whole (it IS a Date) and refuse a Time, and
+    # neither would ever equal the Date a request casts to.
+    def cast_in_member(type, member)
+      member = member.to_s if member.is_a?(Symbol)
+      member = member.to_date if type == :date && (member.is_a?(Time) || member.is_a?(DateTime))
+      cast(type, member)
+    end
+
+    # What an exported enum lists for one member: the cast value, re-encoded
+    # as JSON — except a :date/:datetime member authored as a String, which
+    # is published AS WRITTEN. Re-encoding a cast Time prints whole seconds,
+    # so "2026-09-05T10:00:00.25Z" was published as "…10:00:00Z", a value
+    # the server refuses. The authored String went through the very cast a
+    # request does, so the server accepts it by construction.
+    def published_in_member(type, member, value)
+      member.is_a?(String) && %i[date datetime].include?(type) ? member : value
     end
 
     # Range#include? walks discrete ranges; cover? is the O(1) bounds check
@@ -942,40 +984,55 @@ module Permittable
       validate_message!(field)
     end
 
-    # `in:` is a Range (bounds-checked with cover?) or a list of values. It
-    # used to be anything answering include?, which let a String through —
-    # and String#include? is a SUBSTRING test, so `in: "free pro"` accepted
-    # "e", "fr" and "ee p". A Hash answers include? too, about its keys.
-    # Both are refused here, along with anything else that is not a list.
+    # `in:` is a Range (bounds-checked with cover?), a list of values, or an
+    # object of the host's own that answers include? — kept exactly as given,
+    # since nothing here can know what it accepts. It used to be anything
+    # answering include?, which let a String through, and String#include? is
+    # a SUBSTRING test: `in: "free pro"` accepted "e", "fr" and "ee p". A
+    # String is refused here, along with anything answering neither.
     #
-    # A list is stored cast by the field's type (see
-    # Coercion.cast_in_members), so request-time matching, the exported
-    # enum and the RSpec matcher all read the members the runtime compares
-    # against. A member no request value could ever equal is a contract
-    # mistake, and fails here rather than as an `inclusion` on every request.
+    # A list (see Coercion.in_list — a Hash lists its keys) is stored cast by
+    # the field's type (see Coercion.cast_in_members), so request-time
+    # matching, the exported enum, the RSpec matcher and the column guard's
+    # enum rule all read the members the runtime compares against. A member
+    # no request value could ever equal is a contract mistake, and fails here
+    # rather than as an `inclusion` on every request.
     def resolve_in!(field)
       name = field[:name]
       allowed = field[:in]
       if allowed.is_a?(Range)
         assert_comparable_range!(field, allowed)
-      elsif allowed.is_a?(Enumerable) && !allowed.is_a?(Hash)
-        field[:in] = cast_in_members!(field, allowed)
-      else
-        raise ArgumentError, "#{LABEL}: :in for field :#{name} must be a Range or a list of values " \
-                             "such as an Array or Set (got #{allowed.inspect})"
+      elsif (members = Coercion.in_list(allowed))
+        cast_in_members!(field, members)
+      elsif allowed.is_a?(String) || !allowed.respond_to?(:include?)
+        raise ArgumentError, "#{LABEL}: :in for field :#{name} must be a Range, a list of values (an Array, Set, " \
+                             "or a Hash read as its keys), or an object answering include? " \
+                             "(got #{allowed.inspect})#{string_in_hint(allowed)}"
       end
       assert_satisfiable!(name, :in, field[:in])
     end
 
-    def cast_in_members!(field, allowed)
-      status, members, code = Coercion.cast_in_members(field[:type], allowed)
-      return freeze_in_members(members) if status == :ok
+    def string_in_hint(allowed)
+      return "" unless allowed.is_a?(String)
 
-      # nil is the one member written on purpose, meaning "null is allowed" —
-      # but an absent value never reaches in:, so the fix is worth naming.
-      hint = members.nil? ? " — an absent value never reaches in:; declare nullable: true to accept an explicit null" : ""
-      raise ArgumentError, "#{LABEL}: :in for field :#{field[:name]} contains #{members.inspect}, " \
-                           "which is not a valid :#{field[:type]} (#{code})#{hint}"
+      " — String#include? would accept any substring; list the values instead, e.g. in: %w[#{allowed}]"
+    end
+
+    # `published` is stored only where it differs from the cast members (a
+    # String-authored :date/:datetime member), so it is read as an override.
+    def cast_in_members!(field, members)
+      status, cast, published = Coercion.cast_in_members(field[:type], members, nullable: field[:nullable])
+      unless status == :ok
+        # cast is the offending member here, and published its error code.
+        # nil is the one member written on purpose, meaning "null is allowed"
+        # — but an absent value never reaches in:, so the fix is worth naming.
+        hint = cast.nil? ? " — an absent value never reaches in:; declare nullable: true to accept an explicit null" : ""
+        raise ArgumentError, "#{LABEL}: :in for field :#{field[:name]} contains #{cast.inspect}, " \
+                             "which is not a valid :#{field[:type]} (#{published})#{hint}"
+      end
+
+      field[:in] = freeze_in_members(cast)
+      field[:in_published] = freeze_authored(published) unless published == cast.to_a
     end
 
     def freeze_in_members(members)

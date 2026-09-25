@@ -117,7 +117,7 @@ module Permittable
     def scalar_schema(field)
       schema = SCALAR_SCHEMAS.fetch(field[:type]).dup
       apply_format_name!(schema, field)
-      apply_in!(schema, field[:in])
+      apply_in!(schema, field)
       apply_string_bounds!(schema, field)
       # A preset's pattern is authored by this gem rather than by the app, so
       # it needs no heuristic — see apply_pattern!.
@@ -157,11 +157,18 @@ module Permittable
       schema
     end
 
-    def apply_in!(schema, allowed)
+    # A list is stored cast by the field's type, so its enum is what the
+    # runtime compares against; `in_published` overrides the members an
+    # exact re-encoding would get wrong (see Coercion.published_in_member).
+    # An object that only answers include? says nothing a schema can list —
+    # annotate flags it as custom validation instead.
+    def apply_in!(schema, field)
+      allowed = field[:in]
       return unless allowed
+      return if opaque_in?(allowed)
 
       unless allowed.is_a?(Range)
-        schema["enum"] = allowed.map { |v| json_value(v) }
+        schema["enum"] = (field[:in_published] || allowed).map { |v| json_value(v) }
         return
       end
       # Runtime bounds-checks Ranges with cover?; numeric endpoints map onto
@@ -173,6 +180,11 @@ module Permittable
       end
       schema["minimum"] = json_value(allowed.begin) if allowed.begin
       schema[allowed.exclude_end? ? "exclusiveMaximum" : "maximum"] = json_value(allowed.end) if allowed.end
+    end
+
+    # A host's own include?-answering allowlist, kept by the contract as given.
+    def opaque_in?(allowed)
+      !allowed.nil? && !allowed.is_a?(Range) && !allowed.is_a?(Enumerable)
     end
 
     def apply_string_bounds!(schema, field)
@@ -240,7 +252,7 @@ module Permittable
         schema["writeOnly"] = true
         schema["x-permittable-sensitive"] = true
       end
-      schema["x-permittable-custom-validation"] = true if field[:validate]
+      schema["x-permittable-custom-validation"] = true if field[:validate] || opaque_in?(field[:in])
       schema["x-permittable-transformed"] = true if field[:transform]
       schema
     end
