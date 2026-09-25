@@ -2013,6 +2013,8 @@ RSpec.describe Permittable do
             t.date     :on
             t.json     :payload
             t.binary   :blob
+            t.integer  :status
+            t.string   :tier
           end
         end
       end
@@ -2076,6 +2078,119 @@ RSpec.describe Permittable do
           # improvised for them is left alone rather than second-guessed.
           expect(&declaring(typed) { optional :payload, :string }).not_to raise_error
           expect(&declaring(typed) { optional :blob, :string }).not_to raise_error
+        end
+
+        context "with a Rails enum" do
+          # `enum` is spelled positionally from Rails 7.0 and by keyword before
+          # it; the keyword form is gone in 8.0, and the matrix covers both.
+          def self.define_enum(klass, name, mapping)
+            if ActiveRecord.version >= Gem::Version.new("7.0")
+              klass.enum name, mapping
+            else
+              klass.enum name => mapping
+            end
+          end
+
+          # Named, because the error messages name the model.
+          let(:enum_model) do
+            group = self.class
+            stub_const("EnumThing", Class.new(TestModel) do
+              self.table_name = "typed_things"
+              group.define_enum(self, :status, { pending: 0, shipped: 1 })
+              group.define_enum(self, :tier, { free: "f", pro: "p" })
+              # An enum over a declared attribute, with no column behind it.
+              attribute :ghost, :integer
+              group.define_enum(self, :ghost, { boo: 0 })
+            end)
+          end
+
+          # A `model:` is duck-typed on column_names, so the guard must not
+          # assume the rest of ActiveRecord is there.
+          def duck_model(columns, enums: nil)
+            Class.new do
+              define_singleton_method(:table_name) { "ducks" }
+              define_singleton_method(:table_exists?) { true }
+              define_singleton_method(:column_names) { columns.keys.map(&:to_s) }
+              define_singleton_method(:columns_hash) do
+                columns.to_h { |name, type| [name.to_s, Struct.new(:type).new(type)] }
+              end
+              define_singleton_method(:defined_enums) { enums } if enums
+            end
+          end
+
+          it "accepts the :string declaration an enum is submitted as, listing its names" do
+            m = enum_model
+            expect(&declaring(m) { optional :status, :string, in: m.statuses.keys }).not_to raise_error
+            expect(&declaring(m) { optional :status, :string, in: %w[pending] }).not_to raise_error
+          end
+
+          it "requires the in: — without it, an unknown name would pass and then raise on assignment" do
+            expect(&declaring(enum_model) { optional :status, :string }).to raise_error(ArgumentError) do |e|
+              expect(e.message).to match(/'status' is an enum on EnumThing/)
+              expect(e.message).to include("in: EnumThing.statuses.keys")
+              expect(e.message).not_to match(/virtual: true/)
+            end
+          end
+
+          it "rejects an in: listing anything the enum would refuse, naming it" do
+            m = enum_model
+            expect(&declaring(m) { optional :status, :string, in: %w[pending bogus] })
+              .to raise_error(ArgumentError, /"bogus"/)
+            # An integer-backed enum's stored values are not names it accepts
+            # as strings: `status: "0"` raises on assignment.
+            expect(&declaring(m) { optional :status, :string, in: %w[0 1] })
+              .to raise_error(ArgumentError, /"0", "1"/)
+            expect(&declaring(m) { optional :status, :string, in: "a".."z" })
+              .to raise_error(ArgumentError, /in: EnumThing.statuses.keys/)
+          end
+
+          it "holds a string-backed enum to the same rule, accepting its stored values too" do
+            m = enum_model
+            # Assignment accepts a mapped value as well as a name, and a
+            # string-backed enum's values arrive as strings.
+            expect(&declaring(m) { optional :tier, :string, in: %w[free p] }).not_to raise_error
+            expect(&declaring(m) { optional :tier, :string })
+              .to raise_error(ArgumentError, /in: EnumThing.tiers.keys/)
+          end
+
+          it "still accepts the column's own group" do
+            expect(&declaring(enum_model) { optional :status, :integer }).not_to raise_error
+          end
+
+          it "still catches any other type, suggesting the enum contract rather than virtual: true" do
+            expect(&declaring(enum_model) { optional :status, :datetime }).to raise_error(ArgumentError) do |e|
+              expect(e.message).to match(/'status' is declared :datetime but the column is :integer/)
+              expect(e.message).to include(":string, in: EnumThing.statuses.keys")
+              expect(e.message).not_to match(/virtual: true/)
+            end
+          end
+
+          it "leaves the same column without an enum checked as before" do
+            expect(&declaring(typed) { optional :status, :string })
+              .to raise_error(ArgumentError, /'status' is declared :string but the column is :integer/)
+          end
+
+          it "does not loosen the existence check for an enum with no column" do
+            m = enum_model
+            expect(&declaring(m) { optional :ghost, :string, in: m.ghosts.keys })
+              .to raise_error(ArgumentError, /'ghost' does not exist in the database/)
+          end
+
+          it "is not consulted with the check off" do
+            Permittable.check_column_types = false
+            expect(&declaring(enum_model) { optional :status, :string }).not_to raise_error
+          end
+
+          it "treats a duck-typed model with no defined_enums as having none" do
+            expect(&declaring(duck_model({ count: :integer })) { optional :count, :string })
+              .to raise_error(ArgumentError, /'count' is declared :string but the column is :integer/)
+          end
+
+          it "spells the suggestion through defined_enums when the name is not a method" do
+            duck = duck_model({ 'two-step': :integer }, enums: { "two-step" => { "on" => 1 } })
+            expect(&declaring(duck) { optional :'two-step', :string })
+              .to raise_error(ArgumentError, /in: .*\.defined_enums\["two-step"\]\.keys/)
+          end
         end
 
         it "still skips virtual fields and a missing column still reports as missing" do
@@ -2440,6 +2555,167 @@ RSpec.describe Permittable do
       result = IntegrationHarness.dispatch(controller, :index, query: "page=2&rogue=1")
       expect(result.status).to eq(422)
       expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "rogue", "code" => "unknown" }])
+    end
+
+    describe "unknown: :error on a rootless contract, with a real request" do
+      # `wrap:` names the wrapper key: a String, as Rails derives it from
+      # controller_name, or a Symbol, as the Rails docs write
+      # `wrap_parameters :user`. `rule` overrides the permit_params options.
+      def build_rootless_controller(wrap: nil, **rule, &fields)
+        IntegrationHarness.build_controller do
+          include Permittable
+
+          wrap_parameters wrap, format: [:json] if wrap
+          permit_params(:create, :update, unknown: :error, **rule, &fields)
+
+          def create
+            render json: permitted_params
+          end
+
+          def update
+            render json: permitted_params
+          end
+        end
+      end
+
+      it "does not flag the router's path parameters (PATCH /users/1 merges `id`)" do
+        controller = build_rootless_controller { optional :name, :string }
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", params: { name: "Jo" },
+                                                                  path_params: { id: "1" })
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)).to eq("name" => "Jo")
+      end
+
+      it "does not flag ParamsWrapper's copy of a JSON body under the wrapper key" do
+        controller = build_rootless_controller(wrap: "user") { optional :name, :string }
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo" },
+                                                                  path_params: { id: "1" })
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)).to eq("name" => "Jo")
+      end
+
+      it "still flags a genuine extra key alongside the path and wrapper keys" do
+        controller = build_rootless_controller(wrap: "user") { optional :name, :string }
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo", rogue: 1 },
+                                                                  path_params: { id: "1" })
+        expect(result.status).to eq(422)
+        expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "rogue", "code" => "unknown" }])
+      end
+
+      it "still flags a client-sent key that merely shares the wrapper's name" do
+        # ParamsWrapper leaves a body alone when it already carries the key,
+        # so here `user` is the client's own and is exempt from nothing.
+        controller = build_rootless_controller(wrap: "user") { optional :name, :string }
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH",
+                                                                  json: { name: "Jo", user: { admin: true } })
+        expect(result.status).to eq(422)
+        expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "user", "code" => "unknown" }])
+      end
+
+      it "still flags a client-sent key that shares a Symbol wrapper name" do
+        # `wrap_parameters :user` makes ParamsWrapper ask the string-keyed
+        # params for :user, so it answers "not sent" and wraps anyway. Whether
+        # the client sent the key must not hang on that spelling.
+        controller = build_rootless_controller(wrap: :user) { optional :name, :string }
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH",
+                                                                  json: { name: "Jo", user: { admin: true } })
+        expect(result.status).to eq(422)
+        expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "user", "code" => "unknown" }])
+      end
+
+      it "does not flag the copy under a Symbol wrapper name either" do
+        controller = build_rootless_controller(wrap: :user) { optional :name, :string }
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo" })
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)).to eq("name" => "Jo")
+      end
+
+      # A scalar field that shares the wrapper key's name is ABSENT when Rails
+      # made the copy: the client never sent it. Validating the copy instead
+      # rejected a well-formed body as that field's invalid_type.
+      it "treats a declared scalar field named like the wrapper key as absent when Rails made the copy" do
+        controller = build_rootless_controller(wrap: "feedback") do
+          optional :rating, :integer
+          optional :feedback, :string
+        end
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { rating: 5 })
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)).to eq("rating" => 5)
+      end
+
+      # A rootless contract that declares the wrapper key as a hash container
+      # is reading Rails' copy ON PURPOSE — a root: spelled as a field — and
+      # did so before the copy was ever dropped. It keeps the copy.
+      it "keeps the copy for a rootless contract that reads it through a nested field" do
+        controller = build_rootless_controller(wrap: "user", unknown: :ignore) do
+          required :user do
+            required :name, :string
+          end
+        end
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo" })
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)).to eq("user" => { "name" => "Jo" })
+      end
+
+      it "keeps the copy for a rootless contract that reads it as :json" do
+        controller = build_rootless_controller(wrap: "user") do
+          optional :name, :string
+          optional :user, :json
+        end
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo" })
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)).to eq("name" => "Jo", "user" => { "name" => "Jo" })
+      end
+
+      it "still validates that declared field when the client sent the key itself" do
+        # The body already carries `user`, so ParamsWrapper stays out of it
+        # and the value is the client's own.
+        controller = build_rootless_controller(wrap: "user") do
+          optional :name, :string
+          optional :user, :string
+        end
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo", user: "x" })
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)).to eq("name" => "Jo", "user" => "x")
+
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo", user: { a: 1 } })
+        expect(result.status).to eq(422)
+        expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "user", "code" => "invalid_type" }])
+      end
+
+      it "resets the recorded wrapper key on every dispatch of a reused controller" do
+        # Rails builds a controller per request, so this pins down only the
+        # one piece of state this concern records before ParamsWrapper runs:
+        # a request ParamsWrapper does not wrap (a form POST) must leave no
+        # key behind from the one before. It does not claim a reused instance
+        # is otherwise fresh — Metal#dispatch keeps @_params, for one.
+        controller = build_rootless_controller(wrap: "user") { optional :name, :string }
+        instance = controller.new
+        IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo" }, instance: instance)
+        expect(instance.instance_variable_get(:@permittable_wrapper_key)).to eq("user")
+
+        IntegrationHarness.dispatch(controller, :create, method: "POST", params: { name: "Jo" }, instance: instance)
+        expect(instance.instance_variable_get(:@permittable_wrapper_key)).to be_nil
+      end
+
+      it "still validates a declared path parameter" do
+        controller = build_rootless_controller { required :id, :integer }
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", path_params: { id: "abc" })
+        expect(result.status).to eq(422)
+        expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "id", "code" => "invalid_type" }])
+      end
+
+      it "leaves the path parameters and the wrapper's copy in monitor mode's pass-through" do
+        # Only the CHECK changes: a legacy action being monitored still reads
+        # params[:id] and params[:user] exactly as before the contract.
+        controller = build_rootless_controller(wrap: "user", mode: :monitor) { optional :name, :string }
+        result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo", rogue: 1 },
+                                                                  path_params: { id: "1" })
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)).to eq(
+          "name" => "Jo", "rogue" => 1, "id" => "1", "user" => { "name" => "Jo", "rogue" => 1 }
+        )
+      end
     end
 
     it "transform + finalize replace a params-mutating before_action end to end" do
