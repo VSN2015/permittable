@@ -569,9 +569,9 @@ The setting is app-wide, not per-contract, because the error format of an API is
 
 Under `:log` that bound is the whole record: nothing else names an undeclared key, so beyond the tenth only the count survives. Where you need every name — auditing what a client really sends during a rollout — use `unknown: :error` in monitor mode, which records all of them in `details` and in the instrumentation payload without rejecting the request.
 
-Rails merges its own keys into `params`: `controller`, `action`, and `format` from the router, plus `authenticity_token`, `_method`, `utf8`, and `commit` from an ordinary form POST. All seven are exempt at the top level, so `unknown: :error` flags what the *client* got wrong rather than what the framework added. Inside a `root:` or a nested hash there is no such exemption, because nothing legitimately injects keys there — and a standalone `Contract` exempts nothing at all, having neither a router nor a form.
+Rails merges its own keys into `params`: `controller`, `action`, and `format` from the router, plus `authenticity_token`, `_method`, `utf8`, and `commit` from an ordinary form POST. All seven are exempt at the top level. So are the route's **path parameters** (`PATCH /users/1` merges `id`, which the exported OpenAPI documents as a path parameter rather than a body field); a contract that *declares* `id` has it validated as usual, since the URL really carried it. **ParamsWrapper's copy of a JSON body** under the controller's wrapper key (`user` for `UsersController`) goes further: when Rails made that copy, a rootless contract does not see the key at all, because the client never sent it. So an undeclared wrapper key is not flagged, and a scalar or array field that happens to share the wrapper's name (`optional :feedback, :string` on `FeedbackController`) is simply absent, rather than failing as `invalid_type` against Rails' copy of the whole body. The one exception is a rootless contract that declares the wrapper key as a hash container — a nested block (`required :user do ... end`) or `:json`. That contract is reading the copy on purpose, like a `root:` spelled as a field, so the copy is kept and validated as that field. A client that sends `user` itself is checked like any other key: validated if declared, flagged if not. That holds whether the wrapper name is configured as a String or as a Symbol (`wrap_parameters :user`). Either way `unknown: :error` flags what the *client* got wrong rather than what the framework added. Inside a `root:` or a nested hash there is no such exemption, because nothing legitimately injects keys there — and a standalone `Contract` exempts nothing at all, having neither a router, a form, nor a request.
 
-The exemption covers the *check* only. Monitor mode still hands back the form keys in its raw pass-through, where behaving exactly like the pre-contract app is the whole promise and a legacy action may read `_method` itself; only the router's three are dropped there.
+All of this changes what is *checked* only. Monitor mode still hands back the form keys, the path parameters and the wrapper's copy in its raw pass-through, where behaving exactly like the pre-contract app is the whole promise and a legacy action may read `params[:id]` or `_method` itself; only the router's three are dropped there.
 
 ### Output reshaping (`transform:` and `finalize`)
 
@@ -819,6 +819,7 @@ legacy/invoices
   POST   /legacy/invoices                   create       no contract — ACCEPTS A BODY
 orders
   POST   /orders                            create       enforce
+  DELETE /orders/{id}                       destroy      no contract — action not found
   PUT    /orders/{id}                       update       no contract — ACCEPTS A BODY
 users
   GET    /users                             index        no contract
@@ -826,11 +827,11 @@ users
   DELETE /users/{id}                        destroy      monitor
   PATCH  /users/{id}                        update       enforce  model: User  unknown: error
 
-7 routed actions: 3 enforced, 1 in monitor mode, 3 without a contract
+8 routed actions: 3 enforced, 1 in monitor mode, 3 without a contract, 1 not found (Rails 404s it)
   2 of those accept a request body — untrusted input reaches the action unchecked
   2 covered actions declare no model:, so no schema-drift guard runs for them
 
-Contracts declared for actions no route reaches (renamed or deleted?):
+Contracts declared for actions no route reaches or Rails would 404 (renamed or deleted?):
   users#archive
 ```
 
@@ -838,7 +839,22 @@ Three things it tells you that nothing else does:
 
 - **Which write actions are unguarded.** A `GET` without a contract is usually fine; a `POST` without one is untrusted input reaching the action unchecked. That count is the number `[strict]` fails on, which makes the task a CI gate: *no new unguarded write endpoint*.
 - **Which contracts aren't enforcing yet.** The audit runs inside the app, so unlike the exported OpenAPI it resolves the **effective** mode — a rule's own `mode:` first, then your app-wide `Permittable.mode`. This is the [monitor-mode](#monitor-mode-roll-out-without-rejecting) rollout dashboard.
-- **Which contracts have gone stale.** A contract declared for an action no route reaches is a renamed or deleted action that left its contract behind.
+- **Which contracts have gone stale.** A contract declared for an action no route reaches, or for a routed action Rails would 404, is a renamed or deleted action that left its contract behind.
+
+A route that lists several verbs is audited once per verb. A `match ... via: :all` route is expanded into exactly GET, POST, PUT, PATCH and DELETE, and listed once for each. `resources` routes all seven actions whether or not they exist. A route that Rails would 404 reads `action not found`: no method (inherited ones count), no `action_missing`, and no template to render implicitly. It is not counted against `[strict]` or as coverage. It stays in the table rather than disappearing. The template check uses the class-level view paths and the default lookup details. So a template that is only found at request time reads `action not found`, for example one behind a `prepend_view_path` in a `before_action`, or one that exists only as a variant.
+
+A catch-all 404 route (`match "*path", to: "application#not_found", via: :all`) shows its POST, PUT and PATCH rows as accepting a body. They do accept one: every stray body reaches the controller. Route only GET to the controller (Rails answers HEAD from it). Send the other verbs to a plain Rack endpoint, which never parses the body and which the audit does not list:
+
+```ruby
+match "*path", to: "application#not_found", via: :get
+match "*path", to: ->(_env) { [404, { "content-type" => "text/plain" }, ["Not Found"]] }, via: :all
+```
+
+A `config.exceptions_app = routes` setup (`match "/404", to: "errors#not_found", via: :all`) shows the same rows. It needs only `via: :get`, because on 6.1 and later `ShowExceptions` re-dispatches the error request as a GET.
+
+Under `[strict]` the task aborts on these rows, so the only choices today are to route the catch-all GET-only, as above, or to run the audit without `[strict]` until the ignore list ([#69](https://github.com/VSN2015/permittable/issues/69)) lands. Don't declare a contract on the catch-all to silence the gate. Under monitor mode it validates eagerly, so a malformed JSON POST answers 400 instead of 404. The OpenAPI export would also gain a fake `/{path}` endpoint.
+
+The table lists a row for every verb on every path; the summary counts routes. A route with an optional segment, such as anything under `scope "(:locale)"`, lists each path it expands to (`/users` and `/{locale}/users`), but it is one route, so one unguarded `POST` counts once and the summary line says `N routed actions in M rows`. Rows are collapsed by controller, action, route index and verb; the index is a position within one `rails_routes` call, so audit concatenated route lists (an app's and an engine's) separately, or give them distinct `route:` values. Two separate routes to the same action (`post "/users"` and `post "/admin/users"`) count as two, because each one is a way in.
 
 Controllers that never included `Permittable` are audited too — those are the ones worth finding. Everything is plain Ruby over the frozen registry plus route descriptors, so `Permittable::Audit.entries(controllers:, routes:)` works without Rails.
 
@@ -920,6 +936,18 @@ Permittable::OpenAPI.document(controllers: [...], info: { "title" => "My API" })
 Every operation references shared components for the [error envelope](#violations-and-error-responses): a `422` response always, plus a `400` when the contract declares a `root:`. So consumers get typed *errors*, not just typed inputs.
 
 **What is honestly unrepresentable stays visible instead of guessed.** A `format:` regexp using a Ruby-only construct (or flags) is exported as `x-permittable-pattern` rather than a mistranslated `pattern` — including one anchored with `^`/`$`, which in Ruby anchor a **line** and in ECMA-262 anchor the whole string, so `/^\d{5}$/` accepts `"evil\n12345"` at runtime and publishing that source would promise a stricter rule than the server enforces (use `\A`/`\z`, which translate exactly); `validate:`/`transform:` are flagged `x-permittable-custom-validation`/`x-permittable-transformed`; actions covered only by a catch-all rule on a plain-Ruby host appear under `"*"` with `x-permittable-catch-all`; operations whose rule runs in [monitor mode](#monitor-mode-roll-out-without-rejecting) carry `x-permittable-mode: "monitor"`; operations with no matching route — or whose path-and-verb slot another controller already claimed, which one document cannot represent twice — land in `x-permittable-controllers` instead of being dropped. A templated path segment is declared as a path `parameter` of type `string`, because the route set doesn't say what an `:id` is and the exporter won't invent it. The schema documents the canonical JSON encoding — the runtime additionally accepts string-encoded scalars (`"42"`, `"true"`) for form/query payloads.
+
+**Every `operationId` is unique across the document, and only a collision is ever renamed.** An operation's id is its controller path with `/` folded to `_`, then its action: `users_create`, `admin_users_index`. Client generators name a method after the id, so the scheme itself never changes. Where two places in the document would carry one id, the exporter renames all but one of them:
+
+| Collision | Ids |
+| --- | --- |
+| One operation under two verbs (the separate PATCH and PUT routes `resources` draws to `update`, or one `match ..., via: [:patch, :put]` route) | `users_update` on PATCH, `users_update_put` on PUT |
+| The pair again at a second path (`resources :orgs { resources :users }`) | `users_update_2` on the second PATCH, `users_update_3` on the second PUT |
+| One operation under every verb (with `via: :all` routes, which the exporter documents under each verb) | `webhooks_receive` on GET, then `webhooks_receive_post`, `_put`, `_patch`, `_delete` |
+| One operation at two paths under one verb (with the optional-segment expansion: `(/:locale)/posts` is documented at `/posts` and `/{locale}/posts`) | `posts_create` on the first path in route order, `posts_create_2` on the other |
+| Two controllers that fold to one id (`admin/users` and `admin_users`, both GET) | `admin_users_index` on the first controller, `admin_users_index_2` on the second |
+
+One place keeps the plain id. A routed operation comes before one under `x-permittable-controllers`, which takes part because it is in the same document. After that, controller, action and route order decide. Within one operation, PATCH comes before PUT whichever the route lists first, so `match via: [:put, :patch]` and `resources` name the PATCH method the same way. Between two operations only the order counts, whatever the verbs. Every other place gets its verb appended when that verb differs from the plain id's verb and the result is free. Otherwise it gets the next free number, from `_2`. So a second PATCH is `users_update_2`, not `users_update_patch`, and a second POST is `posts_create_2`. **The stability rule:** an id that only one operation would carry never changes, even when a suffix elsewhere would spell it; that suffix is numbered instead. So a change to routes or controllers can rename only operations that collide, never one that stands alone. A route declared twice is placed once, and a controller passed twice is documented once, so neither collides with itself.
 
 Output is deterministic (fixed key order, declaration-order properties), so the generated file can be committed and reviewed as a diff — a contract change shows up in the same PR as its documentation change.
 

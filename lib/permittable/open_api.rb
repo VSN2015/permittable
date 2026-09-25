@@ -204,12 +204,17 @@ module Permittable
     def document(controllers:, info: {}, routes: nil)
       paths = {}
       unrouted = {}
-      controllers.each do |controller|
+      slots = []
+      targets = route_targets(routes)
+      # A class listed twice would find every slot its first pass claimed and
+      # land under x-permittable-controllers, colliding with itself there.
+      controllers.uniq(&:object_id).each do |controller|
         operations = operations_for(controller)
         next if operations.empty?
 
-        place_operations(controller, operations, routes, paths, unrouted)
+        slots.concat(place_operations(controller, operations, targets, paths, unrouted))
       end
+      assign_unique_operation_ids(slots)
       doc = {
         "openapi" => "3.1.0",
         "info" => { "title" => "Permittable contracts", "version" => VERSION }.merge(info),
@@ -220,20 +225,116 @@ module Permittable
       doc
     end
 
-    def place_operations(controller, operations, routes, paths, unrouted)
+    # Where one operation sits in the document: a path+verb slot under
+    # `paths`, or an action under x-permittable-controllers (verb nil).
+    # `holder[field]` is the placed operation; `id` its natural operationId;
+    # `owner` the [controller key, action] it documents.
+    OperationSlot = Struct.new(:holder, :field, :verb, :id, :owner)
+
+    # { [controller, action] => [[path, verb], ...] }, in route order. Built
+    # once, with each verb normalised once: matching every operation against
+    # every route made placement quadratic in the size of the route set. A
+    # route declared twice names one slot, so it is kept once — not counted
+    # as an operation colliding with itself.
+    def route_targets(routes)
+      return {} if routes.nil?
+
+      routes.group_by { |route| [route[:controller].to_s, route[:action].to_s] }
+            .transform_values { |matching| matching.map { |route| [route[:path], verb_of(route)] }.uniq }
+    end
+
+    # Places every operation and returns the slots it filled, in placement
+    # order (controller, action, route), for assign_unique_operation_ids.
+    def place_operations(controller, operations, targets, paths, unrouted)
       key = controller_key(controller) || controller.inspect
-      operations.each do |action, operation|
+      operations.each_with_object([]) do |(action, operation), slots|
+        owner = [key, action]
         # A path+verb pair carries exactly one operation, so a slot another
         # controller already claimed is not written over: the loser stays
         # visible under x-permittable-controllers, where an operation with no
         # route at all lands, rather than disappearing from the document.
-        free = routes_for(routes, key, action).reject { |route| paths.dig(route[:path], verb_of(route)) }
+        free = action == "*" ? [] : targets.fetch(owner, []).reject { |path, verb| paths.dig(path, verb) }
         if free.empty?
-          (unrouted[key] ||= {})[action] = operation
+          holder = (unrouted[key] ||= {})
+          slots << OperationSlot.new(holder, action, nil, operation["operationId"], owner) unless holder.key?(action)
+          holder[action] = operation
         else
-          free.each { |route| (paths[route[:path]] ||= {})[verb_of(route)] = with_path_parameters(operation, route[:path]) }
+          free.each do |path, verb|
+            holder = (paths[path] ||= {})
+            holder[verb] = with_path_parameters(operation, path)
+            slots << OperationSlot.new(holder, verb, verb, operation["operationId"], owner)
+          end
         end
       end
+    end
+
+    # OpenAPI requires operationId to be unique across the document, and
+    # client generators name a method after it — a duplicate is an invalid
+    # document and, in practice, two methods with one name. One operation is
+    # placed at every slot its routes reach: the separate PATCH and PUT
+    # routes `resources` draws to update, or one `via: [:patch, :put]` route;
+    # with the optional-segment expansion, one route's several paths; with
+    # `via: :all` routes, which are documented under each verb, five verbs.
+    # And `key.tr("/", "_")` folds admin/users and admin_users into one id.
+    #
+    # Renaming the scheme would rename every generated client method, so an
+    # id that is already unique never changes. Every slot's natural id is
+    # known before any is renamed and all of them are reserved, so a suffix
+    # can never take a name that is another operation's own id — that
+    # operation would otherwise be renamed for a collision it never had.
+    # Within a colliding group the first slot keeps the plain id. Another
+    # takes its verb (users_update_put) when that verb differs from the plain
+    # id's and the suffixed id is free; otherwise it is numbered
+    # (posts_create_2 for a second POST, users_update_2 for a second PATCH).
+    # The suffix names how the slot differs from the plain one, so a verb
+    # the two share would say nothing true.
+    #
+    # Unrouted operations take part: x-permittable-controllers is in the same
+    # document and feeds the same generators. They yield the plain id to a
+    # routed operation, though, since `paths` is what a client calls.
+    def assign_unique_operation_ids(slots)
+      slots = slots.select(&:id)
+      taken = slots.to_set(&:id)
+      next_number = Hash.new(2)
+      slots.group_by(&:id).each_value do |group|
+        next if group.one?
+
+        plain, *renamed = collision_order(group)
+        renamed.each do |slot|
+          by_verb = "#{slot.id}_#{slot.verb}"
+          by_verb = nil if slot.verb.nil? || slot.verb == plain.verb || taken.include?(by_verb)
+          unique = by_verb || numbered_id(slot.id, taken, next_number)
+          taken << unique
+          # The same operation object may sit at other slots under its own
+          # id, so the rename goes on a copy; merge keeps the key order.
+          slot.holder[slot.field] = slot.holder[slot.field].merge("operationId" => unique)
+        end
+      end
+    end
+
+    # Routed before unrouted, then placement order: controller, action, route.
+    # Within one operation a PUT sorts after its PATCH, because
+    # `match via: [:put, :patch]` lists PUT first where `resources` lists
+    # PATCH first, and without this one pair of routes would name the PATCH
+    # method two ways. Across operations the order alone decides: a PATCH in
+    # a later controller does not take the plain id from an earlier PUT.
+    def collision_order(group)
+      patched = group.select { |slot| slot.verb == "patch" }.to_set(&:owner)
+      first_at = {}
+      group.each_with_index { |slot, index| first_at[slot.owner] ||= index }
+      group.each_with_index.sort_by do |slot, index|
+        put_after_patch = slot.verb == "put" && patched.include?(slot.owner) ? 1 : 0
+        [slot.verb ? 0 : 1, first_at[slot.owner], put_after_patch, index]
+      end.map(&:first)
+    end
+
+    # The next free "#{id}_n", n from 2. The counter per id means no number
+    # is tried twice for one id, which keeps the pass linear.
+    def numbered_id(id, taken, next_number)
+      number = next_number[id]
+      number += 1 while taken.include?("#{id}_#{number}")
+      next_number[id] = number + 1
+      "#{id}_#{number}"
     end
 
     def verb_of(route)
@@ -260,11 +361,9 @@ module Permittable
       end
     end
 
-    def routes_for(routes, controller_key, action)
-      return [] if routes.nil? || action == "*"
-
-      routes.select { |r| r[:controller].to_s == controller_key && r[:action].to_s == action }
-    end
+    # What a `via: :all` route answers, in the "|"-joined form Journey uses
+    # for a route with several verbs.
+    ALL_VERBS = "GET|POST|PUT|PATCH|DELETE".freeze
 
     # { controller:, action:, verb:, path: } descriptors from a Rails
     # application's route set. Duck-typed against Journey routes (each one
@@ -272,11 +371,27 @@ module Permittable
     # without Rails; Rails path params become OpenAPI templates — both the
     # `:id` form and the `*rest` wildcard, which is a real route shape
     # (`get "files/*path"`) and is not a valid OpenAPI template left as-is.
+    #
+    # An optional group is expanded into the concrete paths it stands for:
+    # parentheses are not valid in an OpenAPI path template, so leaving
+    # `scope "(:locale)"` as `(/{locale})/posts` made the whole document fail
+    # validation. Each variant is its own descriptor, so each path's variables
+    # are required there — which, for that path, they are.
+    #
+    # Each descriptor also carries `route:`, the index of the route it came
+    # from, so a reader counting routes rather than paths (Audit.summary) can
+    # tell one route's expanded variants from a second route that happens to
+    # reach the same action. The exporter ignores it.
     def rails_routes(app)
-      app.routes.routes.flat_map do |route|
+      descriptors = app.routes.routes.each_with_index.flat_map do |route, index|
         requirements = route.requirements
         verb = route.verb.to_s
-        next [] if requirements[:controller].nil? || requirements[:action].nil? || verb.empty?
+        next [] if requirements[:controller].nil? || requirements[:action].nil?
+
+        # `match ..., via: :all` leaves the verb EMPTY rather than listing
+        # them, and skipping it hid an action that takes POST bodies from the
+        # audit entirely. Expand it into the verbs it actually answers.
+        verb = ALL_VERBS if verb.empty?
 
         path = route.path.spec.to_s.sub("(.:format)", "").gsub(/[:*](\w+)/) { "{#{Regexp.last_match(1)}}" }
         # One route can answer several verbs (`match via: [:patch, :put]`, and
@@ -284,9 +399,52 @@ module Permittable
         # dropped the others from the export entirely.
         verb.split("|").map do |single|
           { controller: requirements[:controller], action: requirements[:action],
-            verb: single.downcase, path: path }
+            verb: single.downcase, path: path, route: index }
         end
       end
+      descriptors.flat_map do |descriptor|
+        optional_variants(descriptor[:path]).map { |variant| descriptor.merge(path: variant) }
+      end
+    end
+
+    # Every concrete path an optionally-grouped template stands for:
+    # `/archive(/{year}(/{month}))` → `/archive`, `/archive/{year}`,
+    # `/archive/{year}/{month}`. Rails fills groups left to right, so
+    # `/x(/{a})(/{b})` with one segment present is always `/x/{a}` — the
+    # `/x/{b}` variant is the same URL under another name, and OpenAPI forbids
+    # two templates differing only in variable names. Variants are built with
+    # each group present first, so the one Rails would match is the one kept;
+    # the list is then reversed, which puts every group's ABSENT variant
+    # first at every nesting level. That order matters to the operationId
+    # dedupe (assign_unique_operation_ids, which numbers colliding ids in
+    # route order): the variants of one route share an operation, and it is
+    # that dedupe, not this expansion, that makes their ids unique. Absent
+    # first means `/posts` keeps `posts_create` and `/{locale}/posts` takes
+    # the suffix.
+    def optional_variants(path)
+      variants, = expand_optional_groups(path, 0)
+      variants.map { |variant| variant.empty? ? "/" : variant }
+              .uniq { |variant| variant.gsub(/\{\w+\}/, "{}") }
+              .reverse
+    end
+
+    # Walks the template from `pos` to the matching `)` (or the end),
+    # returning the variants of that stretch and the position after it.
+    def expand_optional_groups(path, pos)
+      variants = [+""]
+      while pos < path.length
+        char = path[pos]
+        if char == "("
+          inner, pos = expand_optional_groups(path, pos + 1)
+          variants = variants.product(inner + [""]).map(&:join)
+        elsif char == ")"
+          return [variants, pos + 1]
+        else
+          variants.each { |variant| variant << char }
+          pos += 1
+        end
+      end
+      [variants, pos]
     end
 
     def controller_key(controller)
