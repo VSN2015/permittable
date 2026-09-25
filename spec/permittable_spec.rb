@@ -88,6 +88,11 @@ RSpec.describe Permittable do
         .to raise_error(ArgumentError, /required and cannot have a :default/)
     end
 
+    it "rejects required + default on an array field, the same way" do
+      expect { permittable_class { permit_params(:create) { array :tags, of: :string, required: true, default: ["x"] } } }
+        .to raise_error(ArgumentError, /required and cannot have a :default/)
+    end
+
     it "rejects format/length/normalize on non-string fields" do
       %i[format length normalize].zip([/\d/, 1..3, :squish]).each do |opt, value|
         expect { permittable_class { permit_params(:create) { required :a, :integer, opt => value } } }
