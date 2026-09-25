@@ -96,6 +96,12 @@ RSpec.describe Permittable::Contract do
       )
     end
 
+    it "does not exempt path-parameter or wrapper-key names either — standalone input has no request" do
+      c = described_class.define(unknown: :error) { optional :name, :string }
+      result = c.call(name: "x", id: "1", user: { name: "x" })
+      expect(result.violations).to contain_exactly({ param: "id", code: "unknown" }, { param: "user", code: "unknown" })
+    end
+
     it "stays enforce-semantics even when the app-wide mode is monitor" do
       Permittable.mode = :monitor
       begin
