@@ -297,7 +297,7 @@ Which options are legal depends on the field kind — anything else raises at cl
 | `length:` | ✅¹ | ✅ | — | `Range` or `Integer`. Character count on strings, **element count** on arrays, where it short-circuits — see [the field DSL](#the-field-dsl) |
 | `normalize:` | ✅¹ | — | — | `:squish`, `:strip`, `:downcase`, `:upcase`, `:email`, or a Proc. Runs **first** — before the absence rule, so a value that normalizes to `""` is absent |
 | `default:` | ✅ | ✅ | — | Value used when the field is absent. Validated against the field's own contract at class load, then stored normalized and frozen (each request gets its own copy) |
-| `validate:` | ✅ | ✅ | — | Callable. Falsy fails as `"invalid"`; a returned `Symbol` becomes the violation code |
+| `validate:` | ✅ | ✅ | — | Callable. Falsy fails as `"invalid"`; a returned `Symbol` becomes the violation code. On an array it runs only when no element violated — an undeclared key inside an element does not count — and `transform:` runs only when nothing violated at all |
 | `transform:` | ✅ | ✅ | — | Callable applied **after** cast and validation — see [output reshaping](#output-reshaping-transform-and-finalize) |
 | `virtual:` | ✅ | ✅ | ✅ | Exempt this field from the schema-drift guard |
 | `sensitive:` | ✅ | ✅ | ✅ | Register the field name for [log redaction](#sensitive-parameters-and-log-redaction) |
@@ -357,8 +357,8 @@ Coercion is **deliberately strict**, and deliberately *not* `ActiveModel::Type`.
 
 | Type | Accepts | Rejects (`invalid_type`) |
 |---|---|---|
-| `:string` | `String`; `Numeric`/`true`/`false` are stringified | Arrays, hashes |
-| `:integer` | `Integer`; whole `Float`s (`4.0`); base-10 numeric strings | `"4.5"`, `"abc"`, `4.5` |
+| `:string` | `String`, returned in the encoding it arrived in; `Numeric`/`true`/`false` are stringified | Arrays, hashes, a `String` whose bytes are invalid in its own encoding (`"caf\xC3"`) |
+| `:integer` | `Integer`; whole `Float`s (`4.0`); base-10 numeric strings | `"4.5"`, `"abc"`, `4.5`, NaN/Infinity |
 | `:float` | `Numeric`; any `Float()`-parseable string | `"abc"` |
 | `:decimal` | `Numeric` or `String` → `BigDecimal` | Unparseable strings |
 | `:boolean` | `true`/`false`, `"true"`/`"false"`, `"1"`/`"0"`, `1`/`0` | `"yes"`, `"on"`, `2` |
@@ -367,6 +367,8 @@ Coercion is **deliberately strict**, and deliberately *not* `ActiveModel::Type`.
 | `:json` | Any `Hash` — passed through uncast, see [free-form hashes](#free-form-hashes-json) | Arrays, scalars |
 
 **Dates are parsed, never guessed.** `Date.parse` fills in what a string omits *from today* — `"09/2026"` becomes the 1st, `"5th"` becomes this month of this year — so the same request would mean different things on different days. A `:date` or `:datetime` string must therefore name all three of year, month and day; which **format** it names them in is `Date.parse`'s business, so every complete format it understands still works. A `:datetime` may omit the *time* part, which reads as midnight UTC.
+
+**Strings in other encodings are inspected, never converted.** A String whose bytes are not valid in its **own** encoding (`"caf\xC3"` in UTF-8, a lone UTF-16 surrogate) is `invalid_type` for every scalar type, before `normalize:` or `format:` sees it. Any other String keeps its encoding: a `:string` value is handed back exactly as it arrived, so a controller using Rails' `skip_parameter_encoding` or `param_encoding` gets its binary or Shift_JIS text unchanged. The number, boolean and date types parse a UTF-8 **copy** of the text, so UTF-16 `"12"` casts to `12` for an `:integer`; when the text has no UTF-8 reading (a byte Windows-1252 leaves undefined) that is `invalid_type`. `normalize:` and `format:` work on the String in its own encoding. Where a normalizer cannot handle that encoding (`:squish` on UTF-16), the value is left as it is; where a `format:` pattern cannot be applied to it (a non-ASCII pattern against UTF-16 or binary bytes), that is a `format` violation. `in:` compares Strings as Ruby does, encoding included. A `:json` field's contents are not examined.
 
 **Numbers must be finite.** `Float("1e400")` is `Infinity` and `Float("1e-400")` is `0.0` — neither represents what was sent, and neither is a value a numeric column can store, so both are `invalid_type`. A genuine zero is unaffected however it is spelled (`"0"`, `"0.0"`, `"0e10"`). `:decimal` has no exponent limit, so `"1e400"` is fine there — but `BigDecimal("NaN")` and `BigDecimal("Infinity")` *succeed* where `Float()` raises, so those literal strings are rejected explicitly.
 
@@ -927,7 +929,7 @@ CreateUser = Permittable::Contract.define(root: :user) do
   optional :plan,  :string, in: %w[free pro], default: "free"
 end
 
-result = CreateUser.call(payload)     # never raises
+result = CreateUser.call(payload)     # a Result — bad client input is a violation, not an exception
 result.valid?                          # => false
 result.violations                      # => [{ param: "user.age", code: "inclusion" }]
 result.params                          # validated HashWithIndifferentAccess; nil when invalid
@@ -937,7 +939,11 @@ CreateUser.json_schema                 # the contract as JSON Schema (draft 2020
 CreateUser.rule                        # the frozen, introspectable rule data
 ```
 
-Everything carries over — strict coercion, `""`/`nil` absence, defaults, `finalize` with `violate!`, `sensitive:` log-redaction registration, `invalid_parameters.permittable` instrumentation, 400-vs-422 status semantics for a missing `root:`. Three differences, all deliberate:
+Everything carries over — strict coercion, `""`/`nil` absence, defaults, `finalize` with `violate!`, `sensitive:` log-redaction registration, `invalid_parameters.permittable` instrumentation, 400-vs-422 status semantics for a missing `root:`.
+
+**What `#call` still raises.** Client data never raises out of the gem's own checks. Wrong types, non-finite numbers, Strings in any encoding (valid or not) and undeclared keys in any encoding all come back as violations in the `Result`. Two things do raise, on purpose, because neither is the client's mistake. An input that is not a Hash, `nil` (read as `{}`) or an object answering `to_unsafe_h` (such as `ActionController::Parameters`) raises `ArgumentError`. And an exception raised by your own code (a `validate:`, `transform:` or `normalize:` proc, or `finalize`) reaches the caller unchanged, since swallowing it would hide a bug. The one exception is a `normalize:` proc that raises `ArgumentError` or an encoding error on a String that is neither UTF-8 nor ASCII-only; that value is left as it is, like a preset's.
+
+Three differences from the controller concern, all deliberate:
 
 - **A `Contract` always enforces.** Monitor mode is a request-rollout switch; standalone callers read the `Result` instead, so the app-wide `Permittable.mode` is ignored here.
 - **No router-key exemption.** `unknown: :error` flags a stray `action` or `controller` key — standalone input has no router to excuse.
