@@ -232,18 +232,29 @@ module Permittable
   # ...and a name that could break the sentence out of its line is escaped.
   # The names are client-sent, and bounding their length escaped nothing: a
   # key of "x\nE, [...] ERROR -- : ..." wrote a second, forged log entry.
-  # The set is every control character (\p{Cc}: C0, DEL and C1 — C1 because
-  # U+0085 is NEL, a line break to many readers, and U+009B is the 8-bit
-  # CSI that starts a terminal escape); U+2028/U+2029, the two Unicode
-  # separators a JSON-lines or JavaScript reader splits a line on; and the
-  # bidi embedding, override and isolate characters (U+202A–U+202E,
-  # U+2066–U+2069), which start no line but can visually reorder one — and
-  # so move text across the closing quote of an escaped name.
-  PROSE_UNSAFE = /[\p{Cc}\u2028\u2029\u202A-\u202E\u2066-\u2069]/
-  # A name is also quoted when it merely LOOKS like prose structure: a quote
-  # anywhere could pass for (or close) an escaped name, and the list
-  # separator could pass for two names or for the ", and N more" count.
-  PROSE_AMBIGUOUS = /"|, /
+  # The set is, by Unicode property:
+  # - every control character (Cc: C0, DEL and C1 — C1 because U+0085 is
+  #   NEL, a line break to many readers, and U+009B is the 8-bit CSI that
+  #   starts a terminal escape);
+  # - U+2028/U+2029 (Zl, Zp), the separators a JSON-lines or JavaScript
+  #   reader splits a line on;
+  # - every format character (Cf): the bidi embeddings, overrides and
+  #   isolates, which can visually reorder a line and so move text across
+  #   the closing quote of an escaped name, and the zero-width and marker
+  #   characters (U+200B, U+200E/U+200F, U+061C, U+FEFF, ...), which make
+  #   two different names print identically;
+  # - every space but U+0020 (Zs), so a no-break or ideographic space
+  #   cannot make "x,<NBSP>y" pass for the ", " between two names.
+  PROSE_UNSAFE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Zs}&&[^ ]]/
+  # A name is also quoted when it merely LOOKS like prose structure. These
+  # characters print as they are — only the quoting marks them:
+  # - a quote anywhere, or a quote lookalike (the fullwidth quote and every
+  #   initial/final quotation mark, Pi/Pf: curly quotes, guillemets), could
+  #   pass for, or close, an escaped name;
+  # - the list separator, or a fullwidth, small or ideographic comma, could
+  #   pass for the ", " between two names;
+  # - a name that begins "and N more" could pass for the overflow count.
+  PROSE_AMBIGUOUS = /["\u{FF02}\p{Pi}\p{Pf}\u{FF0C}\u{FE50}\u{3001}]|, |\Aand \p{Nd}+ more/
   # \n, \r and \t, which a person recognises, get their short escape; any
   # other unsafe character is \uXXXX, which JSON, JavaScript and Ruby all
   # read the same way. The quote and backslash are escaped too, but only
@@ -1590,10 +1601,14 @@ module Permittable
 
   # The name is truncated by whole escapes, never through one: cutting the
   # escaped text at a fixed width could print a dangling backslash, or half
-  # of a \uXXXX. When the name itself is cut, the "..." goes outside the
-  # closing quote, so the quotes still delimit exactly what is shown; when
-  # only the suffix is, the name stays whole. Only as many characters are
-  # escaped as can be shown.
+  # of an escape. When the name itself is cut, the "..." goes outside the
+  # closing quote, so the quotes still delimit exactly what is shown. A
+  # quoted name that fits the limit on its own is never cut: the suffix is
+  # cut instead, to whatever room is left — possibly none — and the "..."
+  # that marks it may then run up to three characters past the limit. A
+  # dropped developer suffix is better flagged than hidden, and the name is
+  # the part a reader is there for. Only as many characters are escaped as
+  # can be shown.
   def permittable_prose_quoted(text, more, suffix)
     budget = PROSE_ITEM_LIMIT - 2 # the two quotes
     pieces = []
@@ -1606,7 +1621,8 @@ module Permittable
     if !more && length <= budget
       quoted = "\"#{pieces.join}\""
       return "#{quoted}#{suffix}" if quoted.length + suffix.length <= PROSE_ITEM_LIMIT
-      return "#{quoted}#{suffix[0, PROSE_ITEM_LIMIT - 3 - quoted.length]}..." if quoted.length <= PROSE_ITEM_LIMIT - 3
+
+      return "#{quoted}#{suffix[0, [PROSE_ITEM_LIMIT - 3 - quoted.length, 0].max]}..."
     end
 
     length -= pieces.pop.length while length > budget - 3
@@ -1615,22 +1631,38 @@ module Permittable
 
   # A byte that is not valid UTF-8 is shown as \xNN rather than passed
   # through: it is not a character a person can read, and a lone 0x85 or
-  # 0x9B is NEL or CSI to a Latin-1 terminal.
+  # 0x9B is NEL or CSI to a Latin-1 terminal. A character beyond the BMP
+  # (the Cf tag characters) is \u{XXXXX}, since \uXXXX holds only four digits.
   def permittable_prose_escape(char)
     return char.bytes.map { |byte| format('\x%02X', byte) }.join unless char.valid_encoding?
 
-    PROSE_ESCAPES.fetch(char) { char.match?(PROSE_UNSAFE) ? format('\u%04X', char.ord) : char }
+    PROSE_ESCAPES.fetch(char) do
+      next char unless char.match?(PROSE_UNSAFE)
+
+      char.ord > 0xFFFF ? format('\u{%X}', char.ord) : format('\u%04X', char.ord)
+    end
   end
 
   # PROSE_UNSAFE is a UTF-8 pattern, and matching it against a binary key
   # with high bytes raises Encoding::CompatibilityError — a log line must
-  # never be what fails a request. A key that will not transcode is read
-  # as UTF-8 bytes, and whatever is invalid is then escaped byte by byte.
+  # never be what fails a request. A binary key has no charset to convert
+  # from, and Rack hands UTF-8 bytes over as binary, so it is read as UTF-8.
+  # A key in a real encoding is transcoded character by character: what
+  # maps is converted, and only a byte that does not (Windows-1252 leaves
+  # 0x81, 0x8D, 0x8F, 0x90 and 0x9D undefined) is kept as an invalid byte,
+  # which the escaper then shows as \xNN — rather than reading the whole
+  # key as UTF-8, which turned a mappable é into \xE9 and mojibake into
+  # characters the client never sent.
   def permittable_prose_utf8(item)
     return item if item.encoding == Encoding::UTF_8
+    return item.dup.force_encoding(Encoding::UTF_8) if item.encoding == Encoding::BINARY || item.ascii_only?
 
-    item.encode(Encoding::UTF_8)
-  rescue EncodingError
+    converter = Encoding::Converter.new(item.encoding, Encoding::UTF_8)
+    source = item.dup
+    out = String.new(encoding: Encoding::UTF_8)
+    out << converter.primitive_errinfo[3].force_encoding(Encoding::UTF_8) until converter.primitive_convert(source, out) == :finished
+    out
+  rescue EncodingError # no converter, as for a dummy encoding such as UTF-7
     item.dup.force_encoding(Encoding::UTF_8)
   end
 

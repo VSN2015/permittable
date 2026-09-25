@@ -1842,7 +1842,7 @@ RSpec.describe Permittable do
     let(:forged) { "evil\nE, [2026-09-23] ERROR -- : forged admin login" }
     let(:log_klass) { permittable_class { permit_params(:create, unknown: :log) { required :a, :string } } }
     let(:error_klass) { permittable_class { permit_params(:create, unknown: :error) { required :a, :string } } }
-    let(:unsafe) { /[\p{Cc}\u2028\u2029\u202a-\u202e\u2066-\u2069]/ }
+    let(:unsafe) { /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Zs}&&[^ ]]/ }
 
     it "cannot forge a second entry through the :log warn line" do
       c, lines = logging_controller(log_klass, params: { "a" => "x", forged => "v" })
@@ -1914,6 +1914,72 @@ RSpec.describe Permittable do
       c, lines = logging_controller(log_klass, params: { "a" => "x", "b, c" => "v", "x, and 49990 more" => "v" })
       c.permitted_params
       expect(lines.first).to end_with('contract: "b, c", "x, and 49990 more"')
+    end
+
+    it "quotes a name that could be read as the overflow count, in every prose output" do
+      c, lines = logging_controller(log_klass, params: { "a" => "x", "b" => "v", "and 49990 more" => "v" })
+      c.permitted_params
+      expect(lines.first).to end_with('contract: b, "and 49990 more"')
+
+      expect(rejection(error_klass, { "a" => "x", "b" => "v", "and 49990 more" => "v" }).message)
+        .to eq('Invalid parameters: b (unknown), "and 49990 more" (unknown)')
+
+      klass = permittable_class { permit_params(:create, unknown: :error, mode: :monitor) { required :a, :string } }
+      c, lines = logging_controller(klass, params: { "a" => "x", "and 1 more" => "v" })
+      c.permitted_params
+      expect(lines.first).to end_with('rejected: "and 1 more" (unknown)')
+      # A name that merely contains the words is ordinary.
+      c, lines = logging_controller(log_klass, params: { "a" => "x", "band 4 more" => "v" })
+      c.permitted_params
+      expect(lines.first).to end_with("contract: band 4 more")
+    end
+
+    it "escapes the non-ASCII spaces, which let a lookalike separator pass for ', '" do
+      name = "x,\u00A0and 49990 more\u2003\u3000\u202F"
+      c, lines = logging_controller(log_klass, params: { "a" => "x", name => "v" })
+      c.permitted_params
+      expect(lines.first).to end_with('contract: "x,\u00A0and 49990 more\u2003\u3000\u202F"')
+    end
+
+    it "quotes a name holding a lookalike comma or quote, and prints those characters as they are" do
+      names = ["a\u{FF0C}b", "a\u{FE50}b", "a\u{3001}b", "\u{201C}x\u{201D}", "\u{2018}y\u{2019}", "\u{AB}z\u{BB}", "\u{FF02}w"]
+      c, lines = logging_controller(log_klass, params: names.to_h { |n| [n, "v"] }.merge("a" => "x"))
+      c.permitted_params
+      expect(lines.first).to end_with("contract: #{names.map { |n| "\"#{n}\"" }.join(', ')}")
+    end
+
+    it "escapes the zero-width and other format characters" do
+      name = "a\u200Bb\u200Ec\u200Fd\u061Ce\uFEFFf\u00ADg\u200Dh\u{E0041}i"
+      c, lines = logging_controller(log_klass, params: { "a" => "x", name => "v" })
+      c.permitted_params
+      expect(lines.first).not_to match(unsafe)
+      expect(lines.first).to end_with('contract: "a\u200Bb\u200Ec\u200Fd\u061Ce\uFEFFf\u00ADg\u200Dh\u{E0041}i"')
+    end
+
+    it "keeps a quoted name whole whenever it fits, cutting only the suffix" do
+      # A quoted name of "\n" plus k z's is k + 4 characters; the suffix is " (unknown)".
+      render = lambda do |k|
+        rejection(error_klass, { "a" => "x", "\n#{'z' * k}" => "v" }).message.delete_prefix("Invalid parameters: ")
+      end
+      quoted = ->(k) { "\"\\n#{'z' * k}\"" }
+      expect(render.call(106)).to eq("#{quoted.call(106)} (unknown)")  # 120: fits exactly
+      expect(render.call(107)).to eq("#{quoted.call(107)} (unkn...")   # 111 + 6 + 3
+      expect(render.call(113)).to eq("#{quoted.call(113)}...")         # 117: no room for any suffix
+      # 118 to 120: the name fits the limit on its own, so it is not cut; the
+      # ellipsis marking the dropped suffix is allowed past the limit.
+      expect(render.call(114)).to eq("#{quoted.call(114)}...")
+      expect(render.call(116)).to eq("#{quoted.call(116)}...")
+      # 121: the name itself no longer fits, and is cut between whole escapes.
+      expect(render.call(117)).to eq("\"\\n#{'z' * 113}\"...")
+    end
+
+    it "transcodes what maps in a legacy key and shows only the unmappable bytes as \\xNN" do
+      unmapped = "caf\xE9\x81\x8D\x8F\x90\x9D".dup.force_encoding(Encoding::Windows_1252)
+      mojibake = "\xC3\xA9".dup.force_encoding(Encoding::Windows_1252) # two cp1252 characters, not one é
+      sjis = "\x82\xA0\x82".dup.force_encoding(Encoding::Shift_JIS) # あ, then half a character
+      c, lines = logging_controller(log_klass, params: { "a" => "x", unmapped => 1, mojibake => 2, sjis => 3 })
+      c.permitted_params
+      expect(lines.first).to end_with("contract: \"café\\x81\\x8D\\x8F\\x90\\x9D\", Ã©, \"あ\\x82\"")
     end
 
     it "escapes only the client-sent name, never the developer's message" do
