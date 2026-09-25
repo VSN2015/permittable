@@ -161,7 +161,11 @@ module Permittable
       return unless allowed
 
       unless allowed.is_a?(Range)
-        schema["enum"] = allowed.map { |v| json_value(v) }
+        # The same numeric-vs-string rule default:/example: use (decimal_json)
+        # applies here too — a :decimal in: member is otherwise always
+        # exported as a string, so a numerically-exported default: is no
+        # longer a member of its own enum's exported list.
+        schema["enum"] = allowed.map { |v| json_value(v, decimal: :number) }
         return
       end
       # Runtime bounds-checks Ranges with cover?; numeric endpoints map onto
@@ -232,9 +236,19 @@ module Permittable
     # Documentation keys shared by every field kind. `default:`/`example:`
     # are stored as the contract casts them (Date, Time, BigDecimal), so they
     # are re-encoded as JSON scalars.
+    #
+    # The :decimal numeric-export rule (decimal_json) is scoped to a
+    # :decimal field's OWN value and never recurses into a :json field's
+    # contents: those are opaque and pass through uncast, so a BigDecimal
+    # found inside one is documented the same way it always was — a string,
+    # via BigDecimal#to_s("F") — rather than reinterpreted as a JSON number
+    # (silently changing a value outside any :decimal schema's justification)
+    # or coerced through Float, where a non-finite BigDecimal (Infinity, NaN)
+    # would crash JSON.generate.
     def annotate(schema, field)
-      schema["default"] = json_value(field[:default], decimal: :number) if field.key?(:default)
-      schema["examples"] = [json_value(field[:example], decimal: :number)] if field.key?(:example)
+      decimal_mode = field[:kind] == JSON_TYPE ? :string : :number
+      schema["default"] = json_value(field[:default], decimal: decimal_mode) if field.key?(:default)
+      schema["examples"] = [json_value(field[:example], decimal: decimal_mode)] if field.key?(:example)
       schema["description"] = field[:desc] if field[:desc]
       if field[:sensitive]
         schema["writeOnly"] = true

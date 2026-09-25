@@ -124,10 +124,12 @@ require "permittable/filter_parameter_registry"
 # ("   " under :squish) cannot satisfy a required field by becoming "". An
 # authored `default:`/`example:` is stored as the contract reads it —
 # normalized and cast, so `default: "18"` on an :integer is 18, and an
-# array's read by the request walker itself — minus `transform:`, which never
-# runs on a default (see OUTPUT RESHAPING). It is deep-frozen on a copy, and
-# each request gets its own deep copy, so no request can corrupt it for the
-# next.
+# array's read by the request walker itself. The one exception is a field
+# declaring `transform:`: its default is stored exactly AS AUTHORED, never
+# cast — `transform:` never runs on a default either (see OUTPUT RESHAPING),
+# so author such a default already in the shape the action should receive.
+# Either way it is deep-frozen on a copy, and each request gets its own deep
+# copy, so no request can corrupt it for the next.
 #
 # `nullable: true` splits that rule in two for one field, which is how a PATCH
 # clears a column: a key the client never sent stays absent (defaults apply,
@@ -177,11 +179,14 @@ require "permittable/filter_parameter_registry"
 #     and validation to reshape that field's output, e.g.
 #     `transform: ->(v) { v.split(",") }` turns a validated delimited String
 #     into an Array. Runs only on request-supplied values: absent fields stay
-#     absent, and a `default:` is handed out as the contract reads it
-#     (normalized, cast, validated) but NOT transformed — so a request
-#     sending a field's default gets the transformed value, a request
-#     omitting it the untransformed one. Author a default in the shape the
-#     action should receive.
+#     absent, and a `default:` is handed out exactly AS AUTHORED — validated
+#     against the field's own contract at class load (as any default is), but
+#     neither cast nor transformed — so a request sending a field's default
+#     gets the transformed value, a request omitting it the untransformed one.
+#     Author a default already in the shape the action should receive:
+#     `transform: ->(v) { v.to_i }, default: 25` on a :string field hands both
+#     paths the Integer 25. A field with no `transform:` still gets its
+#     default cast (see the module-level default:/example: paragraph above).
 #   * `finalize do |p| ... end` (once per contract) — runs after every field
 #     validated cleanly, receives the result hash, and must return the
 #     (possibly restructured) Hash: combine parallel fields, build value
@@ -582,6 +587,13 @@ module Permittable
     def cast_string(value)
       case value
       when String then [:ok, value]
+      # BigDecimal#to_s defaults to engineering notation ("0.15e1" for 1.5) —
+      # stdlib's own rendering, only ever masked in a host that has loaded
+      # Rails' active_support/core_ext/big_decimal/conversions, which patches
+      # the default format to "F". A :decimal default:/example: cast through
+      # here (a plain :string field, not :decimal itself) must render the same
+      # way regardless of whether that patch happens to be loaded.
+      when BigDecimal then [:ok, value.to_s("F")]
       when Numeric, true, false then [:ok, value.to_s]
       else [:error, "invalid_type"]
       end
@@ -1069,14 +1081,24 @@ module Permittable
 
     # An authored value (`default:`, or a documentation `example:`) must
     # satisfy the field's own contract — catching a lie at class load beats
-    # shipping it to every request (or publishing it in generated docs).
-    # The authored value is STORED normalized and cast, because that is the
-    # form it was validated in — and the form a request sending the same value
-    # gets. `default: "  free  "` with `normalize: :squish` was checked as
-    # "free" and used to be handed to requests as "  free  "; `default: "18"`
-    # on an :integer was checked as 18 and handed out (and published in the
-    # JSON Schema, beside "type": "integer") as "18", and `:boolean, default:
-    # "false"` gave the app a truthy String.
+    # shipping it to every request (or publishing it in generated docs) —
+    # which is checked here by normalizing and casting it, same as a request's
+    # value. `default: "  free  "` with `normalize: :squish` is checked as
+    # "free"; `default: "18"` on an :integer is checked as 18.
+    #
+    # What is STORED from that differs by whether the field has `transform:`.
+    # With none, the cast result is stored — the form a request sending the
+    # same value gets, and what used to be thrown away: `default: "18"` used
+    # to be handed to every request omitting it as the String "18", and
+    # `:boolean, default: "false"` gave the app a truthy String.
+    # With a `transform:`, the value is stored exactly AS AUTHORED instead —
+    # `transform:` never runs on a default (see AuthoredValues), so casting it
+    # here would silently change its type out from under an author who, per
+    # the README, writes such a default in the shape the action should
+    # receive: `default: 25` beside `transform: ->(v) { v.to_i }` on a
+    # :string field means the app gets the Integer 25 either way, whether the
+    # request sent "25" (cast then transformed) or omitted the field
+    # (authored as the already-final Integer).
     def validate_authored_value!(field, opt)
       return unless field.key?(opt)
       return if authored_nil!(field, opt)
@@ -1088,19 +1110,26 @@ module Permittable
       status, result = Coercion.check_scalar(field, value)
       raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{result})" unless status == :ok
 
-      field[opt] = freeze_authored(result)
+      field[opt] = freeze_authored(field[:transform] ? field[opt] : result)
     end
 
-    # An array's authored value is read by the REQUEST walker itself (see
-    # AuthoredValues), so what is stored is exactly what a request sending
-    # it gets: elements cast, nested hashes and arrays read at every depth,
-    # a sub-field's own default: filled in, `""` on a nullable sub-field
-    # made the explicit nil a request would get, keys the block does not
-    # declare dropped (as `unknown: :ignore` drops them), and the array's own
-    # `validate:` run over the result. A hand-rolled one-level check used
-    # to cast only the top level of each element, and got every one of those
-    # wrong. The one step deliberately left out is `transform:` — see
-    # AuthoredValues.
+    # An array's authored value is validated by the REQUEST walker itself
+    # (see AuthoredValues) exactly as validate_authored_value! validates a
+    # scalar's: elements cast, nested hashes and arrays read at every depth, a
+    # sub-field's own default: filled in, `""` on a nullable sub-field made
+    # the explicit nil a request would get, keys the block does not declare
+    # dropped (as `unknown: :ignore` drops them), and the array's own
+    # `validate:` run over the result. A hand-rolled one-level check used to
+    # cast only the top level of each element, and got every one of those
+    # wrong.
+    #
+    # What is STORED follows the same split as a scalar's: without
+    # `transform:`, the walker's read (exactly what a request sending it
+    # gets); with one, the array exactly AS AUTHORED — the walker still runs,
+    # so a declaration mistake (an element `validate:` refuses, a sub-field
+    # default out of bounds) still fails at class load, but its cast result
+    # is discarded rather than stored. `transform:` itself is deliberately
+    # never run on a default either way — see AuthoredValues.
     def validate_array_authored_value!(field, opt)
       value = field[opt]
       return if authored_nil!(field, opt)
@@ -1112,7 +1141,7 @@ module Permittable
                              "#{AuthoredValues.summary(violations)}"
       end
 
-      field[opt] = freeze_authored(read)
+      field[opt] = freeze_authored(field[:transform] ? value : read)
     end
 
     # A contract is frozen data, but `@fields.map(&:freeze)` freezes only the

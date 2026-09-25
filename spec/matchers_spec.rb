@@ -97,6 +97,31 @@ RSpec.describe "Permittable RSpec matchers" do
     expect(message).to include('expected default: "nope"')
   end
 
+  it "casts its argument on a copy, so a mutating normalize: cannot rewrite the spec's own literal" do
+    squishy = Class.new(FakeController) do
+      include Permittable
+
+      permit_params(:create) { optional :plan, :string, normalize: ->(v) { v.strip! || v }, default: "free" }
+    end
+    literal = +"  free  "
+
+    expect { expect(squishy).to permit_param(:plan).with_default(literal) }.not_to raise_error
+    expect(literal).to eq("  free  ")
+  end
+
+  it "compares with_default against a transform: field's default: uncast, the way it is now stored" do
+    reshaped = Class.new(FakeController) do
+      include Permittable
+
+      permit_params(:create) { optional :page_size, :string, transform: ->(v) { v.to_i }, default: 25 }
+    end
+
+    expect(reshaped).to permit_param(:page_size).with_default(25)
+    message = failure_of { expect(reshaped).to permit_param(:page_size).with_default("25") }
+    expect(message).to include('expected default: "25"')
+    expect(message).to include("declares default: 25")
+  end
+
   it "checks required and optional" do
     expect(controller).to permit_param(:email).for_action(:create).required
     expect(controller).to permit_param(:age).for_action(:create).optional

@@ -894,6 +894,33 @@ RSpec.describe Permittable do
       expect(defaulted).to eq(sent)
     end
 
+    it "renders a BigDecimal default: for :string in plain notation, not cast_string's generic scientific to_s" do
+      klass = permittable_class { permit_params(:create) { optional :price, :string, default: BigDecimal("1.5") } }
+      expect(controller(klass).permitted_params[:price]).to eq("1.5")
+    end
+
+    it "hands out a transform: field's default: exactly as authored — master's documented behaviour — " \
+       "while a field with no transform: still gets it cast" do
+      klass = permittable_class do
+        permit_params(:create) do
+          optional :limit,     :string, default: 25
+          optional :page_size, :string, transform: ->(v) { v.to_i }, default: 25
+          optional :expires,   :datetime, default: "2026-01-05"
+          optional :on,        :datetime, transform: ->(t) { t.to_date }, default: Date.new(2026, 1, 5)
+          array    :counts,    of: :string, default: [1, 2]
+          array    :ids,       of: :string, transform: ->(a) { a.map(&:to_i) }, default: [1, 2]
+        end
+      end
+      result = controller(klass).permitted_params
+
+      expect(result[:limit]).to eql("25")
+      expect(result[:page_size]).to eql(25)
+      expect(result[:expires]).to eq(Time.utc(2026, 1, 5)).and be_a(Time)
+      expect(result[:on]).to eq(Date.new(2026, 1, 5)).and be_a(Date)
+      expect(result[:counts]).to eq(%w[1 2])
+      expect(result[:ids]).to eq([1, 2])
+    end
+
     it "reads a block array's default: with the request walker, at every depth" do
       klass = permittable_class do
         permit_params(:create) do

@@ -239,10 +239,21 @@ module Permittable
       # written, is read the same way before comparing, by the same code. A
       # value that does not read cleanly is compared as given, and the
       # failure shows both sides.
+      #
+      # A field declaring `transform:` stores its default AS AUTHORED instead
+      # (see validate_authored_value!/validate_array_authored_value!), so
+      # `expected` is compared bare, not cast — the matcher would otherwise
+      # compare a cast value against an uncast stored one and never match.
       def cast_default(field, expected)
+        return expected if field[:transform]
+
         case field[:kind]
         when :scalar
-          status, value = Coercion.cast(field[:type], Coercion.apply_normalize(field[:normalize], expected))
+          # Copied first, like a request's String, so a mutating `normalize:`
+          # proc cannot rewrite the spec's own literal (the same reason
+          # validate_authored_value! copies before normalizing).
+          own = expected.is_a?(String) ? expected.dup : expected
+          status, value = Coercion.cast(field[:type], Coercion.apply_normalize(field[:normalize], own))
           status == :ok ? value : expected
         when :array
           return expected unless expected.is_a?(Array)
