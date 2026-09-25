@@ -288,6 +288,19 @@ RSpec.describe Permittable do
         .to eq([0..Float::INFINITY, 0..100, 1.5..3, (Date.new(2026, 1, 1)..), (Date.new(2026, 1, 1)..)])
     end
 
+    # A NaN endpoint compares to nothing, by design — whatever it stands
+    # beside, not just the field's own values — so it is not evidence of a
+    # wrong-TYPED bound (a String range on an :integer) the way this check
+    # otherwise exists to catch. It loads exactly like an infinite endpoint
+    # already does; the exporter separately omits it, since it is never
+    # `finite?`.
+    it "accepts a NaN endpoint rather than reading it as an incomparable type" do
+      expect { permittable_class { permit_params(:create) { optional :x, :float, in: Float::NAN.. } } }
+        .not_to raise_error
+      expect { permittable_class { permit_params(:create) { optional :x, :decimal, in: ..BigDecimal("NaN") } } }
+        .not_to raise_error
+    end
+
     it "rejects a bound no value could satisfy, rather than failing every request" do
       expect { permittable_class { permit_params(:create) { optional :age, :integer, in: 65..18 } } }
         .to raise_error(ArgumentError, /:in for :age is empty \(65\.\.18\)/)
@@ -683,6 +696,295 @@ RSpec.describe Permittable do
     end
   end
 
+  # Every case here is CLIENT input that used to raise out of the contract —
+  # a 500 where the request deserved a 422. Each must produce a violation.
+  describe "client input is a violation, never an exception" do
+    # Valid-looking text with a truncated UTF-8 sequence: "caf" + the first
+    # byte of "é". A literal, so its encoding is UTF-8 and it is not valid.
+    let(:malformed) { "caf\xC3" }
+
+    it "does not run an array's validate: over the nils of elements that failed to cast" do
+      decl = proc { permit_params(:create) { array :ids, of: :integer, validate: ->(a) { a.sum < 100 } } }
+      expect(violations_for({ ids: ["x", 2] }, &decl).details).to eq([{ param: "ids[0]", code: "invalid_type" }])
+      # Still runs over a fully-cast array.
+      expect(violations_for({ ids: [1, 200] }, &decl).details).to eq([{ param: "ids", code: "invalid" }])
+      expect(permit({ ids: %w[1 2] }, &decl)[:ids]).to eq([1, 2])
+    end
+
+    it "pays for that by not reporting an array-level verdict alongside element violations" do
+      # The accepted trade-off: the duplicate surfaces only once ids[1] is fixed.
+      decl = proc { permit_params(:create) { array :ids, of: :integer, validate: ->(a) { a.uniq.size == a.size || :duplicate } } }
+      expect(violations_for({ ids: [1, "x", 1] }, &decl).details).to eq([{ param: "ids[1]", code: "invalid_type" }])
+      expect(violations_for({ ids: [1, 2, 1] }, &decl).details).to eq([{ param: "ids", code: "duplicate" }])
+    end
+
+    it "does not run an array-of-hashes validate: over elements that violated" do
+      decl = proc do
+        permit_params(:create) do
+          array :items, validate: ->(a) { a.sum { |i| i.fetch(:qty) } < 10 } do
+            required :qty, :integer
+          end
+        end
+      end
+      expect(violations_for({ items: [{ qty: "x" }, { qty: 1 }] }, &decl).details)
+        .to eq([{ param: "items[0].qty", code: "invalid_type" }])
+    end
+
+    it "does not run an array's transform: once its validate: has failed" do
+      decl = proc do
+        permit_params(:create) do
+          array :ids, of: :integer, validate: ->(a) { a.all?(&:positive?) }, transform: ->(a) { a.map { Math.sqrt(_1) } }
+        end
+      end
+      expect(violations_for({ ids: [1, -4] }, &decl).details).to eq([{ param: "ids", code: "invalid" }])
+      expect(permit({ ids: [1, 4] }, &decl)[:ids]).to eq([1.0, 2.0])
+    end
+
+    it "still runs an array-of-hashes validate: when the only element violations are undeclared keys" do
+      decl = proc do
+        permit_params(:create, unknown: :error) do
+          array :items, validate: ->(a) { a.sum { |i| i.fetch(:qty) } < 10 || :too_many } do
+            required :qty, :integer
+          end
+        end
+      end
+      expect(violations_for({ items: [{ qty: 6, extra: 1 }, { qty: 6 }] }, &decl).details)
+        .to contain_exactly({ param: "items[0].extra", code: "unknown" }, { param: "items", code: "too_many" })
+    end
+
+    it "tells an undeclared key from a sub-field whose own validate: happens to return :unknown" do
+      decl = proc do
+        permit_params(:create, unknown: :error) do
+          array :items, validate: ->(a) { a.all? { |i| i.fetch(:country) } } do
+            required :country, :string, validate: ->(v) { v == "NZ" || :unknown }
+          end
+        end
+      end
+      expect(violations_for({ items: [{ country: "XX" }] }, &decl).details)
+        .to eq([{ param: "items[0].country", code: "unknown" }])
+    end
+
+    it "rejects a non-finite Float given to an :integer" do
+      decl = proc do
+        permit_params(:create) do
+          optional :n, :integer
+          array :ns, of: :integer
+        end
+      end
+      [Float::NAN, Float::INFINITY, -Float::INFINITY].each do |value|
+        expect(violations_for({ n: value, ns: [value] }, &decl).details)
+          .to eq([{ param: "n", code: "invalid_type" }, { param: "ns[0]", code: "invalid_type" }]), "for #{value}"
+      end
+      expect(permit({ n: 3.0 }, &decl)[:n]).to eq(3)
+    end
+
+    it "rejects a String that is not valid in its encoding as invalid_type" do
+      expect(violations_for({ s: malformed }) { permit_params(:create) { required :s, :string } }.details)
+        .to eq([{ param: "s", code: "invalid_type" }])
+    end
+
+    it "rejects it before any normalize: preset runs" do
+      Permittable::NORMALIZERS.each_key do |preset|
+        e = violations_for({ s: malformed }) { permit_params(:create) { required :s, :string, normalize: preset } }
+        expect(e.details).to eq([{ param: "s", code: "invalid_type" }]), "for normalize: :#{preset}"
+      end
+    end
+
+    it "never hands it to an app's own normalize: proc" do
+      decl = proc { permit_params(:create) { required :s, :string, normalize: ->(_v) { raise "must not run" } } }
+      expect(violations_for({ s: malformed }, &decl).details).to eq([{ param: "s", code: "invalid_type" }])
+    end
+
+    it "rejects it before format: runs, for a Regexp and a preset alike" do
+      [/\Acaf/, :email].each do |format|
+        e = violations_for({ s: malformed }) { permit_params(:create) { required :s, :string, format: format } }
+        expect(e.details).to eq([{ param: "s", code: "invalid_type" }]), "for format: #{format.inspect}"
+      end
+    end
+
+    it "rejects it as an array element and as a sub-field of an array of hashes" do
+      decl = proc do
+        permit_params(:create) do
+          array :tags, of: :string
+          array :people do
+            required :name, :string, normalize: :squish
+          end
+        end
+      end
+      expect(violations_for({ tags: ["ok", malformed], people: [{ name: malformed }] }, &decl).details)
+        .to eq([{ param: "tags[1]", code: "invalid_type" }, { param: "people[0].name", code: "invalid_type" }])
+    end
+
+    it "rejects it for every other scalar type too" do
+      %i[integer float decimal boolean date datetime].each do |type|
+        e = violations_for({ v: malformed }) { permit_params(:create) { required :v, type } }
+        expect(e.details).to eq([{ param: "v", code: "invalid_type" }]), "for :#{type}"
+      end
+    end
+
+    it "leaves well-formed non-ASCII text alone" do
+      decl = proc { permit_params(:create) { required :s, :string, normalize: :squish, format: /\Acafé\z/ } }
+      expect(permit({ s: "  café " }, &decl)[:s]).to eq("café")
+    end
+
+    it "refuses a malformed authored default: at class load, like any other contract violation" do
+      expect { permittable_class { permit_params(:create) { optional :s, :string, normalize: :strip, default: "caf\xC3" } } }
+        .to raise_error(ArgumentError, /:default for field :s violates its own contract \(invalid_type\)/)
+    end
+
+    # Rails' `skip_parameter_encoding` / `param_encoding` hand a controller
+    # binary or other-encoding Strings ON PURPOSE, so a :string value is kept
+    # exactly as it arrived. Other encodings are only ever converted for
+    # INSPECTION — a number is parsed from a UTF-8 copy of its text — and
+    # never for the value handed back.
+    describe "Strings in other encodings: converted for inspection, never for the value" do
+      def utf16(text) = text.encode("UTF-16LE")
+      def in_encoding(bytes, encoding) = bytes.dup.force_encoding(encoding)
+
+      it "parses a number, boolean or date from a UTF-8 copy of its text, not its bytes" do
+        decl = proc do
+          permit_params(:create) do
+            optional :n, :integer
+            optional :d, :decimal
+            optional :f, :float
+            optional :flag, :boolean
+            optional :on, :date
+            array :ns, of: :integer
+          end
+        end
+        result = permit({ n: utf16("12"), d: utf16("12.5"), f: utf16("1.5"), flag: utf16("true"),
+                          on: utf16("2026-09-05"), ns: [utf16("7")] }, &decl)
+        expect(result.to_h).to eq("n" => 12, "d" => BigDecimal("12.5"), "f" => 1.5, "flag" => true,
+                                  "on" => Date.new(2026, 9, 5), "ns" => [7])
+      end
+
+      it "refuses a number whose text has no UTF-8 reading" do
+        # Windows-1252 leaves 0x81 undefined, so there is nothing to parse.
+        e = violations_for({ n: in_encoding("1\x81", "Windows-1252") }) { permit_params(:create) { required :n, :integer } }
+        expect(e.details).to eq([{ param: "n", code: "invalid_type" }])
+      end
+
+      it "hands a :string back in the encoding it arrived in, bytes unchanged" do
+        decl = proc { permit_params(:create) { required :s, :string } }
+        [
+          "caf\xE9".b, # Latin-1 bytes under skip_parameter_encoding
+          "caf\xC3".b,
+          "テスト".encode("Shift_JIS"),
+          utf16("café"),
+          in_encoding("caf\x81", "Windows-1252")
+        ].each do |value|
+          out = permit({ s: value }, &decl)[:s]
+          expect([out.encoding, out.b]).to eq([value.encoding, value.b]), "for #{value.encoding}"
+        end
+      end
+
+      it "still normalizes a String of another encoding where the preset can, in that encoding" do
+        out = permit({ s: " caf\xE9 ".b }) { permit_params(:create) { required :s, :string, normalize: :strip } }[:s]
+        expect(out).to eq("caf\xE9".b).and(have_attributes(encoding: Encoding::BINARY))
+      end
+
+      it "leaves the value as it is when normalize: cannot be applied to its encoding" do
+        value = utf16(" café ")
+        out = permit({ s: value }) { permit_params(:create) { required :s, :string, normalize: :squish } }[:s]
+        expect(out).to eq(value)
+      end
+
+      it "still raises an app's own normalize: bug on ordinary UTF-8 input" do
+        decl = proc { permit_params(:create) { required :s, :string, normalize: ->(_v) { raise ArgumentError, "app bug" } } }
+        expect { permit({ s: "ok" }, &decl) }.to raise_error(ArgumentError, "app bug")
+      end
+
+      # The rescue in apply_normalize exists so a BUILT-IN preset can decline
+      # an encoding it cannot handle. It must not become a bypass for an
+      # app's own normalize: Proc: its raise is a business rule, not an
+      # encoding failure, and swallowing it on non-UTF-8 input would let
+      # exactly that input skip validation a UTF-8 request could not.
+      it "still raises a custom normalize: Proc's own ArgumentError/EncodingError on non-UTF-8 input" do
+        [
+          ["Shift_JIS", "テスト".encode("Shift_JIS")],
+          ["Windows-1252", in_encoding("caf\xE9", "Windows-1252")],
+          ["binary with a high byte", "caf\xE9".b]
+        ].each do |label, value|
+          [ArgumentError, EncodingError].each do |error_class|
+            decl = proc do
+              permit_params(:create) { required :s, :string, normalize: ->(_v) { raise error_class, "business rule violated" } }
+            end
+            expect { permit({ s: value }, &decl) }.to raise_error(error_class, "business rule violated"), "for #{label}/#{error_class}"
+          end
+        end
+      end
+
+      it "reports format: that cannot be applied to a String's encoding as a format violation" do
+        decl = proc { permit_params(:create) { required :s, :string, format: /\Acafé\z/ } }
+        [utf16("café"), "caf\xC3\xA9".b, "テスト".encode("Shift_JIS")].each do |value|
+          expect(violations_for({ s: value }, &decl).details).to eq([{ param: "s", code: "format" }]), "for #{value.encoding}"
+        end
+        # An ASCII-only pattern applies to binary bytes, as it always did.
+        expect(permit({ s: "caf\xE9".b }) { permit_params(:create) { required :s, :string, format: /\Acaf/ } }[:s])
+          .to eq("caf\xE9".b)
+      end
+
+      it "refuses a String that is not valid in its OWN encoding, whatever the type" do
+        lone_surrogate = in_encoding("\x00\xD8", "UTF-16LE")
+        %i[string integer].each do |type|
+          e = violations_for({ s: lone_surrogate }) { permit_params(:create) { required :s, type } }
+          expect(e.details).to eq([{ param: "s", code: "invalid_type" }]), "for :#{type}"
+        end
+      end
+    end
+
+    describe "an undeclared key the client spelled in bytes that are not UTF-8" do
+      it "is reported under a UTF-8 param, so the 422 can be rendered" do
+        e = violations_for({ "caf\xC3" => 1, "ok".encode("UTF-16LE") => 2, "user" => { "x\xFF" => 3 } }) do
+          permit_params(:create, unknown: :error) do
+            optional :user do
+              optional :name, :string
+            end
+          end
+        end
+        expect(e.details).to contain_exactly(
+          { param: "caf�", code: "unknown" }, { param: "ok", code: "unknown" }, { param: "user.x�", code: "unknown" }
+        )
+        expect(e.details.map { |d| d[:param] }).to all(satisfy { |p| p.encoding == Encoding::UTF_8 && p.valid_encoding? })
+        expect { e.details.to_json }.not_to raise_error
+        expect(e.message).to be_valid_encoding
+      end
+
+      it "is logged in UTF-8 under unknown: :log, rather than raising while building the line" do
+        klass = permittable_class { permit_params(:create, unknown: :log) { required :name, :string } }
+        c = controller(klass, params: { "name" => "a", "caf\xC3" => 1, "ok".encode("UTF-16LE") => 2 })
+        messages = []
+        logger = Object.new
+        logger.define_singleton_method(:warn) { |msg| messages << msg }
+        c.define_singleton_method(:logger) { logger }
+
+        expect(c.permitted_params.to_h).to eq("name" => "a")
+        expect(messages.join).to include("caf�", "ok").and(be_valid_encoding)
+      end
+
+      it "converts only the undeclared keys, never the declared ones a request walks through" do
+        allow(Permittable::Coercion).to receive(:reportable_text).and_call_original
+        decl = proc do
+          permit_params(:create, unknown: :error) do
+            required :name, :string
+            optional(:address) { optional :city, :string }
+            array(:items) { optional :sku, :string }
+          end
+        end
+        permit({ name: "a", address: { city: "b" }, items: [{ sku: "c" }] }, &decl)
+        expect(Permittable::Coercion).not_to have_received(:reportable_text)
+
+        violations_for({ name: "a", stray: 1 }, &decl)
+        expect(Permittable::Coercion).to have_received(:reportable_text).once
+      end
+    end
+
+    it "passes a :json field's contents through unexamined — the gem runs no string operation on them" do
+      decl = proc { permit_params(:create) { optional :meta, :json, max_depth: 3 } }
+      expect(permit({ meta: { "note" => malformed, "list" => [malformed] } }, &decl)[:meta][:note]).to eq(malformed)
+    end
+  end
+
   describe "validations" do
     it "checks in: as Range (cover) and as Array (inclusion)" do
       decl = proc { permit_params(:create) { required :age, :integer, in: 18..120 } }
@@ -919,6 +1221,29 @@ RSpec.describe Permittable do
     it "leaves a field with no length: bound checking format: as before" do
       decl = proc { permit_params(:create) { required :s, :string, format: /\A[a-z]+\z/ } }
       expect(violations_for({ s: "AB" }, &decl).details).to eq([{ param: "s", code: "format" }])
+    end
+
+    # A String subclass so it satisfies scalar_shaped?/is_a?(String) while
+    # recording how many times its own encoding was scanned. Ordinary UTF-8
+    # input is the fast path in Coercion.cast: the value IS already the text
+    # a non-:string type parses from, so validity need be scanned once, not
+    # once directly and once more inside utf8_text for the same object.
+    let(:counting_string) do
+      Class.new(String) do
+        attr_reader :valid_encoding_calls
+
+        def valid_encoding?
+          @valid_encoding_calls = (@valid_encoding_calls || 0) + 1
+          super
+        end
+      end
+    end
+
+    it "scans a UTF-8 String's encoding only once per cast, for a non-:string type" do
+      value = counting_string.new("12")
+      result = permit({ n: value }) { permit_params(:create) { required :n, :integer } }
+      expect(result[:n]).to eq(12)
+      expect(value.valid_encoding_calls).to eq(1)
     end
   end
 

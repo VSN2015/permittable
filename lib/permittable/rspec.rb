@@ -14,6 +14,14 @@ module Permittable
   #   expect(UsersController).to permit_param("address.zip").as(:string).optional
   #   expect(UsersController).not_to permit_param(:admin).for_action(:create)
   #
+  # The negated form asserts that the contract does not declare the param,
+  # and takes no qualifiers: `not_to permit_param(:admin).required` would
+  # pass both when :admin is undeclared and when it is declared optional,
+  # which is a false positive in exactly the assertion most likely to guard
+  # a security property. It raises instead, and names the positive form to
+  # write. It reads the contract, not the runtime mode: under a rule in
+  # monitor mode, permitted_params hands back undeclared keys regardless.
+  #
   # `for_action` picks the rule exactly like a request would
   # (`permit_rule_for`); it may be omitted only when the controller declares
   # a single contract, so an ambiguous expectation fails loudly instead of
@@ -25,12 +33,14 @@ module Permittable
 
     class PermitParamMatcher
       OPTION_LABELS = { in: "in:", format: "format:", length: "length:", default: "default:" }.freeze
+      # One path segment: a name plus any [n] indexes (the runtime's form).
+      SEGMENT = /\A([^\[\]]+)((?:\[\d+\])*)\z/
 
       def initialize(path)
         @path = path.to_s
+        @segments = path_segments!(@path)
         @action = nil
         @expected = {}
-        @mismatches = []
       end
 
       # -- chains -----------------------------------------------------------
@@ -100,34 +110,54 @@ module Permittable
 
       def matches?(subject)
         @subject = resolve_subject(subject)
-        rule = resolve_rule(@subject)
-        return false unless rule
-
-        @field = resolve_field(rule[:fields], @path.split("."))
-        return false unless @field
-
-        @mismatches = collect_mismatches(@field)
+        case locate
+        when :declared then @mismatches = collect_mismatches(@field)
+        when :opaque then @mismatches = @expected.empty? ? [] : [opaque_qualifier_mismatch]
+        else return false
+        end
         @mismatches.empty?
       end
 
+      # Negation is only unambiguous without qualifiers ("not declared"),
+      # and only meaningful against a rule that exists: a mistyped
+      # `for_action(:craete)` with no catch-all rule resolves to no rule,
+      # which declares nothing, so a lenient not_to would pass for any param
+      # whatsoever. (With a catch-all it resolves there, as a request
+      # would, and is checked against that rule.) The subject is
+      # resolved first so a wrong subject is the error reported.
+      def does_not_match?(subject) # rubocop:disable Naming/PredicatePrefix -- the RSpec protocol name
+        @subject = resolve_subject(subject)
+        raise ArgumentError, negated_qualifier_message unless @expected.empty?
+
+        %i[undeclared too_deep].include?(locate)
+      end
+
       def failure_message
-        return "expected #{subject_name} to permit #{path_label}#{action_label}, but it #{@problem}" if @problem
-
-        if @field.nil?
-          declared = (@missing_among || []).map { |f| f[:name] }.join(", ")
-          return "expected #{subject_name} to permit #{path_label}#{action_label}, " \
-                 "but it is not declared (declared: #{declared})"
+        subject = "expected #{subject_name} to permit #{path_label}#{action_label}, but"
+        case @status
+        when :no_rule then "#{subject} it #{@problem}"
+        when :root_prefixed then "#{subject} #{root_prefix_hint}"
+        when :too_deep
+          "#{subject} it is deeper than the opaque :json field #{label_for(@opaque[:path])} allows " \
+          "(max_depth: #{@opaque[:field][:max_depth]})"
+        when :undeclared
+          "#{subject} it is not declared (declared: #{(@missing_among || []).map { |f| f[:name] }.join(', ')})"
+        else "#{subject}:\n  #{@mismatches.join("\n  ")}"
         end
-
-        "expected #{subject_name} to permit #{path_label}#{action_label}, but:\n  #{@mismatches.join("\n  ")}"
       end
 
       def failure_message_when_negated
-        "expected #{subject_name} not to permit #{path_label}#{action_label}, but the contract declares it"
+        subject = "expected #{subject_name} not to permit #{path_label}#{action_label}, but"
+        case @status
+        when :no_rule then "#{subject} it #{@problem}, so there is no rule to check the param against"
+        when :opaque
+          "#{subject} it is inside the opaque :json field #{label_for(@opaque[:path])}, which lets any nested key through"
+        when :root_prefixed then "#{subject} #{root_prefix_hint} — which the contract lets through"
+        else "#{subject} the contract declares it"
+        end
       end
 
       def description
-        descriptors = @expected.filter_map { |key, value| describe_check(key, value) }
         label = "permit #{path_label}"
         label += " (for ##{@action})" if @action
         label += " #{descriptors.join(', ')}" unless descriptors.empty?
@@ -148,6 +178,27 @@ module Permittable
         return subject.class if subject.class.respond_to?(:permit_rule_for)
 
         raise ArgumentError, "#{LABEL}: the subject of permit_param must include Permittable (got #{subject.inspect})"
+      end
+
+      # The one lookup both directions share. Sets @status to :no_rule,
+      # :declared, :opaque (the path runs into a :json field, which accepts
+      # any nested key without declaring it), :too_deep (it runs into one
+      # deeper than its max_depth: allows), :root_prefixed (the path starts
+      # with the rule's root: and resolves without it), or :undeclared.
+      # Every per-run ivar is reset first: a matcher object can be reused
+      # on another subject, and must not answer from the previous run.
+      def locate
+        @rule = @field = @opaque = @problem = @missing_among = nil
+        @mismatches = []
+        @rule = resolve_rule(@subject)
+        return @status = :no_rule unless @rule
+
+        @field = resolve_field(@rule[:fields], @segments)
+        @status = if @field then :declared
+                  elsif @opaque then opaque_within_depth? ? :opaque : :too_deep
+                  elsif root_prefixed? then :root_prefixed
+                  else :undeclared
+                  end
       end
 
       def resolve_rule(subject)
@@ -173,17 +224,78 @@ module Permittable
       end
 
       # Walks a dotted path through nested blocks and array-of-hash blocks
-      # alike, since both carry their sub-fields under :fields.
-      def resolve_field(fields, segments)
-        name = segments.first.to_sym
+      # alike, since both carry their sub-fields under :fields. A :json
+      # field is opaque: it has no :fields, yet lets any nested key through,
+      # so a path running past one is recorded rather than called missing,
+      # along with how many container levels the rest of the path needs.
+      def resolve_field(fields, segments, depth = 0)
+        name = segments[depth][:name].to_sym
         field = fields.find { |f| f[:name] == name }
         if field.nil?
           @missing_among = fields
           return nil
         end
-        return field if segments.length == 1
+        return field if depth == segments.length - 1
 
-        resolve_field(field[:fields] || [], segments.drop(1))
+        if field[:kind] == :json
+          @opaque = { path: segments.take(depth + 1).map { |seg| seg[:name] }.join("."), field: field,
+                      steps: steps_below(segments, depth) }
+          return nil
+        end
+
+        resolve_field(field[:fields] || [], segments, depth + 1)
+      end
+
+      # Each key or [n] step past the :json field descends into one more
+      # container — the same count the runtime's max_depth: check makes,
+      # where the field's own Hash is the first level and arrays count too.
+      def steps_below(segments, depth)
+        (segments.length - depth - 1) + segments.drop(depth).sum { |seg| seg[:indexes] }
+      end
+
+      def opaque_within_depth?
+        limit = @opaque[:field][:max_depth]
+        limit.nil? || @opaque[:steps] <= limit
+      end
+
+      # Paths are relative to root:, so "user.email" under `root: :user`
+      # names params[:user][:user][:email]. When dropping the prefix would
+      # resolve (to a declared field, or into an opaque :json one within its
+      # max_depth:), that is almost certainly what was meant — and silently
+      # passing a negated expectation on it would be a false pass.
+      def root_prefixed?
+        root = @rule[:root]
+        return false unless root && @segments.length > 1 && @segments.first[:name] == root.to_s
+
+        missing_among = @missing_among
+        found = resolve_field(@rule[:fields], @segments.drop(1)) || (@opaque && opaque_within_depth?)
+        @missing_among = missing_among
+        @opaque = nil
+        found ? true : false
+      end
+
+      def root_prefix_hint
+        relative = @segments.drop(1).map { |seg| seg[:raw] }.join(".")
+        "paths are relative to root: :#{@rule[:root]}, so write permit_param(#{label_for(relative)})"
+      end
+
+      def opaque_qualifier_mismatch
+        "it is inside the opaque :json field #{label_for(@opaque[:path])}, which declares nothing about its keys — " \
+          "assert qualifiers on #{label_for(@opaque[:path])} itself"
+      end
+
+      # Accepts the runtime's own path form too — violation details say
+      # "line_items[0].sku" — so a path copied from one resolves: the [n]
+      # indexes are dropped for the walk and kept only as depth.
+      def path_segments!(path)
+        raws = path.split(".", -1)
+        matches = raws.map { |raw| SEGMENT.match(raw) }
+        if raws.empty? || matches.any?(&:nil?)
+          raise ArgumentError, "#{LABEL}: permit_param needs a param name or a dotted path like " \
+                               "\"address.zip\" or \"line_items[0].sku\" (got #{path.inspect})"
+        end
+
+        raws.zip(matches).map { |raw, m| { name: m[1], indexes: m[2].count("["), raw: raw } }
       end
 
       def collect_mismatches(field)
@@ -194,7 +306,7 @@ module Permittable
         case key
         when :type then type_mismatch(field, value)
         when :array then "expected an array field, but it is declared with `#{field[:kind]}`" unless field[:kind] == :array
-        when :of then "expected an array of :#{value}, but it is of: :#{field[:of]}" unless field[:of] == value
+        when :of then of_mismatch(field, value)
         when :required then required_mismatch(field, value)
         when :format then format_mismatch(field, value)
         # Compared cast, but reported as written.
@@ -204,8 +316,20 @@ module Permittable
         end
       end
 
+      # A non-array field is already reported by the :array check that
+      # as_array always chains alongside :of, so this stays silent for it;
+      # an array of hashes has sub-fields rather than an element type.
+      def of_mismatch(field, type)
+        return if field[:kind] != :array || field[:of] == type
+        return "expected an array of :#{type}, but :#{field[:name]} is an array of hashes" if field[:fields]
+
+        "expected an array of :#{type}, but it is of: :#{field[:of]}"
+      end
+
       def type_mismatch(field, type)
-        if field[:kind] == :array
+        if field[:kind] == :array && field[:fields]
+          "expected type :#{type}, but :#{field[:name]} is an array of hashes — assert it with as_array"
+        elsif field[:kind] == :array
           "expected type :#{type}, but :#{field[:name]} is an array — assert it with as_array(of: ...)"
         elsif field[:kind] == :nested
           "expected type :#{type}, but :#{field[:name]} is a nested hash"
@@ -266,6 +390,33 @@ module Permittable
         "expected #{label} #{value.inspect}, but the contract #{declared}"
       end
 
+      def negated_qualifier_message
+        "#{LABEL}: `not_to #{call_label}` cannot take qualifiers (here: #{descriptors.join(', ')}) — " \
+          "negating one is ambiguous, since it would pass both when #{path_label} is not declared and " \
+          "when it is declared differently. Assert what the contract does declare with " \
+          "the positive form, e.g. #{positive_example}, or drop the qualifiers to assert that " \
+          "#{path_label} is not declared at all."
+      end
+
+      # required/optional is the one qualifier with an obvious opposite;
+      # for any other the declared value is not known until the rule is
+      # read, so the example stays generic rather than guessing it.
+      def positive_example
+        case @expected
+        when { required: true } then "`to #{call_label}.optional`"
+        when { required: false } then "`to #{call_label}.required`"
+        else "`to #{call_label}` chained with the qualifiers it should have"
+        end
+      end
+
+      def call_label
+        "permit_param(#{path_label})#{".for_action(:#{@action})" if @action}"
+      end
+
+      def descriptors
+        @expected.filter_map { |key, value| describe_check(key, value) }
+      end
+
       def describe_check(key, value)
         case key
         when :type then "as :#{value}"
@@ -282,7 +433,11 @@ module Permittable
       end
 
       def path_label
-        @path.include?(".") ? @path.inspect : ":#{@path}"
+        label_for(@path)
+      end
+
+      def label_for(path)
+        path.include?(".") ? path.inspect : ":#{path}"
       end
 
       def action_label

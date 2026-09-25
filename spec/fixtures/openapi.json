@@ -28,7 +28,7 @@
                       "email": {
                         "type": "string",
                         "minLength": 1,
-                        "pattern": "^[^@\\s]+@[^@\\s]+$",
+                        "pattern": "^[^@ \\t\\n\\v\\f\\r]+@[^@ \\t\\n\\v\\f\\r]+$",
                         "examples": [
                           "jo@example.com"
                         ]
@@ -134,7 +134,7 @@
                       "email": {
                         "type": "string",
                         "minLength": 1,
-                        "pattern": "^[^@\\s]+@[^@\\s]+$",
+                        "pattern": "^[^@ \\t\\n\\v\\f\\r]+@[^@ \\t\\n\\v\\f\\r]+$",
                         "examples": [
                           "jo@example.com"
                         ]
@@ -238,7 +238,7 @@
                       "email": {
                         "type": "string",
                         "minLength": 1,
-                        "pattern": "^[^@\\s]+@[^@\\s]+$",
+                        "pattern": "^[^@ \\t\\n\\v\\f\\r]+@[^@ \\t\\n\\v\\f\\r]+$",
                         "examples": [
                           "jo@example.com"
                         ]
