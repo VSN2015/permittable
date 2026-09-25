@@ -77,6 +77,104 @@ RSpec.describe Permittable::JsonSchema do
       expect(property("pct") { optional :pct, :integer, in: 0...100 }).to include("minimum" => 0, "exclusiveMaximum" => 100)
     end
 
+    it "emits BigDecimal bounds as JSON numbers, which is all minimum/maximum may be" do
+      # The natural way to bound a price. Routed through the authored-value
+      # re-encoding, the bounds came out as the strings "0.01" / "999.99" —
+      # which the metaschema forbids, so the whole document was invalid.
+      prop = property("price") { optional :price, :decimal, in: BigDecimal("0.01")..BigDecimal("999.99") }
+      expect(prop).to include("minimum" => 0.01, "maximum" => 999.99)
+      expect(prop.values_at("minimum", "maximum")).to all(be_a(Float))
+
+      exact = property("qty") { optional :qty, :decimal, in: BigDecimal("1")...BigDecimal("100") }
+      expect(exact).to include("minimum" => 1, "exclusiveMaximum" => 100)
+      expect(exact.values_at("minimum", "exclusiveMaximum")).to all(be_a(Integer))
+
+      endless = property("tip") { optional :tip, :decimal, in: BigDecimal("0.5").. }
+      expect(endless).to include("minimum" => 0.5)
+      expect(endless.keys.grep(/maximum/i)).to be_empty
+    end
+
+    # The server's own verdict on a value a client sends as the JSON number
+    # `value`: the field's cast, then its rules — exactly what a request runs.
+    def server_accepts?(field_rule, value)
+      Permittable::Coercion.check_scalar(field_rule[:fields].first, value).first == :ok
+    end
+
+    it "rounds a bound a double cannot hold INWARD, verified against the field's own comparison" do
+      # 0.1000000000000000001 has no double. to_f rounds it to 0.1, and a
+      # client sending 0.1 would pass a published `minimum: 0.1` and then be
+      # refused. How far inward is right depends on the TYPE: a :decimal reads
+      # the number back as BigDecimal("0.1…") and compares exactly, while a
+      # :float compares the Float itself, through BigDecimal#<=>'s own
+      # limited-precision reading of it — so one double inward is enough for
+      # the first and not for the second.
+      bound = BigDecimal("0.1000000000000000001")
+      %i[decimal float].each do |type|
+        low_rule = rule_for { optional :x, type, in: bound.. }
+        high_rule = rule_for { optional :x, type, in: ..bound }
+        low = described_class.rule(low_rule)["properties"]["x"]["minimum"]
+        high = described_class.rule(high_rule)["properties"]["x"]["maximum"]
+
+        expect(server_accepts?(low_rule, low)).to be(true), "#{type}: the server refuses the published minimum #{low}"
+        expect(server_accepts?(low_rule, low.prev_float)).to be(false), "#{type}: #{low} is further inward than needed"
+        expect(server_accepts?(high_rule, high)).to be(true), "#{type}: the server refuses the published maximum #{high}"
+      end
+      # The nearest double below the bound needs no nudge on either type. (On
+      # a :float the server's lossy comparison would accept a few doubles
+      # more; the bound only ever moves inward, so those stay unpublished —
+      # stricter, the safe way.)
+      expect(property("x") { optional :x, :decimal, in: ..bound }["maximum"]).to eq(0.1)
+      expect(property("x") { optional :x, :float, in: ..bound }["maximum"]).to eq(0.1)
+      expect(property("x") { optional :x, :decimal, in: bound.. }["minimum"]).to eq(0.1.next_float)
+      expect(property("x") { optional :x, :float, in: bound.. }["minimum"]).to be > 0.1.next_float
+    end
+
+    it "treats an infinite bound as no bound at all" do
+      # BigDecimal("Infinity") used to crash the whole export (to_i raises
+      # FloatDomainError), and Float::INFINITY is not a JSON number.
+      decimal = property("x") { optional :x, :decimal, in: BigDecimal("0")..BigDecimal("Infinity") }
+      expect(decimal).to include("minimum" => 0)
+      expect(decimal.keys.grep(/maximum/i)).to be_empty
+
+      float = property("x") { optional :x, :float, in: -Float::INFINITY...Float::INFINITY }
+      expect(float.keys.grep(/imum/i)).to be_empty
+      expect { JSON.generate(float) }.not_to raise_error
+    end
+
+    it "publishes an integral bound beyond Float::MAX exactly, matching master" do
+      # 10**400 has no double — `to_f` overflows it to Infinity — but a JSON
+      # integer literal has no size limit, and master published it outright:
+      # `minimum: 10**400`. The inward-nudge machinery routes a candidate
+      # bound through `to_f` to ask the field's own cast whether it is
+      # "honoured", which itself overflows to Infinity for a bound this
+      # large and used to walk the bound to Infinity and drop it — looser
+      # than master, not merely a labelled divergence.
+      huge = 10**400
+      expect(property("x") { optional :x, :float, in: huge.. }).to include("minimum" => huge)
+      expect(property("x") { optional :x, :float, in: ..(-huge) }).to include("maximum" => -huge)
+      expect(property("x") { optional :x, :decimal, in: BigDecimal("1e400").. }).to include("minimum" => huge)
+    end
+
+    it "omits a FRACTIONAL bound beyond Float::MAX, unlike an integral one" do
+      # BigDecimal("1e400") + 0.5 has no double either, but unlike an
+      # integral bound it has no arbitrary-precision JSON representation
+      # this exporter emits without going through Float — publishing it
+      # exactly would mean a raw decimal number literal rather than a Ruby
+      # Integer/Float, which this exporter does not produce. It is omitted,
+      # same as a genuinely infinite bound, and deliberately so (see
+      # CHANGELOG) rather than silently.
+      fractional = BigDecimal("1e400") + BigDecimal("0.5")
+      prop = property("x") { optional :x, :decimal, in: fractional.. }
+      expect(prop.keys.grep(/imum/i)).to be_empty
+    end
+
+    it "omits a NaN bound, which compares to nothing" do
+      # Ruby refuses a two-sided Range with a NaN end, but an endless one
+      # builds — and NaN is no JSON number either.
+      prop = property("x") { optional :x, :float, in: Float::NAN.. }
+      expect(prop.keys.grep(/imum/i)).to be_empty
+    end
+
     it "carries a non-numeric Range as an extension instead of guessing" do
       prop = property("code") { optional :code, :string, in: "a".."m" }
       expect(prop["x-permittable-range"]).to eq('"a".."m"')
@@ -282,6 +380,22 @@ RSpec.describe Permittable::JsonSchema do
       expect(props["slug"]["x-permittable-custom-validation"]).to be(true)
       expect(props["slug"]).not_to have_key("pattern")
       expect(props["tags"]["x-permittable-transformed"]).to be(true)
+    end
+
+    it "exports normalize: as x-permittable-normalize — the preset's name, or true for a custom proc" do
+      # The server checks the NORMALIZED value, so minLength/maxLength/pattern
+      # describe a string the client never sends. The step is not a keyword
+      # JSON Schema has; it is flagged so a client can apply it first.
+      props = schema_for do
+        required :name,  :string, length: 3..10, normalize: :squish
+        optional :email, :string, normalize: "email"
+        optional :code,  :string, normalize: ->(v) { v.delete("-") }
+        optional :plain, :string
+      end["properties"]
+      expect(props["name"]).to include("minLength" => 3, "maxLength" => 10, "x-permittable-normalize" => "squish")
+      expect(props["email"]["x-permittable-normalize"]).to eq("email")
+      expect(props["code"]["x-permittable-normalize"]).to be(true)
+      expect(props["plain"]).not_to have_key("x-permittable-normalize")
     end
 
     it "marks a child that inherited sensitive: from its container writeOnly too" do

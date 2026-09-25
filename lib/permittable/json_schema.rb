@@ -25,6 +25,25 @@ module Permittable
   # never surprised by a 422. spec/schema_conformance_spec.rb holds that line,
   # asserting the direction of every divergence it permits.
   #
+  # Where a rule has no JSON Schema keyword, the schema is LOOSER instead,
+  # and a client following it can still earn a 422. Each such rule stays
+  # visible on its own field, and the conformance spec labels each one
+  # rather than letting it pass as agreement:
+  #   * a `:json` field's `max_depth:` — `x-permittable-max-depth`;
+  #   * a Range of non-numbers (`in: "a".."m"`) — `x-permittable-range`;
+  #   * a `validate:` proc — `x-permittable-custom-validation`;
+  #   * a `normalize:` step, which the server runs BEFORE it checks, so
+  #     "   " passes a minLength of 3 and is then absent —
+  #     `x-permittable-normalize`;
+  #   * the string encoding of :decimal, :date and :datetime, whose validity
+  #     rests on `format`, an annotation in draft 2020-12 — so "abc", "NaN"
+  #     and "2026-02-30" pass the schema and fail the cast;
+  #   * the string encoding of a BOUNDED :decimal, which minimum/maximum
+  #     (number-only keywords) never see — the numeric bound is published
+  #     for a client that parses first.
+  # (A `normalize:` step also runs the safe way: "  abcdefghij  " is too
+  # long for a maxLength of 10 and fine once squished.)
+  #
   # Emission is deterministic (fixed key insertion order, declaration-order
   # properties) so generated documents are committable and diff-stable.
   module JsonSchema
@@ -98,7 +117,7 @@ module Permittable
     def scalar_schema(field)
       schema = SCALAR_SCHEMAS.fetch(field[:type]).dup
       apply_format_name!(schema, field)
-      apply_in!(schema, field[:in])
+      apply_in!(schema, field[:in], type: field[:type])
       apply_string_bounds!(schema, field)
       apply_pattern!(schema, field[:format])
       schema
@@ -136,7 +155,7 @@ module Permittable
       schema
     end
 
-    def apply_in!(schema, allowed)
+    def apply_in!(schema, allowed, type:)
       return unless allowed
 
       unless allowed.is_a?(Range)
@@ -150,8 +169,95 @@ module Permittable
         schema["x-permittable-range"] = allowed.inspect
         return
       end
-      schema["minimum"] = json_value(allowed.begin) if allowed.begin
-      schema[allowed.exclude_end? ? "exclusiveMaximum" : "maximum"] = json_value(allowed.end) if allowed.end
+      min = json_bound(allowed, "minimum", type) if allowed.begin
+      schema["minimum"] = min if min
+      keyword = allowed.exclude_end? ? "exclusiveMaximum" : "maximum"
+      max = json_bound(allowed, keyword, type) if allowed.end
+      schema[keyword] = max if max
+    end
+
+    # The types whose cast turns a JSON number into the value `in:` compares,
+    # so a published bound can be checked against the server's own verdict.
+    NUMERIC_TYPES = %i[integer float decimal].freeze
+
+    # minimum/maximum must be JSON numbers — the metaschema says so — so a
+    # bound is NOT an authored value for json_value, which renders a
+    # BigDecimal as its precision-safe string and made `in:
+    # BigDecimal("0.01")..BigDecimal("999.99")` publish an invalid document.
+    # Integer and Float pass through; any other Numeric (BigDecimal,
+    # Rational) becomes an Integer when it is one, else a Float.
+    #
+    # An infinite endpoint (Float::INFINITY, BigDecimal("Infinity")) means
+    # "no bound", and neither it nor NaN — which compares to nothing — is a
+    # JSON number, so both are omitted: nil. (to_i on either raises, which
+    # used to take the whole export down with it.)
+    #
+    # A Float cannot hold every decimal. to_f rounds to the NEAREST double,
+    # which can land on the wrong side of the bound: 0.1000000000000000001
+    # becomes 0.1, and a client sending 0.1 passes `minimum: 0.1` and is then
+    # refused. How far is "wrong" depends on the field's TYPE, not on the
+    # bound: a :decimal reads the number back as BigDecimal("0.1") and
+    # compares exactly, while a :float compares the Float through
+    # BigDecimal#<=>, which reads it at limited precision and so needs a few
+    # doubles more. Rather than model either, the bound asks the server:
+    # while the most extreme value the published keyword admits would be
+    # refused by the field's own cast and comparison, the bound moves one
+    # double INWARD. The published range can then only be narrower than the
+    # enforced one — the safe direction — and stops at the first double the
+    # server accepts. (It never moves outward: where a lossy comparison
+    # would also accept a few doubles beyond the nearest one, those stay
+    # unpublished.) A decimal of up to 15 significant digits — every price —
+    # round-trips through a double, so it is emitted as written.
+    #
+    # An INTEGRAL bound past Float::MAX (`10**400`) needs none of this: a
+    # JSON number literal has no size limit, so it is exact as published,
+    # with no Float rounding to guard against in the first place. Asking the
+    # server would instead break it — the field's own cast runs the bound
+    # through `to_f`, which overflows a value this large to Infinity — so
+    # the loop below walked the bound to Infinity and dropped it, though
+    # master published it as `minimum: 10**400` outright. It is returned
+    # here before the loop runs. A FRACTIONAL bound past Float::MAX has no
+    # such escape (there is no arbitrary-precision JSON number this exporter
+    # emits without going through Float) and stays omitted, same as a
+    # genuinely infinite bound — see CHANGELOG.
+    def json_bound(range, keyword, type)
+      value = keyword == "minimum" ? range.begin : range.end
+      return nil unless value.finite?
+
+      bound = value.is_a?(Float) || value != value.to_i ? value.to_f : value.to_i
+      return bound if bound.is_a?(Integer) && !bound.to_f.finite?
+
+      step = keyword == "minimum" ? :next_float : :prev_float
+      # A fractional bound past Float::MAX converts to Infinity, which no
+      # step moves; it is then as unrepresentable as an infinite one.
+      bound = bound.to_f.public_send(step) until !bound.finite? || honoured?(range, keyword, type, bound)
+      bound if bound.finite?
+    end
+
+    # Would the server accept the most extreme value `keyword: bound`
+    # admits? Only the one side is asked — a range narrower than a double
+    # can span admits no double at all, and checking both ends would never
+    # settle. A non-numeric field type has no cast to ask, so its bound is
+    # published as converted.
+    def honoured?(range, keyword, type, bound)
+      return true unless NUMERIC_TYPES.include?(type)
+
+      side = keyword == "minimum" ? (range.begin..) : Range.new(nil, range.end, range.exclude_end?)
+      status, value = Coercion.cast(type, admitted_extreme(keyword, type, bound))
+      status == :ok && side.cover?(value)
+    end
+
+    # The value nearest the bound that the published keyword still lets
+    # through: the bound itself for minimum/maximum, the double (or, on an
+    # :integer field, the integer) just below it for exclusiveMaximum.
+    def admitted_extreme(keyword, type, bound)
+      if type == :integer
+        return bound.ceil if keyword == "minimum"
+        return bound.floor if keyword == "maximum"
+
+        return bound.ceil - 1
+      end
+      keyword == "exclusiveMaximum" ? bound.to_f.prev_float : bound
     end
 
     def apply_string_bounds!(schema, field)
@@ -217,7 +323,25 @@ module Permittable
       end
       schema["x-permittable-custom-validation"] = true if field[:validate]
       schema["x-permittable-transformed"] = true if field[:transform]
+      apply_normalize!(schema, field)
       schema
+    end
+
+    # The server checks the NORMALIZED string, so minLength/maxLength/pattern
+    # describe a value the client never sends: under `normalize: :squish`,
+    # "   " satisfies a minLength of 3 and then squishes to "" (absent), and
+    # " a  " satisfies it and squishes to "a". JSON Schema has no keyword for
+    # "transform, then check", so the step is flagged rather than dropped —
+    # by the preset's name, which a client can apply itself, or `true` for a
+    # host proc, which is as opaque as `transform:`. The preset is recovered
+    # by identity from the resolved callable, because the contract stores the
+    # lambda it runs rather than the name it was declared by.
+    def apply_normalize!(schema, field)
+      normalizer = field[:normalize]
+      return unless normalizer
+
+      preset = NORMALIZERS.key(normalizer)
+      schema["x-permittable-normalize"] = preset ? preset.to_s : true
     end
 
     def json_value(value)

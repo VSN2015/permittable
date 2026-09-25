@@ -22,23 +22,24 @@ module IntegrationHarness
   # as an application/json body instead (what ParamsWrapper acts on), and
   # `path_params:` stands in for what the router would have matched out of
   # the URL — Rails merges both into `params` exactly as a routed request
-  # would, with no route set needed. `instance:` dispatches on that controller
-  # object instead of a fresh one per request, to pin down state that must
-  # not survive from one request to the next.
-  def dispatch(controller_class, action, method: "GET", query: "", params: nil, json: nil, path_params: nil,
-               instance: nil)
+  # would, with no route set needed. Either way the body is parsed by
+  # ActionDispatch's own JSON parser, never pre-parsed. `raw_json:` sends a
+  # String body verbatim, for input `json:` cannot produce (malformed JSON).
+  # `instance:` dispatches on that controller object instead of a fresh one
+  # per request, to pin down state that must not survive from one request to
+  # the next.
+  def dispatch(controller_class, action, method: "GET", query: "", params: nil, json: nil, raw_json: nil,
+               path_params: nil, instance: nil)
     opts = { method: method }
     opts[:params] = params if params
-    if json
-      opts[:input] = JSON.generate(json)
+    raw_json = JSON.generate(json) if json
+    if raw_json
+      opts[:input] = raw_json
       opts["CONTENT_TYPE"] = "application/json"
     end
     env = Rack::MockRequest.env_for("/?#{query}", **opts)
-    # Pre-parsed, the way ActionDispatch caches a parsed body: the bundled
-    # activesupport calls JSON.parse(source, opts) positionally, which the
-    # locked json 3.x rejects, so letting Rails parse the input here would
-    # test that incompatibility instead of the contract.
-    env["action_dispatch.request.request_parameters"] = JSON.parse(JSON.generate(json)) if json
+    # Without a logger, ActionDispatch logs a body it fails to parse to $stderr.
+    env["action_dispatch.logger"] = Logger.new(nil) if raw_json
     env["action_dispatch.request.path_parameters"] = path_params if path_params
     status, headers, body =
       if instance
