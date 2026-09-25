@@ -502,6 +502,13 @@ RSpec.describe Permittable do
       expect(permit({ ids: %w[1 2] }, &decl)[:ids]).to eq([1, 2])
     end
 
+    it "pays for that by not reporting an array-level verdict alongside element violations" do
+      # The accepted trade-off: the duplicate surfaces only once ids[1] is fixed.
+      decl = proc { permit_params(:create) { array :ids, of: :integer, validate: ->(a) { a.uniq.size == a.size || :duplicate } } }
+      expect(violations_for({ ids: [1, "x", 1] }, &decl).details).to eq([{ param: "ids[1]", code: "invalid_type" }])
+      expect(violations_for({ ids: [1, 2, 1] }, &decl).details).to eq([{ param: "ids", code: "duplicate" }])
+    end
+
     it "does not run an array-of-hashes validate: over elements that violated" do
       decl = proc do
         permit_params(:create) do
@@ -580,6 +587,93 @@ RSpec.describe Permittable do
     it "refuses a malformed authored default: at class load, like any other contract violation" do
       expect { permittable_class { permit_params(:create) { optional :s, :string, normalize: :strip, default: "caf\xC3" } } }
         .to raise_error(ArgumentError, /:default for field :s violates its own contract \(invalid_type\)/)
+    end
+
+    describe "Strings in other encodings are read as UTF-8, or refused" do
+      def utf16(text) = text.encode("UTF-16LE")
+      def in_encoding(bytes, encoding) = bytes.dup.force_encoding(encoding)
+
+      it "casts a UTF-16 number by its characters, not its bytes" do
+        decl = proc do
+          permit_params(:create) do
+            optional :n, :integer
+            optional :d, :decimal
+            optional :f, :float
+            array :ns, of: :integer
+          end
+        end
+        result = permit({ n: utf16("12"), d: utf16("12.5"), f: utf16("1.5"), ns: [utf16("7")] }, &decl)
+        expect(result.to_h).to eq("n" => 12, "d" => BigDecimal("12.5"), "f" => 1.5, "ns" => [7])
+      end
+
+      it "hands normalize:, format:, in: and the app UTF-8, whatever encoding arrived" do
+        decl = proc do
+          permit_params(:create) do
+            optional :s, :string, normalize: :squish, format: /\Acafé\z/
+            optional :plan, :string, in: %w[free pro]
+            optional :flag, :boolean
+          end
+        end
+        inputs = {
+          "UTF-16LE" => [utf16("  café "), utf16("free"), utf16("true")],
+          "binary" => ["  caf\xC3\xA9 ".b, "free".b, "true".b],
+          "Windows-1252" => [in_encoding("  caf\xE9 ", "Windows-1252"), in_encoding("free", "Windows-1252"),
+                             in_encoding("true", "Windows-1252")]
+        }
+        inputs.each do |label, (s, plan, flag)|
+          result = permit({ s: s, plan: plan, flag: flag }, &decl)
+          expect(result.to_h).to eq("s" => "café", "plan" => "free", "flag" => true), "for #{label}"
+          expect(result[:s].encoding).to eq(Encoding::UTF_8), "for #{label}"
+        end
+      end
+
+      it "returns a :string in UTF-8 even with no normalize: or format: to force it" do
+        expect(permit({ s: utf16("café") }) { permit_params(:create) { required :s, :string } }[:s])
+          .to eq("café").and(have_attributes(encoding: Encoding::UTF_8))
+      end
+
+      it "refuses what cannot be read as UTF-8 as invalid_type, before normalize: or format: sees it" do
+        decl = proc { permit_params(:create) { required :s, :string, normalize: :squish, format: /\Acaf/ } }
+        {
+          "binary with high bytes that are not UTF-8" => "caf\xC3".b,
+          "a byte Windows-1252 leaves undefined" => in_encoding("caf\x81", "Windows-1252"),
+          "UTF-16 with a lone surrogate" => in_encoding("\x00\xD8", "UTF-16LE")
+        }.each do |label, value|
+          expect(violations_for({ s: value }, &decl).details).to eq([{ param: "s", code: "invalid_type" }]), "for #{label}"
+          expect(violations_for({ s: value }) { permit_params(:create) { required :s, :integer } }.details)
+            .to eq([{ param: "s", code: "invalid_type" }]), "for #{label} as :integer"
+        end
+      end
+    end
+
+    describe "an undeclared key the client spelled in bytes that are not UTF-8" do
+      it "is reported under a UTF-8 param, so the 422 can be rendered" do
+        e = violations_for({ "caf\xC3" => 1, "ok".encode("UTF-16LE") => 2, "user" => { "x\xFF" => 3 } }) do
+          permit_params(:create, unknown: :error) do
+            optional :user do
+              optional :name, :string
+            end
+          end
+        end
+        expect(e.details).to contain_exactly(
+          { param: "caf�", code: "unknown" }, { param: "ok", code: "unknown" }, { param: "user.x�", code: "unknown" }
+        )
+        expect(e.details.map { |d| d[:param] }).to all(satisfy { |p| p.encoding == Encoding::UTF_8 && p.valid_encoding? })
+        expect { e.details.to_json }.not_to raise_error
+        expect(e.message).to be_valid_encoding
+      end
+
+      it "is logged in UTF-8 under unknown: :log, rather than raising while building the line" do
+        klass = permittable_class { permit_params(:create, unknown: :log) { required :name, :string } }
+        c = controller(klass, params: { "name" => "a", "caf\xC3" => 1, "ok".encode("UTF-16LE") => 2 })
+        messages = []
+        logger = Object.new
+        logger.define_singleton_method(:warn) { |msg| messages << msg }
+        c.define_singleton_method(:logger) { logger }
+
+        expect(c.permitted_params.to_h).to eq("name" => "a")
+        expect(messages.join).to include("caf�", "ok").and(be_valid_encoding)
+      end
     end
 
     it "passes a :json field's contents through unexamined — the gem runs no string operation on them" do

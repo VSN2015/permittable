@@ -357,7 +357,7 @@ Coercion is **deliberately strict**, and deliberately *not* `ActiveModel::Type`.
 
 | Type | Accepts | Rejects (`invalid_type`) |
 |---|---|---|
-| `:string` | `String`; `Numeric`/`true`/`false` are stringified | Arrays, hashes, a `String` with bytes invalid in its encoding (`"caf\xC3"`) — rejected before `normalize:` or `format:` sees it, for every scalar type |
+| `:string` | `String` (returned as UTF-8 — see below); `Numeric`/`true`/`false` are stringified | Arrays, hashes, a `String` that cannot be read as UTF-8 |
 | `:integer` | `Integer`; whole `Float`s (`4.0`); base-10 numeric strings | `"4.5"`, `"abc"`, `4.5`, NaN/Infinity |
 | `:float` | `Numeric`; any `Float()`-parseable string | `"abc"` |
 | `:decimal` | `Numeric` or `String` → `BigDecimal` | Unparseable strings |
@@ -367,6 +367,8 @@ Coercion is **deliberately strict**, and deliberately *not* `ActiveModel::Type`.
 | `:json` | Any `Hash` — passed through uncast, see [free-form hashes](#free-form-hashes-json) | Arrays, scalars |
 
 **Dates are parsed, never guessed.** `Date.parse` fills in what a string omits *from today* — `"09/2026"` becomes the 1st, `"5th"` becomes this month of this year — so the same request would mean different things on different days. A `:date` or `:datetime` string must therefore name all three of year, month and day; which **format** it names them in is `Date.parse`'s business, so every complete format it understands still works. A `:datetime` may omit the *time* part, which reads as midnight UTC.
+
+**Strings are read as UTF-8, or refused.** Every scalar type casts from UTF-8 text, and `normalize:`, `format:`, `in:`, `validate:` and your app all receive UTF-8. A String in UTF-8 or US-ASCII is used as it is. A binary (`ASCII-8BIT`) String is read as UTF-8. A String in any other encoding (UTF-16, Windows-1252) is converted with `encode`, so UTF-16 `"12"` casts to `12` for an `:integer`. A String that is still not valid UTF-8 after that (`"caf\xC3"`, a byte Windows-1252 leaves undefined, a lone UTF-16 surrogate) is `invalid_type` for every scalar type, before `normalize:` or `format:` sees it. A `:json` field's contents are not read, so they are not converted either.
 
 **Numbers must be finite.** `Float("1e400")` is `Infinity` and `Float("1e-400")` is `0.0` — neither represents what was sent, and neither is a value a numeric column can store, so both are `invalid_type`. A genuine zero is unaffected however it is spelled (`"0"`, `"0.0"`, `"0e10"`). `:decimal` has no exponent limit, so `"1e400"` is fine there — but `BigDecimal("NaN")` and `BigDecimal("Infinity")` *succeed* where `Float()` raises, so those literal strings are rejected explicitly.
 
@@ -923,7 +925,7 @@ CreateUser = Permittable::Contract.define(root: :user) do
   optional :plan,  :string, in: %w[free pro], default: "free"
 end
 
-result = CreateUser.call(payload)     # never raises
+result = CreateUser.call(payload)     # a Result — bad client input is a violation, not an exception
 result.valid?                          # => false
 result.violations                      # => [{ param: "user.age", code: "inclusion" }]
 result.params                          # validated HashWithIndifferentAccess; nil when invalid
@@ -933,7 +935,11 @@ CreateUser.json_schema                 # the contract as JSON Schema (draft 2020
 CreateUser.rule                        # the frozen, introspectable rule data
 ```
 
-Everything carries over — strict coercion, `""`/`nil` absence, defaults, `finalize` with `violate!`, `sensitive:` log-redaction registration, `invalid_parameters.permittable` instrumentation, 400-vs-422 status semantics for a missing `root:`. Three differences, all deliberate:
+Everything carries over — strict coercion, `""`/`nil` absence, defaults, `finalize` with `violate!`, `sensitive:` log-redaction registration, `invalid_parameters.permittable` instrumentation, 400-vs-422 status semantics for a missing `root:`.
+
+**What `#call` still raises.** Client data never raises out of the gem's own checks. Wrong types, non-finite numbers, Strings that cannot be read as UTF-8 and undeclared keys in any encoding all come back as violations in the `Result`. Two things do raise, on purpose, because neither is the client's mistake. An input that is not a Hash raises `ArgumentError`. And an exception raised by your own code (a `validate:`, `transform:` or `normalize:` proc, or `finalize`) reaches the caller unchanged, since swallowing it would hide a bug.
+
+Three differences from the controller concern, all deliberate:
 
 - **A `Contract` always enforces.** Monitor mode is a request-rollout switch; standalone callers read the `Result` instead, so the app-wide `Permittable.mode` is ignored here.
 - **No router-key exemption.** `unknown: :error` flags a stray `action` or `controller` key — standalone input has no router to excuse.

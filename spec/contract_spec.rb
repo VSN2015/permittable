@@ -116,13 +116,37 @@ RSpec.describe Permittable::Contract do
         described_class.define { required :s, :string, normalize: :strip } => [{ s: malformed }, "s"],
         described_class.define { required :s, :string, format: /\Acaf/ } => [{ s: malformed }, "s"],
         described_class.define { required :s, :string, format: :email } => [{ s: malformed }, "s"],
-        described_class.define { array :tags, of: :string } => [{ tags: [malformed] }, "tags[0]"]
+        described_class.define { array :tags, of: :string } => [{ tags: [malformed] }, "tags[0]"],
+        described_class.define { required :s, :string, format: /\Acaf/ } => [{ s: "caf\xC3".b }, "s"],
+        described_class.define { required :s, :string, normalize: :squish } =>
+          [{ s: "caf\x81".dup.force_encoding("Windows-1252") }, "s"],
+        described_class.define { required :n, :integer } => [{ n: "\x00\xD8".dup.force_encoding("UTF-16LE") }, "n"]
       }
       cases.each do |c, (input, param)|
         result = nil
         expect { result = c.call(input) }.not_to raise_error, "for #{input.inspect}"
         expect(result.violations).to eq([{ param: param, code: "invalid_type" }]), "for #{input.inspect}"
       end
+    end
+
+    it "reads a UTF-16 payload by its characters — a number is not cast from its bytes" do
+      c = described_class.define do
+        required :n, :integer
+        required :d, :decimal
+        required :s, :string, normalize: :strip, format: /\Acafé\z/
+      end
+      result = nil
+      expect { result = c.call(n: "12".encode("UTF-16LE"), d: "12".encode("UTF-16LE"), s: " café ".encode("UTF-16LE")) }
+        .not_to raise_error
+      expect(result.params.to_h).to eq("n" => 12, "d" => BigDecimal("12"), "s" => "café")
+    end
+
+    it "renders a violation for an undeclared key that is not valid UTF-8" do
+      c = described_class.define(unknown: :error) { optional :name, :string }
+      result = c.call("caf\xC3" => 1, "ok".encode("UTF-16LE") => 2)
+      expect(result.violations).to contain_exactly({ param: "caf�", code: "unknown" }, { param: "ok", code: "unknown" })
+      expect { result.violations.to_json }.not_to raise_error
+      expect { c.call!("caf\xC3" => 1) }.to raise_error(Permittable::InvalidParameters) { |e| expect(e.message).to be_valid_encoding }
     end
 
     it "stays enforce-semantics even when the app-wide mode is monitor" do
