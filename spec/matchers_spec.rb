@@ -87,15 +87,22 @@ RSpec.describe "Permittable RSpec matchers" do
   it "reads within's argument exactly as the contract reads in: — a Hash as its keys, an allowlist as itself" do
     allowlist = Object.new
     def allowlist.include?(_value) = true
+    registry = Class.new(Hash) { def include?(value) = value.to_s.start_with?("custom-") }.new
+    registry[:unrelated] = 1
     contract = Permittable::Contract.define do
       optional :status, :string, in: { draft: 0, published: 1 }
       optional :sku,    :string, in: allowlist
       optional :tier,   :string, in: [nil, "pro"], nullable: true
+      optional :code,   :string, in: registry
     end
     expect(contract).to permit_param(:status).within({ draft: 0, published: 1 })
     expect(contract).to permit_param(:status).within(%w[draft published])
     expect(contract).to permit_param(:sku).within(allowlist)
     expect(contract).to permit_param(:tier).within([nil, "pro"])
+    # A Hash subclass overriding include? is opaque, so within compares it
+    # as given — not by casting its keys, which would silently accept the
+    # wrong values.
+    expect(contract).to permit_param(:code).within(registry)
   end
 
   it "checks required and optional" do

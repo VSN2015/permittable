@@ -292,7 +292,7 @@ Which options are legal depends on the field kind — anything else raises at cl
 
 | Option | Scalar | Array | Nested | Meaning |
 |---|:---:|:---:|:---:|---|
-| `in:` | ✅ | — | — | Allowed values: a `Range` (bounds-checked with `cover?`), a list (`Array`, `Set`, `Enumerator`, or a `Hash` read as its keys — so `in: Post.statuses` works), or any other object answering `include?`, Enumerable or not (used as given, and read on every request). A list is cast with the field's own type and **snapshotted** at class load, so `in: %i[draft published]` on a `:string` and `in: %w[1 2 3]` on an `:integer` match what a request casts to — and a later `PLANS << "gold"` is not seen; pass your own `include?` object for a live list. A `nil` member is dropped on a `nullable:` field |
+| `in:` | ✅ | — | — | Allowed values: a `Range` (bounds-checked with `cover?`), a list (a plain `Array`, `Set`, `Enumerator`, or `Hash` read as its keys — so `in: Post.statuses` works), or any other object answering `include?` (used as given, and read on every request) — including a Hash/Array/Set **subclass that overrides `include?`**, whose override is kept rather than read for its raw contents. A list is cast with the field's own type and **snapshotted** at class load, so `in: %i[draft published]` on a `:string` and `in: %w[1 2 3]` on an `:integer` match what a request casts to — and a later `PLANS << "gold"` is not seen; pass your own `include?` object for a live list. A `nil` member is dropped on a `nullable:` field |
 | `format:` | ✅¹ | — | — | Regexp the value must match, or a [preset name](#format-presets): `:email`, `:uuid`, `:url`, `:slug`, `:hostname` |
 | `length:` | ✅¹ | ✅ | — | `Range` or `Integer`. Character count on strings, **element count** on arrays, where it short-circuits — see [the field DSL](#the-field-dsl) |
 | `normalize:` | ✅¹ | — | — | `:squish`, `:strip`, `:downcase`, `:upcase`, `:email`, or a Proc. Runs **first** — before the absence rule, so a value that normalizes to `""` is absent |
@@ -1072,7 +1072,7 @@ A bad contract is a programmer error, so it fails when the class loads — never
 - An unknown `normalize:` or `format:` preset, listing the presets
 - A `format:` that is neither a `Regexp` nor a preset name
 - `format:`, `length:`, or `normalize:` on a non-`:string` field
-- `length:` that isn't a non-negative `Integer` or a `Range`; an `in:` that is a `String` (`String#include?` would match any substring — `in: "free pro"` accepted `"e"`), or that answers neither `cover?` nor `include?`
+- `length:` that isn't a non-negative `Integer` or a `Range`; an `in:` that is a `String` (`String#include?` would match any substring — `in: "free pro"` accepted `"e"`), or that is neither a `Range` nor answers `include?`
 - An `in:` member the field's own type can't cast (`in: %w[1 two]` on an `:integer`, `nil` on a field that isn't `nullable:`, or a `Time` on a `:date` field that isn't exactly midnight UTC), or an `in:` `Range` whose endpoints a value of the field's type can't be compared with (`in: "1".."5"` on an `:integer`) — either would reject every request as `inclusion`
 - A bound **no value could satisfy**: a reversed or empty `Range` (`in: 65..18`, `length: 5..2`, `length: 3...3`), an empty `in:` set, or a `length:` of 0 on a `required` field (where `""` already violates as `missing`)
 - `validate:` or `transform:` that isn't callable

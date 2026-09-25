@@ -144,6 +144,61 @@ RSpec.describe Permittable do
       expect(violations_for({ plan: "gold" }, &decl).details).to eq([{ param: "plan", code: "inclusion" }])
     end
 
+    # A Hash/Array/Set SUBCLASS overriding include? is the same story as the
+    # Enumerable above, by CLASS rather than by module: `case allowed; when
+    # Hash ...` matches with ===, which for a Class is is_a? — so a subclass
+    # matched the branch for its ancestor and had its override silently
+    # discarded, reading its raw contents (keys, elements) instead and
+    # inverting which values it actually accepts. Each is kept exactly as
+    # given, like any other object whose include? is the point.
+    it "keeps a Hash subclass's own include?, not its keys, when the override differs from Hash's" do
+      registry = Class.new(Hash) do
+        def include?(value) = value.to_s.start_with?("custom-")
+      end.new
+      registry[:unrelated] = 1
+      decl = proc { permit_params(:create) { optional :sku, :string, in: registry } }
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in]).to be(registry)
+      expect(permit({ sku: "custom-1" }, &decl)[:sku]).to eq("custom-1")
+      expect(violations_for({ sku: "unrelated" }, &decl).details).to eq([{ param: "sku", code: "inclusion" }])
+    end
+
+    it "keeps an Array subclass's own include?, not its elements" do
+      allowlist = Class.new(Array) do
+        def include?(value) = any? { |candidate| candidate.to_s.casecmp?(value.to_s) }
+      end.new(%w[free pro])
+      decl = proc { permit_params(:create) { optional :plan, :string, in: allowlist } }
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in]).to be(allowlist)
+      expect(permit({ plan: "PRO" }, &decl)[:plan]).to eq("PRO")
+      expect(violations_for({ plan: "gold" }, &decl).details).to eq([{ param: "plan", code: "inclusion" }])
+    end
+
+    it "keeps a Set subclass's own include?, not its elements" do
+      fuzzy = Class.new(Set) do
+        def include?(value) = any? { |candidate| candidate.to_s.include?(value.to_s) }
+      end.new(%w[free pro])
+      decl = proc { permit_params(:create) { optional :plan, :string, in: fuzzy } }
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in]).to be(fuzzy)
+      expect(permit({ plan: "p" }, &decl)[:plan]).to eq("p")
+      expect(violations_for({ plan: "gold" }, &decl).details).to eq([{ param: "plan", code: "inclusion" }])
+    end
+
+    # A plain Hash's keys are still cast to a Set for O(1) membership, and
+    # HashWithIndifferentAccess — a Hash SUBCLASS — is the one deliberate
+    # exception to the rule above: its include? override only canonicalises
+    # the argument (String/Symbol) before the same key lookup, so its keys
+    # are still exactly its members. It is what a Rails enum's own reader
+    # (`Post.statuses`) actually returns.
+    it "still reads a plain Hash and a HashWithIndifferentAccess as their keys" do
+      decl = proc do
+        permit_params(:create) do
+          optional :status, :string, in: { draft: 0, published: 1 }
+          optional :tier, :string, in: ActiveSupport::HashWithIndifferentAccess.new(free: "f", pro: "p")
+        end
+      end
+      fields = permittable_class(&decl).permit_rule_for(:create)[:fields]
+      expect(fields.map { |f| f[:in] }).to eq([Set["draft", "published"], Set["free", "pro"]])
+    end
+
     # The approved snapshot: a list is cast once, so a later `PLANS << "gold"`
     # is not seen. An app that needs a live list passes its own include?
     # object, which is read on every request.

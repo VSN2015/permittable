@@ -129,6 +129,26 @@ RSpec.describe Permittable::JsonSchema do
       expect(prop["x-permittable-custom-validation"]).to be(true)
     end
 
+    # A Hash/Array/Set subclass overriding include? is opaque exactly like
+    # the plain-Object and Enumerable allowlists above — its raw contents
+    # (keys, elements) are not what it actually matches, so no enum can
+    # honestly be published for it.
+    it "exports a Hash/Array/Set subclass overriding include? as custom validation too" do
+      # Non-empty: assert_satisfiable! reads any object's own empty? at
+      # class load, and this Hash subclass inherits Hash's — unrelated to
+      # its overridden include?, but a truly empty one would already fail
+      # that check on its own, before ever reaching the list/opaque split.
+      registry = Class.new(Hash) { def include?(value) = value.to_s.start_with?("custom-") }.new
+      registry[:unrelated] = 1
+      allowlist = Class.new(Array) { def include?(value) = any? { |c| c.to_s.casecmp?(value.to_s) } }.new(%w[pro])
+      fuzzy = Class.new(Set) { def include?(value) = any? { |c| c.to_s.include?(value.to_s) } }.new(%w[pro])
+      [registry, allowlist, fuzzy].each do |allowed|
+        prop = property("sku") { optional :sku, :string, in: allowed }
+        expect(prop).not_to have_key("enum")
+        expect(prop["x-permittable-custom-validation"]).to be(true)
+      end
+    end
+
     it "carries a non-numeric Range as an extension instead of guessing" do
       prop = property("code") { optional :code, :string, in: "a".."m" }
       expect(prop["x-permittable-range"]).to eq('"a".."m"')
