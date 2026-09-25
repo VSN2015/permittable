@@ -985,16 +985,22 @@ Output is deterministic (fixed key order, declaration-order properties), so the 
 
 `spec/schema_conformance_spec.rb` holds the "cannot drift" claim to account: it walks canonical JSON payloads through both the contract and its own exported schema and asserts the verdicts agree.
 
-Where they legitimately differ, the spec names the reason and asserts the **direction**, so a new divergence fails the suite instead of shipping quietly. Two cases go the safe way — the **server accepts what its docs reject**, leaving a client that follows the docs merely conservative:
+Where they legitimately differ, the spec names the reason and asserts the **direction**, so a new divergence fails the suite instead of shipping quietly. Three cases go the safe way — the **server accepts what its docs reject**, leaving a client that follows the docs merely conservative:
 
 - **Non-canonical encodings.** Coercion accepts `"30"` for an `:integer` and `1` for a `:string`, because form and query payloads are all strings. The schema documents the canonical JSON encoding only.
 - **`null` as absence.** The runtime reads `{"age": null}` as `{}` ([absence](#absence-defaults-and-partial-updates)); JSON Schema cannot express that, so `type: integer` rejects a null the server would accept and ignore. A [`nullable:`](#explicit-nulls-nullable) field is not this case — there the null is a value, the exported `type` widens to say so, and the two agree.
+- **Padding that normalizes away.** `normalize:` runs before the checks, so under `normalize: :squish` and `length: 3..10` the server accepts `"  abcdefghij  "` — ten characters once squished — while the docs reject its fourteen.
 
-One case goes the other way, and is worth knowing before you hand the document to a client:
+Six cases go the other way, and are worth knowing before you hand the document to a client. Each rule stays visible on its own field, and the spec asserts that as well as the direction:
 
 - **Bounds JSON Schema has no keyword for.** A `:json` field's `max_depth:` is enforced by the server but cannot be written as a JSON Schema keyword, so the published document is **looser** there and an over-nested payload still earns a 422. The bound is not dropped — it is exported as `x-permittable-max-depth` — so a generator or linter that wants it can read it.
+- **`normalize:` runs before the checks.** The server validates the *normalized* string, and JSON Schema has no keyword for "transform, then check". With `required :name, :string, length: 3..10, normalize: :squish`, `"   "` passes the docs' `minLength: 3` and then squishes to `""` — absent, so `missing` — and `" a  "` passes them and squishes to `"a"`, which is too short. The step is exported as `x-permittable-normalize` — the preset's name (`"squish"`, `"email"`, …), which a client can apply before validating, or `true` for a custom proc.
+- **A bounded `:decimal` sent as a string.** A `:decimal` is documented as `["string", "number"]`, because the string is its precision-safe encoding, but `minimum`/`maximum` constrain only numbers — so `"5000"` passes the docs for `in: BigDecimal("0.01")..BigDecimal("999.99")` and the server answers `inclusion`. The bound is still published, as a JSON number, for a client that parses the string first. (Numbers are published exactly as written, at any magnitude — `10**400` included, since a JSON integer has no size limit — but a client that reads the document back with ordinary double-precision floats, rather than the digits as sent, can still round a value across a boundary. That is inherent to parsing any JSON number as a double, not something this exporter controls.)
+- **A `validate:` proc.** It is opaque app code, so the schema can only flag it — `x-permittable-custom-validation` — never enforce what it checks. A value the proc refuses still passes the docs.
+- **A Range of non-numbers.** `in: "a".."m"` has no `minimum`/`maximum` equivalent (those constrain numbers only) and rides along as `x-permittable-range` instead. A value outside it still passes the docs.
+- **Strings whose validity is a `format`.** `:decimal`, `:date` and `:datetime` are sent as strings, and what makes such a string valid is its `format` (`"decimal"`, `"date"`, `"date-time"`) — which draft 2020-12 treats as an annotation unless a validator opts into asserting it. So `"abc"` or `"NaN"` for a `:decimal` and `"2026-02-30"` for a `:date` pass most validators and fail the server's cast with `invalid_type`.
 
-Everything else the exporter cannot translate stays visible as an `x-permittable-*` extension rather than being guessed at.
+A `format:` regexp that does not translate to ECMA-262 is looser in the same way — it publishes as `x-permittable-pattern` rather than a `pattern` that would enforce something else, so a value it refuses still passes the docs — but it is not one of the six above: `spec/schema_conformance_spec.rb` does not yet assert a case for it, since the Ruby → ECMA-262 translation it would depend on is being reworked separately. Everything else the exporter cannot translate stays visible as an `x-permittable-*` extension rather than being guessed at.
 
 
 <details>
