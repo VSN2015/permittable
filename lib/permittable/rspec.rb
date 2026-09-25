@@ -596,12 +596,26 @@ module Permittable
       # question these matchers answer is what the CONTRACT says, not what the
       # current rollout mode does with it — so a monitor-mode rule still reports
       # its violations here.
+      #
+      # The host is a bare `include Permittable` class rather than a subclass
+      # of @subject's own class: @subject may be a real controller, and
+      # instantiating one outside the framework's own dispatch (no request,
+      # no response, whatever else its own before_actions assume) is not
+      # safe in general. That means it does not automatically inherit any
+      # override @subject's class makes to permittable_check_unknown — which
+      # is exactly what a standalone Permittable::Contract relies on
+      # (Contract#initialize forces top_level: false, since standalone input
+      # has no router to exempt routing keys for). So that one override is
+      # replicated here for a Contract subject specifically, keeping the
+      # controller path (which is presumed to use the plain module default)
+      # byte-for-byte unchanged.
       def run(rule)
         host = Class.new do
           include Permittable
 
           attr_accessor :params
         end
+        mirror_contract_unknown_check(host) if @subject.is_a?(Permittable::Contract)
         host.permittable_contracts = [rule.merge(mode: :enforce).freeze]
         instance = host.new
         instance.params = @params
@@ -609,6 +623,16 @@ module Permittable
         violations = instance.permittable_violations(action)
         result = violations.empty? ? instance.permitted_params(action) : nil
         [violations, result]
+      end
+
+      # Mirrors Permittable::Contract's own host override verbatim (see
+      # lib/permittable/contract.rb): standalone input has no router and no
+      # request, so nothing is exempt from unknown: checking, top level or
+      # not.
+      def mirror_contract_unknown_check(host)
+        host.define_method(:permittable_check_unknown) do |fields, hash, path:, unknown:, top_level:, violations:| # rubocop:disable Lint/UnusedBlockArgument
+          super(fields, hash, path: path, unknown: unknown, top_level: false, violations: violations)
+        end
       end
 
       def resolve_rule
