@@ -230,11 +230,11 @@ module Permittable
     end
 
     # Documentation keys shared by every field kind. `default:`/`example:`
-    # are authored values (possibly Date/Time/BigDecimal literals), so they
+    # are stored as the contract casts them (Date, Time, BigDecimal), so they
     # are re-encoded as JSON scalars.
     def annotate(schema, field)
-      schema["default"] = json_value(field[:default]) if field.key?(:default)
-      schema["examples"] = [json_value(field[:example])] if field.key?(:example)
+      schema["default"] = json_value(field[:default], decimal: :number) if field.key?(:default)
+      schema["examples"] = [json_value(field[:example], decimal: :number)] if field.key?(:example)
       schema["description"] = field[:desc] if field[:desc]
       if field[:sensitive]
         schema["writeOnly"] = true
@@ -245,13 +245,13 @@ module Permittable
       schema
     end
 
-    def json_value(value)
+    def json_value(value, decimal: :string)
       case value
-      when Array then value.map { |v| json_value(v) }
+      when Array then value.map { |v| json_value(v, decimal: decimal) }
       # An authored `:json` default/example is a whole hash; its values get
       # the same re-encoding as any other authored scalar.
-      when Hash then value.to_h { |k, v| [k.to_s, json_value(v)] }
-      when BigDecimal then value.to_s("F")
+      when Hash then value.to_h { |k, v| [k.to_s, json_value(v, decimal: decimal)] }
+      when BigDecimal then decimal == :number ? decimal_json(value) : value.to_s("F")
       when Time then value.utc.iso8601
       # DateTime subclasses Date, so it must match first.
       when DateTime then value.to_time.utc.iso8601
@@ -259,6 +259,19 @@ module Permittable
       when Symbol then value.to_s
       else value
       end
+    end
+
+    # A :decimal default/example is stored cast — a BigDecimal, even when it
+    # was authored as `1.5` — and exporting every BigDecimal as a string
+    # turned the number such a default had always been published as into
+    # "1.5". So it is a JSON number whenever a Float carries it exactly (the
+    # Float's shortest text reads back as the same BigDecimal), which is what
+    # a JSON number is to most consumers anyway, and a string only when the
+    # precision would otherwise be lost. Both spellings are within the
+    # :decimal schema's own `["string", "number"]`.
+    def decimal_json(value)
+      float = value.to_f
+      BigDecimal(float.to_s) == value ? float : value.to_s("F")
     end
   end
 end

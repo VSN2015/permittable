@@ -122,10 +122,12 @@ require "permittable/filter_parameter_registry"
 # absence. `normalize:` runs BEFORE that rule rather than inside the cast, so
 # there is exactly one reading of absence and a value that normalizes to empty
 # ("   " under :squish) cannot satisfy a required field by becoming "". An
-# authored `default:`/`example:` is stored normalized and cast — the form it
-# was validated in, so `default: "18"` on an :integer is 18 — and deep-frozen
-# on a copy; each request gets its own deep copy, so no request can corrupt
-# it for the next.
+# authored `default:`/`example:` is stored as the contract reads it —
+# normalized and cast, so `default: "18"` on an :integer is 18, and an
+# array's read by the request walker itself — minus `transform:`, which never
+# runs on a default (see OUTPUT RESHAPING). It is deep-frozen on a copy, and
+# each request gets its own deep copy, so no request can corrupt it for the
+# next.
 #
 # `nullable: true` splits that rule in two for one field, which is how a PATCH
 # clears a column: a key the client never sent stays absent (defaults apply,
@@ -175,7 +177,11 @@ require "permittable/filter_parameter_registry"
 #     and validation to reshape that field's output, e.g.
 #     `transform: ->(v) { v.split(",") }` turns a validated delimited String
 #     into an Array. Runs only on request-supplied values: absent fields stay
-#     absent and `default:` values are authored in final shape.
+#     absent, and a `default:` is handed out as the contract reads it
+#     (normalized, cast, validated) but NOT transformed — so a request
+#     sending a field's default gets the transformed value, a request
+#     omitting it the untransformed one. Author a default in the shape the
+#     action should receive.
 #   * `finalize do |p| ... end` (once per contract) — runs after every field
 #     validated cleanly, receives the result hash, and must return the
 #     (possibly restructured) Hash: combine parallel fields, build value
@@ -513,11 +519,20 @@ module Permittable
     # nesting (`max_depth:`). Shared with macro-time `default:`/`example:`
     # checking, like check_scalar.
     def check_json(field, value)
+      status, code = check_json_bounds(field, value)
+      return [status, code] unless status == :ok
+
+      check_custom(field[:validate], value)
+    end
+
+    # The structural half of check_json, which the request walker runs on
+    # its own so that it can copy an accepted hash before app code sees it.
+    def check_json_bounds(field, value)
       return [:error, "invalid_type"] unless value.is_a?(Hash)
       return [:error, "length"] if field[:length] && !length_ok?(field[:length], value.length)
       return [:error, "depth"] if field[:max_depth] && depth_exceeds?(value, field[:max_depth])
 
-      check_custom(field[:validate], value)
+      [:ok, value]
     end
 
     # Container nesting, with the field's own hash as level 1. An Array counts
@@ -560,16 +575,13 @@ module Permittable
       true
     end
 
-    # A String is COPIED, never passed through: the result must not alias the
-    # request's own objects (see OUTPUT RESHAPING in the module comment).
-    # Returning the caller's String let `permitted_params[:name] << "x"`, or a
-    # `transform: ->(v) { v.strip! || v }`, rewrite `params` behind the app's
-    # back. String#dup shares a long String's buffer copy-on-write (a short
-    # one is embedded and copied outright), so the copy is cheap until
-    # someone actually writes to it.
+    # A String is returned as given. The request walker has already copied
+    # it on the way in (Permittable#permittable_normalized), before
+    # `normalize:` could see it — copying here as well would allocate twice
+    # per value and still come too late for a mutating `normalize:` proc.
     def cast_string(value)
       case value
-      when String then [:ok, value.dup]
+      when String then [:ok, value]
       when Numeric, true, false then [:ok, value.to_s]
       else [:error, "invalid_type"]
       end
@@ -1069,87 +1081,38 @@ module Permittable
       return unless field.key?(opt)
       return if authored_nil!(field, opt)
 
-      value = Coercion.apply_normalize(field[:normalize], field[opt])
+      # Copied first, like a request's String, so a mutating `normalize:`
+      # proc cannot rewrite the host's own literal.
+      authored = field[opt].is_a?(String) ? field[opt].dup : field[opt]
+      value = Coercion.apply_normalize(field[:normalize], authored)
       status, result = Coercion.check_scalar(field, value)
       raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{result})" unless status == :ok
 
       field[opt] = freeze_authored(result)
     end
 
+    # An array's authored value is read by the REQUEST walker itself (see
+    # AuthoredValues), so what is stored is exactly what a request sending
+    # it gets: elements cast, nested hashes and arrays read at every depth,
+    # a sub-field's own default: filled in, `""` on a nullable sub-field
+    # made the explicit nil a request would get, keys the block does not
+    # declare dropped (as `unknown: :ignore` drops them), and the array's own
+    # `validate:` run over the result. A hand-rolled one-level check used
+    # to cast only the top level of each element, and got every one of those
+    # wrong. The one step deliberately left out is `transform:` — see
+    # AuthoredValues.
     def validate_array_authored_value!(field, opt)
       value = field[opt]
       return if authored_nil!(field, opt)
       raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} must be an Array" unless value.is_a?(Array)
-      if field[:length] && !Coercion.length_ok?(field[:length], value.length)
-        raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} violates its own contract (length)"
+
+      read, violations = AuthoredValues.read_array(field, value)
+      unless violations.empty?
+        raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} violates its own contract: " \
+                             "#{AuthoredValues.summary(violations)}"
       end
 
-      # Stored as the checks cast it, for the same reason a scalar's is.
-      value = validate_array_elements!(field, opt, value) if field[:of]
-      value = validate_array_element_hashes!(field, opt, value) if field[:fields]
-      field[opt] = freeze_authored(value)
-    end
-
-    # The nested-block counterpart of the of: element check below. Without it
-    # `field[:of]` was nil for a block array, so its `default:` skipped
-    # validation entirely and whatever was authored went straight to every
-    # request that omitted the key. Shallow in the same way the of: check is:
-    # required sub-fields must be present and scalar ones must satisfy their
-    # own contract, which is what an authored value gets wrong. Returns the
-    # elements with each present scalar sub-field replaced by its cast value
-    # (`"qty" => "2"` against `optional :qty, :integer` becomes 2), under the
-    # key as authored; everything else is left exactly as written.
-    def validate_array_element_hashes!(field, opt, value)
-      value.map do |element|
-        unless element.is_a?(Hash)
-          raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} contains #{element.class} " \
-                               "where the block declares a hash"
-        end
-
-        # Wrapped the way permittable_check_element wraps an element at
-        # request time, so class load reads keys exactly as a request does.
-        indifferent = ActiveSupport::HashWithIndifferentAccess.new(element)
-        cast = field[:fields].each_with_object({}) do |sub, out|
-          checked = validate_array_element_field!(field, opt, indifferent, sub)
-          out[sub[:name].to_s] = checked if sub[:kind] == :scalar && indifferent.key?(sub[:name])
-        end
-        element.to_h { |key, sub_value| [key, cast.fetch(key.to_s, sub_value)] }
-      end
-    end
-
-    def validate_array_element_field!(field, opt, element, sub)
-      # Normalized before absence is read, and absence read with the runtime's
-      # own rule: a default: is applied WITHOUT revalidation, so anything this
-      # check waves through is handed to the app unexamined — and "" here used
-      # to mean a default could carry the very value a client is refused.
-      value = Coercion.apply_normalize(sub[:normalize], element[sub[:name]])
-      if Coercion.absent_value?(value)
-        # nullable: splits that rule exactly as permittable_explicit_null?
-        # does — a key present but empty is an explicit null, not an absence.
-        return value if sub[:nullable] && element.key?(sub[:name])
-        return value unless sub[:required]
-
-        raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} is missing :#{sub[:name]}, " \
-                             "which the block declares as required"
-      end
-      return value unless sub[:kind] == :scalar
-
-      status, result = Coercion.check_scalar(sub, value)
-      return result if status == :ok
-
-      raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} has :#{sub[:name]} " \
-                           "violating its own contract (#{result})"
-    end
-
-    # Returns the elements cast, as a request's would be (`of: :integer,
-    # default: ["1", "2"]` is stored as [1, 2]).
-    def validate_array_elements!(field, opt, value)
-      value.map do |element|
-        status, result = Coercion.cast(field[:of], element)
-        next result if status == :ok
-
-        raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} contains an element violating of: :#{field[:of]} (#{result})"
-      end
+      field[opt] = freeze_authored(read)
     end
 
     # A contract is frozen data, but `@fields.map(&:freeze)` freezes only the
@@ -1668,10 +1631,7 @@ module Permittable
       # Already normalized by permittable_normalized, before the absence rule.
       permittable_check_whole(field, Coercion.check_scalar(field, value), full, result, violations: violations)
     when :json
-      # Deep-copied for the reason cast_string copies: the opaque hash is
-      # handed over whole, and HashWithIndifferentAccess rebuilt its
-      # containers but not the Strings inside them.
-      permittable_check_whole(field, Coercion.check_json(field, value.deep_dup), full, result, violations: violations)
+      permittable_check_whole(field, permittable_check_json(field, value), full, result, violations: violations)
     when :nested
       if value.is_a?(Hash)
         result[key] = permittable_check_hash(field[:fields], ActiveSupport::HashWithIndifferentAccess.new(value),
@@ -1688,14 +1648,27 @@ module Permittable
     end
   end
 
+  # Coercion.check_json, with the copy the result needs made in the middle.
+  # The opaque hash is handed over whole, and HashWithIndifferentAccess
+  # rebuilt its containers but not the Strings inside them, so it is
+  # deep-copied for the reason permittable_normalized copies a String — but
+  # only once it is within its bounds. Copying first meant a megabyte
+  # payload refused on `length:` or `max_depth:` was copied in full just to
+  # be refused, undoing the early exit those bounds exist for.
+  def permittable_check_json(field, value)
+    status, code = Coercion.check_json_bounds(field, value)
+    return [status, code] unless status == :ok
+
+    Coercion.check_custom(field[:validate], value.deep_dup)
+  end
+
   # The shared tail of the two kinds whose entire value is checked in one
   # call — a scalar, or an opaque hash. A clean value is transformed into the
   # result; anything else records its code.
   def permittable_check_whole(field, outcome, full, result, violations:)
     status, out = outcome
     if status == :ok
-      out = field[:transform].call(out) if field[:transform]
-      result[field[:name].to_s] = out
+      result[field[:name].to_s] = permittable_transform(field, out)
     else
       violations << permittable_violation(field, full, out)
     end
@@ -1723,8 +1696,14 @@ module Permittable
     end
     # Transform only a fully-valid array — a partially-nil one (element
     # violations) would hand user code garbage it never agreed to see.
-    out = field[:transform].call(out) if field[:transform] && violations.length == before
-    out
+    violations.length == before ? permittable_transform(field, out) : out
+  end
+
+  # The one place a field's `transform:` is applied — a seam, so that
+  # AuthoredValues can walk an authored default through this same walker
+  # without running app code over it at class load.
+  def permittable_transform(field, value)
+    field[:transform] ? field[:transform].call(value) : value
   end
 
   def permittable_check_element(field, element, path, unknown:, violations:)
@@ -1737,7 +1716,7 @@ module Permittable
                                     path: path, unknown: unknown, top_level: false, violations: violations)
     end
 
-    status, out = Coercion.cast(field[:of], element)
+    status, out = Coercion.cast(field[:of], permittable_own(element))
     return out if status == :ok
 
     violations << permittable_violation(field, path, out)
@@ -1751,8 +1730,22 @@ module Permittable
   # corruption strict coercion exists to refuse, delivered by the gem's own
   # preset. Only scalars take normalize:, and apply_normalize is itself a
   # no-op without one, so it owns that decision for every caller.
+  #
+  # It is also where a request's String stops being the request's. Nothing
+  # the walker hands to app code — `normalize:`, `validate:`, `transform:`,
+  # the result — may alias the caller's params, or `permitted_params[:name]
+  # << "x"` (or `normalize: ->(v) { v.strip! || v }`) rewrites the caller's
+  # Hash or ActionController::Parameters behind the app's back. Copying at
+  # the walker's input, ahead of normalize:, makes it one copy per String;
+  # String#dup shares a long String's buffer copy-on-write, so the copy is
+  # cheap until someone writes to it. `of:` elements get the same treatment
+  # in permittable_check_element, and a :json hash in permittable_check_json.
   def permittable_normalized(field, value)
-    Coercion.apply_normalize(field[:normalize], value)
+    Coercion.apply_normalize(field[:normalize], permittable_own(value))
+  end
+
+  def permittable_own(value)
+    value.is_a?(String) ? value.dup : value
   end
 
   # An authored default belongs to the contract, which is frozen data (see
@@ -1849,6 +1842,10 @@ module Permittable
     self.class.name
   end
 end
+
+# Class-load reading of an authored array default:/example: — the request
+# walker itself, so it needs the concern's body loaded.
+require "permittable/authored_values"
 
 # Contract exporters — the other readers of the frozen contract registry.
 # Loaded after the module body so OpenAPI can see the concern's own methods.

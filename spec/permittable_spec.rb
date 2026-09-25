@@ -21,6 +21,14 @@ RSpec.describe Permittable do
     controller(permittable_class(&declaration), params: params, action: action).permitted_params
   end
 
+  # FakeController wraps a Hash in HashWithIndifferentAccess; this hands the
+  # concern a real ActionController::Parameters instead, as Rails would.
+  def permit_parameters(parameters, &declaration)
+    c = controller(permittable_class(&declaration))
+    c.params = parameters
+    c.permitted_params
+  end
+
   def violations_for(params, action: "create", &declaration)
     permit(params, action: action, &declaration)
     raise "expected InvalidParameters"
@@ -130,7 +138,7 @@ RSpec.describe Permittable do
             end
           end
         end
-      end.to raise_error(ArgumentError, /:default for array :items.*is missing :sku/)
+      end.to raise_error(ArgumentError, /:default for array :items violates its own contract: items\[0\]\.sku \(missing\)/)
 
       expect do
         permittable_class do
@@ -140,7 +148,7 @@ RSpec.describe Permittable do
             end
           end
         end
-      end.to raise_error(ArgumentError, /:default for array :items.*:sku.*invalid_type/)
+      end.to raise_error(ArgumentError, /:default for array :items violates its own contract: items\[0\]\.sku \(invalid_type\)/)
 
       expect do
         permittable_class do
@@ -165,7 +173,7 @@ RSpec.describe Permittable do
             end
           end
         end
-      end.to raise_error(ArgumentError, /:default for array :items.*is missing :sku/)
+      end.to raise_error(ArgumentError, /:default for array :items violates its own contract: items\[0\]\.sku \(missing\)/)
 
       # normalize: runs BEFORE the absence rule at request time; a default
       # that normalizes to empty is absent for the same reason.
@@ -177,7 +185,7 @@ RSpec.describe Permittable do
             end
           end
         end
-      end.to raise_error(ArgumentError, /:default for array :items.*is missing :sku/)
+      end.to raise_error(ArgumentError, /:default for array :items violates its own contract: items\[0\]\.sku \(missing\)/)
     end
 
     it "accepts an empty value a block array's default: is allowed to carry" do
@@ -242,7 +250,7 @@ RSpec.describe Permittable do
       expect { permittable_class { permit_params(:create) { array :a, default: "x" } } }
         .to raise_error(ArgumentError, /:default for array :a must be an Array/)
       expect { permittable_class { permit_params(:create) { array :a, of: :integer, default: ["x"] } } }
-        .to raise_error(ArgumentError, /contains an element violating of: :integer/)
+        .to raise_error(ArgumentError, /:default for array :a violates its own contract: a\[0\] \(invalid_type\)/)
     end
 
     it "rejects a default that violates the field's own contract" do
@@ -273,7 +281,7 @@ RSpec.describe Permittable do
       expect { permittable_class { permit_params(:create) { optional :plan, :string, in: %w[free pro], example: "gold" } } }
         .to raise_error(ArgumentError, /:example for field :plan violates its own contract \(inclusion\)/)
       expect { permittable_class { permit_params(:create) { array :ids, of: :integer, example: ["x"] } } }
-        .to raise_error(ArgumentError, /:example for array :ids contains an element violating of: :integer/)
+        .to raise_error(ArgumentError, /:example for array :ids violates its own contract: ids\[0\] \(invalid_type\)/)
       expect { permittable_class { permit_params(:create) { required(:a, example: {}) { required :b } } } }
         .to raise_error(ArgumentError, /unknown option\(s\) :example for field :a/)
     end
@@ -886,6 +894,52 @@ RSpec.describe Permittable do
       expect(defaulted).to eq(sent)
     end
 
+    it "reads a block array's default: with the request walker, at every depth" do
+      klass = permittable_class do
+        permit_params(:create) do
+          array :items, default: [{ "sku" => "a", "note" => "", "extra" => 1,
+                                    "dims" => { "w" => "3" }, "tags" => %w[1 2] }] do
+            required :sku, :string
+            optional :note, :string, nullable: true
+            optional :qty, :integer, default: 1
+            optional(:dims) { optional :w, :integer }
+            array :tags, of: :integer
+          end
+        end
+      end
+      defaulted = controller(klass).permitted_params
+      sent = controller(klass, params: { items: [{ sku: "a", note: "", extra: 1, dims: { w: "3" }, tags: %w[1 2] }] })
+             .permitted_params
+
+      expect(defaulted[:items]).to eq([{ "sku" => "a", "note" => nil, "qty" => 1, "dims" => { "w" => 3 }, "tags" => [1, 2] }])
+      expect(defaulted).to eq(sent)
+    end
+
+    it "runs an array's own validate: over its authored default:, as a request's array gets it" do
+      expect do
+        permittable_class do
+          permit_params(:create) { array :ids, of: :integer, validate: ->(v) { v.uniq == v || :duplicates }, default: %w[1 1] }
+        end
+      end.to raise_error(ArgumentError, /:default for array :ids violates its own contract: ids \(duplicates\)/)
+    end
+
+    it "never runs an app's transform: over a default:, at class load or on the way out" do
+      calls = []
+      klass = permittable_class do
+        permit_params(:create) do
+          optional :plan, :string, default: "free", transform: ->(v) { (calls << :plan) && v.upcase }
+          array :items, default: [{ "sku" => "a" }], transform: ->(v) { (calls << :items) && v } do
+            required :sku, :string, transform: ->(v) { (calls << :sku) && v.upcase }
+          end
+        end
+      end
+      result = controller(klass).permitted_params
+
+      expect(result[:plan]).to eq("free")
+      expect(result[:items].map(&:to_h)).to eq([{ "sku" => "a" }])
+      expect(calls).to be_empty
+    end
+
     it "casts an authored example: the same way, so docs publish the value a request would carry" do
       klass = permittable_class do
         permit_params(:create) do
@@ -944,6 +998,48 @@ RSpec.describe Permittable do
 
       expect(result[:name]).to eq("bob")
       expect(params[:name]).to eq("  bob  ")
+    end
+
+    it "hands normalize: a copy too, whether params is a Hash or ActionController::Parameters" do
+      decl = proc { permit_params(:create) { required :name, :string, normalize: ->(v) { v.strip! || v } } }
+
+      hash = { name: +"  bob  " }
+      expect(permit(hash, &decl)[:name]).to eq("bob")
+      expect(hash[:name]).to eq("  bob  ")
+
+      params = ActionController::Parameters.new(name: +"  bob  ")
+      expect(permit_parameters(params, &decl)[:name]).to eq("bob")
+      expect(params[:name]).to eq("  bob  ")
+    end
+
+    it "copies from ActionController::Parameters as from a Hash" do
+      params = ActionController::Parameters.new(name: +"bob", tags: [+"a"], meta: { "note" => +"n" })
+      result = permit_parameters(params) do
+        permit_params(:create) do
+          required :name, :string
+          array :tags, of: :string
+          optional :meta, :json
+        end
+      end
+      result[:name] << "!"
+      result[:tags].first << "!"
+      result[:meta]["note"] << "!"
+
+      expect(params.to_unsafe_h).to eq("name" => "bob", "tags" => ["a"], "meta" => { "note" => "n" })
+    end
+
+    it "copies a :json value only once it is within its bounds, so a rejected payload is never copied" do
+      copies = 0
+      leaf = Object.new
+      leaf.define_singleton_method(:deep_dup) { (copies += 1) && self }
+      decl = proc { permit_params(:create) { optional :meta, :json, length: 0..1 } }
+
+      expect(violations_for({ meta: { "a" => leaf, "b" => 1 } }, &decl).details)
+        .to eq([{ param: "meta", code: "length" }])
+      expect(copies).to eq(0)
+
+      permit({ meta: { "a" => leaf } }, &decl)
+      expect(copies).to eq(1)
     end
   end
 
@@ -1395,7 +1491,7 @@ RSpec.describe Permittable do
 
     it "refuses an authored default: that is itself outside the bound, at class load" do
       expect { permittable_class { permit_params(:create) { array :t, of: :string, length: 0..1, default: %w[a b] } } }
-        .to raise_error(ArgumentError, /:default for array :t violates its own contract \(length\)/)
+        .to raise_error(ArgumentError, /:default for array :t violates its own contract: t \(length\)/)
       expect { permittable_class { permit_params(:create) { array :t, of: :string, length: 0..2, example: %w[a b] } } }
         .not_to raise_error
     end
@@ -2346,7 +2442,7 @@ RSpec.describe Permittable do
       expect(violations_for({ ids: "1;2" }, &decl).details).to eq([{ param: "ids", code: "format" }])
     end
 
-    it "does NOT run on defaults (they are authored in final shape) or absent fields" do
+    it "does NOT run on defaults (stored as the contract reads them, untransformed) or absent fields" do
       decl = proc do
         permit_params(:create) { optional :ids, :string, default: "authored", transform: ->(v) { v.split(",") } }
       end

@@ -197,6 +197,8 @@ module Permittable
         when :of then "expected an array of :#{value}, but it is of: :#{field[:of]}" unless field[:of] == value
         when :required then required_mismatch(field, value)
         when :format then format_mismatch(field, value)
+        # Compared cast, but reported as written.
+        when :default then default_mismatch(field, value)
         when :virtual, :sensitive, :nullable then "expected the field to be #{key}, but it is not" unless field[key]
         else option_mismatch(field, key, value)
         end
@@ -225,6 +227,30 @@ module Permittable
         return if field[:format_name] == expected
 
         "expected format: :#{expected}, but the contract #{declared_format(field)}"
+      end
+
+      def default_mismatch(field, expected)
+        option_mismatch(field, :default, expected) unless field.key?(:default) && field[:default] == cast_default(field, expected)
+      end
+
+      # A contract stores its `default:` as the field reads it — cast,
+      # normalized, and for an array read by the request walker — so
+      # `with_default("18")` on an :integer, the declaration repeated as
+      # written, is read the same way before comparing, by the same code. A
+      # value that does not read cleanly is compared as given, and the
+      # failure shows both sides.
+      def cast_default(field, expected)
+        case field[:kind]
+        when :scalar
+          status, value = Coercion.cast(field[:type], Coercion.apply_normalize(field[:normalize], expected))
+          status == :ok ? value : expected
+        when :array
+          return expected unless expected.is_a?(Array)
+
+          value, violations = AuthoredValues.read_array(field, expected)
+          violations.empty? ? value : expected
+        else expected
+        end
       end
 
       def declared_format(field)

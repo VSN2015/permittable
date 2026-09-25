@@ -65,6 +65,38 @@ RSpec.describe "Permittable RSpec matchers" do
     expect(message).to include("in: 1..5")
   end
 
+  it "compares with_default cast, so the declaration's own spelling passes, and reports what the spec wrote" do
+    typed = Class.new(FakeController) do
+      include Permittable
+
+      permit_params(:create) do
+        optional :age,    :integer, default: "18"
+        optional :day,    :date,    default: "2026-01-05"
+        optional :opt_in, :boolean, default: "false"
+        array    :ids,    of: :integer, default: %w[1 2]
+        array :items, default: [{ "sku" => "a" }] do
+          required :sku, :string
+          optional :qty, :integer, default: 1
+        end
+      end
+    end
+
+    expect(typed).to permit_param(:age).with_default("18")
+    expect(typed).to permit_param(:age).with_default(18)
+    expect(typed).to permit_param(:day).with_default("2026-01-05")
+    expect(typed).to permit_param(:day).with_default(Date.new(2026, 1, 5))
+    expect(typed).to permit_param(:opt_in).with_default("false")
+    expect(typed).to permit_param(:opt_in).with_default(false)
+    expect(typed).to permit_param(:ids).with_default(%w[1 2])
+    expect(typed).to permit_param(:items).with_default([{ sku: "a" }])
+
+    message = failure_of { expect(typed).to permit_param(:age).with_default("19") }
+    expect(message).to include('expected default: "19"')
+    expect(message).to include("declares default: 18")
+    message = failure_of { expect(typed).to permit_param(:age).with_default("nope") }
+    expect(message).to include('expected default: "nope"')
+  end
+
   it "checks required and optional" do
     expect(controller).to permit_param(:email).for_action(:create).required
     expect(controller).to permit_param(:age).for_action(:create).optional

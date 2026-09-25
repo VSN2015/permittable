@@ -160,11 +160,23 @@ RSpec.describe Permittable::JsonSchema do
       expect(props["ids"]).to include("default" => [1, 2])
     end
 
+    it "exports a :decimal default:/example: as a JSON number when a Float holds it exactly, else as a string" do
+      price = property("price") { optional :price, :decimal, default: 1.5, example: "19.99" }
+      expect(price["default"]).to eq(1.5).and be_a(Float)
+      expect(price["examples"]).to eq([19.99])
+
+      precise = property("rate") { optional :rate, :decimal, default: "0.1000000000000000055511151231257827" }
+      expect(precise["default"]).to eq("0.1000000000000000055511151231257827")
+
+      money = property("totals") { optional :totals, :json, default: { "net" => BigDecimal("2.5") } }
+      expect(money["default"]).to eq("net" => 2.5)
+    end
+
     it "re-encodes authored Date/Time/BigDecimal values as JSON scalars" do
       expect(property("day") { optional :day, :date, default: Date.new(2026, 1, 5) }["default"]).to eq("2026-01-05")
       expect(property("at") { optional :at, :datetime, example: Time.utc(2026, 1, 5, 10) }["examples"])
         .to eq(["2026-01-05T10:00:00Z"])
-      expect(property("price") { optional :price, :decimal, example: BigDecimal("19.99") }["examples"]).to eq(["19.99"])
+      expect(property("price") { optional :price, :decimal, example: BigDecimal("19.99") }["examples"]).to eq([19.99])
     end
 
     it "marks sensitive fields writeOnly and flags opaque callables as extensions" do

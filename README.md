@@ -296,7 +296,7 @@ Which options are legal depends on the field kind — anything else raises at cl
 | `format:` | ✅¹ | — | — | Regexp the value must match, or a [preset name](#format-presets): `:email`, `:uuid`, `:url`, `:slug`, `:hostname` |
 | `length:` | ✅¹ | ✅ | — | `Range` or `Integer`. Character count on strings, **element count** on arrays, where it short-circuits — see [the field DSL](#the-field-dsl) |
 | `normalize:` | ✅¹ | — | — | `:squish`, `:strip`, `:downcase`, `:upcase`, `:email`, or a Proc. Runs **first** — before the absence rule, so a value that normalizes to `""` is absent |
-| `default:` | ✅ | ✅ | — | Value used when the field is absent. Validated against the field's own contract at class load, then stored normalized, cast (`default: "18"` on an `:integer` is `18`) and frozen (each request gets its own deep copy) |
+| `default:` | ✅ | ✅ | — | Value used when the field is absent. Validated against the field's own contract at class load, then stored as a request sending it would read it — normalized, cast (`default: "18"` on an `:integer` is `18`), an array walked at every depth — but never passed through `transform:`; frozen, and each request gets its own deep copy |
 | `validate:` | ✅ | ✅ | — | Callable. Falsy fails as `"invalid"`; a returned `Symbol` becomes the violation code |
 | `transform:` | ✅ | ✅ | — | Callable applied **after** cast and validation — see [output reshaping](#output-reshaping-transform-and-finalize) |
 | `virtual:` | ✅ | ✅ | ✅ | Exempt this field from the schema-drift guard |
@@ -583,7 +583,7 @@ This is the safe replacement for params-mutating `before_action`s. **Both layers
 required :tags, :string, transform: ->(v) { v.split(",") }
 ```
 
-It runs only on request-supplied values. Absent fields stay absent, `default:` values are authored in their final shape, and a **partially-invalid array is never transformed** — user code is never handed garbage it didn't agree to see.
+It runs only on request-supplied values. Absent fields stay absent, a `default:` is handed out normalized and cast but **not** transformed (a request that sends the default's value gets it transformed, one that omits the field does not — so author a default in the shape the action should receive), and a **partially-invalid array is never transformed** — user code is never handed garbage it didn't agree to see.
 
 **`finalize` — per contract.** Declared once, at the top level only. It runs after every field has validated cleanly, receives the result hash, and must return the final `Hash`. Use it to combine parallel fields, build value objects, or drop scaffolding keys.
 
