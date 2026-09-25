@@ -918,6 +918,31 @@ It reads the contract, not the runtime mode. In enforce mode an undeclared key n
 
 `for_action` picks the rule exactly like a request would (`permit_rule_for`), and may be omitted only when the controller declares a single contract — an ambiguous expectation raises instead of silently checking the wrong rule. Failure messages name what the contract actually declares.
 
+#### Asserting on behaviour, not just the declaration
+
+`permit_param` checks what a contract **says**. `accept_params` / `reject_params` check what it **does** — still without dispatching a request:
+
+```ruby
+expect(described_class).to accept_params(user: { name: "Jo", email: "a@b.co", age: "30" })
+  .for_action(:create)
+  .returning("name" => "Jo", "email" => "a@b.co", "age" => 30, "plan" => "free")
+
+expect(described_class).to reject_params(user: { name: "Jo", email: "nope" })
+  .for_action(:create).with_violation("user.email", :format)
+```
+
+`returning` asserts the **cast, defaulted, transformed** output — the part `permit_param` can't reach, since it only reads the declaration. `with_violation` is repeatable and its code is optional.
+
+Failure messages name what actually happened:
+
+```
+expected UsersController to accept those params, but it rejected them: user.email (missing)
+expected UsersController to reject those params, but it accepted them, returning {"name"=>"Jo", "email"=>"a@b.co"}
+expected UsersController to reject those params with user.age (inclusion), but the violations were: user.name (missing), user.email (missing)
+```
+
+Both work on a controller class, a controller instance, or a [standalone `Contract`](#standalone-contracts-no-controller), and both read the **contract** rather than the rollout mode — a [monitor-mode](#monitor-mode-roll-out-without-rejecting) rule still `reject_params`, because the question is what the contract says, not what the deploy currently does with it.
+
 ### Standalone contracts (no controller)
 
 The same DSL, callable on any Hash — webhook payloads, job arguments, service-object inputs, CSV rows:
@@ -1071,7 +1096,7 @@ A `format:` regexp that does not translate to ECMA-262 is looser in the same way
 | `Permittable::Generator` | Contract drafting (`.draft`, `.for_controller`, `.scan`) — see [generating draft contracts](#generating-draft-contracts-permittablegenerate) |
 | `Permittable::Audit` | Coverage across the route set (`.entries`, `.summary`, `.stale`, `.format`) — see [auditing coverage](#auditing-coverage-permittableaudit) |
 | `Permittable::Contract` | [Standalone contracts](#standalone-contracts-no-controller) (`.define`, `#call`, `#call!`, `#json_schema`, `#rule`) |
-| `Permittable::Matchers` | RSpec matchers via `require "permittable/rspec"` — see [testing contracts](#testing-contracts-rspec-matchers) |
+| `Permittable::Matchers` | RSpec matchers via `require "permittable/rspec"` — `permit_param` for the declaration, `accept_params`/`reject_params` for the behaviour. See [testing contracts](#testing-contracts-rspec-matchers) |
 
 ### Errors caught at class load
 
