@@ -205,6 +205,110 @@
             "$ref": "#/components/responses/PermittableUnprocessableEntity"
           }
         }
+      },
+      "put": {
+        "operationId": "users_update_put",
+        "description": "Create or update a user",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "user": {
+                    "type": "object",
+                    "properties": {
+                      "name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 80,
+                        "description": "Display name"
+                      },
+                      "email": {
+                        "type": "string",
+                        "minLength": 1,
+                        "pattern": "^[^@\\s]+@[^@\\s]+$",
+                        "examples": [
+                          "jo@example.com"
+                        ]
+                      },
+                      "age": {
+                        "type": "integer",
+                        "minimum": 18,
+                        "maximum": 120
+                      },
+                      "ssn": {
+                        "type": "string",
+                        "writeOnly": true,
+                        "x-permittable-sensitive": true
+                      },
+                      "plan": {
+                        "type": "string",
+                        "enum": [
+                          "free",
+                          "pro"
+                        ],
+                        "default": "free"
+                      },
+                      "tag_names": {
+                        "type": "array",
+                        "minItems": 0,
+                        "maxItems": 10,
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "address": {
+                        "type": "object",
+                        "properties": {
+                          "city": {
+                            "type": "string",
+                            "minLength": 1
+                          },
+                          "zip": {
+                            "type": "string",
+                            "pattern": "^\\d{5}$"
+                          }
+                        },
+                        "required": [
+                          "city"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "required": [
+                      "name",
+                      "email"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "user"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "400": {
+            "$ref": "#/components/responses/PermittableBadRequest"
+          },
+          "422": {
+            "$ref": "#/components/responses/PermittableUnprocessableEntity"
+          }
+        }
       }
     }
   },
