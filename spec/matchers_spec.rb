@@ -173,7 +173,7 @@ RSpec.describe "Permittable RSpec matchers" do
 
     it "refuses a negated qualifier instead of passing on a field it does permit" do
       expect { expect(with_admin).not_to permit_param(:admin).for_action(:create).required }
-        .to raise_error(ArgumentError, /here: required.*ambiguous.*`to permit_param\(:admin\)\.optional`/m)
+        .to raise_error(ArgumentError, /here: required.*ambiguous.*`to permit_param\(:admin\)\.for_action\(:create\)\.optional`/m)
       expect { expect(with_admin).not_to permit_param(:admin).for_action(:create).as(:string) }
         .to raise_error(ArgumentError, /here: as :string.*ambiguous/m)
     end
@@ -208,10 +208,69 @@ RSpec.describe "Permittable RSpec matchers" do
       expect(message).to include("declares no contracts")
     end
 
+    it "resolves the subject before refusing qualifiers, so a wrong subject is reported first" do
+      expect { expect(Class.new).not_to permit_param(:admin).required }
+        .to raise_error(ArgumentError, /include Permittable/)
+    end
+
+    it "fails for a key under an opaque :json field, which lets any nested key through" do
+      opaque = Class.new(FakeController) do
+        include Permittable
+
+        permit_params(:create, root: :user) do
+          optional :meta, :json
+          optional :settings do
+            optional :prefs, :json
+          end
+        end
+      end
+      message = failure_of { expect(opaque).not_to permit_param("meta.admin") }
+      expect(message).to include(%(not to permit "meta.admin"))
+      expect(message).to include("opaque :json field :meta")
+      expect(failure_of { expect(opaque).not_to permit_param("settings.prefs.admin") })
+        .to include(%(opaque :json field "settings.prefs"))
+      expect(failure_of { expect(opaque).not_to permit_param("user.meta.admin") })
+        .to include(%(relative to root: :user, so write permit_param("meta.admin")))
+    end
+
+    it "fails for a root-prefixed path, naming the path relative to root:" do
+      message = failure_of { expect(controller).not_to permit_param("user.email").for_action(:create) }
+      expect(message).to include("relative to root: :user")
+      expect(message).to include("permit_param(:email)")
+      expect(failure_of { expect(controller).not_to permit_param("user.address.zip").for_action(:create) })
+        .to include(%(permit_param("address.zip")))
+    end
+
     it "still passes for an undeclared field on a resolved rule, and fails for a declared one" do
       expect(with_admin).not_to permit_param(:owner).for_action(:create)
       expect(failure_of { expect(with_admin).not_to permit_param(:admin).for_action(:create) })
         .to include("but the contract declares it")
+    end
+  end
+
+  it "passes for a key under an opaque :json field, but will not check qualifiers it cannot see" do
+    opaque = Class.new(FakeController) do
+      include Permittable
+
+      permit_params(:create) { optional :meta, :json }
+    end
+    expect(opaque).to permit_param("meta.admin")
+    expect(failure_of { expect(opaque).to permit_param("meta.admin").as(:string) })
+      .to include("inside the opaque :json field :meta, which declares nothing about its keys")
+  end
+
+  it "fails a root-prefixed path with a hint, instead of listing what is declared" do
+    message = failure_of { expect(controller).to permit_param("user.email").for_action(:create) }
+    expect(message).to include("paths are relative to root: :user")
+    expect(message).to include("permit_param(:email)")
+  end
+
+  it "rejects an empty or malformed dotted path with an ArgumentError" do
+    ["", "a.", ".a", "a..b"].each do |path|
+      expect { expect(controller).to permit_param(path).for_action(:create) }
+        .to raise_error(ArgumentError, /\APermittable: .*#{Regexp.escape(path.inspect)}/)
+      expect { expect(controller).not_to permit_param(path).for_action(:create) }
+        .to raise_error(ArgumentError, /\APermittable: /)
     end
   end
 

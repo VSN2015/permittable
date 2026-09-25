@@ -14,11 +14,13 @@ module Permittable
   #   expect(UsersController).to permit_param("address.zip").as(:string).optional
   #   expect(UsersController).not_to permit_param(:admin).for_action(:create)
   #
-  # The negated form takes no qualifiers: `not_to permit_param(:admin)
-  # .required` would pass both when :admin is undeclared and when it is
-  # declared optional, which is a false positive in exactly the assertion
-  # most likely to guard a security property. It raises instead, and
-  # names the positive form to write.
+  # The negated form asserts that the contract does not declare the param,
+  # and takes no qualifiers: `not_to permit_param(:admin).required` would
+  # pass both when :admin is undeclared and when it is declared optional,
+  # which is a false positive in exactly the assertion most likely to guard
+  # a security property. It raises instead, and names the positive form to
+  # write. It reads the contract, not the runtime mode: a rule in monitor
+  # mode passes undeclared keys through to the action regardless.
   #
   # `for_action` picks the rule exactly like a request would
   # (`permit_rule_for`); it may be omitted only when the controller declares
@@ -34,6 +36,7 @@ module Permittable
 
       def initialize(path)
         @path = path.to_s
+        @segments = path_segments!(@path)
         @action = nil
         @expected = {}
         @mismatches = []
@@ -106,54 +109,49 @@ module Permittable
 
       def matches?(subject)
         @subject = resolve_subject(subject)
-        rule = resolve_rule(@subject)
-        return false unless rule
-
-        @field = resolve_field(rule[:fields], @path.split("."))
-        return false unless @field
-
-        @mismatches = collect_mismatches(@field)
+        case locate
+        when :declared then @mismatches = collect_mismatches(@field)
+        when :opaque then @mismatches = @expected.empty? ? [] : [opaque_qualifier_mismatch]
+        else return false
+        end
         @mismatches.empty?
       end
 
-      def failure_message
-        return "expected #{subject_name} to permit #{path_label}#{action_label}, but it #{@problem}" if @problem
-
-        if @field.nil?
-          declared = (@missing_among || []).map { |f| f[:name] }.join(", ")
-          return "expected #{subject_name} to permit #{path_label}#{action_label}, " \
-                 "but it is not declared (declared: #{declared})"
-        end
-
-        "expected #{subject_name} to permit #{path_label}#{action_label}, but:\n  #{@mismatches.join("\n  ")}"
-      end
-
-      # Negation is only unambiguous without qualifiers ("not permitted at
-      # all"), and only meaningful against a rule that exists: a mistyped
-      # `for_action(:craete)` resolves to no rule, which permits nothing, so
-      # a lenient not_to would pass for any param whatsoever.
+      # Negation is only unambiguous without qualifiers ("not declared"),
+      # and only meaningful against a rule that exists: a mistyped
+      # `for_action(:craete)` resolves to no rule, which declares nothing, so
+      # a lenient not_to would pass for any param whatsoever. The subject is
+      # resolved first so a wrong subject is the error reported.
       def does_not_match?(subject) # rubocop:disable Naming/PredicatePrefix -- the RSpec protocol name
+        @subject = resolve_subject(subject)
         raise ArgumentError, negated_qualifier_message unless @expected.empty?
 
-        @subject = resolve_subject(subject)
-        rule = resolve_rule(@subject)
-        return false unless rule
+        locate == :undeclared
+      end
 
-        @field = resolve_field(rule[:fields], @path.split("."))
-        @field.nil?
+      def failure_message
+        subject = "expected #{subject_name} to permit #{path_label}#{action_label}, but"
+        case @status
+        when :no_rule then "#{subject} it #{@problem}"
+        when :root_prefixed then "#{subject} #{root_prefix_hint}"
+        when :undeclared
+          "#{subject} it is not declared (declared: #{(@missing_among || []).map { |f| f[:name] }.join(', ')})"
+        else "#{subject}:\n  #{@mismatches.join("\n  ")}"
+        end
       end
 
       def failure_message_when_negated
-        if @problem
-          return "expected #{subject_name} not to permit #{path_label}#{action_label}, but it #{@problem}, " \
-                 "so there is no rule to check the param against"
+        subject = "expected #{subject_name} not to permit #{path_label}#{action_label}, but"
+        case @status
+        when :no_rule then "#{subject} it #{@problem}, so there is no rule to check the param against"
+        when :opaque
+          "#{subject} it is inside the opaque :json field #{label_for(@opaque_path)}, which lets any nested key through"
+        when :root_prefixed then "#{subject} #{root_prefix_hint} — which the contract lets through"
+        else "#{subject} the contract declares it"
         end
-
-        "expected #{subject_name} not to permit #{path_label}#{action_label}, but the contract declares it"
       end
 
       def description
-        descriptors = @expected.filter_map { |key, value| describe_check(key, value) }
         label = "permit #{path_label}"
         label += " (for ##{@action})" if @action
         label += " #{descriptors.join(', ')}" unless descriptors.empty?
@@ -174,6 +172,23 @@ module Permittable
         return subject.class if subject.class.respond_to?(:permit_rule_for)
 
         raise ArgumentError, "#{LABEL}: the subject of permit_param must include Permittable (got #{subject.inspect})"
+      end
+
+      # The one lookup both directions share. Sets @status to :no_rule,
+      # :declared, :opaque (the path runs into a :json field, which accepts
+      # any nested key without declaring it), :root_prefixed (the path
+      # starts with the rule's root: and resolves without it), or
+      # :undeclared.
+      def locate
+        @rule = resolve_rule(@subject)
+        return @status = :no_rule unless @rule
+
+        @field = resolve_field(@rule[:fields], @segments)
+        @status = if @field then :declared
+                  elsif @opaque_path then :opaque
+                  elsif root_prefixed? then :root_prefixed
+                  else :undeclared
+                  end
       end
 
       def resolve_rule(subject)
@@ -199,17 +214,57 @@ module Permittable
       end
 
       # Walks a dotted path through nested blocks and array-of-hash blocks
-      # alike, since both carry their sub-fields under :fields.
-      def resolve_field(fields, segments)
-        name = segments.first.to_sym
+      # alike, since both carry their sub-fields under :fields. A :json
+      # field is opaque: it has no :fields, yet lets any nested key through,
+      # so a path running past one is recorded rather than called missing.
+      def resolve_field(fields, segments, depth = 0)
+        name = segments[depth].to_sym
         field = fields.find { |f| f[:name] == name }
         if field.nil?
           @missing_among = fields
           return nil
         end
-        return field if segments.length == 1
+        return field if depth == segments.length - 1
 
-        resolve_field(field[:fields] || [], segments.drop(1))
+        if field[:kind] == :json
+          @opaque_path = segments.take(depth + 1).join(".")
+          return nil
+        end
+
+        resolve_field(field[:fields] || [], segments, depth + 1)
+      end
+
+      # Paths are relative to root:, so "user.email" under `root: :user`
+      # names params[:user][:user][:email]. When dropping the prefix would
+      # resolve (to a declared field, or into an opaque :json one), that is
+      # almost certainly what was meant — and silently passing a negated
+      # expectation on it would be a false pass.
+      def root_prefixed?
+        root = @rule[:root]
+        return false unless root && @segments.length > 1 && @segments.first == root.to_s
+
+        missing_among = @missing_among
+        found = resolve_field(@rule[:fields], @segments.drop(1)) || @opaque_path
+        @missing_among = missing_among
+        @opaque_path = nil
+        !found.nil?
+      end
+
+      def root_prefix_hint
+        "paths are relative to root: :#{@rule[:root]}, so write permit_param(#{label_for(@segments.drop(1).join('.'))})"
+      end
+
+      def opaque_qualifier_mismatch
+        "it is inside the opaque :json field #{label_for(@opaque_path)}, which declares nothing about its keys — " \
+          "assert qualifiers on #{label_for(@opaque_path)} itself"
+      end
+
+      def path_segments!(path)
+        segments = path.split(".", -1)
+        return segments unless segments.empty? || segments.any?(&:empty?)
+
+        raise ArgumentError, "#{LABEL}: permit_param needs a param name or a dotted path like " \
+                             "\"address.zip\" (got #{path.inspect})"
       end
 
       def collect_mismatches(field)
@@ -281,12 +336,11 @@ module Permittable
       end
 
       def negated_qualifier_message
-        qualifiers = @expected.filter_map { |key, value| describe_check(key, value) }.join(", ")
-        "#{LABEL}: `not_to permit_param(#{path_label})` cannot take qualifiers (here: #{qualifiers}) — " \
-          "negating one is ambiguous, since it would pass both when #{path_label} is not permitted and " \
-          "when it is permitted but declared differently. Assert what the contract does declare with " \
+        "#{LABEL}: `not_to #{call_label}` cannot take qualifiers (here: #{descriptors.join(', ')}) — " \
+          "negating one is ambiguous, since it would pass both when #{path_label} is not declared and " \
+          "when it is declared differently. Assert what the contract does declare with " \
           "the positive form, e.g. #{positive_example}, or drop the qualifiers to assert that " \
-          "#{path_label} is not permitted at all."
+          "#{path_label} is not declared at all."
       end
 
       # required/optional is the one qualifier with an obvious opposite;
@@ -294,10 +348,18 @@ module Permittable
       # read, so the example stays generic rather than guessing it.
       def positive_example
         case @expected
-        when { required: true } then "`to permit_param(#{path_label}).optional`"
-        when { required: false } then "`to permit_param(#{path_label}).required`"
-        else "`to permit_param(#{path_label})` chained with the qualifiers it should have"
+        when { required: true } then "`to #{call_label}.optional`"
+        when { required: false } then "`to #{call_label}.required`"
+        else "`to #{call_label}` chained with the qualifiers it should have"
         end
+      end
+
+      def call_label
+        "permit_param(#{path_label})#{".for_action(:#{@action})" if @action}"
+      end
+
+      def descriptors
+        @expected.filter_map { |key, value| describe_check(key, value) }
       end
 
       def describe_check(key, value)
@@ -316,7 +378,11 @@ module Permittable
       end
 
       def path_label
-        @path.include?(".") ? @path.inspect : ":#{@path}"
+        label_for(@path)
+      end
+
+      def label_for(path)
+        path.include?(".") ? path.inspect : ":#{path}"
       end
 
       def action_label
