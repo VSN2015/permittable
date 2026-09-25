@@ -652,7 +652,17 @@ When enabled it compares **groups**, not exact types, so it fires on a genuine c
 
 Any column type **not** in that table — `json`, `jsonb`, `binary`, an adapter's own `inet` or `money` — is never checked. A contract has no faithful type for those, so whatever you improvised is left alone rather than guessed about.
 
-**A Rails `enum` is compared by what clients send, not what the column stores.** An enum is submitted by name — `status: "shipped"` — so `optional :status, :string, in: Order.statuses.keys` is the right contract for an integer-backed enum, and a text declaration on any attribute in the model's `defined_enums` passes. Other declarations are still held to the column's own group: `:integer` on an integer-backed enum passes, `:datetime` does not. The attribute API is **not** treated the same way: `attribute :starts_at, :datetime` over a string column is still compared against the string column, because the guard reads the schema and cannot tell a deliberate override from drift. Declare such a field to match its column, or leave the check off.
+**A Rails `enum` is compared by what clients send, not what the column stores.** An enum is submitted by name — `status: "shipped"` — so `optional :status, :string, in: Order.statuses.keys` is the right contract for an integer-backed enum, and a text declaration on any attribute in the model's `defined_enums` is not held to the column's group. It **must** carry that `in:`, though: assignment raises `ArgumentError` for a value the enum does not map, so without one `status: "bogus"` would pass the contract and become a 500 in the action. A text declaration with no `in:`, or with an `in:` listing anything the enum would refuse, fails at class load:
+
+```
+Permittable: 'status' is an enum on Order, declared :string without an in: (table: orders).
+A value outside the enum would pass the contract and then raise on assignment.
+Declare it with in: Order.statuses.keys.
+```
+
+The `in:` may list names and, for a string-backed enum, stored values, since assignment accepts both. It must be a list: a Range is refused because it cannot be checked. String-backed enums follow the same rule. Other declarations are still held to the column's own group: `:integer` on an integer-backed enum passes, and `:datetime` fails with a suggestion of the enum contract rather than `virtual: true`.
+
+The attribute API is **not** treated the same way, by choice. `attribute :starts_at, :datetime` over a string column is still compared against the string column. An enum's mapping says exactly which strings are valid, so the exemption can demand a matching `in:`. An attribute override gives the guard nothing comparable to check the contract against, so exempting it would only switch the check off for that field. Declare such a field to match its column, or leave the check off.
 
 
 - **Fields not backed by a column** — `password_confirmation`, terms checkboxes, search filters — opt out with `virtual: true`.

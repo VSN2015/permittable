@@ -2014,6 +2014,7 @@ RSpec.describe Permittable do
             t.json     :payload
             t.binary   :blob
             t.integer  :status
+            t.string   :tier
           end
         end
       end
@@ -2079,32 +2080,89 @@ RSpec.describe Permittable do
           expect(&declaring(typed) { optional :blob, :string }).not_to raise_error
         end
 
-        context "with a Rails enum over an integer column" do
+        context "with a Rails enum" do
           # `enum` is spelled positionally from Rails 7.0 and by keyword before
           # it; the keyword form is gone in 8.0, and the matrix covers both.
-          let(:enum_model) do
-            Class.new(TestModel) do
-              self.table_name = "typed_things"
-              if ActiveRecord.version >= Gem::Version.new("7.0")
-                enum :status, { pending: 0, shipped: 1 }
-              else
-                enum status: { pending: 0, shipped: 1 }
-              end
+          def self.define_enum(klass, name, mapping)
+            if ActiveRecord.version >= Gem::Version.new("7.0")
+              klass.enum name, mapping
+            else
+              klass.enum name => mapping
             end
           end
 
-          it "accepts the :string declaration an enum is actually submitted as" do
+          # Named, because the error messages name the model.
+          let(:enum_model) do
+            group = self.class
+            stub_const("EnumThing", Class.new(TestModel) do
+              self.table_name = "typed_things"
+              group.define_enum(self, :status, { pending: 0, shipped: 1 })
+              group.define_enum(self, :tier, { free: "f", pro: "p" })
+              # An enum over a declared attribute, with no column behind it.
+              attribute :ghost, :integer
+              group.define_enum(self, :ghost, { boo: 0 })
+            end)
+          end
+
+          # A `model:` is duck-typed on column_names, so the guard must not
+          # assume the rest of ActiveRecord is there.
+          def duck_model(columns, enums: nil)
+            Class.new do
+              define_singleton_method(:table_name) { "ducks" }
+              define_singleton_method(:table_exists?) { true }
+              define_singleton_method(:column_names) { columns.keys.map(&:to_s) }
+              define_singleton_method(:columns_hash) do
+                columns.to_h { |name, type| [name.to_s, Struct.new(:type).new(type)] }
+              end
+              define_singleton_method(:defined_enums) { enums } if enums
+            end
+          end
+
+          it "accepts the :string declaration an enum is submitted as, listing its names" do
             m = enum_model
             expect(&declaring(m) { optional :status, :string, in: m.statuses.keys }).not_to raise_error
+            expect(&declaring(m) { optional :status, :string, in: %w[pending] }).not_to raise_error
+          end
+
+          it "requires the in: — without it, an unknown name would pass and then raise on assignment" do
+            expect(&declaring(enum_model) { optional :status, :string }).to raise_error(ArgumentError) do |e|
+              expect(e.message).to match(/'status' is an enum on EnumThing/)
+              expect(e.message).to include("in: EnumThing.statuses.keys")
+              expect(e.message).not_to match(/virtual: true/)
+            end
+          end
+
+          it "rejects an in: listing anything the enum would refuse, naming it" do
+            m = enum_model
+            expect(&declaring(m) { optional :status, :string, in: %w[pending bogus] })
+              .to raise_error(ArgumentError, /"bogus"/)
+            # An integer-backed enum's stored values are not names it accepts
+            # as strings: `status: "0"` raises on assignment.
+            expect(&declaring(m) { optional :status, :string, in: %w[0 1] })
+              .to raise_error(ArgumentError, /"0", "1"/)
+            expect(&declaring(m) { optional :status, :string, in: "a".."z" })
+              .to raise_error(ArgumentError, /in: EnumThing.statuses.keys/)
+          end
+
+          it "holds a string-backed enum to the same rule, accepting its stored values too" do
+            m = enum_model
+            # Assignment accepts a mapped value as well as a name, and a
+            # string-backed enum's values arrive as strings.
+            expect(&declaring(m) { optional :tier, :string, in: %w[free p] }).not_to raise_error
+            expect(&declaring(m) { optional :tier, :string })
+              .to raise_error(ArgumentError, /in: EnumThing.tiers.keys/)
           end
 
           it "still accepts the column's own group" do
             expect(&declaring(enum_model) { optional :status, :integer }).not_to raise_error
           end
 
-          it "still catches a declaration that is neither text nor the column's group" do
-            expect(&declaring(enum_model) { optional :status, :datetime })
-              .to raise_error(ArgumentError, /'status' is declared :datetime but the column is :integer/)
+          it "still catches any other type, suggesting the enum contract rather than virtual: true" do
+            expect(&declaring(enum_model) { optional :status, :datetime }).to raise_error(ArgumentError) do |e|
+              expect(e.message).to match(/'status' is declared :datetime but the column is :integer/)
+              expect(e.message).to include(":string, in: EnumThing.statuses.keys")
+              expect(e.message).not_to match(/virtual: true/)
+            end
           end
 
           it "leaves the same column without an enum checked as before" do
@@ -2112,9 +2170,26 @@ RSpec.describe Permittable do
               .to raise_error(ArgumentError, /'status' is declared :string but the column is :integer/)
           end
 
-          it "does not loosen the existence check" do
-            expect(&declaring(enum_model) { optional :statuses, :string })
-              .to raise_error(ArgumentError, /'statuses' does not exist/)
+          it "does not loosen the existence check for an enum with no column" do
+            m = enum_model
+            expect(&declaring(m) { optional :ghost, :string, in: m.ghosts.keys })
+              .to raise_error(ArgumentError, /'ghost' does not exist in the database/)
+          end
+
+          it "is not consulted with the check off" do
+            Permittable.check_column_types = false
+            expect(&declaring(enum_model) { optional :status, :string }).not_to raise_error
+          end
+
+          it "treats a duck-typed model with no defined_enums as having none" do
+            expect(&declaring(duck_model({ count: :integer })) { optional :count, :string })
+              .to raise_error(ArgumentError, /'count' is declared :string but the column is :integer/)
+          end
+
+          it "spells the suggestion through defined_enums when the name is not a method" do
+            duck = duck_model({ 'two-step': :integer }, enums: { "two-step" => { "on" => 1 } })
+            expect(&declaring(duck) { optional :'two-step', :string })
+              .to raise_error(ArgumentError, /in: .*\.defined_enums\["two-step"\]\.keys/)
           end
         end
 
