@@ -807,6 +807,7 @@ legacy/invoices
   POST   /legacy/invoices                   create       no contract — ACCEPTS A BODY
 orders
   POST   /orders                            create       enforce
+  DELETE /orders/{id}                       destroy      no contract — action not found
   PUT    /orders/{id}                       update       no contract — ACCEPTS A BODY
 users
   GET    /users                             index        no contract
@@ -814,11 +815,11 @@ users
   DELETE /users/{id}                        destroy      monitor
   PATCH  /users/{id}                        update       enforce  model: User  unknown: error
 
-7 routed actions: 3 enforced, 1 in monitor mode, 3 without a contract
+8 routed actions: 3 enforced, 1 in monitor mode, 3 without a contract, 1 not found (Rails 404s it)
   2 of those accept a request body — untrusted input reaches the action unchecked
   2 covered actions declare no model:, so no schema-drift guard runs for them
 
-Contracts declared for actions no route reaches (renamed or deleted?):
+Contracts declared for actions no route reaches or Rails would 404 (renamed or deleted?):
   users#archive
 ```
 
@@ -826,7 +827,20 @@ Three things it tells you that nothing else does:
 
 - **Which write actions are unguarded.** A `GET` without a contract is usually fine; a `POST` without one is untrusted input reaching the action unchecked. That count is the number `[strict]` fails on, which makes the task a CI gate: *no new unguarded write endpoint*.
 - **Which contracts aren't enforcing yet.** The audit runs inside the app, so unlike the exported OpenAPI it resolves the **effective** mode — a rule's own `mode:` first, then your app-wide `Permittable.mode`. This is the [monitor-mode](#monitor-mode-roll-out-without-rejecting) rollout dashboard.
-- **Which contracts have gone stale.** A contract declared for an action no route reaches is a renamed or deleted action that left its contract behind.
+- **Which contracts have gone stale.** A contract declared for an action no route reaches, or for a routed action Rails would 404, is a renamed or deleted action that left its contract behind.
+
+A route that lists several verbs is audited once per verb. A `match ... via: :all` route is expanded into exactly GET, POST, PUT, PATCH and DELETE, and listed once for each. `resources` routes all seven actions whether or not they exist. A route that Rails would 404 reads `action not found`: no method (inherited ones count), no `action_missing`, and no template to render implicitly. It is not counted against `[strict]` or as coverage. It stays in the table rather than disappearing. The template check uses the class-level view paths and the default lookup details. So a template that is only found at request time reads `action not found`, for example one behind a `prepend_view_path` in a `before_action`, or one that exists only as a variant.
+
+A catch-all 404 route (`match "*path", to: "application#not_found", via: :all`) shows its POST, PUT and PATCH rows as accepting a body. They do accept one: every stray body reaches the controller. Route only GET to the controller (Rails answers HEAD from it). Send the other verbs to a plain Rack endpoint, which never parses the body and which the audit does not list:
+
+```ruby
+match "*path", to: "application#not_found", via: :get
+match "*path", to: ->(_env) { [404, { "content-type" => "text/plain" }, ["Not Found"]] }, via: :all
+```
+
+A `config.exceptions_app = routes` setup (`match "/404", to: "errors#not_found", via: :all`) shows the same rows. It needs only `via: :get`, because on 6.1 and later `ShowExceptions` re-dispatches the error request as a GET.
+
+Under `[strict]` the task aborts on these rows, so the only choices today are to route the catch-all GET-only, as above, or to run the audit without `[strict]` until the ignore list ([#69](https://github.com/VSN2015/permittable/issues/69)) lands. Don't declare a contract on the catch-all to silence the gate. Under monitor mode it validates eagerly, so a malformed JSON POST answers 400 instead of 404. The OpenAPI export would also gain a fake `/{path}` endpoint.
 
 The table lists a row for every verb on every path; the summary counts routes. A route with an optional segment, such as anything under `scope "(:locale)"`, lists each path it expands to (`/users` and `/{locale}/users`), but it is one route, so one unguarded `POST` counts once and the summary line says `N routed actions in M rows`. Rows are collapsed by controller, action, route index and verb; the index is a position within one `rails_routes` call, so audit concatenated route lists (an app's and an engine's) separately, or give them distinct `route:` values. Two separate routes to the same action (`post "/users"` and `post "/admin/users"`) count as two, because each one is a way in.
 

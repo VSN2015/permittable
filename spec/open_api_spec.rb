@@ -423,8 +423,8 @@ RSpec.describe Permittable::OpenAPI do
         [
           journey_route.new({ controller: "users", action: "show" }, "GET", journey_path.new("/users/:id(.:format)")),
           journey_route.new({ controller: "users", action: "create" }, "POST", journey_path.new("/users(.:format)")),
-          journey_route.new({}, "GET", journey_path.new("/rails/info")),                        # internal — skipped
-          journey_route.new({ controller: "x", action: "y" }, "", journey_path.new("/mounted")) # no verb — skipped
+          journey_route.new({}, "GET", journey_path.new("/rails/info")), # internal — skipped
+          journey_route.new({}, "", journey_path.new("/sidekiq")) # mounted engine — skipped
         ]
       )
       app = Struct.new(:routes).new(route_set)
@@ -449,6 +449,22 @@ RSpec.describe Permittable::OpenAPI do
           { controller: "users", action: "update", verb: "patch", path: "/users/{id}", route: 0 },
           { controller: "users", action: "update", verb: "put", path: "/users/{id}", route: 0 }
         ]
+      )
+    end
+
+    it "expands a via: :all route into every verb it answers, instead of dropping it" do
+      # `match "hooks", to: "webhooks#receive", via: :all` has an EMPTY verb.
+      # Skipping it hid a body-accepting action from the audit entirely.
+      journey_route = Struct.new(:requirements, :verb, :path)
+      journey_path = Struct.new(:spec)
+      route_set = Struct.new(:routes).new(
+        [journey_route.new({ controller: "webhooks", action: "receive" }, "", journey_path.new("/hooks(.:format)"))]
+      )
+      app = Struct.new(:routes).new(route_set)
+      expect(described_class.rails_routes(app)).to eq(
+        %w[get post put patch delete].map do |verb|
+          { controller: "webhooks", action: "receive", verb: verb, path: "/hooks", route: 0 }
+        end
       )
     end
 

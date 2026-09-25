@@ -361,6 +361,10 @@ module Permittable
       end
     end
 
+    # What a `via: :all` route answers, in the "|"-joined form Journey uses
+    # for a route with several verbs.
+    ALL_VERBS = "GET|POST|PUT|PATCH|DELETE".freeze
+
     # { controller:, action:, verb:, path: } descriptors from a Rails
     # application's route set. Duck-typed against Journey routes (each one
     # responds to requirements / verb / path.spec) so it stays unit-testable
@@ -382,7 +386,12 @@ module Permittable
       descriptors = app.routes.routes.each_with_index.flat_map do |route, index|
         requirements = route.requirements
         verb = route.verb.to_s
-        next [] if requirements[:controller].nil? || requirements[:action].nil? || verb.empty?
+        next [] if requirements[:controller].nil? || requirements[:action].nil?
+
+        # `match ..., via: :all` leaves the verb EMPTY rather than listing
+        # them, and skipping it hid an action that takes POST bodies from the
+        # audit entirely. Expand it into the verbs it actually answers.
+        verb = ALL_VERBS if verb.empty?
 
         path = route.path.spec.to_s.sub("(.:format)", "").gsub(/[:*](\w+)/) { "{#{Regexp.last_match(1)}}" }
         # One route can answer several verbs (`match via: [:patch, :put]`, and
