@@ -96,6 +96,12 @@ RSpec.describe Permittable::Contract do
       )
     end
 
+    it "does not exempt path-parameter or wrapper-key names either — standalone input has no request" do
+      c = described_class.define(unknown: :error) { optional :name, :string }
+      result = c.call(name: "x", id: "1", user: { name: "x" })
+      expect(result.violations).to contain_exactly({ param: "id", code: "unknown" }, { param: "user", code: "unknown" })
+    end
+
     # The documented promise. A webhook payload has no Rails params builder in
     # front of it, so it reaches the contract with whatever a client sent —
     # malformed UTF-8 and non-finite Floats included.
