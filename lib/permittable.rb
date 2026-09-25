@@ -241,6 +241,49 @@ module Permittable
   # ...and each name it does list is truncated. Capping the COUNT alone still
   # let ONE 1 MB key name write the 1 MB log line the cap exists to prevent.
   PROSE_ITEM_LIMIT = 120
+  # ...and a name that could break the sentence out of its line is escaped.
+  # The names are client-sent, and bounding their length escaped nothing: a
+  # key of "x\nE, [...] ERROR -- : ..." wrote a second, forged log entry.
+  # The set is, by Unicode property:
+  # - every control character (Cc: C0, DEL and C1 — C1 because U+0085 is
+  #   NEL, a line break to many readers, and U+009B is the 8-bit CSI that
+  #   starts a terminal escape);
+  # - U+2028/U+2029 (Zl, Zp), the separators a JSON-lines or JavaScript
+  #   reader splits a line on;
+  # - every format character (Cf): the bidi embeddings, overrides and
+  #   isolates, which can visually reorder a line and so move text across
+  #   the closing quote of an escaped name, and the zero-width and marker
+  #   characters (U+200B, U+200E/U+200F, U+061C, U+FEFF, ...), which make
+  #   two different names print identically;
+  # - every space but U+0020 (Zs), so a no-break or ideographic space
+  #   cannot make "x,<NBSP>y" pass for the ", " between two names.
+  PROSE_UNSAFE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Zs}&&[^ ]]/
+  # A name is also quoted when it merely LOOKS like prose structure. These
+  # characters print as they are — only the quoting marks them:
+  # - Unicode's own Quotation_Mark property, rather than a hand-picked list:
+  #   it already covers the plain and fullwidth `"`, every curly quote and
+  #   guillemet (Pi/Pf), AND the CJK corner brackets U+300C/U+300D, which
+  #   are real quotation marks in Japanese and Chinese text but are punctuation
+  #   category Ps/Pe, not Pi/Pf, so a Pi/Pf-only check missed them;
+  # - the list separator, or a fullwidth, small, ideographic or small-form-
+  #   ideographic comma (the last, U+FE51, is U+3001's small-form sibling,
+  #   the way U+FE50 is the plain comma's), could pass for the ", " between
+  #   two names;
+  # - a name that begins "and N more" (matched case-insensitively — "And"/
+  #   "AND" reads identically once rendered) could pass for the overflow
+  #   count. This still only catches the literal word: a homoglyph
+  #   substitution such as Cyrillic "а" for Latin "a" is not detected, and
+  #   no Unicode confusable-detection is attempted here — see CHANGELOG.
+  PROSE_AMBIGUOUS = /\p{Quotation_Mark}|[\u{FF0C}\u{FE50}\u{3001}\u{FE51}]|, |\A(?i:and \p{Nd}+ more)/
+  # \n, \r and \t, which a person recognises, get their short escape; any
+  # other unsafe character is \uXXXX, which JSON, JavaScript and Ruby all
+  # read the same way. The quote and backslash are escaped too, but only
+  # inside an escaped (quoted) name, where they would otherwise be ambiguous.
+  PROSE_ESCAPES = { "\n" => '\n', "\r" => '\r', "\t" => '\t', '"' => '\"', "\\" => '\\\\' }.freeze
+  # How much of a name the prose ever reads. Every character the rendering
+  # could show lies inside it even when each one is a 4-byte sequence in a
+  # binary key, so a 1 MB name is converted and scanned no further than this.
+  PROSE_SCAN_LIMIT = PROSE_ITEM_LIMIT * 4
 
   # The single proc Permittable::Railtie appends to config.filter_parameters.
   # Declared with an optional third parameter so its own arity is -3 and Rails
@@ -513,9 +556,22 @@ module Permittable
     def check_scalar_rules(field, value)
       return [:error, "length"] if field[:length] && !length_ok?(field[:length], value.length)
       return [:error, "inclusion"] if field[:in] && !included_in?(field[:in], value)
-      return [:error, "format"] if field[:format] && !field[:format].match?(value)
+      return [:error, "format"] if field[:format] && !format_match?(field[:format], value)
 
       check_custom(field[:validate], value)
+    end
+
+    # A Regexp RAISES rather than answers when a String's encoding cannot meet
+    # it — a UTF-8 pattern with non-ASCII characters against UTF-16,
+    # Shift_JIS or binary bytes (Encoding::CompatibilityError). A value the
+    # pattern cannot even be applied to has not been shown to match, so it is
+    # a `format` violation, the answer the client can act on. An app that
+    # takes other encodings on purpose (`skip_parameter_encoding`) sees what
+    # it saw before this rule, except that the crash is now a 422.
+    def format_match?(pattern, value)
+      pattern.match?(value)
+    rescue EncodingError, ArgumentError
+      false
     end
 
     # Free-form hash. The shape is deliberately undeclared, so the only
@@ -567,8 +623,76 @@ module Permittable
 
     def cast(type, value)
       return [:error, "invalid_type"] unless scalar_shaped?(value)
+      return public_send("cast_#{type}", value) unless value.is_a?(String)
+      # Bytes that are not valid in the String's OWN encoding are not text in
+      # any encoding: every String operation after the cast raises on them
+      # (`format:`, the normalize presets, an app's `validate:`). Rails'
+      # params builder guards a controller; a standalone Contract#call on a
+      # webhook payload has nothing in front of it, so `"caf\xC3"` was a 500.
+      return [:error, "invalid_type"] unless value.valid_encoding?
+      # A :string is handed back exactly as it arrived, in its own encoding.
+      # `skip_parameter_encoding` / `param_encoding` send a controller binary
+      # or Shift_JIS text ON PURPOSE, and converting it would hand the app
+      # something other than what it asked Rails for.
+      return cast_string(value) if type == :string
 
-      public_send("cast_#{type}", value)
+      # A UTF-8 String IS already its own inspection copy — the check just
+      # above already scanned it — so utf8_text would only scan the same
+      # object a second time for no new answer. Every other encoding still
+      # goes through it: a US-ASCII or binary String is a NEW object once
+      # force_encoding'd, and one only `encode` could produce is not yet
+      # known to be valid UTF-8 at all.
+      text = value.encoding == Encoding::UTF_8 ? value : utf8_text(value)
+      text ? public_send("cast_#{type}", text) : [:error, "invalid_type"]
+    end
+
+    # Encodings whose bytes are READ as UTF-8 rather than converted: UTF-8
+    # itself, US-ASCII (a subset of it), and binary — which names no
+    # encoding at all, and is how a raw socket read or an unlabelled file
+    # hands a payload over.
+    UTF8_READABLE = [Encoding::UTF_8, Encoding::US_ASCII, Encoding::BINARY].freeze
+
+    # A UTF-8 copy of a String, for INSPECTION only — the text a number, a
+    # boolean or a date is parsed from — or nil when there is no UTF-8
+    # reading of it. The value handed back to the app is never this copy.
+    #
+    # Parsing the String itself went wrong for any encoding but UTF-8:
+    # `Integer()` on UTF-16 "12" raised Encoding::CompatibilityError, and
+    # `BigDecimal` read the same String byte by byte and returned 1 — a wrong
+    # answer where the other at least crashed.
+    #
+    # Binary and US-ASCII are read as UTF-8 (on a copy — the caller's String
+    # keeps its encoding), anything else is converted with `encode`, and a
+    # result that is not valid UTF-8, or a conversion that raises, is nil.
+    def utf8_text(value)
+      text = if value.encoding == Encoding::UTF_8 then value
+             elsif UTF8_READABLE.include?(value.encoding) then value.dup.force_encoding(Encoding::UTF_8)
+             else value.encode(Encoding::UTF_8)
+             end
+      text.valid_encoding? ? text : nil
+    rescue EncodingError
+      nil
+    end
+
+    # utf8_text for text the gem must REPORT rather than judge — a client's
+    # undeclared key, written into a violation's `param`, the exception
+    # message and the log line. Refusing is not an option there, so what
+    # cannot be read is replaced with U+FFFD. Otherwise the undeclared key
+    # "caf\xC3" was copied raw into the 422 and rendering it raised
+    # JSON::GeneratorError, and a UTF-16 key raised
+    # Encoding::CompatibilityError while its path was being interpolated.
+    # Only undeclared keys come here (see permittable_unknown_key_violation):
+    # a declared key is the contract's own UTF-8 name.
+    def reportable_text(value)
+      utf8_text(value) || scrubbed_text(value)
+    end
+
+    def scrubbed_text(value)
+      return value.dup.force_encoding(Encoding::UTF_8).scrub if UTF8_READABLE.include?(value.encoding)
+
+      value.encode(Encoding::UTF_8, invalid: :replace, undef: :replace)
+    rescue EncodingError
+      value.dup.force_encoding(Encoding::UTF_8).scrub
     end
 
     # Arrays, hashes, and nested ActionController::Parameters
@@ -602,7 +726,10 @@ module Permittable
     def cast_integer(value)
       case value
       when Integer then [:ok, value]
-      when Float then value == value.truncate ? [:ok, value.to_i] : [:error, "invalid_type"]
+      # NaN and Infinity first: `truncate` raises FloatDomainError on them (a
+      # RangeError, which the ArgumentError rescue below does not catch), and
+      # no integer is what either one sent. Same rule as finite_float.
+      when Float then value.finite? && value == value.truncate ? [:ok, value.to_i] : [:error, "invalid_type"]
       when String then [:ok, Integer(value, 10)]
       else [:error, "invalid_type"]
       end
@@ -729,10 +856,37 @@ module Permittable
 
     # Presets only make sense on String input; a non-String value (JSON
     # numbers, booleans) skips normalization and goes straight to the cast.
+    #
+    # A String that is not valid in its own encoding is left as it came, for
+    # the cast to refuse: every preset raises on invalid bytes, and an app's
+    # own proc would be handed input it never agreed to see. It is not empty,
+    # so the absence rule in between cannot mistake it for a missing value.
+    #
+    # A VALID String in another encoding is normalized in that encoding —
+    # `:strip` works on binary and Shift_JIS alike — and when a BUILT-IN
+    # PRESET cannot handle the encoding (`:squish` on UTF-16 raises
+    # Encoding::CompatibilityError) the value is left as it is rather than
+    # raising.
+    #
+    # That leniency is only for the gem's own presets, identified by object
+    # identity against NORMALIZERS' values (resolve_normalizer! replaces
+    # field[:normalize] with the exact Proc from that Hash, so a preset and
+    # an app-supplied Proc are never the same object). An app's own Proc
+    # raising is never swallowed, on ANY encoding: `normalize: ->(v) { raise
+    # ArgumentError, "..." if ... }` is a business rule, not an encoding
+    # failure, and treating its raise as "this encoding defeated the
+    # normalizer" would have let exactly the input a UTF-8 request could not
+    # bypass the very check it names.
     def apply_normalize(normalizer, value)
       return value unless normalizer && value.is_a?(String)
+      return value unless value.valid_encoding?
+      return normalizer.call(value) unless NORMALIZERS.value?(normalizer)
 
-      normalizer.call(value)
+      begin
+        normalizer.call(value)
+      rescue EncodingError, ArgumentError
+        value
+      end
     end
 
     # nil and "" are both ABSENT — see the module comment. The VALUE half of
@@ -741,6 +895,109 @@ module Permittable
     # to a different reading of absence than the request it stands in for.
     def absent_value?(value)
       value.nil? || (value.is_a?(String) && value.empty?)
+    end
+
+    # An `in:` list as the runtime holds it: every member cast by the field's
+    # own type, because included_in? compares the CAST request value against
+    # it. Comparing against the members as authored meant `in: %i[draft
+    # published]` on a :string field (and `in: %w[1 2 3]` on an :integer one)
+    # held values no cast could ever produce, and rejected every request.
+    #
+    # `normalize:` is deliberately not applied — it rewrites what a client
+    # sent, not what the contract author wrote. Duplicates the cast collapses
+    # ("1" and 1 on an :integer) are dropped, and a Set stays a Set, so an
+    # author who chose one for its O(1) include? keeps it. A nil member is
+    # dropped on a nullable field, where an explicit null is accepted before
+    # in: is ever consulted; anywhere else it is a member no value can equal,
+    # and is an error like any other.
+    #
+    # `members` is what in_list returned. Returns [:ok, cast, published] —
+    # `published` being what an exported enum lists, see published_in_member
+    # — or [:error, offending_member, code]. Shared by ContractBuilder and the
+    # RSpec matcher's `within` chain so the two cannot read a list differently.
+    def cast_in_members(type, members, nullable: false)
+      pairs = []
+      members.each do |member|
+        next if member.nil? && nullable
+
+        status, value = cast_in_member(type, member)
+        return [:error, member, value] unless status == :ok
+
+        pairs << [value, published_in_member(type, member, value)]
+      end
+      pairs = pairs.uniq(&:first)
+      cast_members = pairs.map(&:first)
+      [:ok, members.is_a?(Set) ? cast_members.to_set : cast_members, pairs.map(&:last)]
+    end
+
+    # The members of an `in:` that is a LIST, or nil when it is not one.
+    # Only Array, Set, Hash and Enumerator count, and only when the object's
+    # OWN class provides the collection's ordinary include? — not a Hash,
+    # Array or Set SUBCLASS overriding it (a case-insensitive allowlist, a
+    # fuzzy Set, a registry matching some other way entirely). `case allowed;
+    # when Hash ...` matches with ===, which for a Class is is_a?, so a
+    # subclass would otherwise match its ancestor's branch and have its
+    # override silently discarded — read for its raw keys/elements instead,
+    # which can invert which values it actually accepts. It is left opaque
+    # instead, exactly like any other object whose include? is the point
+    # (see resolve_in!) and enumerating it may be expensive (a DB-backed
+    # registry).
+    #
+    # A Hash lists its KEYS, which is what Hash#include? asks about — the
+    # Rails enum idiom, `in: Post.statuses` — and, like a Set, is stored as a
+    # Set, so membership stays O(1) per request.
+    # ActiveSupport::HashWithIndifferentAccess is the one Hash subclass
+    # accepted anyway: its include? override only canonicalises the argument
+    # (String/Symbol) before the SAME key lookup, so its keys are still
+    # exactly its members — and it is what a Rails enum's own reader
+    # (`Post.statuses`) actually returns.
+    # Enumerator::Lazy is the same story on the Enumerator side: Lazy
+    # overrides chain methods like map and select, but not include?, so it
+    # is still read as a list — and forced to an Array here, once, since
+    # left lazy it would be cast on every request instead of at class load.
+    def in_list(allowed)
+      case allowed
+      when Hash then allowed.keys.to_set if plain_hash?(allowed)
+      when Set then allowed if allowed.instance_of?(Set)
+      when Array then allowed.to_a if allowed.instance_of?(Array)
+      when Enumerator then allowed.to_a if allowed.method(:include?).owner == Enumerable
+      end
+    end
+
+    def plain_hash?(allowed)
+      allowed.instance_of?(Hash) || allowed.instance_of?(ActiveSupport::HashWithIndifferentAccess)
+    end
+
+    # A Symbol is read as its String: it is how Ruby spells a constant
+    # string, and a request never carries one, so no cast accepts it as is.
+    def cast_in_member(type, member)
+      member = member.to_s if member.is_a?(Symbol)
+      return instant_as_date(member) if type == :date && (member.is_a?(Time) || member.is_a?(DateTime))
+
+      cast(type, member)
+    end
+
+    # A Time or DateTime member of a :date field. ActiveSupport compares one
+    # with a Date as INSTANTS, the Date standing for its midnight UTC, so
+    # that instant is the only one that ever equalled a request's date. It
+    # is read as that UTC date; any other instant never matched anything,
+    # and is refused like any member no request could equal. (cast_date
+    # would keep a DateTime whole — it IS a Date — and refuse a Time.)
+    def instant_as_date(member)
+      utc = member.to_time.getutc
+      return [:error, "not midnight UTC, so it never equals a date"] unless utc == utc.beginning_of_day
+
+      [:ok, utc.to_date]
+    end
+
+    # What an exported enum lists for one member: the cast value, re-encoded
+    # as JSON — except a :date/:datetime member authored as a String, which
+    # is published AS WRITTEN. Re-encoding a cast Time prints whole seconds,
+    # so "2026-09-05T10:00:00.25Z" was published as "…10:00:00Z", a value
+    # the server refuses. The authored String went through the very cast a
+    # request does, so the server accepts it by construction.
+    def published_in_member(type, member, value)
+      member.is_a?(String) && %i[date datetime].include?(type) ? member : value
     end
 
     # Range#include? walks discrete ranges; cover? is the O(1) bounds check
@@ -765,6 +1022,13 @@ module Permittable
                      nullable].freeze
     ARRAY_OPTS  = %i[of length default validate virtual sensitive required transform message desc example
                      nullable].freeze
+
+    # One value of each scalar type as a cast produces it, for asking whether
+    # an `in:` Range's endpoints can be compared with that type at all.
+    RANGE_PROBES = {
+      string: "", integer: 0, float: 0.0, decimal: BigDecimal("0"), boolean: true,
+      date: Date.new(2000, 1, 1), datetime: Time.utc(2000)
+    }.freeze
 
     attr_reader :finalizer
 
@@ -928,14 +1192,7 @@ module Permittable
         raise ArgumentError, "#{LABEL}: field :#{name} is required and cannot have a :default (default implies optional)"
       end
 
-      if field.key?(:in)
-        unless field[:in].respond_to?(:include?)
-          raise ArgumentError, "#{LABEL}: :in for field :#{name} must respond to include? (Range or Array)"
-        end
-
-        assert_satisfiable!(name, :in, field[:in])
-      end
-
+      resolve_in!(field) if field.key?(:in)
       validate_string_only_opts!(field)
       validate_length!(name, field[:length]) if field.key?(:length)
       validate_required_length!(field)
@@ -946,6 +1203,96 @@ module Permittable
       validate_authored_value!(field, :default)
       validate_authored_value!(field, :example)
       validate_message!(field)
+    end
+
+    # `in:` is a Range (bounds-checked with cover?), a list of values, or an
+    # object of the host's own that answers include? — kept exactly as given,
+    # since nothing here can know what it accepts. It used to be anything
+    # answering include?, which let a String through, and String#include? is
+    # a SUBSTRING test: `in: "free pro"` accepted "e", "fr" and "ee p". A
+    # String is refused here, along with anything answering neither.
+    #
+    # A list (see Coercion.in_list — a Hash lists its keys) is stored cast by
+    # the field's type (see Coercion.cast_in_members), so request-time
+    # matching, the exported enum, the RSpec matcher and the column guard's
+    # enum rule all read the members the runtime compares against. A member
+    # no request value could ever equal is a contract mistake, and fails here
+    # rather than as an `inclusion` on every request.
+    def resolve_in!(field)
+      name = field[:name]
+      allowed = field[:in]
+      if allowed.is_a?(Range)
+        assert_comparable_range!(field, allowed)
+      elsif (members = Coercion.in_list(allowed))
+        cast_in_members!(field, members)
+      elsif allowed.is_a?(String) || !allowed.respond_to?(:include?)
+        raise ArgumentError, "#{LABEL}: :in for field :#{name} must be a Range, a list of values (an Array, Set, " \
+                             "or a Hash read as its keys), or an object answering include? " \
+                             "(got #{allowed.inspect})#{string_in_hint(allowed)}"
+      end
+      assert_satisfiable!(name, :in, field[:in])
+    end
+
+    def string_in_hint(allowed)
+      return "" unless allowed.is_a?(String)
+
+      " — String#include? would accept any substring; list the values instead, e.g. in: %w[#{allowed}]"
+    end
+
+    # `published` is stored only where it differs from the cast members (a
+    # String-authored :date/:datetime member), so it is read as an override.
+    def cast_in_members!(field, members)
+      status, cast, published = Coercion.cast_in_members(field[:type], members, nullable: field[:nullable])
+      unless status == :ok
+        # cast is the offending member here, and published its error code.
+        # nil is the one member written on purpose, meaning "null is allowed"
+        # — but an absent value never reaches in:, so the fix is worth naming.
+        hint = cast.nil? ? " — an absent value never reaches in:; declare nullable: true to accept an explicit null" : ""
+        raise ArgumentError, "#{LABEL}: :in for field :#{field[:name]} contains #{cast.inspect}, " \
+                             "which is not a valid :#{field[:type]} (#{published})#{hint}"
+      end
+
+      field[:in] = freeze_in_members(cast)
+      field[:in_published] = freeze_authored(published) unless published == cast.to_a
+    end
+
+    def freeze_in_members(members)
+      members.is_a?(Set) ? members.to_set { |member| freeze_authored(member) }.freeze : freeze_authored(members)
+    end
+
+    # A Range is kept exactly as written, unlike a list: casting its
+    # endpoints would change what it means. `0..Float::INFINITY` on a :float
+    # and `1.5..3` on an :integer are real bounds whose endpoints no cast
+    # accepts, and a :decimal's `0..100` would become BigDecimal endpoints
+    # that export as the STRING "0.0" where `minimum` needs a number.
+    #
+    # What does fail every request is an endpoint the cast value cannot be
+    # compared with — `"1".."5"` on an :integer, `1..5` on a :string,
+    # `.."9.99"` on a :decimal. cover? then answers false for every value, so
+    # that is caught here. The probe asks exactly what cover? will — begin
+    # <=> value, then value <=> end — so whatever the host's own <=> allows
+    # (ActiveSupport lets a Date range bound a :datetime) is allowed here too.
+    def assert_comparable_range!(field, range)
+      probe = RANGE_PROBES.fetch(field[:type])
+      # A NaN endpoint compares to nothing, by design, whatever it stands
+      # beside — not evidence of a wrong-TYPED bound (a String range on an
+      # :integer), which is what this check exists to catch. It is left
+      # alone here exactly as an infinite endpoint already is (INFINITY
+      # compares fine); the exporter separately omits it, since it is
+      # never `finite?`.
+      # Wrapped in an Array so a `false` endpoint still reads as found.
+      stray = if !range.begin.nil? && !nan?(range.begin) && (range.begin <=> probe).nil? then [range.begin]
+              elsif !range.end.nil? && !nan?(range.end) && (probe <=> range.end).nil? then [range.end]
+              end
+      return unless stray
+
+      raise ArgumentError, "#{LABEL}: :in for field :#{field[:name]} is a Range of #{stray.first.class} " \
+                           "(#{range.inspect}), which a :#{field[:type]} value cannot be compared with — " \
+                           "no value could satisfy it; write the bounds as :#{field[:type]} values"
+    end
+
+    def nan?(value)
+      value.respond_to?(:nan?) && value.nan?
     end
 
     def validate_json_opts!(field)
@@ -1542,25 +1889,121 @@ module Permittable
   end
 
   def permittable_violation_summary(violations)
+    # The param is the client-controlled part; the message (or code) is the
+    # developer's, so it is handed over separately and never escaped — a
+    # YAML `|` message ending in "\n" must not quote every name it follows.
+    #
+    # An unknown-key violation's `param:` is already reportable_text — valid
+    # UTF-8, but scrubbed to U+FFFD wherever the key wasn't. That is right
+    # for `details`/instrumentation (a machine reads it and only needs it not
+    # to crash `to_json`), but prose can do better: permittable_prose_utf8
+    # keeps a legacy byte transcodable and an invalid one visible as \xNN
+    # rather than replacing it, so prose reads the RAW key when one was
+    # saved (see permittable_unknown_key_violation), and falls back to the
+    # param for any other violation.
     permittable_prose_list(violations) do |v|
-      v[:message] ? "#{v[:param]} #{v[:message]}" : "#{v[:param]} (#{v[:code]})"
+      name = @permittable_unknown_key_raw&.[](v) || v[:param].to_s
+      [name, v[:message] ? " #{v[:message]}" : " (#{v[:code]})"]
     end
   end
 
   # See PROSE_LIST_LIMIT. `unknown: :error` on a request carrying 50,000
   # undeclared keys used to produce a 50,000-item sentence — a megabyte of
   # log line, or of exception message handed to every error tracker.
-  # The block formats one item, and is called only for the items actually
-  # shown — the rest are counted, never rendered.
+  # The block returns one item's name, or [name, suffix], and is called
+  # only for the items actually shown — the rest are counted, never rendered.
   def permittable_prose_list(items)
-    shown = items.first(PROSE_LIST_LIMIT).map { |item| permittable_prose_item(yield(item)) }.join(", ")
+    shown = items.first(PROSE_LIST_LIMIT).map { |item| permittable_prose_item(*yield(item)) }.join(", ")
     return shown if items.length <= PROSE_LIST_LIMIT
 
     "#{shown}, and #{items.length - PROSE_LIST_LIMIT} more"
   end
 
-  def permittable_prose_item(item)
-    item.length <= PROSE_ITEM_LIMIT ? item : "#{item[0, PROSE_ITEM_LIMIT - 3]}..."
+  # See PROSE_ITEM_LIMIT, PROSE_UNSAFE and PROSE_AMBIGUOUS. The item is the
+  # name plus the suffix, truncated as one. Only a name that needs it is
+  # quoted and escaped, judged by the part of it the truncated item would
+  # SHOW — a control character past the cut is not printed, so it quotes
+  # nothing. Every ordinary name therefore prints exactly as before, just
+  # always as UTF-8: a Windows-1252 or binary key is converted rather than
+  # written raw, and names of mixed encodings can be joined.
+  def permittable_prose_item(name, suffix = "")
+    text = permittable_prose_utf8(name[0, PROSE_SCAN_LIMIT])
+    suffix = permittable_prose_utf8(suffix)
+    more = !name[PROSE_SCAN_LIMIT].nil?
+    fits = !more && text.length + suffix.length <= PROSE_ITEM_LIMIT
+    shown = fits ? text : text[0, PROSE_ITEM_LIMIT - 3]
+    if !shown.valid_encoding? || shown.match?(PROSE_UNSAFE) || shown.match?(PROSE_AMBIGUOUS)
+      return permittable_prose_quoted(text, more, suffix)
+    end
+
+    fits ? "#{text}#{suffix}" : "#{"#{text}#{suffix}"[0, PROSE_ITEM_LIMIT - 3]}..."
+  end
+
+  # The name is truncated by whole escapes, never through one: cutting the
+  # escaped text at a fixed width could print a dangling backslash, or half
+  # of an escape. When the name itself is cut, the "..." goes outside the
+  # closing quote, so the quotes still delimit exactly what is shown. A
+  # quoted name that fits the limit on its own is never cut: the suffix is
+  # cut instead, to whatever room is left — possibly none — and the "..."
+  # that marks it may then run up to three characters past the limit. A
+  # dropped developer suffix is better flagged than hidden, and the name is
+  # the part a reader is there for. Only as many characters are escaped as
+  # can be shown.
+  def permittable_prose_quoted(text, more, suffix)
+    budget = PROSE_ITEM_LIMIT - 2 # the two quotes
+    pieces = []
+    length = 0
+    text.each_char do |char|
+      pieces << permittable_prose_escape(char)
+      length += pieces.last.length
+      break if length > budget
+    end
+    if !more && length <= budget
+      quoted = "\"#{pieces.join}\""
+      return "#{quoted}#{suffix}" if quoted.length + suffix.length <= PROSE_ITEM_LIMIT
+
+      return "#{quoted}#{suffix[0, [PROSE_ITEM_LIMIT - 3 - quoted.length, 0].max]}..."
+    end
+
+    length -= pieces.pop.length while length > budget - 3
+    "\"#{pieces.join}\"..."
+  end
+
+  # A byte that is not valid UTF-8 is shown as \xNN rather than passed
+  # through: it is not a character a person can read, and a lone 0x85 or
+  # 0x9B is NEL or CSI to a Latin-1 terminal. A character beyond the BMP
+  # (the Cf tag characters) is \u{XXXXX}, since \uXXXX holds only four digits.
+  def permittable_prose_escape(char)
+    return char.bytes.map { |byte| format('\x%02X', byte) }.join unless char.valid_encoding?
+
+    PROSE_ESCAPES.fetch(char) do
+      next char unless char.match?(PROSE_UNSAFE)
+
+      char.ord > 0xFFFF ? format('\u{%X}', char.ord) : format('\u%04X', char.ord)
+    end
+  end
+
+  # PROSE_UNSAFE is a UTF-8 pattern, and matching it against a binary key
+  # with high bytes raises Encoding::CompatibilityError — a log line must
+  # never be what fails a request. A binary key has no charset to convert
+  # from, and Rack hands UTF-8 bytes over as binary, so it is read as UTF-8.
+  # A key in a real encoding is transcoded character by character: what
+  # maps is converted, and only a byte that does not (Windows-1252 leaves
+  # 0x81, 0x8D, 0x8F, 0x90 and 0x9D undefined) is kept as an invalid byte,
+  # which the escaper then shows as \xNN — rather than reading the whole
+  # key as UTF-8, which turned a mappable é into \xE9 and mojibake into
+  # characters the client never sent.
+  def permittable_prose_utf8(item)
+    return item if item.encoding == Encoding::UTF_8
+    return item.dup.force_encoding(Encoding::UTF_8) if item.encoding == Encoding::BINARY || item.ascii_only?
+
+    converter = Encoding::Converter.new(item.encoding, Encoding::UTF_8)
+    source = item.dup
+    out = String.new(encoding: Encoding::UTF_8)
+    out << converter.primitive_errinfo[3].force_encoding(Encoding::UTF_8) until converter.primitive_convert(source, out) == :finished
+    out
+  rescue EncodingError # no converter, as for a dummy encoding such as UTF-7
+    item.dup.force_encoding(Encoding::UTF_8)
   end
 
   # One violation detail entry. A field's `message:` (String, or Hash keyed
@@ -1719,7 +2162,27 @@ module Permittable
     out = value.each_with_index.map do |element, index|
       permittable_check_element(field, element, "#{path}[#{index}]", unknown: unknown, violations: violations)
     end
-    if field[:validate]
+    # validate: and transform: see only a fully-valid array. A partially-nil
+    # one (element violations) would hand user code garbage it never agreed
+    # to see — and for validate: that was a crash, not just garbage:
+    # `validate: ->(a) { a.sum < 100 }` sent `["x", 2]` raised TypeError on
+    # the nil where "x" failed to cast, turning the element's 422 into a 500.
+    #
+    # The cost is real and accepted: the whole-array verdict is no longer
+    # reported ALONGSIDE element violations. `[1, "x", 1]` against a
+    # uniqueness validator reports only `ids[1]`; the client fixes it,
+    # resends, and only then learns of the duplicate. Running app code over
+    # nils it never agreed to handle is the worse failure.
+    #
+    # An undeclared key inside an element (`unknown: :error`) is not such a
+    # violation: it removes nothing from the element validate: sees, so it
+    # does not stop validate: from running.
+    #
+    # transform: is stricter, as on the scalar path: it runs only when
+    # NOTHING violated, validate: included — a transform may rely on what
+    # validate: checked (`Math.sqrt` after "all positive").
+    elements_valid = violations.drop(before).all? { |v| permittable_unknown_key_violation?(v) }
+    if field[:validate] && elements_valid
       status, code = Coercion.check_custom(field[:validate], out)
       violations << permittable_violation(field, path, code) unless status == :ok
     end
@@ -1812,9 +2275,9 @@ module Permittable
     return if extra.empty?
 
     if unknown == :error
-      extra.each { |key| violations << permittable_violation({}, permittable_path(path, key), "unknown") }
+      extra.each { |key| violations << permittable_unknown_key_violation(path, key) }
     elsif respond_to?(:logger) && logger
-      listed = permittable_prose_list(extra) { |key| permittable_path(path, key) }
+      listed = permittable_prose_list(extra) { |key| permittable_path(path, permittable_prose_utf8(key)) }
       logger.warn("#{LABEL}: unknown parameter(s) ignored by the ##{permittable_action_name} contract: #{listed}")
     end
   end
@@ -1859,6 +2322,30 @@ module Permittable
 
   def permittable_path(path, key)
     path ? "#{path}.#{key}" : key
+  end
+
+  # The one place a CLIENT's key enters a path, so the only one converted to
+  # reportable UTF-8 (see Coercion.reportable_text) — every declared key a
+  # request walks through is the contract's own name and is left alone.
+  #
+  # The entry is also remembered by identity, which is how
+  # permittable_check_array tells an undeclared key from a sub-field that
+  # failed. The code alone cannot: a sub-field's validate: may itself
+  # return :unknown.
+  def permittable_unknown_key_violation(path, key)
+    entry = permittable_violation({}, permittable_path(path, Coercion.reportable_text(key)), "unknown")
+    (@permittable_unknown_key_violations ||= {}.compare_by_identity)[entry] = true
+    # Prose (the exception message) gets the richer transcoding instead of
+    # `param:`'s scrubbed-to-U+FFFD text — see permittable_violation_summary.
+    # permittable_prose_utf8, not Coercion.reportable_text, is what keeps the
+    # concatenation with `path` (the contract's own UTF-8 field names) from
+    # raising Encoding::CompatibilityError, the same as the :log line below.
+    (@permittable_unknown_key_raw ||= {}.compare_by_identity)[entry] = permittable_path(path, permittable_prose_utf8(key))
+    entry
+  end
+
+  def permittable_unknown_key_violation?(entry)
+    @permittable_unknown_key_violations&.key?(entry) || false
   end
 
   def permittable_action_name

@@ -95,9 +95,218 @@ RSpec.describe Permittable do
       end
     end
 
-    it "rejects :in that does not respond to include?" do
+    it "rejects an :in that answers neither cover? nor include?" do
       expect { permittable_class { permit_params(:create) { required :a, :integer, in: 5 } } }
-        .to raise_error(ArgumentError, /:in for field :a must respond to include\?/)
+        .to raise_error(ArgumentError, /:in for field :a must be a Range, a list of values .*\(got 5\)/)
+    end
+
+    # String#include? is a substring test: in: "free pro" accepted "e", "fr"
+    # and "ee p" as plans.
+    it "rejects a String :in, which would have matched any substring" do
+      expect { permittable_class { permit_params(:create) { optional :plan, :string, in: "free pro" } } }
+        .to raise_error(ArgumentError, /:in for field :plan must be a Range, a list of values .*\(got "free pro"\).*substring/)
+    end
+
+    # The Rails enum idiom: `in: Post.statuses` is a HashWithIndifferentAccess
+    # of name => stored value, and Hash#include? asks about its keys.
+    it "reads a Hash :in as its keys, cast like any list" do
+      statuses = ActiveSupport::HashWithIndifferentAccess.new(draft: 0, published: 1)
+      decl = proc do
+        permit_params(:create) do
+          optional :status, :string, in: statuses
+          optional :tier,   :string, in: { free: "f", pro: "p" }
+        end
+      end
+      expect(permit({ status: "published", tier: "pro" }, &decl).to_h).to eq("status" => "published", "tier" => "pro")
+      expect(violations_for({ status: "0", tier: "f" }, &decl).details)
+        .to eq([{ param: "status", code: "inclusion" }, { param: "tier", code: "inclusion" }])
+      # A Set, so membership stays O(1) per request as Hash#include? was.
+      ins = permittable_class(&decl).permit_rule_for(:create)[:fields].map { |f| f[:in] }
+      expect(ins).to eq([Set["draft", "published"], Set["free", "pro"]])
+      expect(ins).to all(be_frozen)
+    end
+
+    it "keeps an :in that only answers include? exactly as given, uncast" do
+      allowlist = Object.new
+      def allowlist.include?(value) = value.to_s.start_with?("sku-")
+      decl = proc { permit_params(:create) { optional :sku, :string, in: allowlist } }
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in]).to be(allowlist)
+      expect(permit({ sku: "sku-1" }, &decl)[:sku]).to eq("sku-1")
+      expect(violations_for({ sku: "abc" }, &decl).details).to eq([{ param: "sku", code: "inclusion" }])
+    end
+
+    # Only Array, Set, Hash and Enumerator are lists. An app's own Enumerable
+    # with its own include? — a case-insensitive allowlist, a DB-backed
+    # registry — is used as given: never enumerated at class load, never
+    # replaced by an exact-match copy.
+    it "keeps an app's own Enumerable that defines include? as given, never enumerating it" do
+      plans = Class.new do
+        include Enumerable
+
+        def each = raise("enumerated at class load")
+        def include?(value) = %w[free pro].include?(value.to_s.downcase)
+      end.new
+      decl = proc { permit_params(:create) { optional :plan, :string, in: plans } }
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in]).to be(plans)
+      expect(permit({ plan: "PRO" }, &decl)[:plan]).to eq("PRO")
+      expect(violations_for({ plan: "gold" }, &decl).details).to eq([{ param: "plan", code: "inclusion" }])
+    end
+
+    # A Hash/Array/Set SUBCLASS overriding include? is the same story as the
+    # Enumerable above, by CLASS rather than by module: `case allowed; when
+    # Hash ...` matches with ===, which for a Class is is_a? — so a subclass
+    # matched the branch for its ancestor and had its override silently
+    # discarded, reading its raw contents (keys, elements) instead and
+    # inverting which values it actually accepts. Each is kept exactly as
+    # given, like any other object whose include? is the point.
+    it "keeps a Hash subclass's own include?, not its keys, when the override differs from Hash's" do
+      registry = Class.new(Hash) do
+        def include?(value) = value.to_s.start_with?("custom-")
+      end.new
+      registry[:unrelated] = 1
+      decl = proc { permit_params(:create) { optional :sku, :string, in: registry } }
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in]).to be(registry)
+      expect(permit({ sku: "custom-1" }, &decl)[:sku]).to eq("custom-1")
+      expect(violations_for({ sku: "unrelated" }, &decl).details).to eq([{ param: "sku", code: "inclusion" }])
+    end
+
+    it "keeps an Array subclass's own include?, not its elements" do
+      allowlist = Class.new(Array) do
+        def include?(value) = any? { |candidate| candidate.to_s.casecmp?(value.to_s) }
+      end.new(%w[free pro])
+      decl = proc { permit_params(:create) { optional :plan, :string, in: allowlist } }
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in]).to be(allowlist)
+      expect(permit({ plan: "PRO" }, &decl)[:plan]).to eq("PRO")
+      expect(violations_for({ plan: "gold" }, &decl).details).to eq([{ param: "plan", code: "inclusion" }])
+    end
+
+    it "keeps a Set subclass's own include?, not its elements" do
+      fuzzy = Class.new(Set) do
+        def include?(value) = any? { |candidate| candidate.to_s.include?(value.to_s) }
+      end.new(%w[free pro])
+      decl = proc { permit_params(:create) { optional :plan, :string, in: fuzzy } }
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in]).to be(fuzzy)
+      expect(permit({ plan: "p" }, &decl)[:plan]).to eq("p")
+      expect(violations_for({ plan: "gold" }, &decl).details).to eq([{ param: "plan", code: "inclusion" }])
+    end
+
+    # A plain Hash's keys are still cast to a Set for O(1) membership, and
+    # HashWithIndifferentAccess — a Hash SUBCLASS — is the one deliberate
+    # exception to the rule above: its include? override only canonicalises
+    # the argument (String/Symbol) before the same key lookup, so its keys
+    # are still exactly its members. It is what a Rails enum's own reader
+    # (`Post.statuses`) actually returns.
+    it "still reads a plain Hash and a HashWithIndifferentAccess as their keys" do
+      decl = proc do
+        permit_params(:create) do
+          optional :status, :string, in: { draft: 0, published: 1 }
+          optional :tier, :string, in: ActiveSupport::HashWithIndifferentAccess.new(free: "f", pro: "p")
+        end
+      end
+      fields = permittable_class(&decl).permit_rule_for(:create)[:fields]
+      expect(fields.map { |f| f[:in] }).to eq([Set["draft", "published"], Set["free", "pro"]])
+    end
+
+    # The approved snapshot: a list is cast once, so a later `PLANS << "gold"`
+    # is not seen. An app that needs a live list passes its own include?
+    # object, which is read on every request.
+    it "snapshots an Array :in at class load" do
+      plans = %w[free pro]
+      klass = permittable_class { permit_params(:create) { optional :plan, :string, in: plans } }
+      plans << "gold"
+      e = klass.new(params: { plan: "gold" })
+      e.define_singleton_method(:action_name) { "create" }
+      expect(e.permittable_violations).to eq([{ param: "plan", code: "inclusion" }])
+    end
+
+    # A lazy list left lazy was cast per request, and the cast's early return
+    # escaped its block there as a LocalJumpError — a 500.
+    it "forces a lazy :in to a list once, at class load" do
+      decl = proc { permit_params(:create) { optional :n, :integer, in: %w[1 2 3].lazy.map(&:itself) } }
+      field = permittable_class(&decl).permit_rule_for(:create)[:fields].first
+      expect(field[:in]).to eq([1, 2, 3]).and be_frozen
+      expect(permit({ n: "2" }, &decl)[:n]).to eq(2)
+      expect(violations_for({ n: "4" }, &decl).details).to eq([{ param: "n", code: "inclusion" }])
+      expect { permittable_class { permit_params(:create) { optional :n, :integer, in: %w[1 x].lazy.map(&:itself) } } }
+        .to raise_error(ArgumentError, /:in for field :n contains "x"/)
+    end
+
+    # ActiveSupport compares a Time (or DateTime) with a Date as instants,
+    # the Date standing for its midnight UTC — so that instant was the only
+    # one that ever matched. It is read as that UTC date; any other instant
+    # never matched a request, and fails like any never-matching member.
+    it "reads a Time or DateTime member of a :date field as its date only at midnight UTC" do
+      decl = proc do
+        permit_params(:create) do
+          optional :day, :date, in: [Time.utc(2026, 9, 5), DateTime.new(2026, 9, 6, 5, 0, 0, "+05:00")]
+        end
+      end
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in])
+        .to eq([Date.new(2026, 9, 5), Date.new(2026, 9, 6)])
+      expect(permit({ day: "2026-09-05" }, &decl)[:day]).to eq(Date.new(2026, 9, 5))
+      expect(permit({ day: "2026-09-06" }, &decl)[:day]).to eq(Date.new(2026, 9, 6))
+
+      [Time.utc(2026, 9, 5, 10), Time.new(2026, 9, 5, 0, 0, 0, "+05:00"), DateTime.new(2026, 9, 6, 23)].each do |member|
+        expect { permittable_class { permit_params(:create) { optional :day, :date, in: [member] } } }
+          .to raise_error(ArgumentError, /:in for field :day contains .*, which is not a valid :date \(not midnight UTC/)
+      end
+    end
+
+    # On a nullable field an explicit null is accepted before in: is ever
+    # consulted, so a nil member only restates that; elsewhere it is a member
+    # no request could equal.
+    it "drops a nil :in member on a nullable field, and refuses it on any other" do
+      decl = proc { permit_params(:create) { optional :tier, :string, in: [nil, "pro"], nullable: true } }
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in]).to eq(["pro"])
+      expect(permit({ tier: "pro" }, &decl)[:tier]).to eq("pro")
+      expect(permit({ tier: nil }, &decl).to_h).to eq("tier" => nil)
+      expect { permittable_class { permit_params(:create) { optional :tier, :string, in: [nil, "pro"] } } }
+        .to raise_error(ArgumentError, /:in for field :tier contains nil.*declare nullable: true/)
+    end
+
+    it "rejects an :in member that the field's own type cannot cast" do
+      expect { permittable_class { permit_params(:create) { optional :n, :integer, in: %w[1 two] } } }
+        .to raise_error(ArgumentError, /:in for field :n contains "two", which is not a valid :integer \(invalid_type\)/)
+      expect { permittable_class { permit_params(:create) { optional :day, :date, in: ["2026-02-30"] } } }
+        .to raise_error(ArgumentError, /:in for field :day contains "2026-02-30", which is not a valid :date/)
+    end
+
+    it "rejects an :in Range whose endpoints the field's values cannot be compared with" do
+      expect { permittable_class { permit_params(:create) { optional :n, :integer, in: "1".."5" } } }
+        .to raise_error(ArgumentError, /:in for field :n is a Range of String \("1"\.\."5"\), which a :integer value cannot be compared/)
+      expect { permittable_class { permit_params(:create) { optional :s, :string, in: 1..5 } } }
+        .to raise_error(ArgumentError, /:in for field :s is a Range of Integer/)
+      expect { permittable_class { permit_params(:create) { optional :price, :decimal, in: .."9.99" } } }
+        .to raise_error(ArgumentError, /:in for field :price is a Range of String/)
+    end
+
+    it "accepts a Range whose endpoints compare with the field's values, without rewriting it" do
+      decl = proc do
+        permit_params(:create) do
+          optional :ratio, :float,   in: 0..Float::INFINITY
+          optional :price, :decimal, in: 0..100
+          optional :n,     :integer, in: 1.5..3
+          optional :day,   :date,    in: (Date.new(2026, 1, 1)..)
+          # ActiveSupport teaches Date#<=> to compare with a Time.
+          optional :at,    :datetime, in: (Date.new(2026, 1, 1)..)
+        end
+      end
+      fields = permittable_class(&decl).permit_rule_for(:create)[:fields]
+      expect(fields.map { |f| f[:in] })
+        .to eq([0..Float::INFINITY, 0..100, 1.5..3, (Date.new(2026, 1, 1)..), (Date.new(2026, 1, 1)..)])
+    end
+
+    # A NaN endpoint compares to nothing, by design — whatever it stands
+    # beside, not just the field's own values — so it is not evidence of a
+    # wrong-TYPED bound (a String range on an :integer) the way this check
+    # otherwise exists to catch. It loads exactly like an infinite endpoint
+    # already does; the exporter separately omits it, since it is never
+    # `finite?`.
+    it "accepts a NaN endpoint rather than reading it as an incomparable type" do
+      expect { permittable_class { permit_params(:create) { optional :x, :float, in: Float::NAN.. } } }
+        .not_to raise_error
+      expect { permittable_class { permit_params(:create) { optional :x, :decimal, in: ..BigDecimal("NaN") } } }
+        .not_to raise_error
     end
 
     it "rejects a bound no value could satisfy, rather than failing every request" do
@@ -495,6 +704,298 @@ RSpec.describe Permittable do
     end
   end
 
+  # Every case here is CLIENT input that used to raise out of the contract —
+  # a 500 where the request deserved a 422. Each must produce a violation.
+  describe "client input is a violation, never an exception" do
+    # Valid-looking text with a truncated UTF-8 sequence: "caf" + the first
+    # byte of "é". A literal, so its encoding is UTF-8 and it is not valid.
+    let(:malformed) { "caf\xC3" }
+
+    it "does not run an array's validate: over the nils of elements that failed to cast" do
+      decl = proc { permit_params(:create) { array :ids, of: :integer, validate: ->(a) { a.sum < 100 } } }
+      expect(violations_for({ ids: ["x", 2] }, &decl).details).to eq([{ param: "ids[0]", code: "invalid_type" }])
+      # Still runs over a fully-cast array.
+      expect(violations_for({ ids: [1, 200] }, &decl).details).to eq([{ param: "ids", code: "invalid" }])
+      expect(permit({ ids: %w[1 2] }, &decl)[:ids]).to eq([1, 2])
+    end
+
+    it "pays for that by not reporting an array-level verdict alongside element violations" do
+      # The accepted trade-off: the duplicate surfaces only once ids[1] is fixed.
+      decl = proc { permit_params(:create) { array :ids, of: :integer, validate: ->(a) { a.uniq.size == a.size || :duplicate } } }
+      expect(violations_for({ ids: [1, "x", 1] }, &decl).details).to eq([{ param: "ids[1]", code: "invalid_type" }])
+      expect(violations_for({ ids: [1, 2, 1] }, &decl).details).to eq([{ param: "ids", code: "duplicate" }])
+    end
+
+    it "does not run an array-of-hashes validate: over elements that violated" do
+      decl = proc do
+        permit_params(:create) do
+          array :items, validate: ->(a) { a.sum { |i| i.fetch(:qty) } < 10 } do
+            required :qty, :integer
+          end
+        end
+      end
+      expect(violations_for({ items: [{ qty: "x" }, { qty: 1 }] }, &decl).details)
+        .to eq([{ param: "items[0].qty", code: "invalid_type" }])
+    end
+
+    it "does not run an array's transform: once its validate: has failed" do
+      decl = proc do
+        permit_params(:create) do
+          array :ids, of: :integer, validate: ->(a) { a.all?(&:positive?) }, transform: ->(a) { a.map { Math.sqrt(_1) } }
+        end
+      end
+      expect(violations_for({ ids: [1, -4] }, &decl).details).to eq([{ param: "ids", code: "invalid" }])
+      expect(permit({ ids: [1, 4] }, &decl)[:ids]).to eq([1.0, 2.0])
+    end
+
+    it "still runs an array-of-hashes validate: when the only element violations are undeclared keys" do
+      decl = proc do
+        permit_params(:create, unknown: :error) do
+          array :items, validate: ->(a) { a.sum { |i| i.fetch(:qty) } < 10 || :too_many } do
+            required :qty, :integer
+          end
+        end
+      end
+      expect(violations_for({ items: [{ qty: 6, extra: 1 }, { qty: 6 }] }, &decl).details)
+        .to contain_exactly({ param: "items[0].extra", code: "unknown" }, { param: "items", code: "too_many" })
+    end
+
+    it "tells an undeclared key from a sub-field whose own validate: happens to return :unknown" do
+      decl = proc do
+        permit_params(:create, unknown: :error) do
+          array :items, validate: ->(a) { a.all? { |i| i.fetch(:country) } } do
+            required :country, :string, validate: ->(v) { v == "NZ" || :unknown }
+          end
+        end
+      end
+      expect(violations_for({ items: [{ country: "XX" }] }, &decl).details)
+        .to eq([{ param: "items[0].country", code: "unknown" }])
+    end
+
+    it "rejects a non-finite Float given to an :integer" do
+      decl = proc do
+        permit_params(:create) do
+          optional :n, :integer
+          array :ns, of: :integer
+        end
+      end
+      [Float::NAN, Float::INFINITY, -Float::INFINITY].each do |value|
+        expect(violations_for({ n: value, ns: [value] }, &decl).details)
+          .to eq([{ param: "n", code: "invalid_type" }, { param: "ns[0]", code: "invalid_type" }]), "for #{value}"
+      end
+      expect(permit({ n: 3.0 }, &decl)[:n]).to eq(3)
+    end
+
+    it "rejects a String that is not valid in its encoding as invalid_type" do
+      expect(violations_for({ s: malformed }) { permit_params(:create) { required :s, :string } }.details)
+        .to eq([{ param: "s", code: "invalid_type" }])
+    end
+
+    it "rejects it before any normalize: preset runs" do
+      Permittable::NORMALIZERS.each_key do |preset|
+        e = violations_for({ s: malformed }) { permit_params(:create) { required :s, :string, normalize: preset } }
+        expect(e.details).to eq([{ param: "s", code: "invalid_type" }]), "for normalize: :#{preset}"
+      end
+    end
+
+    it "never hands it to an app's own normalize: proc" do
+      decl = proc { permit_params(:create) { required :s, :string, normalize: ->(_v) { raise "must not run" } } }
+      expect(violations_for({ s: malformed }, &decl).details).to eq([{ param: "s", code: "invalid_type" }])
+    end
+
+    it "rejects it before format: runs, for a Regexp and a preset alike" do
+      [/\Acaf/, :email].each do |format|
+        e = violations_for({ s: malformed }) { permit_params(:create) { required :s, :string, format: format } }
+        expect(e.details).to eq([{ param: "s", code: "invalid_type" }]), "for format: #{format.inspect}"
+      end
+    end
+
+    it "rejects it as an array element and as a sub-field of an array of hashes" do
+      decl = proc do
+        permit_params(:create) do
+          array :tags, of: :string
+          array :people do
+            required :name, :string, normalize: :squish
+          end
+        end
+      end
+      expect(violations_for({ tags: ["ok", malformed], people: [{ name: malformed }] }, &decl).details)
+        .to eq([{ param: "tags[1]", code: "invalid_type" }, { param: "people[0].name", code: "invalid_type" }])
+    end
+
+    it "rejects it for every other scalar type too" do
+      %i[integer float decimal boolean date datetime].each do |type|
+        e = violations_for({ v: malformed }) { permit_params(:create) { required :v, type } }
+        expect(e.details).to eq([{ param: "v", code: "invalid_type" }]), "for :#{type}"
+      end
+    end
+
+    it "leaves well-formed non-ASCII text alone" do
+      decl = proc { permit_params(:create) { required :s, :string, normalize: :squish, format: /\Acafé\z/ } }
+      expect(permit({ s: "  café " }, &decl)[:s]).to eq("café")
+    end
+
+    it "refuses a malformed authored default: at class load, like any other contract violation" do
+      expect { permittable_class { permit_params(:create) { optional :s, :string, normalize: :strip, default: "caf\xC3" } } }
+        .to raise_error(ArgumentError, /:default for field :s violates its own contract \(invalid_type\)/)
+    end
+
+    # Rails' `skip_parameter_encoding` / `param_encoding` hand a controller
+    # binary or other-encoding Strings ON PURPOSE, so a :string value is kept
+    # exactly as it arrived. Other encodings are only ever converted for
+    # INSPECTION — a number is parsed from a UTF-8 copy of its text — and
+    # never for the value handed back.
+    describe "Strings in other encodings: converted for inspection, never for the value" do
+      def utf16(text) = text.encode("UTF-16LE")
+      def in_encoding(bytes, encoding) = bytes.dup.force_encoding(encoding)
+
+      it "parses a number, boolean or date from a UTF-8 copy of its text, not its bytes" do
+        decl = proc do
+          permit_params(:create) do
+            optional :n, :integer
+            optional :d, :decimal
+            optional :f, :float
+            optional :flag, :boolean
+            optional :on, :date
+            array :ns, of: :integer
+          end
+        end
+        result = permit({ n: utf16("12"), d: utf16("12.5"), f: utf16("1.5"), flag: utf16("true"),
+                          on: utf16("2026-09-05"), ns: [utf16("7")] }, &decl)
+        expect(result.to_h).to eq("n" => 12, "d" => BigDecimal("12.5"), "f" => 1.5, "flag" => true,
+                                  "on" => Date.new(2026, 9, 5), "ns" => [7])
+      end
+
+      it "refuses a number whose text has no UTF-8 reading" do
+        # Windows-1252 leaves 0x81 undefined, so there is nothing to parse.
+        e = violations_for({ n: in_encoding("1\x81", "Windows-1252") }) { permit_params(:create) { required :n, :integer } }
+        expect(e.details).to eq([{ param: "n", code: "invalid_type" }])
+      end
+
+      it "hands a :string back in the encoding it arrived in, bytes unchanged" do
+        decl = proc { permit_params(:create) { required :s, :string } }
+        [
+          "caf\xE9".b, # Latin-1 bytes under skip_parameter_encoding
+          "caf\xC3".b,
+          "テスト".encode("Shift_JIS"),
+          utf16("café"),
+          in_encoding("caf\x81", "Windows-1252")
+        ].each do |value|
+          out = permit({ s: value }, &decl)[:s]
+          expect([out.encoding, out.b]).to eq([value.encoding, value.b]), "for #{value.encoding}"
+        end
+      end
+
+      it "still normalizes a String of another encoding where the preset can, in that encoding" do
+        out = permit({ s: " caf\xE9 ".b }) { permit_params(:create) { required :s, :string, normalize: :strip } }[:s]
+        expect(out).to eq("caf\xE9".b).and(have_attributes(encoding: Encoding::BINARY))
+      end
+
+      it "leaves the value as it is when normalize: cannot be applied to its encoding" do
+        value = utf16(" café ")
+        out = permit({ s: value }) { permit_params(:create) { required :s, :string, normalize: :squish } }[:s]
+        expect(out).to eq(value)
+      end
+
+      it "still raises an app's own normalize: bug on ordinary UTF-8 input" do
+        decl = proc { permit_params(:create) { required :s, :string, normalize: ->(_v) { raise ArgumentError, "app bug" } } }
+        expect { permit({ s: "ok" }, &decl) }.to raise_error(ArgumentError, "app bug")
+      end
+
+      # The rescue in apply_normalize exists so a BUILT-IN preset can decline
+      # an encoding it cannot handle. It must not become a bypass for an
+      # app's own normalize: Proc: its raise is a business rule, not an
+      # encoding failure, and swallowing it on non-UTF-8 input would let
+      # exactly that input skip validation a UTF-8 request could not.
+      it "still raises a custom normalize: Proc's own ArgumentError/EncodingError on non-UTF-8 input" do
+        [
+          ["Shift_JIS", "テスト".encode("Shift_JIS")],
+          ["Windows-1252", in_encoding("caf\xE9", "Windows-1252")],
+          ["binary with a high byte", "caf\xE9".b]
+        ].each do |label, value|
+          [ArgumentError, EncodingError].each do |error_class|
+            decl = proc do
+              permit_params(:create) { required :s, :string, normalize: ->(_v) { raise error_class, "business rule violated" } }
+            end
+            expect { permit({ s: value }, &decl) }.to raise_error(error_class, "business rule violated"), "for #{label}/#{error_class}"
+          end
+        end
+      end
+
+      it "reports format: that cannot be applied to a String's encoding as a format violation" do
+        decl = proc { permit_params(:create) { required :s, :string, format: /\Acafé\z/ } }
+        [utf16("café"), "caf\xC3\xA9".b, "テスト".encode("Shift_JIS")].each do |value|
+          expect(violations_for({ s: value }, &decl).details).to eq([{ param: "s", code: "format" }]), "for #{value.encoding}"
+        end
+        # An ASCII-only pattern applies to binary bytes, as it always did.
+        expect(permit({ s: "caf\xE9".b }) { permit_params(:create) { required :s, :string, format: /\Acaf/ } }[:s])
+          .to eq("caf\xE9".b)
+      end
+
+      it "refuses a String that is not valid in its OWN encoding, whatever the type" do
+        lone_surrogate = in_encoding("\x00\xD8", "UTF-16LE")
+        %i[string integer].each do |type|
+          e = violations_for({ s: lone_surrogate }) { permit_params(:create) { required :s, type } }
+          expect(e.details).to eq([{ param: "s", code: "invalid_type" }]), "for :#{type}"
+        end
+      end
+    end
+
+    describe "an undeclared key the client spelled in bytes that are not UTF-8" do
+      it "is reported under a UTF-8 param, so the 422 can be rendered" do
+        e = violations_for({ "caf\xC3" => 1, "ok".encode("UTF-16LE") => 2, "user" => { "x\xFF" => 3 } }) do
+          permit_params(:create, unknown: :error) do
+            optional :user do
+              optional :name, :string
+            end
+          end
+        end
+        expect(e.details).to contain_exactly(
+          { param: "caf�", code: "unknown" }, { param: "ok", code: "unknown" }, { param: "user.x�", code: "unknown" }
+        )
+        expect(e.details.map { |d| d[:param] }).to all(satisfy { |p| p.encoding == Encoding::UTF_8 && p.valid_encoding? })
+        expect { e.details.to_json }.not_to raise_error
+        expect(e.message).to be_valid_encoding
+      end
+
+      it "is logged in UTF-8 under unknown: :log, rather than raising while building the line" do
+        klass = permittable_class { permit_params(:create, unknown: :log) { required :name, :string } }
+        c = controller(klass, params: { "name" => "a", "caf\xC3" => 1, "ok".encode("UTF-16LE") => 2 })
+        messages = []
+        logger = Object.new
+        logger.define_singleton_method(:warn) { |msg| messages << msg }
+        c.define_singleton_method(:logger) { logger }
+
+        expect(c.permitted_params.to_h).to eq("name" => "a")
+        # The prose-escaping fix in #63 makes this MORE informative than a
+        # plain U+FFFD replacement: the invalid byte is shown as \xC3 rather
+        # than lost, but it still never raises and is always valid UTF-8.
+        expect(messages.join).to include('caf\xC3', "ok").and(be_valid_encoding)
+      end
+
+      it "converts only the undeclared keys, never the declared ones a request walks through" do
+        allow(Permittable::Coercion).to receive(:reportable_text).and_call_original
+        decl = proc do
+          permit_params(:create, unknown: :error) do
+            required :name, :string
+            optional(:address) { optional :city, :string }
+            array(:items) { optional :sku, :string }
+          end
+        end
+        permit({ name: "a", address: { city: "b" }, items: [{ sku: "c" }] }, &decl)
+        expect(Permittable::Coercion).not_to have_received(:reportable_text)
+
+        violations_for({ name: "a", stray: 1 }, &decl)
+        expect(Permittable::Coercion).to have_received(:reportable_text).once
+      end
+    end
+
+    it "passes a :json field's contents through unexamined — the gem runs no string operation on them" do
+      decl = proc { permit_params(:create) { optional :meta, :json, max_depth: 3 } }
+      expect(permit({ meta: { "note" => malformed, "list" => [malformed] } }, &decl)[:meta][:note]).to eq(malformed)
+    end
+  end
+
   describe "validations" do
     it "checks in: as Range (cover) and as Array (inclusion)" do
       decl = proc { permit_params(:create) { required :age, :integer, in: 18..120 } }
@@ -503,6 +1004,41 @@ RSpec.describe Permittable do
 
       e = violations_for({ plan: "gold" }) { permit_params(:create) { required :plan, :string, in: %w[free pro] } }
       expect(e.details.first[:code]).to eq("inclusion")
+    end
+
+    # The members used to be compared as authored against the CAST value, so
+    # a :string field listing Symbols rejected every request — while its
+    # exported enum, which stringifies Symbols, advertised the very values it
+    # refused.
+    it "casts in: members with the field's own type, so Symbols work on a :string field" do
+      decl = proc { permit_params(:create) { optional :status, :string, in: %i[draft published], default: "draft" } }
+      expect(permit({ status: "published" }, &decl)[:status]).to eq("published")
+      expect(permit({}, &decl)[:status]).to eq("draft")
+      expect(violations_for({ status: "archived" }, &decl).details).to eq([{ param: "status", code: "inclusion" }])
+    end
+
+    it "casts String in: members on an :integer field, and any listed spelling on a :date field" do
+      decl = proc { permit_params(:create) { optional :n, :integer, in: %w[1 2 3] } }
+      expect(permit({ n: "2" }, &decl)[:n]).to eq(2)
+      expect(permit({ n: 3 }, &decl)[:n]).to eq(3)
+      expect(violations_for({ n: "4" }, &decl).details).to eq([{ param: "n", code: "inclusion" }])
+
+      decl = proc { permit_params(:create) { optional :day, :date, in: ["2026-09-05", Date.new(2026, 9, 6)] } }
+      expect(permit({ day: "Sep 5, 2026" }, &decl)[:day]).to eq(Date.new(2026, 9, 5))
+      expect(permit({ day: "2026-09-06" }, &decl)[:day]).to eq(Date.new(2026, 9, 6))
+    end
+
+    it "stores the cast members frozen, deduplicated, and in the container they were given in" do
+      decl = proc do
+        permit_params(:create) do
+          optional :n,    :integer, in: ["1", 1, "01", 2]
+          optional :tier, :string,  in: Set[:free, :pro]
+        end
+      end
+      n, tier = permittable_class(&decl).permit_rule_for(:create)[:fields]
+      expect(n[:in]).to eq([1, 2]).and be_frozen
+      expect(tier[:in]).to eq(Set["free", "pro"]).and be_frozen
+      expect(tier[:in]).to all(be_frozen)
     end
 
     it "checks format on strings" do
@@ -696,6 +1232,30 @@ RSpec.describe Permittable do
     it "leaves a field with no length: bound checking format: as before" do
       decl = proc { permit_params(:create) { required :s, :string, format: /\A[a-z]+\z/ } }
       expect(violations_for({ s: "AB" }, &decl).details).to eq([{ param: "s", code: "format" }])
+    end
+
+    it "scans a UTF-8 String's encoding only once per cast, for a non-:string type" do
+      # A shared counter, not an instance variable on the string itself: the
+      # walker copies a request's String before Coercion.cast ever sees it
+      # (permittable_own, so the result never aliases the caller's params),
+      # and `dup` makes a new instance with its own ivars — so counting on
+      # the ORIGINAL object would show zero calls no matter how many times
+      # the (correctly, once-scanned) copy was checked. The invariant this
+      # pins is Coercion.cast's own: the value IS already the text a
+      # non-:string type parses from, so validity need be scanned once, not
+      # once directly and once more inside utf8_text for the same object —
+      # regardless of which object identity ends up doing the scanning.
+      calls = []
+      counting_string = Class.new(String) do
+        define_method(:valid_encoding?) do
+          calls << object_id
+          super()
+        end
+      end
+      value = counting_string.new("12")
+      result = permit({ n: value }) { permit_params(:create) { required :n, :integer } }
+      expect(result[:n]).to eq(12)
+      expect(calls.length).to eq(1)
     end
   end
 
@@ -2032,6 +2592,258 @@ RSpec.describe Permittable do
     end
   end
 
+  describe "escaped prose: control characters in client-sent names" do
+    def logging_controller(klass, params:, action: "create")
+      c = controller(klass, params: params, action: action)
+      lines = []
+      logger = Object.new
+      logger.define_singleton_method(:warn) { |message| lines << message }
+      c.define_singleton_method(:logger) { logger }
+      [c, lines]
+    end
+
+    def rejection(klass, params)
+      controller(klass, params: params).permitted_params
+      raise "expected InvalidParameters"
+    rescue described_class::InvalidParameters => e
+      e
+    end
+
+    let(:forged) { "evil\nE, [2026-09-23] ERROR -- : forged admin login" }
+    let(:log_klass) { permittable_class { permit_params(:create, unknown: :log) { required :a, :string } } }
+    let(:error_klass) { permittable_class { permit_params(:create, unknown: :error) { required :a, :string } } }
+    let(:unsafe) { /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Zs}&&[^ ]]/ }
+
+    it "cannot forge a second entry through the :log warn line" do
+      c, lines = logging_controller(log_klass, params: { "a" => "x", forged => "v" })
+      c.permitted_params
+      expect(lines.length).to eq(1)
+      expect(lines.first).not_to include("\n")
+      expect(lines.first).to end_with('contract: "evil\nE, [2026-09-23] ERROR -- : forged admin login"')
+    end
+
+    it "cannot forge one through the exception message, while details keeps the name as sent" do
+      e = rejection(error_klass, { "a" => "x", forged => "v" })
+      expect(e.message).not_to include("\n")
+      expect(e.message).to eq('Invalid parameters: "evil\nE, [2026-09-23] ERROR -- : forged admin login" (unknown)')
+      # details is data, not prose: the offending name arrives byte-for-byte.
+      expect(e.details).to eq([{ param: forged, code: "unknown" }])
+    end
+
+    it "escapes the monitor-mode warn line too, and instruments the name as sent" do
+      klass = permittable_class { permit_params(:create, unknown: :error, mode: :monitor) { required :a, :string } }
+      c, lines = logging_controller(klass, params: { "a" => "x", forged => "v" })
+      events = []
+      subscription = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
+        events << payload
+      end
+      begin
+        c.permitted_params
+      ensure
+        ActiveSupport::Notifications.unsubscribe(subscription)
+      end
+      expect(lines.first).not_to include("\n")
+      expect(lines.first).to include('"evil\nE, [2026-09-23]')
+      expect(events.first[:details]).to eq([{ param: forged, code: "unknown" }])
+    end
+
+    it "escapes every C0 and C1 control, DEL, and the Unicode line and paragraph separators" do
+      name = "k\u0000\u0007\b\t\n\v\f\r\e\u001F\u007F\u0080\u0085\u009B\u009F\u2028\u2029"
+      c, lines = logging_controller(log_klass, params: { "a" => "x", name => "v" })
+      c.permitted_params
+      expect(lines.first).not_to match(unsafe)
+      expect(lines.first).to end_with(
+        'contract: "k\u0000\u0007\u0008\t\n\u000B\u000C\r\u001B\u001F\u007F\u0080\u0085\u009B\u009F\u2028\u2029"'
+      )
+    end
+
+    it "escapes the bidi override and isolate characters, which can reorder a line or hide its closing quote" do
+      name = "a\u202A\u202B\u202C\u202D\u202E\u2066\u2067\u2068\u2069b"
+      c, lines = logging_controller(log_klass, params: { "a" => "x", name => "v" })
+      c.permitted_params
+      expect(lines.first).not_to match(unsafe)
+      expect(lines.first).to end_with('contract: "a\u202A\u202B\u202C\u202D\u202E\u2066\u2067\u2068\u2069b"')
+    end
+
+    it "leaves ordinary names byte-identical, non-ASCII and backslashes included" do
+      c, lines = logging_controller(log_klass, params: { "a" => "x", "café" => 1, "名前" => 2, 'a\nb' => 3, "x,y" => 4 })
+      c.permitted_params
+      expect(lines.first).to end_with('contract: café, 名前, a\nb, x,y')
+    end
+
+    it "quotes a name containing a quote anywhere, so a raw name can never pass for an escaped one" do
+      # Unescaped, this literal backslash-n name would print exactly like a
+      # name "x" followed by the escaped rendering of a real newline.
+      lookalike = 'x, "evil\nE, [2026-09-23] ERROR -- : forged"'
+      c, lines = logging_controller(log_klass, params: { "a" => "x", lookalike => "v", 'q"' => "v" })
+      c.permitted_params
+      expect(lines.first).to end_with('contract: "x, \"evil\\\\nE, [2026-09-23] ERROR -- : forged\"", "q\""')
+    end
+
+    it "quotes a name containing the list separator, so it cannot pass for two names or fake the overflow count" do
+      c, lines = logging_controller(log_klass, params: { "a" => "x", "b, c" => "v", "x, and 49990 more" => "v" })
+      c.permitted_params
+      expect(lines.first).to end_with('contract: "b, c", "x, and 49990 more"')
+    end
+
+    it "quotes a name that could be read as the overflow count, in every prose output" do
+      c, lines = logging_controller(log_klass, params: { "a" => "x", "b" => "v", "and 49990 more" => "v" })
+      c.permitted_params
+      expect(lines.first).to end_with('contract: b, "and 49990 more"')
+
+      expect(rejection(error_klass, { "a" => "x", "b" => "v", "and 49990 more" => "v" }).message)
+        .to eq('Invalid parameters: b (unknown), "and 49990 more" (unknown)')
+
+      klass = permittable_class { permit_params(:create, unknown: :error, mode: :monitor) { required :a, :string } }
+      c, lines = logging_controller(klass, params: { "a" => "x", "and 1 more" => "v" })
+      c.permitted_params
+      expect(lines.first).to end_with('rejected: "and 1 more" (unknown)')
+      # A name that merely contains the words is ordinary.
+      c, lines = logging_controller(log_klass, params: { "a" => "x", "band 4 more" => "v" })
+      c.permitted_params
+      expect(lines.first).to end_with("contract: band 4 more")
+    end
+
+    it "quotes the overflow phrase in any letter case, since it would look identical to the real suffix" do
+      c, lines = logging_controller(log_klass, params: { "a" => "x", "And 49990 more" => "v", "AND 1 MORE" => "v" })
+      c.permitted_params
+      expect(lines.first).to end_with('contract: "And 49990 more", "AND 1 MORE"')
+    end
+
+    it "escapes the non-ASCII spaces, which let a lookalike separator pass for ', '" do
+      name = "x,\u00A0and 49990 more\u2003\u3000\u202F"
+      c, lines = logging_controller(log_klass, params: { "a" => "x", name => "v" })
+      c.permitted_params
+      expect(lines.first).to end_with('contract: "x,\u00A0and 49990 more\u2003\u3000\u202F"')
+    end
+
+    it "quotes a name holding a lookalike comma or quote, and prints those characters as they are" do
+      names = ["a\u{FF0C}b", "a\u{FE50}b", "a\u{3001}b", "\u{201C}x\u{201D}", "\u{2018}y\u{2019}", "\u{AB}z\u{BB}", "\u{FF02}w"]
+      c, lines = logging_controller(log_klass, params: names.to_h { |n| [n, "v"] }.merge("a" => "x"))
+      c.permitted_params
+      expect(lines.first).to end_with("contract: #{names.map { |n| "\"#{n}\"" }.join(', ')}")
+    end
+
+    it "quotes a name using CJK corner brackets as quotes, or an ideographic/small-ideographic comma" do
+      # U+300C/U+300D are real quotation marks in Japanese and Chinese text
+      # (Ps/Pe, not Pi/Pf, so the earlier quote check missed them), and
+      # U+FE51 is the small-form sibling of the ideographic comma U+3001.
+      names = ["\u{300C}x\u{300D}", "a\u{FE51}b"]
+      c, lines = logging_controller(log_klass, params: names.to_h { |n| [n, "v"] }.merge("a" => "x"))
+      c.permitted_params
+      expect(lines.first).to end_with("contract: #{names.map { |n| "\"#{n}\"" }.join(', ')}")
+    end
+
+    it "escapes the zero-width and other format characters" do
+      name = "a\u200Bb\u200Ec\u200Fd\u061Ce\uFEFFf\u00ADg\u200Dh\u{E0041}i"
+      c, lines = logging_controller(log_klass, params: { "a" => "x", name => "v" })
+      c.permitted_params
+      expect(lines.first).not_to match(unsafe)
+      expect(lines.first).to end_with('contract: "a\u200Bb\u200Ec\u200Fd\u061Ce\uFEFFf\u00ADg\u200Dh\u{E0041}i"')
+    end
+
+    it "keeps a quoted name whole whenever it fits, cutting only the suffix" do
+      # A quoted name of "\n" plus k z's is k + 4 characters; the suffix is " (unknown)".
+      render = lambda do |k|
+        rejection(error_klass, { "a" => "x", "\n#{'z' * k}" => "v" }).message.delete_prefix("Invalid parameters: ")
+      end
+      quoted = ->(k) { "\"\\n#{'z' * k}\"" }
+      expect(render.call(106)).to eq("#{quoted.call(106)} (unknown)")  # 120: fits exactly
+      expect(render.call(107)).to eq("#{quoted.call(107)} (unkn...")   # 111 + 6 + 3
+      expect(render.call(113)).to eq("#{quoted.call(113)}...")         # 117: no room for any suffix
+      # 118 to 120: the name fits the limit on its own, so it is not cut; the
+      # ellipsis marking the dropped suffix is allowed past the limit.
+      expect(render.call(114)).to eq("#{quoted.call(114)}...")
+      expect(render.call(116)).to eq("#{quoted.call(116)}...")
+      # 121: the name itself no longer fits, and is cut between whole escapes.
+      expect(render.call(117)).to eq("\"\\n#{'z' * 113}\"...")
+    end
+
+    it "transcodes what maps in a legacy key and shows only the unmappable bytes as \\xNN" do
+      unmapped = "caf\xE9\x81\x8D\x8F\x90\x9D".dup.force_encoding(Encoding::Windows_1252)
+      mojibake = "\xC3\xA9".dup.force_encoding(Encoding::Windows_1252) # two cp1252 characters, not one é
+      sjis = "\x82\xA0\x82".dup.force_encoding(Encoding::Shift_JIS) # あ, then half a character
+      c, lines = logging_controller(log_klass, params: { "a" => "x", unmapped => 1, mojibake => 2, sjis => 3 })
+      c.permitted_params
+      expect(lines.first).to end_with("contract: \"café\\x81\\x8D\\x8F\\x90\\x9D\", Ã©, \"あ\\x82\"")
+    end
+
+    it "escapes only the client-sent name, never the developer's message" do
+      klass = permittable_class do
+        permit_params(:create) do
+          required :a, :string
+          finalize { |p| violate!(p[:a], :taken, message: "is taken\n") }
+        end
+      end
+      expect(rejection(klass, { "a" => "b" }).message).to eq("Invalid parameters: b is taken\n")
+      expect(rejection(klass, { "a" => "evil\nE" }).message).to eq("Invalid parameters: \"evil\\nE\" is taken\n")
+    end
+
+    it "judges a name by what survives truncation, so an unseen control does not quote it" do
+      c, lines = logging_controller(log_klass, params: { "a" => "x", "#{'x' * 200}\n" => "v", "#{'y' * 116}\n" => "v" })
+      c.permitted_params
+      expect(lines.first).to end_with("contract: #{'x' * 117}..., \"#{'y' * 116}\\n\"")
+
+      # In the summary the cut includes the code: this "\n" is the 111th of
+      # 121 characters, so it is shown, and the name is quoted.
+      e = rejection(error_klass, { "a" => "x", "#{'z' * 110}\n" => "v" })
+      expect(e.message).to eq("Invalid parameters: \"#{'z' * 110}\\n\" (u...")
+    end
+
+    it "emits UTF-8 whatever the name's encoding, so a legacy byte is not written raw and names of mixed encodings join" do
+      cp1252 = "caf\x85".dup.force_encoding(Encoding::Windows_1252) # 0x85 is an ellipsis here...
+      latin1 = "caf\x85".dup.force_encoding(Encoding::ISO_8859_1)   # ...and NEL here
+      mixed = "café".b # valid UTF-8 bytes, tagged binary
+      c, lines = logging_controller(log_klass, params: { "a" => "x", cp1252 => 1, latin1 => 2, mixed => 3, "名前" => 4 })
+      c.permitted_params
+      expect(lines.first.encoding).to eq(Encoding::UTF_8)
+      expect(lines.first).to end_with("contract: caf…, \"caf\\u0085\", café, 名前")
+    end
+
+    it "escapes the quote and backslash inside an escaped name, so the rendering stays unambiguous" do
+      c, lines = logging_controller(log_klass, params: { "a" => "x", "q\"b\\\n" => "v" })
+      c.permitted_params
+      expect(lines.first).to end_with('contract: "q\"b\\\\\n"')
+    end
+
+    it "truncates an escaped name between escapes, never through one, and outside the closing quote" do
+      # Cutting the escaped text at a fixed width would land inside the first
+      # "\n" and print a dangling backslash; the cut backs off to a whole escape.
+      name = ("x" * 114) + ("\n" * 50)
+      c, lines = logging_controller(log_klass, params: { "a" => "x", name => "v" })
+      c.permitted_params
+      shown = lines.first.split("contract: ").last
+      expect(shown).to eq("\"#{'x' * 114}\"...")
+      expect(shown.length).to be <= 120
+    end
+
+    it "bounds an enormous escaped name like any other" do
+      c, lines = logging_controller(log_klass, params: { "a" => "x", ("\n" * 100_000) => "v" })
+      c.permitted_params
+      expect(lines.first.bytesize).to be < 300
+      expect(lines.first).to end_with("#{'\n' * 57}\"...")
+    end
+
+    it "shows the bytes of a name that is not valid UTF-8 instead of raising" do
+      invalid = "bad\xFF\xFEkey".dup.force_encoding(Encoding::UTF_8)
+      binary = "raw\xC0".b
+      c, lines = logging_controller(log_klass, params: { "a" => "x", invalid => 1, binary => 2 })
+      c.permitted_params
+      expect(lines.first).to end_with('contract: "bad\xFF\xFEkey", "raw\xC0"')
+    end
+
+    it "shows the same rich transcoding in the exception message as in the log line, while details stays the plainer, JSON-safe form" do
+      unmapped = "caf\xE9\x81".dup.force_encoding(Encoding::Windows_1252)
+      e = rejection(error_klass, { "a" => "x", unmapped => 1 })
+      expect(e.message).to eq('Invalid parameters: "café\x81" (unknown)')
+      # details/instrumentation stay valid UTF-8 (Coercion.reportable_text,
+      # scrubbed to U+FFFD) — a machine reading them only needs them not to
+      # crash to_json, not to be maximally legible.
+      expect(e.details).to contain_exactly({ param: "café\u{FFFD}", code: "unknown" })
+      expect { e.details.to_json }.not_to raise_error
+    end
+  end
+
   describe "monitor mode" do
     after { Permittable.mode = :enforce }
 
@@ -2332,6 +3144,15 @@ RSpec.describe Permittable do
             m = enum_model
             expect(&declaring(m) { optional :status, :string, in: m.statuses.keys }).not_to raise_error
             expect(&declaring(m) { optional :status, :string, in: %w[pending] }).not_to raise_error
+          end
+
+          # The guard reads the in: the contract stores — a Hash already read
+          # as its keys, Symbols already cast to the Strings a request sends —
+          # so it agrees with what the field will actually accept.
+          it "accepts the enum's own mapping, or its names as Symbols, as the in:" do
+            m = enum_model
+            expect(&declaring(m) { optional :status, :string, in: m.statuses }).not_to raise_error
+            expect(&declaring(m) { optional :status, :string, in: %i[pending shipped] }).not_to raise_error
           end
 
           it "requires the in: — without it, an unknown name would pass and then raise on assignment" do
