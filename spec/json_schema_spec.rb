@@ -13,6 +13,14 @@ RSpec.describe Permittable::JsonSchema do
     schema_for(**opts, &contract)["properties"][name]
   end
 
+  def quietly
+    verbose = $VERBOSE
+    $VERBOSE = nil
+    yield
+  ensure
+    $VERBOSE = verbose
+  end
+
   after { Permittable.filter_parameter_registry.reset! }
 
   describe "scalar types" do
@@ -201,6 +209,115 @@ RSpec.describe Permittable::JsonSchema do
         expect(prop).not_to have_key("pattern"), "expected #{regexp.inspect} to be untranslatable"
         expect(prop["x-permittable-pattern"]).to eq(regexp.inspect)
       end
+    end
+
+    # Each of these is a SyntaxError under the `u` flag Ajv compiles with, or
+    # means something else in ECMA-262 — {,3} is a literal there without the
+    # flag, && two ampersands, a backreference to a group that took no part
+    # matches the empty string — so none may be published as `pattern`.
+    it "falls back for constructs ECMA-262 lacks or reads differently" do
+      [/\A(?>a+)b\z/, /a(?#note)b/, /(?'n'a)\k'n'/, /\Aa{,3}\z/, /\A\e\z/, /\A[a-z&&[^q]]\z/,
+       /\A\101\z/, /\A\01\z/, /\A[a\S]\z/, /\Aa{2}?\z/, /\A+a/, /a{2}{3}/, /(?=a)*b/, /\x7/,
+       /(?<n>a)\g<n>/, /[a-z[0-9]]/, /(?<a>x)|(?<a>y)/,
+       /\A(a)?\1b\z/, /\A(?<y>\d)\k<y>\z/, /\Aa\b/, /\Aa\B/].each do |regexp|
+        prop = property("a") { optional :a, :string, format: regexp }
+        expect(prop).not_to have_key("pattern"), "expected #{regexp.inspect} to be untranslatable"
+        expect(prop["x-permittable-pattern"]).to eq(regexp.inspect)
+      end
+    end
+
+    # Ruby warns about the bare - or ] in each of these, so they are built
+    # quietly. `[$-&&%]` is the empty intersection of $-& and %, matching
+    # nothing in Ruby; in ECMA-262 it is a class that accepts "%". `[a-&&z]`
+    # is a SyntaxError in Unicode mode, and a leading ] ends an empty class.
+    it "refuses an intersection or nested class straight after a range hyphen, and a leading ]" do
+      ["[$-&&%]", "[a-&&z]", "[!-[a]]", "[]a]"].each do |source|
+        regexp = quietly { Regexp.new(source) }
+        expect(described_class.ecma_pattern(regexp)).to be_nil, "expected #{source} to be untranslatable"
+      end
+    end
+
+    # Ruby's \b counts a non-ASCII letter as a word character and Unicode
+    # mode's does not, so /\Aa\b/ rejects "aé" at runtime and ^a\b accepts it.
+    # Inside a class \b is a backspace in both.
+    it "keeps a backspace \\b inside a class" do
+      expect(described_class.ecma_pattern(/\A[\b]\z/)).to eq('^[\b]$')
+    end
+
+    # A literal - right after a completed range is not "a different range in
+    # Unicode mode" — both dialects read [a-c-e] as the set {a, b, c, -, e},
+    # rejecting "d". Regression: this used to be refused outright, so a
+    # common format: like /\A[a-zA-Z0-9-_]+\z/ published no pattern at all.
+    # Built via Regexp.new and quietly, like the other ambiguous-hyphen
+    # cases below, so the suite prints no regexp warnings.
+    it "keeps a literal - right after a completed range, in both engines" do
+      {
+        '\A[a-zA-Z0-9-_]+\z' => '^[a-zA-Z0-9-_]+$',
+        '\A[A-Za-z0-9-_.]+\z' => '^[A-Za-z0-9-_.]+$',
+        '\A[a-z0-9-_]{3,16}\z' => '^[a-z0-9-_]{3,16}$',
+        '\A[a-z-A-Z]\z' => '^[a-z-A-Z]$',
+        '\A[a-c-e]\z' => '^[a-c-e]$',
+        # The hyphen may itself reopen a range, chaining like Ruby does.
+        '\A[a-z--x]\z' => '^[a-z--x]$'
+      }.each do |source, expected|
+        regexp = quietly { Regexp.new(source) }
+        expect(described_class.ecma_pattern(regexp)).to eq(expected), "expected #{source} to translate to #{expected}"
+      end
+    end
+
+    # A class escape (\d, \D, \w, \W, \s, \S) can never sit next to a range
+    # hyphen in a real Regexp: Ruby itself raises building the source, on
+    # either side of the hyphen, so this can never reach the translator.
+    # ecma_pattern's own refusal for it (previous == :set) is a defensive
+    # backstop, not something a live disagreement between the two engines
+    # depends on.
+    it "cannot even construct a class escape beside a range hyphen, so its refusal in ecma_pattern is a backstop" do
+      ['[\d-z]', '[\s-z]', '[\w-z]', '[a-\d]', '[a-\S]'].each do |source|
+        expect { Regexp.new(source) }.to raise_error(RegexpError)
+      end
+    end
+
+    # rubocop:disable-next Style/RedundantRegexpEscape -- the redundant escapes are what is under test
+    it "un-escapes the identity escapes Unicode mode rejects, but keeps \\- inside a class" do
+      expect(described_class.ecma_pattern(/\A\d{3}\-\d{4}\z/)).to eq('^\d{3}-\d{4}$')
+      expect(described_class.ecma_pattern(/\A\#\ \z/)).to eq("^# $")
+      expect(described_class.ecma_pattern(/\A[\w\-\#]+\z/)).to eq('^[\w\-#]+$')
+      expect(described_class.ecma_pattern(%r{\A\$\.\/\z})).to eq('^\$\.\/$')
+    end
+
+    it "spells out Ruby's ASCII-only \\s, which ECMA-262 widens to every Unicode space" do
+      expect(described_class.ecma_pattern(/\A\s\z/)).to eq('^[ \t\n\v\f\r]$')
+      expect(described_class.ecma_pattern(/\A\S\z/)).to eq('^[^ \t\n\v\f\r]$')
+      expect(described_class.ecma_pattern(/\A[^@\s]+\z/)).to eq('^[^@ \t\n\v\f\r]+$')
+    end
+
+    it "carries \\S in a class only where it can be written exactly" do
+      # The any-character idiom: \s and \S together cover everything whatever
+      # either one means, so ECMA-262's wider \s is harmless here.
+      expect(described_class.ecma_pattern(/\A[\s\S]*\z/)).to eq('^[\s\S]*$')
+      expect(described_class.ecma_pattern(/\A[a\S\s]\z/)).to eq('^[\s\S]$')
+      expect(described_class.ecma_pattern(/\A[^\s\S]\z/)).to eq('^[^\s\S]$')
+      # rubocop:disable-next Style/RedundantRegexpCharacterClass -- the single-member class is what is under test
+      expect(described_class.ecma_pattern(/\A[\S]\z/)).to eq('^[^ \t\n\v\f\r]$')
+      expect(described_class.ecma_pattern(/\A[^\S]\z/)).to eq('^[ \t\n\v\f\r]$')
+    end
+
+    it "spells out Ruby's dot, which ECMA-262 without the s flag also refuses at \\r, U+2028 and U+2029" do
+      expect(described_class.ecma_pattern(/\A.+\z/)).to eq('^[^\n]+$')
+      expect(described_class.ecma_pattern(/\A[.]\z/)).to eq("^[.]$")
+    end
+
+    it "rewrites only real \\A and \\z anchors, never an escaped backslash followed by A or z" do
+      expect(described_class.ecma_pattern(/\A\\A\z/)).to eq('^\\\\A$')
+      expect(described_class.ecma_pattern(/\A\\z\z/)).to eq('^\\\\z$')
+    end
+
+    it "carries the \\u{...} and \\x escapes that survive into the source" do
+      expect(described_class.ecma_pattern(Regexp.new('\A\u{41}\x42\z'))).to eq('^\u{41}\x42$')
+    end
+
+    it "escapes a brace Ruby reads as a literal, which Unicode mode rejects bare" do
+      expect(described_class.ecma_pattern(/\A{\d}\z/)).to eq('^\{\d\}$')
     end
   end
 
