@@ -248,13 +248,21 @@ module Permittable
   PROSE_UNSAFE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Zs}&&[^ ]]/
   # A name is also quoted when it merely LOOKS like prose structure. These
   # characters print as they are — only the quoting marks them:
-  # - a quote anywhere, or a quote lookalike (the fullwidth quote and every
-  #   initial/final quotation mark, Pi/Pf: curly quotes, guillemets), could
-  #   pass for, or close, an escaped name;
-  # - the list separator, or a fullwidth, small or ideographic comma, could
-  #   pass for the ", " between two names;
-  # - a name that begins "and N more" could pass for the overflow count.
-  PROSE_AMBIGUOUS = /["\u{FF02}\p{Pi}\p{Pf}\u{FF0C}\u{FE50}\u{3001}]|, |\Aand \p{Nd}+ more/
+  # - Unicode's own Quotation_Mark property, rather than a hand-picked list:
+  #   it already covers the plain and fullwidth `"`, every curly quote and
+  #   guillemet (Pi/Pf), AND the CJK corner brackets U+300C/U+300D, which
+  #   are real quotation marks in Japanese and Chinese text but are punctuation
+  #   category Ps/Pe, not Pi/Pf, so a Pi/Pf-only check missed them;
+  # - the list separator, or a fullwidth, small, ideographic or small-form-
+  #   ideographic comma (the last, U+FE51, is U+3001's small-form sibling,
+  #   the way U+FE50 is the plain comma's), could pass for the ", " between
+  #   two names;
+  # - a name that begins "and N more" (matched case-insensitively — "And"/
+  #   "AND" reads identically once rendered) could pass for the overflow
+  #   count. This still only catches the literal word: a homoglyph
+  #   substitution such as Cyrillic "а" for Latin "a" is not detected, and
+  #   no Unicode confusable-detection is attempted here — see CHANGELOG.
+  PROSE_AMBIGUOUS = /\p{Quotation_Mark}|[\u{FF0C}\u{FE50}\u{3001}\u{FE51}]|, |\A(?i:and \p{Nd}+ more)/
   # \n, \r and \t, which a person recognises, get their short escape; any
   # other unsafe character is \uXXXX, which JSON, JavaScript and Ruby all
   # read the same way. The quote and backslash are escaped too, but only

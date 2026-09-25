@@ -1934,6 +1934,12 @@ RSpec.describe Permittable do
       expect(lines.first).to end_with("contract: band 4 more")
     end
 
+    it "quotes the overflow phrase in any letter case, since it would look identical to the real suffix" do
+      c, lines = logging_controller(log_klass, params: { "a" => "x", "And 49990 more" => "v", "AND 1 MORE" => "v" })
+      c.permitted_params
+      expect(lines.first).to end_with('contract: "And 49990 more", "AND 1 MORE"')
+    end
+
     it "escapes the non-ASCII spaces, which let a lookalike separator pass for ', '" do
       name = "x,\u00A0and 49990 more\u2003\u3000\u202F"
       c, lines = logging_controller(log_klass, params: { "a" => "x", name => "v" })
@@ -1943,6 +1949,16 @@ RSpec.describe Permittable do
 
     it "quotes a name holding a lookalike comma or quote, and prints those characters as they are" do
       names = ["a\u{FF0C}b", "a\u{FE50}b", "a\u{3001}b", "\u{201C}x\u{201D}", "\u{2018}y\u{2019}", "\u{AB}z\u{BB}", "\u{FF02}w"]
+      c, lines = logging_controller(log_klass, params: names.to_h { |n| [n, "v"] }.merge("a" => "x"))
+      c.permitted_params
+      expect(lines.first).to end_with("contract: #{names.map { |n| "\"#{n}\"" }.join(', ')}")
+    end
+
+    it "quotes a name using CJK corner brackets as quotes, or an ideographic/small-ideographic comma" do
+      # U+300C/U+300D are real quotation marks in Japanese and Chinese text
+      # (Ps/Pe, not Pi/Pf, so the earlier quote check missed them), and
+      # U+FE51 is the small-form sibling of the ideographic comma U+3001.
+      names = ["\u{300C}x\u{300D}", "a\u{FE51}b"]
       c, lines = logging_controller(log_klass, params: names.to_h { |n| [n, "v"] }.merge("a" => "x"))
       c.permitted_params
       expect(lines.first).to end_with("contract: #{names.map { |n| "\"#{n}\"" }.join(', ')}")
