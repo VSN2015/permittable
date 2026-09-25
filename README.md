@@ -569,9 +569,9 @@ The setting is app-wide, not per-contract, because the error format of an API is
 
 Under `:log` that bound is the whole record: nothing else names an undeclared key, so beyond the tenth only the count survives. Where you need every name — auditing what a client really sends during a rollout — use `unknown: :error` in monitor mode, which records all of them in `details` and in the instrumentation payload without rejecting the request.
 
-Rails merges its own keys into `params`: `controller`, `action`, and `format` from the router, plus `authenticity_token`, `_method`, `utf8`, and `commit` from an ordinary form POST. All seven are exempt at the top level, so `unknown: :error` flags what the *client* got wrong rather than what the framework added. Inside a `root:` or a nested hash there is no such exemption, because nothing legitimately injects keys there — and a standalone `Contract` exempts nothing at all, having neither a router nor a form.
+Rails merges its own keys into `params`: `controller`, `action`, and `format` from the router, plus `authenticity_token`, `_method`, `utf8`, and `commit` from an ordinary form POST. All seven are exempt at the top level. So are the route's **path parameters** (`PATCH /users/1` merges `id`, which the exported OpenAPI documents as a path parameter rather than a body field); a contract that *declares* `id` has it validated as usual, since the URL really carried it. **ParamsWrapper's copy of a JSON body** under the controller's wrapper key (`user` for `UsersController`) goes further: when Rails made that copy, a rootless contract does not see the key at all, because the client never sent it. So an undeclared wrapper key is not flagged, and a scalar or array field that happens to share the wrapper's name (`optional :feedback, :string` on `FeedbackController`) is simply absent, rather than failing as `invalid_type` against Rails' copy of the whole body. The one exception is a rootless contract that declares the wrapper key as a hash container — a nested block (`required :user do ... end`) or `:json`. That contract is reading the copy on purpose, like a `root:` spelled as a field, so the copy is kept and validated as that field. A client that sends `user` itself is checked like any other key: validated if declared, flagged if not. That holds whether the wrapper name is configured as a String or as a Symbol (`wrap_parameters :user`). Either way `unknown: :error` flags what the *client* got wrong rather than what the framework added. Inside a `root:` or a nested hash there is no such exemption, because nothing legitimately injects keys there — and a standalone `Contract` exempts nothing at all, having neither a router, a form, nor a request.
 
-The exemption covers the *check* only. Monitor mode still hands back the form keys in its raw pass-through, where behaving exactly like the pre-contract app is the whole promise and a legacy action may read `_method` itself; only the router's three are dropped there.
+All of this changes what is *checked* only. Monitor mode still hands back the form keys, the path parameters and the wrapper's copy in its raw pass-through, where behaving exactly like the pre-contract app is the whole promise and a legacy action may read `params[:id]` or `_method` itself; only the router's three are dropped there.
 
 ### Output reshaping (`transform:` and `finalize`)
 
@@ -651,6 +651,18 @@ When enabled it compares **groups**, not exact types, so it fires on a genuine c
 `boolean` sits with the numerics because a boolean stored as an integer `0`/`1` is a real legacy pattern and ActiveRecord casts cleanly between them; the temporal types are one group because a `:date` contract on a `datetime` column is a narrowing, not drift.
 
 Any column type **not** in that table — `json`, `jsonb`, `binary`, an adapter's own `inet` or `money` — is never checked. A contract has no faithful type for those, so whatever you improvised is left alone rather than guessed about.
+
+**A Rails `enum` is compared by what clients send, not what the column stores.** An enum is submitted by name — `status: "shipped"` — so `optional :status, :string, in: Order.statuses.keys` is the right contract for an integer-backed enum, and a text declaration on any attribute in the model's `defined_enums` is not held to the column's group. It **must** carry that `in:`, though: assignment raises `ArgumentError` for a value the enum does not map, so without one `status: "bogus"` would pass the contract and become a 500 in the action. A text declaration with no `in:`, or with an `in:` listing anything the enum would refuse, fails at class load:
+
+```
+Permittable: 'status' is an enum on Order, declared :string without an in: (table: orders).
+A value outside the enum would pass the contract and then raise on assignment.
+Declare it with in: Order.statuses.keys.
+```
+
+The `in:` may list names and, for a string-backed enum, stored values, since assignment accepts both. It must be a list: a Range is refused because it cannot be checked. String-backed enums follow the same rule. Other declarations are still held to the column's own group: `:integer` on an integer-backed enum passes, and `:datetime` fails with a suggestion of the enum contract rather than `virtual: true`.
+
+The attribute API is **not** treated the same way, by choice. `attribute :starts_at, :datetime` over a string column is still compared against the string column. An enum's mapping says exactly which strings are valid, so the exemption can demand a matching `in:`. An attribute override gives the guard nothing comparable to check the contract against, so exempting it would only switch the check off for that field. Declare such a field to match its column, or leave the check off.
 
 
 - **Fields not backed by a column** — `password_confirmation`, terms checkboxes, search filters — opt out with `virtual: true`.
@@ -769,25 +781,51 @@ For each controller the task infers the model from `controller_name` (columns gi
 ```ruby
 # Drafted by permittable:generate — review the TODOs, then deploy: monitor
 # mode reports violations (instrumentation + log) without rejecting requests.
-permit_params :create, :update, root: :user, model: User, mode: :monitor do
+permit_params :create, root: :user, model: User, mode: :monitor do
   required :name, :string
   optional :age, :integer
-  optional :status, :string # database default: "active"
+  optional :status, :string, in: User.statuses.keys # database default: "active"; TODO: Rails also assigns the stored integers (status: 1) — if API clients send them, add User.statuses.values.map(&:to_s) to in: and map them back to keys with transform:
+  optional :password_confirmation, :string, virtual: true # TODO: not a database column — confirm the type
+  array :tag_names, of: :string # TODO: confirm the element type, and declare length: — an array without one is unbounded
+end
+
+# :update has nothing required — a PATCH sends only the fields it changes.
+permit_params :update, root: :user, model: User, mode: :monitor do
+  optional :name, :string
+  optional :age, :integer
+  optional :status, :string, in: User.statuses.keys # database default: "active"; TODO: Rails also assigns the stored integers (status: 1) — if API clients send them, add User.statuses.values.map(&:to_s) to in: and map them back to keys with transform:
   optional :password_confirmation, :string, virtual: true # TODO: not a database column — confirm the type
   array :tag_names, of: :string # TODO: confirm the element type, and declare length: — an array without one is unbounded
 end
 ```
+
+A scanned draft keeps the root its permit call names (a rootless `params.permit(...)` stays rootless). Only a draft with no permit call to scan — drafted from the columns alone — takes its root from the model: `User.model_name.param_key`, the key Rails forms submit under, so a namespaced `Blog::Post` is rooted at `:blog_post`.
 
 The generator's one rule is **draft, don't guess** — everything it cannot know for sure stays visible instead of silently decided:
 
 - Drafts come out in **monitor mode**, so pasting one changes nothing until you flip it.
 - A permitted key that isn't a column becomes `virtual: true` with a TODO; a column type with no faithful representation (`binary`, geometry types) becomes a TODO comment; a permit argument the conservative parser can't read (`*dynamic_keys`) is kept verbatim in a TODO instead of dropped.
 - **Comments are not code.** A commented-out `params.require(:admin).permit(:superuser)` kept for reference is skipped, so it can't contribute a root or a field to the draft. The source is tokenised with `Ripper` for this, because `#` is only sometimes a comment — a permit call inside `#{'#{...}'}` interpolation is live code and is still read, and quoted keys like `permit("name")` still work.
+- NOT NULL is only true of a **create**. When a column makes a field `required`, the draft splits into a `:create` rule and an `:update` rule with every field optional, so a PATCH carrying only the edited field is not rejected for what it left out. With nothing required it stays one `:create, :update` rule. A default the **model** declares (`attribute :plan, default: "free"`, `enum ..., default: :pending`) keeps a NOT NULL column optional just as a database default does, and is shown as `# model default:`, written as declared rather than cast through the attribute type — a `Proc` default is named, never called.
+- A Rails `enum` drafts as the keys a form sends (`:string, in: User.statuses.keys`), not the integer it is stored as — and reads them from the model, so a new enum value cannot leave the contract behind. For an integer-backed enum, Rails also accepts the stored integer (`status: 1`), which JSON clients sometimes send; a TODO on the line says how to admit it.
+- The STI inheritance column (`type`, when the model actually uses STI) and the optimistic-locking column (`lock_version`, when `lock_optimistically` is on) are **not** drafted from the columns alone: assigning `type` changes the record's class. Each is named in a TODO saying why, so the omission is visible. When the controller's own permit call lists one, it **stays a field**, with a TODO — an edit form that round-trips `lock_version` is how Rails detects a stale update, and dropping it would switch that off the day the draft is enforced.
 - A database default is noted in a comment but **not** copied into `default:` — a contract default is injected on every request that omits the field, which would overwrite columns on partial updates. The database already handles creation.
 - `key: [:a, :b]` in a permit call drafts as a nested block, with a TODO noting it may be an array of hashes. In a `params.expect` call the two shapes are distinguishable — `key: [:a]` is a nested hash, `key: [[:a]]` is an array of hashes — so that draft carries no TODO at all.
-- In a `params.expect` call, a route param sitting next to the envelope (`params.expect(:id, user: [:name])`) is **not** drafted as a field; it stays visible in a TODO, because a routing key is not body input. Neither is a second envelope, which belongs under a different `root:` than one contract can express.
+- **One contract, one envelope.** A contract has one `root:`, so the generator picks it from every call in the file before it drafts any field:
+  1. When the model is known and any call uses its envelope (`post` for `Post`), that envelope wins outright, even `require(:post).permit(*PERMITTED)`.
+  2. With no model known, an envelope beats the rootless calls if it has at least one **parsed** field (`*PERMITTED` counts for nothing). An envelope with no parsed field, such as `expect(search: FILTERS)`, beats only rootless calls with no parsed field either. Among the envelopes, the one with more parsed fields wins. Every envelope of an `expect(post: [...], comment: [...])` call counts, and so does `expect(post: PERMITTED_PARAMS)`.
+  3. With a model that no envelope matches, the rootless calls, taken together, compete too. An envelope wins a tie with them.
 
-No Rails required for the core: `Permittable::Generator.draft(model: User)`, `.for_controller(controller, source: File.read(path))`, and `.scan(source)` are plain Ruby.
+  Remaining ties go to the first call in the source. A single-key `expect` lookup of `:id` or a `*_id` key, like a Rails 8 scaffold's `Post.find(params.expect(:id))`, is a route param. It never scores and is never drafted as a field. A single-key `params.permit(:group_id)` is mass assignment and is drafted as usual. Only the winner's calls become fields, and a key the winner drafts is never also a TODO. Everything else stays visible as a TODO that says why:
+  - `belongs to another envelope (search): params.require(:search).permit(:q)` for a losing envelope, quoted as the call (or, inside an `expect`, the argument) the source spells it with.
+  - `route or query param, not a body field: :id` for a route param, or a bare key beside the envelope in the same `expect` call.
+  - `outside the post envelope, so not in this contract: :page` for a rootless call's keys once an envelope wins, or an array or hash beside the envelope.
+
+  A file with only rootless calls drafts a rootless contract.
+- **A draft always declares a field, or there is no draft.** Sometimes no scanned line would declare a field: every call is `permit(*PERMITTED)`, or the only scanned key is a `binary` column, which has no contract type. A contract of only TODO lines would raise `a contract must declare at least one field` when pasted. So the columns are drafted instead, with the scan's TODOs underneath. Columns the TODOs say are not drafted (a route param, or a key permitted in shapes that accept different input) are left out. A rootless controller whose calls carried a body field gets a rootless draft, with the columns at the top level. A scan that found only a route-param lookup gets the model's root. If the columns cannot declare a field either, the next candidate root is tried — the model's envelope permitting only a `binary` column does not stop the file's other envelope from being drafted — and only when no candidate can be drafted is there no draft.
+- **A key permitted in two shapes is drafted once.** A contract rejects a field declared twice. A nested hash and an array of hashes merge into the array of hashes, keeping the sub-keys of both. An array of scalars (`tags: []`) and a hash shape (`tags: [:a]`) accept different input, so neither is drafted, and the TODO asks you to declare the shape the actions share. Otherwise the richer shape wins over a scalar. Every conflict is named in a TODO that lists each shape and what was drafted (`tags is permitted as both a scalar and an array — drafted as the array`). An empty list such as `meta: [[ ]]` is kept as a TODO, never drafted as an empty block.
+
+No Rails required for the core: `Permittable::Generator.draft(model: User)`, `.for_controller(controller, source: File.read(path))`, and `.scan(source, model: User)` are plain Ruby.
 
 ---
 
@@ -807,6 +845,7 @@ legacy/invoices
   POST   /legacy/invoices                   create       no contract — ACCEPTS A BODY
 orders
   POST   /orders                            create       enforce
+  DELETE /orders/{id}                       destroy      no contract — action not found
   PUT    /orders/{id}                       update       no contract — ACCEPTS A BODY
 users
   GET    /users                             index        no contract
@@ -814,11 +853,11 @@ users
   DELETE /users/{id}                        destroy      monitor
   PATCH  /users/{id}                        update       enforce  model: User  unknown: error
 
-7 routed actions: 3 enforced, 1 in monitor mode, 3 without a contract
+8 routed actions: 3 enforced, 1 in monitor mode, 3 without a contract, 1 not found (Rails 404s it)
   2 of those accept a request body — untrusted input reaches the action unchecked
   2 covered actions declare no model:, so no schema-drift guard runs for them
 
-Contracts declared for actions no route reaches (renamed or deleted?):
+Contracts declared for actions no route reaches or Rails would 404 (renamed or deleted?):
   users#archive
 ```
 
@@ -826,7 +865,22 @@ Three things it tells you that nothing else does:
 
 - **Which write actions are unguarded.** A `GET` without a contract is usually fine; a `POST` without one is untrusted input reaching the action unchecked. That count is the number `[strict]` fails on, which makes the task a CI gate: *no new unguarded write endpoint*.
 - **Which contracts aren't enforcing yet.** The audit runs inside the app, so unlike the exported OpenAPI it resolves the **effective** mode — a rule's own `mode:` first, then your app-wide `Permittable.mode`. This is the [monitor-mode](#monitor-mode-roll-out-without-rejecting) rollout dashboard.
-- **Which contracts have gone stale.** A contract declared for an action no route reaches is a renamed or deleted action that left its contract behind.
+- **Which contracts have gone stale.** A contract declared for an action no route reaches, or for a routed action Rails would 404, is a renamed or deleted action that left its contract behind.
+
+A route that lists several verbs is audited once per verb. A `match ... via: :all` route is expanded into exactly GET, POST, PUT, PATCH and DELETE, and listed once for each. `resources` routes all seven actions whether or not they exist. A route that Rails would 404 reads `action not found`: no method (inherited ones count), no `action_missing`, and no template to render implicitly. It is not counted against `[strict]` or as coverage. It stays in the table rather than disappearing. The template check uses the class-level view paths and the default lookup details. So a template that is only found at request time reads `action not found`, for example one behind a `prepend_view_path` in a `before_action`, or one that exists only as a variant.
+
+A catch-all 404 route (`match "*path", to: "application#not_found", via: :all`) shows its POST, PUT and PATCH rows as accepting a body. They do accept one: every stray body reaches the controller. Route only GET to the controller (Rails answers HEAD from it). Send the other verbs to a plain Rack endpoint, which never parses the body and which the audit does not list:
+
+```ruby
+match "*path", to: "application#not_found", via: :get
+match "*path", to: ->(_env) { [404, { "content-type" => "text/plain" }, ["Not Found"]] }, via: :all
+```
+
+A `config.exceptions_app = routes` setup (`match "/404", to: "errors#not_found", via: :all`) shows the same rows. It needs only `via: :get`, because on 6.1 and later `ShowExceptions` re-dispatches the error request as a GET.
+
+Under `[strict]` the task aborts on these rows, so the only choices today are to route the catch-all GET-only, as above, or to run the audit without `[strict]` until the ignore list ([#69](https://github.com/VSN2015/permittable/issues/69)) lands. Don't declare a contract on the catch-all to silence the gate. Under monitor mode it validates eagerly, so a malformed JSON POST answers 400 instead of 404. The OpenAPI export would also gain a fake `/{path}` endpoint.
+
+The table lists a row for every verb on every path; the summary counts routes. A route with an optional segment, such as anything under `scope "(:locale)"`, lists each path it expands to (`/users` and `/{locale}/users`), but it is one route, so one unguarded `POST` counts once and the summary line says `N routed actions in M rows`. Rows are collapsed by controller, action, route index and verb; the index is a position within one `rails_routes` call, so audit concatenated route lists (an app's and an engine's) separately, or give them distinct `route:` values. Two separate routes to the same action (`post "/users"` and `post "/admin/users"`) count as two, because each one is a way in.
 
 Controllers that never included `Permittable` are audited too — those are the ones worth finding. Everything is plain Ruby over the frozen registry plus route descriptors, so `Permittable::Audit.entries(controllers:, routes:)` works without Rails.
 
@@ -908,6 +962,18 @@ Permittable::OpenAPI.document(controllers: [...], info: { "title" => "My API" })
 Every operation references shared components for the [error envelope](#violations-and-error-responses): a `422` response always, plus a `400` when the contract declares a `root:`. So consumers get typed *errors*, not just typed inputs.
 
 **What is honestly unrepresentable stays visible instead of guessed.** A `format:` regexp using a Ruby-only construct (or flags), or one ECMA-262 reads differently (`{,3}`, `&&` in a class, a backreference), is exported as `x-permittable-pattern` rather than a mistranslated `pattern` — including one anchored with `^`/`$`, which in Ruby anchor a **line** and in ECMA-262 anchor the whole string, so `/^\d{5}$/` accepts `"evil\n12345"` at runtime and publishing that source would promise a stricter rule than the server enforces (use `\A`/`\z`, which translate exactly); `validate:`/`transform:` are flagged `x-permittable-custom-validation`/`x-permittable-transformed`; actions covered only by a catch-all rule on a plain-Ruby host appear under `"*"` with `x-permittable-catch-all`; operations whose rule runs in [monitor mode](#monitor-mode-roll-out-without-rejecting) carry `x-permittable-mode: "monitor"`; operations with no matching route — or whose path-and-verb slot another controller already claimed, which one document cannot represent twice — land in `x-permittable-controllers` instead of being dropped. A templated path segment is declared as a path `parameter` of type `string`, because the route set doesn't say what an `:id` is and the exporter won't invent it. The schema documents the canonical JSON encoding — the runtime additionally accepts string-encoded scalars (`"42"`, `"true"`) for form/query payloads.
+
+**Every `operationId` is unique across the document, and only a collision is ever renamed.** An operation's id is its controller path with `/` folded to `_`, then its action: `users_create`, `admin_users_index`. Client generators name a method after the id, so the scheme itself never changes. Where two places in the document would carry one id, the exporter renames all but one of them:
+
+| Collision | Ids |
+| --- | --- |
+| One operation under two verbs (the separate PATCH and PUT routes `resources` draws to `update`, or one `match ..., via: [:patch, :put]` route) | `users_update` on PATCH, `users_update_put` on PUT |
+| The pair again at a second path (`resources :orgs { resources :users }`) | `users_update_2` on the second PATCH, `users_update_3` on the second PUT |
+| One operation under every verb (with `via: :all` routes, which the exporter documents under each verb) | `webhooks_receive` on GET, then `webhooks_receive_post`, `_put`, `_patch`, `_delete` |
+| One operation at two paths under one verb (with the optional-segment expansion: `(/:locale)/posts` is documented at `/posts` and `/{locale}/posts`) | `posts_create` on the first path in route order, `posts_create_2` on the other |
+| Two controllers that fold to one id (`admin/users` and `admin_users`, both GET) | `admin_users_index` on the first controller, `admin_users_index_2` on the second |
+
+One place keeps the plain id. A routed operation comes before one under `x-permittable-controllers`, which takes part because it is in the same document. After that, controller, action and route order decide. Within one operation, PATCH comes before PUT whichever the route lists first, so `match via: [:put, :patch]` and `resources` name the PATCH method the same way. Between two operations only the order counts, whatever the verbs. Every other place gets its verb appended when that verb differs from the plain id's verb and the result is free. Otherwise it gets the next free number, from `_2`. So a second PATCH is `users_update_2`, not `users_update_patch`, and a second POST is `posts_create_2`. **The stability rule:** an id that only one operation would carry never changes, even when a suffix elsewhere would spell it; that suffix is numbered instead. So a change to routes or controllers can rename only operations that collide, never one that stands alone. A route declared twice is placed once, and a controller passed twice is documented once, so neither collides with itself.
 
 Output is deterministic (fixed key order, declaration-order properties), so the generated file can be committed and reviewed as a diff — a contract change shows up in the same PR as its documentation change.
 
