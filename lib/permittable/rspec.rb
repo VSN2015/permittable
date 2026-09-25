@@ -535,7 +535,7 @@ module Permittable
       # -- RSpec protocol -----------------------------------------------------
 
       def matches?(subject)
-        @subject = PermitParamMatcher.new("").send(:resolve_subject, subject)
+        @subject = resolve_subject(subject)
         rule = resolve_rule
         return false unless rule
 
@@ -629,6 +629,13 @@ module Permittable
       def record_problem(problem)
         @problem = problem
         nil
+      end
+
+      def resolve_subject(subject)
+        return subject if subject.respond_to?(:permit_rule_for)
+        return subject.class if subject.class.respond_to?(:permit_rule_for)
+
+        raise ArgumentError, "#{LABEL}: the subject of accept_params/reject_params must include Permittable (got #{subject.inspect})"
       end
 
       def summary(violations)
