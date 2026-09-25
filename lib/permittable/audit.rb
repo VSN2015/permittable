@@ -17,7 +17,8 @@ module Permittable
   #
   # Plain Ruby over the frozen registry and a list of route descriptors (the
   # same `{ controller:, action:, verb:, path: }` shape OpenAPI.rails_routes
-  # produces), so it is unit-testable without Rails. Unlike the exporter it
+  # produces, plus the optional `route:` it tags each one with), so it is
+  # unit-testable without Rails. Unlike the exporter it
   # reports the EFFECTIVE mode: an audit runs inside the app that sets
   # `Permittable.mode`, so it can resolve what the exporter deliberately
   # cannot.
@@ -32,7 +33,10 @@ module Permittable
     # One routed action, paired with the rule a request for it would resolve
     # through (nil when nothing covers it — including when the controller
     # never included the concern, which is exactly the case worth finding).
-    Entry = Struct.new(:controller, :action, :verb, :path, :rule, keyword_init: true) do
+    #
+    # `route` identifies the route the path came from (nil for a hand-built
+    # descriptor, which is then its own route); see `summary`.
+    Entry = Struct.new(:controller, :action, :verb, :path, :rule, :route, keyword_init: true) do
       def covered?
         !rule.nil?
       end
@@ -70,7 +74,7 @@ module Permittable
       routes.select { |route| route[:controller].to_s == key }.map do |route|
         action = route[:action].to_s
         Entry.new(controller: key, action: action, verb: route[:verb], path: route[:path],
-                  rule: rule_for(controller, action))
+                  rule: rule_for(controller, action), route: route[:route])
       end
     end
 
@@ -97,7 +101,15 @@ module Permittable
     # The numbers worth putting in a CI log. `uncovered_with_body` is the one
     # that should be zero; `unguarded_models` counts covered actions whose
     # rule declares no `model:`, so no schema-drift guard runs for them.
+    #
+    # Counted per route and verb rather than per row: `scope "(:locale)"`
+    # expands one route into two paths, both listed in the table, and one
+    # unguarded POST must not count as two. Only a route's OWN variants
+    # collapse — `post "/users"` and `post "/admin/users"` are two ways into
+    # users#create, two gaps if neither is covered, and `[strict]` must see
+    # both.
     def summary(entries)
+      entries = routed(entries)
       {
         actions: entries.length,
         enforced: entries.count { |e| e.mode == :enforce },
@@ -108,13 +120,22 @@ module Permittable
       }
     end
 
+    # One entry per route and verb, in the entries' own order. `route` is a
+    # position within ONE rails_routes call, so it is keyed with the
+    # controller and action: an app's list concatenated with an engine's
+    # reuses the same small integers for unrelated routes. An entry with no
+    # `route` (a hand-built descriptor) is its own route.
+    def routed(entries)
+      entries.uniq { |e| e.route.nil? ? e.object_id : [e.controller, e.action, e.route, e.verb.to_s.downcase] }
+    end
+
     # The human-readable report: one block per controller, then the summary,
     # then anything stale.
     def format(entries, stale: {})
       return "Permittable audit: no routed actions to report.\n" if entries.empty?
 
       out = entries.group_by(&:controller).map { |key, group| controller_block(key, group) }
-      out << summary_lines(summary(entries))
+      out << summary_lines(summary(entries), rows: entries.length)
       out << stale_lines(stale) unless stale.empty?
       "#{out.join("\n")}\n"
     end
@@ -138,11 +159,18 @@ module Permittable
       parts.join("  ")
     end
 
-    def summary_lines(counts)
+    # The table lists rows (a verb on a path) and the summary counts routes;
+    # when the two numbers differ, the line gives both and names each. Rows,
+    # not distinct paths: PATCH and PUT on one path are two rows. It does not
+    # say WHY they differ: an optional segment's variants are the usual
+    # reason, but two concatenated route lists sharing a controller, action
+    # and index collapse the same way.
+    def summary_lines(counts, rows: counts[:actions])
       body = counts[:uncovered_with_body]
+      listed = " in #{rows} rows" unless rows == counts[:actions]
       [
         "",
-        "#{counts[:actions]} routed action#{'s' unless counts[:actions] == 1}: " \
+        "#{counts[:actions]} routed action#{'s' unless counts[:actions] == 1}#{listed}: " \
         "#{counts[:enforced]} enforced, #{counts[:monitored]} in monitor mode, " \
         "#{counts[:uncovered]} without a contract",
         "  #{body} of those accept a request body#{' — untrusted input reaches the action unchecked' unless body.zero?}",

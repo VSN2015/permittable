@@ -430,8 +430,8 @@ RSpec.describe Permittable::OpenAPI do
       app = Struct.new(:routes).new(route_set)
       expect(described_class.rails_routes(app)).to eq(
         [
-          { controller: "users", action: "show", verb: "get", path: "/users/{id}" },
-          { controller: "users", action: "create", verb: "post", path: "/users" }
+          { controller: "users", action: "show", verb: "get", path: "/users/{id}", route: 0 },
+          { controller: "users", action: "create", verb: "post", path: "/users", route: 1 }
         ]
       )
     end
@@ -446,8 +446,8 @@ RSpec.describe Permittable::OpenAPI do
       app = Struct.new(:routes).new(route_set)
       expect(described_class.rails_routes(app)).to eq(
         [
-          { controller: "users", action: "update", verb: "patch", path: "/users/{id}" },
-          { controller: "users", action: "update", verb: "put", path: "/users/{id}" }
+          { controller: "users", action: "update", verb: "patch", path: "/users/{id}", route: 0 },
+          { controller: "users", action: "update", verb: "put", path: "/users/{id}", route: 0 }
         ]
       )
     end
@@ -466,10 +466,89 @@ RSpec.describe Permittable::OpenAPI do
       app = Struct.new(:routes).new(route_set)
       expect(described_class.rails_routes(app)).to eq(
         [
-          { controller: "files", action: "show", verb: "get", path: "/files/{rest}" },
-          { controller: "files", action: "nested", verb: "get", path: "/files/{bucket}/{path}" }
+          { controller: "files", action: "show", verb: "get", path: "/files/{rest}", route: 0 },
+          { controller: "files", action: "nested", verb: "get", path: "/files/{bucket}/{path}", route: 1 }
         ]
       )
+    end
+
+    # A real route set rather than a Journey-shaped Struct: the bug was in
+    # the spec strings Rails actually generates, so the test reads those.
+    context "with optional segments" do
+      def app_with(&draw)
+        route_set = ActionDispatch::Routing::RouteSet.new
+        route_set.draw(&draw)
+        Struct.new(:routes).new(route_set)
+      end
+
+      it "expands an optional scope into the path without it and the path with it" do
+        app = app_with { scope("(:locale)") { resources :posts, only: %i[index show] } }
+        expect(described_class.rails_routes(app)).to eq(
+          [
+            { controller: "posts", action: "index", verb: "get", path: "/posts", route: 0 },
+            { controller: "posts", action: "index", verb: "get", path: "/{locale}/posts", route: 0 },
+            { controller: "posts", action: "show", verb: "get", path: "/posts/{id}", route: 1 },
+            { controller: "posts", action: "show", verb: "get", path: "/{locale}/posts/{id}", route: 1 }
+          ]
+        )
+      end
+
+      it "expands nested optional groups recursively" do
+        app = app_with { get "archive(/:year(/:month))", to: "archive#show" }
+        expect(described_class.rails_routes(app).map { |r| r[:path] })
+          .to eq(["/archive", "/archive/{year}", "/archive/{year}/{month}"])
+      end
+
+      it "keeps an optional root scope a valid path" do
+        app = app_with { scope("(:locale)") { root to: "home#index" } }
+        expect(described_class.rails_routes(app).map { |r| r[:path] }).to eq(["/", "/{locale}"])
+      end
+
+      # `x(/:a)(/:b)` with one segment present is always matched as :a — the
+      # :b-only variant is the same URL shape under another name, and OpenAPI
+      # forbids two templates that differ only in their variable names.
+      it "drops a variant that coincides with one already emitted" do
+        app = app_with { get "x(/:a)(/:b)", to: "x#y" }
+        expect(described_class.rails_routes(app).map { |r| r[:path] })
+          .to eq(["/x", "/x/{a}", "/x/{a}/{b}"])
+      end
+
+      # Order is part of the contract: the operationId dedupe
+      # (assign_unique_operation_ids) numbers colliding ids in route order, so
+      # the path without the segment must come first to keep the plain id
+      # (`/posts` is `posts_create`, not `_2`).
+      # Each group reads absent-before-present, outer groups before inner, and
+      # the order does not change which coinciding variant survives
+      # (`/p/{q}`, not `/p/{s}`).
+      it "emits the path without each optional segment first, at every nesting level" do
+        app = app_with { get "(:l)/p(/:q(/:r))(/:s)", to: "m#n" }
+        expect(described_class.rails_routes(app).map { |r| r[:path] }).to eq(
+          ["/p", "/p/{q}", "/p/{q}/{r}", "/p/{q}/{r}/{s}",
+           "/{l}/p", "/{l}/p/{q}", "/{l}/p/{q}/{r}", "/{l}/p/{q}/{r}/{s}"]
+        )
+      end
+
+      it "exports a document with no parentheses and every templated variable declared" do
+        klass = controller_class(path: "posts") { permit_params(:create) { required :title, :string } }
+        app = app_with do
+          scope("(:locale)") { resources :posts, only: :create }
+          get "archive(/:year(/:month))", to: "posts#create"
+        end
+        doc = described_class.document(controllers: [klass], routes: described_class.rails_routes(app))
+
+        expect(doc["paths"].keys).to contain_exactly(
+          "/posts", "/{locale}/posts", "/archive", "/archive/{year}", "/archive/{year}/{month}"
+        )
+        expect(doc["paths"].keys.grep(/[()]/)).to be_empty
+        doc["paths"].each do |path, operations|
+          variables = path.scan(/\{(\w+)\}/).flatten
+          operations.each_value do |operation|
+            declared = operation.fetch("parameters", []).select { |p| p["in"] == "path" }
+            expect(declared.map { |p| p["name"] }).to match_array(variables), "#{path} declares #{declared.inspect}"
+            expect(declared).to all(include("required" => true))
+          end
+        end
+      end
     end
   end
 
