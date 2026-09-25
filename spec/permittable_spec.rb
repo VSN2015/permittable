@@ -685,6 +685,26 @@ RSpec.describe Permittable do
         expect { permit({ s: "ok" }, &decl) }.to raise_error(ArgumentError, "app bug")
       end
 
+      # The rescue in apply_normalize exists so a BUILT-IN preset can decline
+      # an encoding it cannot handle. It must not become a bypass for an
+      # app's own normalize: Proc: its raise is a business rule, not an
+      # encoding failure, and swallowing it on non-UTF-8 input would let
+      # exactly that input skip validation a UTF-8 request could not.
+      it "still raises a custom normalize: Proc's own ArgumentError/EncodingError on non-UTF-8 input" do
+        [
+          ["Shift_JIS", "テスト".encode("Shift_JIS")],
+          ["Windows-1252", in_encoding("caf\xE9", "Windows-1252")],
+          ["binary with a high byte", "caf\xE9".b]
+        ].each do |label, value|
+          [ArgumentError, EncodingError].each do |error_class|
+            decl = proc do
+              permit_params(:create) { required :s, :string, normalize: ->(_v) { raise error_class, "business rule violated" } }
+            end
+            expect { permit({ s: value }, &decl) }.to raise_error(error_class, "business rule violated"), "for #{label}/#{error_class}"
+          end
+        end
+      end
+
       it "reports format: that cannot be applied to a String's encoding as a format violation" do
         decl = proc { permit_params(:create) { required :s, :string, format: /\Acafé\z/ } }
         [utf16("café"), "caf\xC3\xA9".b, "テスト".encode("Shift_JIS")].each do |value|
@@ -957,6 +977,29 @@ RSpec.describe Permittable do
     it "leaves a field with no length: bound checking format: as before" do
       decl = proc { permit_params(:create) { required :s, :string, format: /\A[a-z]+\z/ } }
       expect(violations_for({ s: "AB" }, &decl).details).to eq([{ param: "s", code: "format" }])
+    end
+
+    # A String subclass so it satisfies scalar_shaped?/is_a?(String) while
+    # recording how many times its own encoding was scanned. Ordinary UTF-8
+    # input is the fast path in Coercion.cast: the value IS already the text
+    # a non-:string type parses from, so validity need be scanned once, not
+    # once directly and once more inside utf8_text for the same object.
+    let(:counting_string) do
+      Class.new(String) do
+        attr_reader :valid_encoding_calls
+
+        def valid_encoding?
+          @valid_encoding_calls = (@valid_encoding_calls || 0) + 1
+          super
+        end
+      end
+    end
+
+    it "scans a UTF-8 String's encoding only once per cast, for a non-:string type" do
+      value = counting_string.new("12")
+      result = permit({ n: value }) { permit_params(:create) { required :n, :integer } }
+      expect(result[:n]).to eq(12)
+      expect(value.valid_encoding_calls).to eq(1)
     end
   end
 

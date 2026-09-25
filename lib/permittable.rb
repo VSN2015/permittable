@@ -572,7 +572,13 @@ module Permittable
       # something other than what it asked Rails for.
       return cast_string(value) if type == :string
 
-      text = utf8_text(value)
+      # A UTF-8 String IS already its own inspection copy — the check just
+      # above already scanned it — so utf8_text would only scan the same
+      # object a second time for no new answer. Every other encoding still
+      # goes through it: a US-ASCII or binary String is a NEW object once
+      # force_encoding'd, and one only `encode` could produce is not yet
+      # known to be valid UTF-8 at all.
+      text = value.encoding == Encoding::UTF_8 ? value : utf8_text(value)
       text ? public_send("cast_#{type}", text) : [:error, "invalid_type"]
     end
 
@@ -782,21 +788,30 @@ module Permittable
     # so the absence rule in between cannot mistake it for a missing value.
     #
     # A VALID String in another encoding is normalized in that encoding —
-    # `:strip` works on binary and Shift_JIS alike — and when the normalizer
-    # cannot handle the encoding (`:squish` on UTF-16 raises
+    # `:strip` works on binary and Shift_JIS alike — and when a BUILT-IN
+    # PRESET cannot handle the encoding (`:squish` on UTF-16 raises
     # Encoding::CompatibilityError) the value is left as it is rather than
-    # raising. Only for such a String: on UTF-8 or ASCII-only text nothing
-    # the encoding does can be the cause, so an error there is the app's own
-    # bug and is raised as one.
+    # raising.
+    #
+    # That leniency is only for the gem's own presets, identified by object
+    # identity against NORMALIZERS' values (resolve_normalizer! replaces
+    # field[:normalize] with the exact Proc from that Hash, so a preset and
+    # an app-supplied Proc are never the same object). An app's own Proc
+    # raising is never swallowed, on ANY encoding: `normalize: ->(v) { raise
+    # ArgumentError, "..." if ... }` is a business rule, not an encoding
+    # failure, and treating its raise as "this encoding defeated the
+    # normalizer" would have let exactly the input a UTF-8 request could not
+    # bypass the very check it names.
     def apply_normalize(normalizer, value)
       return value unless normalizer && value.is_a?(String)
       return value unless value.valid_encoding?
+      return normalizer.call(value) unless NORMALIZERS.value?(normalizer)
 
-      normalizer.call(value)
-    rescue EncodingError, ArgumentError
-      raise if value.encoding == Encoding::UTF_8 || value.ascii_only?
-
-      value
+      begin
+        normalizer.call(value)
+      rescue EncodingError, ArgumentError
+        value
+      end
     end
 
     # nil and "" are both ABSENT — see the module comment. The VALUE half of
