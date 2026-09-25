@@ -112,8 +112,10 @@ RSpec.describe Permittable do
       expect(permit({ status: "published", tier: "pro" }, &decl).to_h).to eq("status" => "published", "tier" => "pro")
       expect(violations_for({ status: "0", tier: "f" }, &decl).details)
         .to eq([{ param: "status", code: "inclusion" }, { param: "tier", code: "inclusion" }])
-      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].map { |f| f[:in] })
-        .to eq([%w[draft published], %w[free pro]])
+      # A Set, so membership stays O(1) per request as Hash#include? was.
+      ins = permittable_class(&decl).permit_rule_for(:create)[:fields].map { |f| f[:in] }
+      expect(ins).to eq([Set["draft", "published"], Set["free", "pro"]])
+      expect(ins).to all(be_frozen)
     end
 
     it "keeps an :in that only answers include? exactly as given, uncast" do
@@ -123,6 +125,35 @@ RSpec.describe Permittable do
       expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in]).to be(allowlist)
       expect(permit({ sku: "sku-1" }, &decl)[:sku]).to eq("sku-1")
       expect(violations_for({ sku: "abc" }, &decl).details).to eq([{ param: "sku", code: "inclusion" }])
+    end
+
+    # Only Array, Set, Hash and Enumerator are lists. An app's own Enumerable
+    # with its own include? — a case-insensitive allowlist, a DB-backed
+    # registry — is used as given: never enumerated at class load, never
+    # replaced by an exact-match copy.
+    it "keeps an app's own Enumerable that defines include? as given, never enumerating it" do
+      plans = Class.new do
+        include Enumerable
+
+        def each = raise("enumerated at class load")
+        def include?(value) = %w[free pro].include?(value.to_s.downcase)
+      end.new
+      decl = proc { permit_params(:create) { optional :plan, :string, in: plans } }
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in]).to be(plans)
+      expect(permit({ plan: "PRO" }, &decl)[:plan]).to eq("PRO")
+      expect(violations_for({ plan: "gold" }, &decl).details).to eq([{ param: "plan", code: "inclusion" }])
+    end
+
+    # The approved snapshot: a list is cast once, so a later `PLANS << "gold"`
+    # is not seen. An app that needs a live list passes its own include?
+    # object, which is read on every request.
+    it "snapshots an Array :in at class load" do
+      plans = %w[free pro]
+      klass = permittable_class { permit_params(:create) { optional :plan, :string, in: plans } }
+      plans << "gold"
+      e = klass.new(params: { plan: "gold" })
+      e.define_singleton_method(:action_name) { "create" }
+      expect(e.permittable_violations).to eq([{ param: "plan", code: "inclusion" }])
     end
 
     # A lazy list left lazy was cast per request, and the cast's early return
@@ -137,14 +168,25 @@ RSpec.describe Permittable do
         .to raise_error(ArgumentError, /:in for field :n contains "x"/)
     end
 
-    it "reads a Time or DateTime member of a :date field as its date" do
+    # ActiveSupport compares a Time (or DateTime) with a Date as instants,
+    # the Date standing for its midnight UTC — so that instant was the only
+    # one that ever matched. It is read as that UTC date; any other instant
+    # never matched a request, and fails like any never-matching member.
+    it "reads a Time or DateTime member of a :date field as its date only at midnight UTC" do
       decl = proc do
-        permit_params(:create) { optional :day, :date, in: [Time.utc(2026, 9, 5, 10), DateTime.new(2026, 9, 6, 23)] }
+        permit_params(:create) do
+          optional :day, :date, in: [Time.utc(2026, 9, 5), DateTime.new(2026, 9, 6, 5, 0, 0, "+05:00")]
+        end
       end
       expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in])
         .to eq([Date.new(2026, 9, 5), Date.new(2026, 9, 6)])
       expect(permit({ day: "2026-09-05" }, &decl)[:day]).to eq(Date.new(2026, 9, 5))
       expect(permit({ day: "2026-09-06" }, &decl)[:day]).to eq(Date.new(2026, 9, 6))
+
+      [Time.utc(2026, 9, 5, 10), Time.new(2026, 9, 5, 0, 0, 0, "+05:00"), DateTime.new(2026, 9, 6, 23)].each do |member|
+        expect { permittable_class { permit_params(:create) { optional :day, :date, in: [member] } } }
+          .to raise_error(ArgumentError, /:in for field :day contains .*, which is not a valid :date \(not midnight UTC/)
+      end
     end
 
     # On a nullable field an explicit null is accepted before in: is ever

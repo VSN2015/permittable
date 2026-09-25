@@ -198,7 +198,7 @@ module Permittable
         when :required then required_mismatch(field, value)
         when :format then format_mismatch(field, value)
         # Compared cast, but reported as written.
-        when :in then option_mismatch(field, :in, value) unless field.key?(:in) && field[:in] == cast_in(field, value)
+        when :in then option_mismatch(field, :in, value) unless field.key?(:in) && same_in?(field[:in], cast_in(field, value))
         when :virtual, :sensitive, :nullable then "expected the field to be #{key}, but it is not" unless field[key]
         else option_mismatch(field, key, value)
         end
@@ -241,6 +241,14 @@ module Permittable
 
         status, cast = Coercion.cast_in_members(field[:type], members, nullable: field[:nullable])
         status == :ok ? cast : expected
+      end
+
+      # A list's order and container say nothing about what it allows:
+      # `in: Post.statuses` is stored as a Set, and `within(%w[draft
+      # published])` names exactly its values.
+      def same_in?(declared, expected)
+        lists = [declared, expected].all? { |list| list.is_a?(Array) || list.is_a?(Set) }
+        lists ? declared.to_set == expected.to_set : declared == expected
       end
 
       def declared_format(field)

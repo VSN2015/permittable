@@ -98,10 +98,33 @@ RSpec.describe Permittable::JsonSchema do
       end
     end
 
+    # A Time/DateTime/TimeWithZone member is re-encoded, so it must keep the
+    # sub-second digits it has — whole seconds named an instant the server
+    # refused.
+    it "exports a sub-second Time-like :datetime member with its fractional digits, and the server accepts it" do
+      members = [Time.utc(2026, 9, 5, 10, 0, Rational(1, 4)), DateTime.new(2026, 9, 5, 11, 0, Rational(123_456_789, 10**9)),
+                 Time.utc(2026, 9, 5, 12).in_time_zone("Tokyo") + Rational(1, 1000), Time.utc(2026, 9, 5, 13)]
+      contract = Permittable::Contract.define { optional :at, :datetime, in: members }
+      enum = described_class.rule(contract.rule)["properties"]["at"]["enum"]
+      expect(enum).to eq(["2026-09-05T10:00:00.25Z", "2026-09-05T11:00:00.123456789Z",
+                          "2026-09-05T12:00:00.001Z", "2026-09-05T13:00:00Z"])
+      enum.each { |member| expect(contract.call(at: member).violations).to be_empty, "#{member} was refused" }
+    end
+
     it "exports an :in that only answers include? as custom validation, not as an enum" do
       allowlist = Object.new
       def allowlist.include?(_value) = true
       prop = property("sku") { optional :sku, :string, in: allowlist }
+      expect(prop).not_to have_key("enum")
+      expect(prop["x-permittable-custom-validation"]).to be(true)
+
+      plans = Class.new do
+        include Enumerable
+
+        def each(&) = %w[free pro].each(&)
+        def include?(value) = %w[free pro].include?(value.to_s.downcase)
+      end.new
+      prop = property("plan") { optional :plan, :string, in: plans }
       expect(prop).not_to have_key("enum")
       expect(prop["x-permittable-custom-validation"]).to be(true)
     end

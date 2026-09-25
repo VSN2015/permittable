@@ -744,29 +744,46 @@ module Permittable
       [:ok, members.is_a?(Set) ? cast_members.to_set : cast_members, pairs.map(&:last)]
     end
 
-    # The members of an `in:` that is a LIST, or nil when it is not one: a
-    # Range bounds rather than lists, and an object that merely answers
-    # include? (a host's own allowlist) is kept as given. A Hash lists its
-    # KEYS, which is what Hash#include? asks about — the Rails enum idiom,
-    # `in: Post.statuses`. Anything else Enumerable is forced to an Array
-    # here, once: an Enumerator::Lazy left lazy would be cast on every
+    # The members of an `in:` that is a LIST, or nil when it is not one.
+    # Only the collections whose include? is plain membership count: Array,
+    # Set, Hash and Enumerator. Anything else answering include? — a Range,
+    # or an app's own object, Enumerable or not — is used as given, because
+    # its include? may be exactly the point (a case-insensitive allowlist)
+    # and enumerating it may be expensive (a DB-backed registry).
+    #
+    # A Hash lists its KEYS, which is what Hash#include? asks about — the
+    # Rails enum idiom, `in: Post.statuses` — and, like a Set, stays a Set,
+    # so membership stays O(1) per request. An Enumerator (Lazy included) is
+    # forced to an Array here, once: left lazy, it would be cast on every
     # request instead of at class load.
     def in_list(allowed)
-      return nil if allowed.is_a?(Range) || !allowed.is_a?(Enumerable)
-      return allowed.keys if allowed.is_a?(Hash)
-
-      allowed.is_a?(Set) ? allowed : allowed.to_a
+      case allowed
+      when Hash then allowed.keys.to_set
+      when Set then allowed
+      when Array, Enumerator then allowed.to_a
+      end
     end
 
     # A Symbol is read as its String: it is how Ruby spells a constant
     # string, and a request never carries one, so no cast accepts it as is.
-    # A Time or DateTime on a :date field is read as its date — cast_date
-    # would keep a DateTime whole (it IS a Date) and refuse a Time, and
-    # neither would ever equal the Date a request casts to.
     def cast_in_member(type, member)
       member = member.to_s if member.is_a?(Symbol)
-      member = member.to_date if type == :date && (member.is_a?(Time) || member.is_a?(DateTime))
+      return instant_as_date(member) if type == :date && (member.is_a?(Time) || member.is_a?(DateTime))
+
       cast(type, member)
+    end
+
+    # A Time or DateTime member of a :date field. ActiveSupport compares one
+    # with a Date as INSTANTS, the Date standing for its midnight UTC, so
+    # that instant is the only one that ever equalled a request's date. It
+    # is read as that UTC date; any other instant never matched anything,
+    # and is refused like any member no request could equal. (cast_date
+    # would keep a DateTime whole — it IS a Date — and refuse a Time.)
+    def instant_as_date(member)
+      utc = member.to_time.getutc
+      return [:error, "not midnight UTC, so it never equals a date"] unless utc == utc.beginning_of_day
+
+      [:ok, utc.to_date]
     end
 
     # What an exported enum lists for one member: the cast value, re-encoded

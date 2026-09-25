@@ -182,9 +182,10 @@ module Permittable
       schema[allowed.exclude_end? ? "exclusiveMaximum" : "maximum"] = json_value(allowed.end) if allowed.end
     end
 
-    # A host's own include?-answering allowlist, kept by the contract as given.
+    # A host's own include?-answering object, kept by the contract as given —
+    # the same predicate the contract used to decide it was not a list.
     def opaque_in?(allowed)
-      !allowed.nil? && !allowed.is_a?(Range) && !allowed.is_a?(Enumerable)
+      !allowed.nil? && !allowed.is_a?(Range) && Coercion.in_list(allowed).nil?
     end
 
     def apply_string_bounds!(schema, field)
@@ -264,13 +265,23 @@ module Permittable
       # the same re-encoding as any other authored scalar.
       when Hash then value.to_h { |k, v| [k.to_s, json_value(v)] }
       when BigDecimal then value.to_s("F")
-      when Time then value.utc.iso8601
+      when Time then exact_iso8601(value.getutc)
       # DateTime subclasses Date, so it must match first.
-      when DateTime then value.to_time.utc.iso8601
+      when DateTime then exact_iso8601(value.to_time.getutc)
       when Date then value.iso8601
       when Symbol then value.to_s
       else value
       end
+    end
+
+    # iso8601 prints whole seconds unless told otherwise, and a sub-second
+    # instant re-encoded that way names a DIFFERENT instant — one an `in:`
+    # listing the original refuses. So as many fractional digits as the
+    # value has, up to the nanoseconds Time#nsec can report.
+    def exact_iso8601(time)
+      nsec = time.nsec
+      digits = nsec.zero? ? 0 : 9 - nsec.to_s.rjust(9, "0")[/0*\z/].length
+      time.iso8601(digits)
     end
   end
 end
