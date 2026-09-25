@@ -102,6 +102,56 @@ RSpec.describe Permittable::Contract do
       expect(result.violations).to contain_exactly({ param: "id", code: "unknown" }, { param: "user", code: "unknown" })
     end
 
+    # The documented promise. A webhook payload has no Rails params builder in
+    # front of it, so it reaches the contract with whatever a client sent —
+    # malformed UTF-8, other encodings and non-finite Floats included.
+    it "never raises on client input it cannot use — every case is a violation" do
+      malformed = "caf\xC3"
+      utf16 = "café".encode("UTF-16LE")
+      cases = {
+        described_class.define { array :ids, of: :integer, validate: ->(a) { a.sum < 100 } } =>
+          [{ ids: ["x", 2] }, "ids[0]"],
+        described_class.define { required :n, :integer } => [{ n: Float::NAN }, "n"],
+        described_class.define { required :n, :integer } => [{ n: Float::INFINITY }, "n"],
+        described_class.define { required :s, :string, normalize: :squish } => [{ s: malformed }, "s"],
+        described_class.define { required :s, :string, normalize: :strip } => [{ s: malformed }, "s"],
+        described_class.define { required :s, :string, format: /\Acaf/ } => [{ s: malformed }, "s"],
+        described_class.define { required :s, :string, format: :email } => [{ s: malformed }, "s"],
+        described_class.define { array :tags, of: :string } => [{ tags: [malformed] }, "tags[0]"],
+        described_class.define { required :n, :integer } => [{ n: "\x00\xD8".dup.force_encoding("UTF-16LE") }, "n"],
+        described_class.define { required :n, :integer } => [{ n: "1\x81".dup.force_encoding("Windows-1252") }, "n"],
+        described_class.define { required :s, :string, format: /\Acafé\z/ } => [{ s: utf16 }, "s", "format"],
+        described_class.define { required :s, :string, format: /\Acafé\z/ } => [{ s: "caf\xC3\xA9".b }, "s", "format"],
+        described_class.define { required :s, :string, normalize: :squish, format: /\Acafé\z/ } =>
+          [{ s: utf16 }, "s", "format"]
+      }
+      cases.each do |c, (input, param, code)|
+        result = nil
+        expect { result = c.call(input) }.not_to raise_error, "for #{input.inspect}"
+        expect(result.violations).to eq([{ param: param, code: code || "invalid_type" }]), "for #{input.inspect}"
+      end
+    end
+
+    it "reads a UTF-16 number by its characters, and hands a UTF-16 :string back as it came" do
+      c = described_class.define do
+        required :n, :integer
+        required :d, :decimal
+        required :s, :string, normalize: :strip
+      end
+      result = nil
+      expect { result = c.call(n: "12".encode("UTF-16LE"), d: "12".encode("UTF-16LE"), s: " café ".encode("UTF-16LE")) }
+        .not_to raise_error
+      expect(result.params.to_h).to eq("n" => 12, "d" => BigDecimal("12"), "s" => "café".encode("UTF-16LE"))
+    end
+
+    it "renders a violation for an undeclared key that is not valid UTF-8" do
+      c = described_class.define(unknown: :error) { optional :name, :string }
+      result = c.call("caf\xC3" => 1, "ok".encode("UTF-16LE") => 2)
+      expect(result.violations).to contain_exactly({ param: "caf�", code: "unknown" }, { param: "ok", code: "unknown" })
+      expect { result.violations.to_json }.not_to raise_error
+      expect { c.call!("caf\xC3" => 1) }.to raise_error(Permittable::InvalidParameters) { |e| expect(e.message).to be_valid_encoding }
+    end
+
     it "stays enforce-semantics even when the app-wide mode is monitor" do
       Permittable.mode = :monitor
       begin

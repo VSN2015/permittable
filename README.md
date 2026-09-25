@@ -297,7 +297,7 @@ Which options are legal depends on the field kind — anything else raises at cl
 | `length:` | ✅¹ | ✅ | — | `Range` or `Integer`. Character count on strings, **element count** on arrays, where it short-circuits — see [the field DSL](#the-field-dsl) |
 | `normalize:` | ✅¹ | — | — | `:squish`, `:strip`, `:downcase`, `:upcase`, `:email`, or a Proc. Runs **first** — before the absence rule, so a value that normalizes to `""` is absent |
 | `default:` | ✅ | ✅ | — | Value used when the field is absent. Validated against the field's own contract at class load, then stored normalized and frozen (each request gets its own copy) |
-| `validate:` | ✅ | ✅ | — | Callable. Falsy fails as `"invalid"`; a returned `Symbol` becomes the violation code |
+| `validate:` | ✅ | ✅ | — | Callable. Falsy fails as `"invalid"`; a returned `Symbol` becomes the violation code. On an array it runs only when no element violated — an undeclared key inside an element does not count — and `transform:` runs only when nothing violated at all |
 | `transform:` | ✅ | ✅ | — | Callable applied **after** cast and validation — see [output reshaping](#output-reshaping-transform-and-finalize) |
 | `virtual:` | ✅ | ✅ | ✅ | Exempt this field from the schema-drift guard |
 | `sensitive:` | ✅ | ✅ | ✅ | Register the field name for [log redaction](#sensitive-parameters-and-log-redaction) |
@@ -357,8 +357,8 @@ Coercion is **deliberately strict**, and deliberately *not* `ActiveModel::Type`.
 
 | Type | Accepts | Rejects (`invalid_type`) |
 |---|---|---|
-| `:string` | `String`; `Numeric`/`true`/`false` are stringified | Arrays, hashes |
-| `:integer` | `Integer`; whole `Float`s (`4.0`); base-10 numeric strings | `"4.5"`, `"abc"`, `4.5` |
+| `:string` | `String`, returned in the encoding it arrived in; `Numeric`/`true`/`false` are stringified | Arrays, hashes, a `String` whose bytes are invalid in its own encoding (`"caf\xC3"`) |
+| `:integer` | `Integer`; whole `Float`s (`4.0`); base-10 numeric strings | `"4.5"`, `"abc"`, `4.5`, NaN/Infinity |
 | `:float` | `Numeric`; any `Float()`-parseable string | `"abc"` |
 | `:decimal` | `Numeric` or `String` → `BigDecimal` | Unparseable strings |
 | `:boolean` | `true`/`false`, `"true"`/`"false"`, `"1"`/`"0"`, `1`/`0` | `"yes"`, `"on"`, `2` |
@@ -367,6 +367,8 @@ Coercion is **deliberately strict**, and deliberately *not* `ActiveModel::Type`.
 | `:json` | Any `Hash` — passed through uncast, see [free-form hashes](#free-form-hashes-json) | Arrays, scalars |
 
 **Dates are parsed, never guessed.** `Date.parse` fills in what a string omits *from today* — `"09/2026"` becomes the 1st, `"5th"` becomes this month of this year — so the same request would mean different things on different days. A `:date` or `:datetime` string must therefore name all three of year, month and day; which **format** it names them in is `Date.parse`'s business, so every complete format it understands still works. A `:datetime` may omit the *time* part, which reads as midnight UTC.
+
+**Strings in other encodings are inspected, never converted.** A String whose bytes are not valid in its **own** encoding (`"caf\xC3"` in UTF-8, a lone UTF-16 surrogate) is `invalid_type` for every scalar type, before `normalize:` or `format:` sees it. Any other String keeps its encoding: a `:string` value is handed back exactly as it arrived, so a controller using Rails' `skip_parameter_encoding` or `param_encoding` gets its binary or Shift_JIS text unchanged. The number, boolean and date types parse a UTF-8 **copy** of the text, so UTF-16 `"12"` casts to `12` for an `:integer`; when the text has no UTF-8 reading (a byte Windows-1252 leaves undefined) that is `invalid_type`. `normalize:` and `format:` work on the String in its own encoding. Where a normalizer cannot handle that encoding (`:squish` on UTF-16), the value is left as it is; where a `format:` pattern cannot be applied to it (a non-ASCII pattern against UTF-16 or binary bytes), that is a `format` violation. `in:` compares Strings as Ruby does, encoding included. A `:json` field's contents are not examined.
 
 **Numbers must be finite.** `Float("1e400")` is `Infinity` and `Float("1e-400")` is `0.0` — neither represents what was sent, and neither is a value a numeric column can store, so both are `invalid_type`. A genuine zero is unaffected however it is spelled (`"0"`, `"0.0"`, `"0e10"`). `:decimal` has no exponent limit, so `"1e400"` is fine there — but `BigDecimal("NaN")` and `BigDecimal("Infinity")` *succeed* where `Float()` raises, so those literal strings are rejected explicitly.
 
@@ -927,7 +929,7 @@ CreateUser = Permittable::Contract.define(root: :user) do
   optional :plan,  :string, in: %w[free pro], default: "free"
 end
 
-result = CreateUser.call(payload)     # never raises
+result = CreateUser.call(payload)     # a Result — bad client input is a violation, not an exception
 result.valid?                          # => false
 result.violations                      # => [{ param: "user.age", code: "inclusion" }]
 result.params                          # validated HashWithIndifferentAccess; nil when invalid
@@ -937,7 +939,11 @@ CreateUser.json_schema                 # the contract as JSON Schema (draft 2020
 CreateUser.rule                        # the frozen, introspectable rule data
 ```
 
-Everything carries over — strict coercion, `""`/`nil` absence, defaults, `finalize` with `violate!`, `sensitive:` log-redaction registration, `invalid_parameters.permittable` instrumentation, 400-vs-422 status semantics for a missing `root:`. Three differences, all deliberate:
+Everything carries over — strict coercion, `""`/`nil` absence, defaults, `finalize` with `violate!`, `sensitive:` log-redaction registration, `invalid_parameters.permittable` instrumentation, 400-vs-422 status semantics for a missing `root:`.
+
+**What `#call` still raises.** Client data never raises out of the gem's own checks. Wrong types, non-finite numbers, Strings in any encoding (valid or not) and undeclared keys in any encoding all come back as violations in the `Result`. Two things do raise, on purpose, because neither is the client's mistake. An input that is not a Hash, `nil` (read as `{}`) or an object answering `to_unsafe_h` (such as `ActionController::Parameters`) raises `ArgumentError`. And an exception raised by your own code (a `validate:`, `transform:` or `normalize:` proc, or `finalize`) reaches the caller unchanged, since swallowing it would hide a bug. The one exception is a `normalize:` proc that raises `ArgumentError` or an encoding error on a String that is neither UTF-8 nor ASCII-only; that value is left as it is, like a preset's.
+
+Three differences from the controller concern, all deliberate:
 
 - **A `Contract` always enforces.** Monitor mode is a request-rollout switch; standalone callers read the `Result` instead, so the app-wide `Permittable.mode` is ignored here.
 - **No router-key exemption.** `unknown: :error` flags a stray `action` or `controller` key — standalone input has no router to excuse.
@@ -965,7 +971,7 @@ Permittable::OpenAPI.document(controllers: [...], info: { "title" => "My API" })
 
 Every operation references shared components for the [error envelope](#violations-and-error-responses): a `422` response always, plus a `400` when the contract declares a `root:`. So consumers get typed *errors*, not just typed inputs.
 
-**What is honestly unrepresentable stays visible instead of guessed.** A `format:` regexp using a Ruby-only construct (or flags) is exported as `x-permittable-pattern` rather than a mistranslated `pattern` — including one anchored with `^`/`$`, which in Ruby anchor a **line** and in ECMA-262 anchor the whole string, so `/^\d{5}$/` accepts `"evil\n12345"` at runtime and publishing that source would promise a stricter rule than the server enforces (use `\A`/`\z`, which translate exactly); `validate:`/`transform:` are flagged `x-permittable-custom-validation`/`x-permittable-transformed`; actions covered only by a catch-all rule on a plain-Ruby host appear under `"*"` with `x-permittable-catch-all`; operations whose rule runs in [monitor mode](#monitor-mode-roll-out-without-rejecting) carry `x-permittable-mode: "monitor"`; operations with no matching route — or whose path-and-verb slot another controller already claimed, which one document cannot represent twice — land in `x-permittable-controllers` instead of being dropped. A templated path segment is declared as a path `parameter` of type `string`, because the route set doesn't say what an `:id` is and the exporter won't invent it. The schema documents the canonical JSON encoding — the runtime additionally accepts string-encoded scalars (`"42"`, `"true"`) for form/query payloads.
+**What is honestly unrepresentable stays visible instead of guessed.** A `format:` regexp using a construct with no faithful ECMA-262 spelling is exported as `x-permittable-pattern` rather than a mistranslated `pattern`: a Ruby-only escape or flag, one ECMA-262 reads differently or refuses to compile at all (`{,3}`, `&&` in a class, a backreference, the word boundary `\b`), or one that cannot be carried once folded into the rest of its own character class (`\S` beside a member other than `\s`) — but **not** a hyphen right after a completed range (`[a-c-e]`), which both dialects read the same way and export unchanged. This also covers a regexp anchored with `^`/`$`, which in Ruby anchor a **line** and in ECMA-262 anchor the whole string, so `/^\d{5}$/` accepts `"evil\n12345"` at runtime and publishing that source would promise a stricter rule than the server enforces (use `\A`/`\z`, which translate exactly); `validate:`/`transform:` are flagged `x-permittable-custom-validation`/`x-permittable-transformed`; actions covered only by a catch-all rule on a plain-Ruby host appear under `"*"` with `x-permittable-catch-all`; operations whose rule runs in [monitor mode](#monitor-mode-roll-out-without-rejecting) carry `x-permittable-mode: "monitor"`; operations with no matching route — or whose path-and-verb slot another controller already claimed, which one document cannot represent twice — land in `x-permittable-controllers` instead of being dropped. A templated path segment is declared as a path `parameter` of type `string`, because the route set doesn't say what an `:id` is and the exporter won't invent it. The schema documents the canonical JSON encoding — the runtime additionally accepts string-encoded scalars (`"42"`, `"true"`) for form/query payloads.
 
 **Every `operationId` is unique across the document, and only a collision is ever renamed.** An operation's id is its controller path with `/` folded to `_`, then its action: `users_create`, `admin_users_index`. Client generators name a method after the id, so the scheme itself never changes. Where two places in the document would carry one id, the exporter renames all but one of them:
 
@@ -985,16 +991,22 @@ Output is deterministic (fixed key order, declaration-order properties), so the 
 
 `spec/schema_conformance_spec.rb` holds the "cannot drift" claim to account: it walks canonical JSON payloads through both the contract and its own exported schema and asserts the verdicts agree.
 
-Where they legitimately differ, the spec names the reason and asserts the **direction**, so a new divergence fails the suite instead of shipping quietly. Two cases go the safe way — the **server accepts what its docs reject**, leaving a client that follows the docs merely conservative:
+Where they legitimately differ, the spec names the reason and asserts the **direction**, so a new divergence fails the suite instead of shipping quietly. Three cases go the safe way — the **server accepts what its docs reject**, leaving a client that follows the docs merely conservative:
 
 - **Non-canonical encodings.** Coercion accepts `"30"` for an `:integer` and `1` for a `:string`, because form and query payloads are all strings. The schema documents the canonical JSON encoding only.
 - **`null` as absence.** The runtime reads `{"age": null}` as `{}` ([absence](#absence-defaults-and-partial-updates)); JSON Schema cannot express that, so `type: integer` rejects a null the server would accept and ignore. A [`nullable:`](#explicit-nulls-nullable) field is not this case — there the null is a value, the exported `type` widens to say so, and the two agree.
+- **Padding that normalizes away.** `normalize:` runs before the checks, so under `normalize: :squish` and `length: 3..10` the server accepts `"  abcdefghij  "` — ten characters once squished — while the docs reject its fourteen.
 
-One case goes the other way, and is worth knowing before you hand the document to a client:
+Six cases go the other way, and are worth knowing before you hand the document to a client. Each rule stays visible on its own field, and the spec asserts that as well as the direction:
 
 - **Bounds JSON Schema has no keyword for.** A `:json` field's `max_depth:` is enforced by the server but cannot be written as a JSON Schema keyword, so the published document is **looser** there and an over-nested payload still earns a 422. The bound is not dropped — it is exported as `x-permittable-max-depth` — so a generator or linter that wants it can read it.
+- **`normalize:` runs before the checks.** The server validates the *normalized* string, and JSON Schema has no keyword for "transform, then check". With `required :name, :string, length: 3..10, normalize: :squish`, `"   "` passes the docs' `minLength: 3` and then squishes to `""` — absent, so `missing` — and `" a  "` passes them and squishes to `"a"`, which is too short. The step is exported as `x-permittable-normalize` — the preset's name (`"squish"`, `"email"`, …), which a client can apply before validating, or `true` for a custom proc.
+- **A bounded `:decimal` sent as a string.** A `:decimal` is documented as `["string", "number"]`, because the string is its precision-safe encoding, but `minimum`/`maximum` constrain only numbers — so `"5000"` passes the docs for `in: BigDecimal("0.01")..BigDecimal("999.99")` and the server answers `inclusion`. The bound is still published, as a JSON number, for a client that parses the string first. (Numbers are published exactly as written, at any magnitude — `10**400` included, since a JSON integer has no size limit — but a client that reads the document back with ordinary double-precision floats, rather than the digits as sent, can still round a value across a boundary. That is inherent to parsing any JSON number as a double, not something this exporter controls.)
+- **A `validate:` proc.** It is opaque app code, so the schema can only flag it — `x-permittable-custom-validation` — never enforce what it checks. A value the proc refuses still passes the docs.
+- **A Range of non-numbers.** `in: "a".."m"` has no `minimum`/`maximum` equivalent (those constrain numbers only) and rides along as `x-permittable-range` instead. A value outside it still passes the docs.
+- **Strings whose validity is a `format`.** `:decimal`, `:date` and `:datetime` are sent as strings, and what makes such a string valid is its `format` (`"decimal"`, `"date"`, `"date-time"`) — which draft 2020-12 treats as an annotation unless a validator opts into asserting it. So `"abc"` or `"NaN"` for a `:decimal` and `"2026-02-30"` for a `:date` pass most validators and fail the server's cast with `invalid_type`.
 
-Everything else the exporter cannot translate stays visible as an `x-permittable-*` extension rather than being guessed at.
+A `format:` regexp that does not translate to ECMA-262 is looser in the same way — it publishes as `x-permittable-pattern` rather than a `pattern` that would enforce something else, so a value it refuses still passes the docs — but it is not one of the six above: `spec/schema_conformance_spec.rb` does not yet assert a case for it, since the Ruby → ECMA-262 translation it would depend on is being reworked separately. Everything else the exporter cannot translate stays visible as an `x-permittable-*` extension rather than being guessed at.
 
 
 <details>
@@ -1010,7 +1022,7 @@ Everything else the exporter cannot translate stays visible as an `x-permittable
 | `:decimal` | `type: ["string", "number"]` + `format: decimal` (string is the precision-safe encoding) |
 | `in:` Array / numeric Range | `enum` / `minimum` + `maximum` (exclusive ends honoured) |
 | `length:` | `minLength`/`maxLength` on strings, `minItems`/`maxItems` on arrays |
-| `format:` | `pattern`, with `\A`/`\z` translated to `^`/`$` |
+| `format:` | `pattern`, valid under the `u` flag Ajv compiles with: `\A`/`\z` become `^`/`$`, `\s` and `.` are spelled out as the classes they are in Ruby (ECMA-262's `\s` also matches NBSP and U+2028; its `.` also stops at `\r`), and redundant escapes like `\-` and `\#` are written bare |
 | `default:` / `desc:` / `example:` | `default` / `description` / `examples` |
 | nested block / `array` | `object` + `properties` / `array` + `items` |
 | `unknown: :error` | `additionalProperties: false`, at every nesting level |
