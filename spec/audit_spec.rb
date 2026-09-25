@@ -92,6 +92,191 @@ RSpec.describe Permittable::Audit do
       expect(described_class.entries(controllers: [catch_all], routes: thing_routes).map(&:covered?))
         .to eq([true, true])
     end
+
+    it "counts a via: :all route as body-accepting when nothing covers it" do
+      hooks = bare_class("webhooks")
+      hook_routes = %w[get post put patch delete].map do |verb|
+        { controller: "webhooks", action: "receive", verb: verb, path: "/hooks" }
+      end
+      found = described_class.entries(controllers: [hooks], routes: hook_routes)
+      expect(found.map(&:verb)).to eq(%w[delete get patch post put])
+      expect(described_class.summary(found)[:uncovered_with_body]).to eq(3)
+    end
+
+    context "when a routed action has no action method" do
+      # `resources :posts` routes all seven actions whether or not the
+      # controller defines them; Rails 404s the ones it does not.
+      let(:posts) do
+        bare_class("posts").tap do |klass|
+          klass.define_singleton_method(:action_methods) { Set.new(%w[index show]) }
+        end
+      end
+      let(:post_routes) do
+        [{ controller: "posts", action: "index", verb: "get", path: "/posts" },
+         { controller: "posts", action: "create", verb: "post", path: "/posts" },
+         { controller: "posts", action: "show", verb: "get", path: "/posts/{id}" },
+         { controller: "posts", action: "update", verb: "patch", path: "/posts/{id}" }]
+      end
+      let(:found) { described_class.entries(controllers: [posts], routes: post_routes) }
+
+      it "labels the entry rather than dropping it" do
+        expect(found.map { |e| [e.action, e.missing_action?] }).to eq(
+          [["index", false], ["create", true], ["show", false], ["update", true]]
+        )
+      end
+
+      it "leaves it out of the strict count" do
+        expect(described_class.summary(found)).to include(uncovered: 2, uncovered_with_body: 0, missing_actions: 2)
+      end
+
+      it "says so in the report instead of flagging a body" do
+        report = described_class.format(found)
+        expect(report).to match(%r{POST\s+/posts\s+create\s+no contract — action not found$})
+        expect(report).not_to include("ACCEPTS A BODY")
+        expect(report).to include("4 routed actions: 0 enforced, 0 in monitor mode, 2 without a contract, " \
+                                  "2 not found (Rails 404s them)")
+        expect(report).to include("0 of those accept a request body")
+      end
+
+      it "still counts the action once the controller defines it" do
+        posts.define_singleton_method(:action_methods) { Set.new(%w[index show create update]) }
+        expect(described_class.summary(found)[:uncovered_with_body]).to eq(2)
+      end
+
+      it "assumes the action exists when the controller cannot say" do
+        expect(entries.none?(&:missing_action?)).to be(true)
+      end
+
+      # A duck listing Symbols once marked EVERY action missing, and strict
+      # passed everything.
+      it "normalises an action list of Symbols" do
+        posts.define_singleton_method(:action_methods) { Set.new(%i[index show create update]) }
+        expect(found.none?(&:missing_action?)).to be(true)
+      end
+
+      # The README quotes the singular form.
+      it "says it, not them, for a single missing action" do
+        posts.define_singleton_method(:action_methods) { Set.new(%w[index show update]) }
+        expect(described_class.format(found)).to include("3 without a contract, 1 not found (Rails 404s it)")
+      end
+
+      it "reads the action list once per controller, however many routes it has" do
+        allow(posts).to receive(:action_methods).and_call_original
+        found
+        expect(posts).to have_received(:action_methods).once
+      end
+
+      context "when a contract is left on it" do
+        let(:covered) do
+          controller_class("posts") { permit_params(:create) { required :title, :string } }.tap do |klass|
+            klass.define_singleton_method(:action_methods) { Set.new(%w[index show]) }
+          end
+        end
+        let(:found) { described_class.entries(controllers: [covered], routes: post_routes) }
+
+        # A contract left on an action that no longer exists guards nothing, so
+        # it must not read as coverage: the buckets stay disjoint and add up.
+        it "counts it only as missing" do
+          expect(described_class.summary(found)).to include(actions: 4, enforced: 0, monitored: 0, uncovered: 2,
+                                                            unguarded_models: 0, missing_actions: 2)
+        end
+
+        it "shows the mode and that the action is not found" do
+          expect(described_class.format(found)).to match(%r{POST\s+/posts\s+create\s+enforce  action not found$})
+        end
+
+        # Out of every bucket, it would otherwise vanish from the report's
+        # conclusions — and a routed action Rails 404s is exactly the renamed
+        # or deleted one the stale list exists for.
+        it "lists the contract as stale" do
+          expect(described_class.stale(controllers: [covered], routes: post_routes)).to eq("posts" => ["create"])
+        end
+      end
+    end
+
+    # Rails dispatches more than action_methods: an inherited method, an
+    # `action_missing` handler, and a template with no method behind it all
+    # run with the body parsed. Only an action none of them answers 404s.
+    context "with a real ActionController" do
+      around do |example|
+        Dir.mktmpdir do |views|
+          FileUtils.mkdir_p(File.join(views, "audit_pages"))
+          File.write(File.join(views, "audit_pages", "preview.html.erb"), "preview")
+          @views = views
+          example.run
+        end
+      end
+
+      let(:pages) do
+        views = @views
+        stub_const("AuditPagesController", Class.new(ActionController::Base) do
+          prepend_view_path views
+
+          def create
+            head :created
+          end
+        end)
+      end
+      let(:child) { stub_const("AuditChildPagesController", Class.new(pages)) }
+      let(:catch_all) do
+        stub_const("AuditCatchAllController", Class.new(ActionController::Base) do
+          def action_missing(_name, *)
+            head :ok
+          end
+        end)
+      end
+
+      def missing?(controller, action)
+        route = { controller: controller.controller_path, action: action, verb: "post", path: "/x" }
+        described_class.entries(controllers: [controller], routes: [route]).first.missing_action?
+      end
+
+      it "finds an action inherited from a parent controller" do
+        expect(missing?(child, "create")).to be(false)
+      end
+
+      it "finds every action of a controller that defines action_missing" do
+        expect(missing?(catch_all, "anything")).to be(false)
+      end
+
+      it "finds a template-only action, which renders implicitly" do
+        expect(missing?(pages, "preview")).to be(false)
+        expect(missing?(child, "preview")).to be(false)
+      end
+
+      it "reports an action with no method, no action_missing and no template" do
+        expect(missing?(pages, "destroy")).to be(true)
+      end
+
+      it "reports a missing action on an API controller, which has no template fallback" do
+        api = stub_const("AuditApiThingsController", Class.new(ActionController::API) do
+          def index
+            head :ok
+          end
+        end)
+        expect([missing?(api, "index"), missing?(api, "create")]).to eq([false, true])
+      end
+
+      # A via: :all route is five entries for one action; Rails need only be
+      # asked once.
+      it "asks Rails's resolver once per action, not once per verb" do
+        allow(catch_all).to receive(:new).and_call_original
+        verb_routes = %w[get post put patch delete].map do |verb|
+          { controller: catch_all.controller_path, action: "anything", verb: verb, path: "/x" }
+        end
+        described_class.entries(controllers: [catch_all], routes: verb_routes)
+        expect(catch_all).to have_received(:new).once
+      end
+
+      it "assumes the action exists when Rails's resolver cannot be asked" do
+        unbuildable = stub_const("AuditUnbuildableController", Class.new(ActionController::Base) do
+          def initialize(*) # rubocop:disable Lint/MissingSuper -- raising is the point
+            raise ArgumentError, "needs collaborators"
+          end
+        end)
+        expect(missing?(unbuildable, "create")).to be(false)
+      end
+    end
   end
 
   describe ".stale" do
@@ -109,8 +294,55 @@ RSpec.describe Permittable::Audit do
   describe ".summary" do
     it "counts coverage, with the body-accepting gap called out separately" do
       expect(described_class.summary(entries)).to eq(
-        actions: 5, enforced: 1, monitored: 1, uncovered: 3, uncovered_with_body: 2, unguarded_models: 2
+        actions: 5, enforced: 1, monitored: 1, uncovered: 3, uncovered_with_body: 2, unguarded_models: 2,
+        missing_actions: 0
       )
+    end
+
+    # rails_routes expands `scope "(:locale)"` into one descriptor per URL,
+    # each tagged with the route it came from. The table lists both — each is
+    # a real URL — but they are one route, and one unguarded POST must not
+    # count as two.
+    it "counts the paths expanded from one route once" do
+      sourced = routes.each_with_index.map { |route, index| route.merge(route: index) }
+      localized = sourced + [{ controller: "users", action: "create", verb: "post", path: "/{locale}/users", route: 1 },
+                             { controller: "legacy", action: "create", verb: "post", path: "/{locale}/legacy", route: 4 }]
+      expanded = described_class.entries(controllers: [users, bare_class("legacy")], routes: localized)
+      expect(expanded.length).to eq(7)
+      expect(described_class.summary(expanded)).to eq(described_class.summary(entries))
+    end
+
+    # Two routes to the same action are two ways in, not one: each unguarded
+    # POST is its own gap, and `[strict]` must count both. A hand-built
+    # descriptor with no `route:` is its own route.
+    it "counts distinct routes to the same action separately" do
+      admin = routes + [{ controller: "legacy", action: "create", verb: "post", path: "/admin/legacy" }]
+      counts = described_class.summary(described_class.entries(controllers: [users, bare_class("legacy")],
+                                                               routes: admin))
+      expect(counts).to include(actions: 6, uncovered: 4, uncovered_with_body: 3)
+    end
+
+    # `route:` is a position within ONE rails_routes call, so two lists
+    # concatenated (an app plus a mounted engine) reuse the same small
+    # integers. Route 0 of one controller is not route 0 of another.
+    it "keeps a reused route index on different controllers apart" do
+      app = [{ controller: "legacy", action: "create", verb: "post", path: "/legacy", route: 0 }]
+      engine = [{ controller: "imports", action: "create", verb: "post", path: "/imports", route: 0 }]
+      found = described_class.entries(controllers: [bare_class("legacy"), bare_class("imports")],
+                                      routes: app + engine)
+      expect(described_class.summary(found)).to include(actions: 2, uncovered_with_body: 2)
+    end
+
+    it "tells a route's expanded paths from a second route, reading a real route set" do
+      route_set = ActionDispatch::Routing::RouteSet.new
+      route_set.draw do
+        scope("(:locale)") { post "legacy", to: "legacy#create" }
+        post "admin/legacy", to: "legacy#create"
+      end
+      descriptors = Permittable::OpenAPI.rails_routes(Struct.new(:routes).new(route_set))
+      found = described_class.entries(controllers: [bare_class("legacy")], routes: descriptors)
+      expect(found.map(&:path)).to contain_exactly("/legacy", "/{locale}/legacy", "/admin/legacy")
+      expect(described_class.summary(found)).to include(actions: 2, uncovered_with_body: 2)
     end
   end
 
@@ -125,6 +357,29 @@ RSpec.describe Permittable::Audit do
       expect(report).to include("3 without a contract")
       expect(report).to include("2 of those accept a request body")
       expect(report).to include("users#archive")
+    end
+
+    # The summary counts routes, the table lists rows; when the two differ,
+    # the report gives both numbers and names each.
+    it "says how many rows the table lists when one route expands to several" do
+      sourced = routes.each_with_index.map { |route, index| route.merge(route: index) }
+      localized = sourced + [{ controller: "legacy", action: "create", verb: "post", path: "/{locale}/legacy", route: 4 }]
+      expanded = described_class.entries(controllers: [users, bare_class("legacy")], routes: localized)
+      report = described_class.format(expanded)
+      expect(report).to include("5 routed actions in 6 rows: ")
+      expect(described_class.format(entries)).to include("5 routed actions: ")
+    end
+
+    # A row is a verb on a path, not a path: PATCH and PUT on the two locale
+    # variants are four rows over two distinct paths, so the number printed
+    # must be labelled as rows.
+    it "counts rows, not distinct paths, when a route answers several verbs" do
+      route_set = ActionDispatch::Routing::RouteSet.new
+      route_set.draw { scope("(:locale)") { resources :posts, only: :update } }
+      descriptors = Permittable::OpenAPI.rails_routes(Struct.new(:routes).new(route_set))
+      found = described_class.entries(controllers: [bare_class("posts")], routes: descriptors)
+      expect(found.map(&:path).uniq.length).to eq(2)
+      expect(described_class.format(found)).to include("2 routed actions in 4 rows: ")
     end
 
     it "says so plainly when there is nothing to report" do
