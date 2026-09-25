@@ -12,7 +12,10 @@ require "open3"
 # Compiling is not enough on its own: `\s` compiled happily for years while
 # accepting spaces the server rejects. So every translated regexp is also run
 # against samples on both sides, and the two engines must agree.
-RSpec.describe "Exported patterns under ECMA-262's u flag" do
+#
+# The cases live in a module rather than as constants inside the describe
+# block, which would define them at the top level.
+module EcmaPatternSpec
   NODE_VERDICTS = <<~JS.freeze
     const cases = JSON.parse(require("fs").readFileSync(0, "utf8"));
     console.log(JSON.stringify(cases.map(({ pattern, samples }) => {
@@ -28,7 +31,7 @@ RSpec.describe "Exported patterns under ECMA-262's u flag" do
   # App-style regexps, each with samples chosen to sit on the edge the
   # translation has to get right. The redundant escapes are the point: apps
   # write them, Ruby accepts them, and Unicode mode does not.
-  # rubocop:disable-next Style/RedundantRegexpEscape
+  # rubocop:disable-next Style/RedundantRegexpEscape, Style/RedundantRegexpCharacterClass
   APP_REGEXPS = {
     /\A\d{5}\z/ => %w[12345 1234],
     /\A\d{3}\-\d{4}\z/ => %w[555-1234 5551234],
@@ -47,7 +50,15 @@ RSpec.describe "Exported patterns under ECMA-262's u flag" do
     /\A\$\d+(?:\.\d{2})?\z/ => ["$5", "$5.00", "5"],
     %r{\Ahttps?://\S+\z} => ["https://a.b/c", "https://a\u00a0b"],
     /\A(?:foo|bar)\z/ => %w[foo bar baz],
-    /\A\u0041\x42\z/ => %w[AB aB],
+    # Braced and built from a string: Ruby rewrites \u0041 to a bare A in
+    # the source, even through Regexp.new, so only this form reaches the
+    # translation as an escape.
+    Regexp.new('\A\u{41}\x42\z') => %w[AB aB],
+    /\A[\s\S]+\z/ => ["a b", "\u00a0\n\u2028"],
+    /\A[^\s\S]\z/ => ["a", " "],
+    /\A[\S]+\z/ => ["ab", "a\u00a0b", "a b"],
+    /\A[^\S]\z/ => [" ", "\u00a0", "a"],
+    /\A[\b]\z/ => ["\b", "b"],
     /\A(?<y>\d{2})-(?:ab)+\z/ => %w[12-abab 12-],
     /\A[a-z]{2,3}?\z/ => %w[ab abc a],
     /(?<=\$)\d+/ => %w[$5 5],
@@ -64,13 +75,15 @@ RSpec.describe "Exported patterns under ECMA-262's u flag" do
     slug: %w[a-b-c a--b -a],
     hostname: %w[example.com ex-ample.co -example.com]
   }.freeze
+end
 
+RSpec.describe "Exported patterns under ECMA-262's u flag" do
   def self.node_path
     ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).map { |dir| File.join(dir, "node") }.find { |f| File.executable?(f) }
   end
 
   def verdicts_for(cases)
-    out, err, status = Open3.capture3("node", "-e", NODE_VERDICTS, stdin_data: JSON.generate(cases))
+    out, err, status = Open3.capture3("node", "-e", EcmaPatternSpec::NODE_VERDICTS, stdin_data: JSON.generate(cases))
     raise "node failed: #{err}" unless status.success?
 
     JSON.parse(out)
@@ -91,8 +104,8 @@ RSpec.describe "Exported patterns under ECMA-262's u flag" do
 
     fixture = JSON.parse(File.read(File.expand_path("fixtures/openapi.json", __dir__)))
     @cases = {}
-    PRESET_SAMPLES.each { |name, samples| @cases["preset #{name.inspect}"] = [Permittable::FORMATS[name][:pattern], exported(name), samples] }
-    APP_REGEXPS.each { |regexp, samples| @cases[regexp.inspect] = [regexp, exported(regexp), samples] }
+    EcmaPatternSpec::PRESET_SAMPLES.each { |name, samples| @cases["preset #{name.inspect}"] = [Permittable::FORMATS[name][:pattern], exported(name), samples] }
+    EcmaPatternSpec::APP_REGEXPS.each { |regexp, samples| @cases[regexp.inspect] = [regexp, exported(regexp), samples] }
     patterns_in(fixture).each_with_index { |pattern, i| @cases["golden fixture pattern ##{i}"] = [nil, { "pattern" => pattern }, []] }
 
     inputs = @cases.values.map { |_, schema, samples| { pattern: schema["pattern"].to_s, samples: samples } }
@@ -108,7 +121,7 @@ RSpec.describe "Exported patterns under ECMA-262's u flag" do
   end
 
   it "checks every preset" do
-    expect(PRESET_SAMPLES.keys).to match_array(Permittable::FORMATS.keys)
+    expect(EcmaPatternSpec::PRESET_SAMPLES.keys).to match_array(Permittable::FORMATS.keys)
   end
 
   it "exports every preset and every app-style regexp as a real pattern" do

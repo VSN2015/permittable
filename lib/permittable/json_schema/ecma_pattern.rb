@@ -27,6 +27,10 @@ module Permittable
     #     runtime. \A and \z translate exactly.
     #   * \Z \h \K \R \G \e \g and the other Ruby-only escapes, and octal
     #     escapes, which Unicode mode rejects.
+    #   * \b and \B outside a class. Ruby's word boundary counts a non-ASCII
+    #     letter as a word character (its \w does not) and Unicode mode's is
+    #     ASCII-only, so /\Aa\b/ rejects "a\u00e9" at runtime while ^a\b
+    #     accepts it, and \B diverges the other way.
     #   * Backreferences. One to a group that took no part FAILS in Ruby and
     #     matches "" in ECMA-262 — /(a)?\1b/ rejects "b" at runtime and its
     #     translation would accept it — and \12 is a backreference or an
@@ -36,7 +40,8 @@ module Permittable
     #     "{n}, optionally" in Ruby and a lazy — so still exact — {n} in
     #     ECMA-262.
     #   * `\p{...}`, whose property names differ between the two.
-    #   * Nested classes, POSIX brackets and `&&`.
+    #   * Nested classes, POSIX brackets and `&&`; \S in a class beside
+    #     anything but \s.
     #   * A repeated group name, a SyntaxError in Unicode mode before ES2025.
     module EcmaPattern
       module_function
@@ -138,7 +143,6 @@ module Permittable
         elsif scanner.skip(/z/) then ["$", false]
         elsif scanner.skip(/s/) then ["[#{SPACE}]", true]
         elsif scanner.skip(/S/) then ["[^#{SPACE}]", true]
-        elsif scanner.scan(/[bB]/) then ["\\#{scanner.matched}", false]
         elsif scanner.scan(/[dDwW]/) then ["\\#{scanner.matched}", true]
         else [literal_escape(scanner), true]
         end
@@ -148,11 +152,13 @@ module Permittable
       # between two single characters: `[\w-z]` and `[a-c-e]` are warnings or
       # errors in Ruby and errors or different ranges in Unicode mode.
       def char_class(scanner)
-        out = +"["
-        out << "^" if scanner.skip(/\^/)
+        negated = scanner.skip(/\^/)
         # A leading ] is a literal in Ruby and ends an empty class in ECMA-262.
         return nil if scanner.check(/\]/)
 
+        members = +""
+        count = 0
+        space = complement = false
         previous = nil # :char, :set (a class escape like \d) or :range
         until scanner.skip(/\]/)
           # A nested class or POSIX bracket, or an intersection.
@@ -162,19 +168,38 @@ module Permittable
             return nil unless previous == :char
 
             scanner.skip(/-/)
+            # Checked again past the hyphen: `[$-&&%]` is an (empty)
+            # intersection in Ruby and a class accepting "%" in ECMA-262.
+            return nil if scanner.check(/\[|&&/)
+
             text, kind = class_atom(scanner)
             return nil unless kind == :char
 
-            out << "-" << text
+            members << "-" << text
             previous = :range
+          elsif scanner.skip(/\\S/)
+            complement = true
+            previous = :set
           else
             text, previous = class_atom(scanner)
             return nil unless text
 
-            out << text
+            space ||= text == SPACE
+            members << text
           end
+          count += 1
         end
-        out << "]"
+        return "[#{'^' if negated}#{members}]" unless complement
+
+        # \S cannot be spliced in as members, but two classes containing it
+        # can be written exactly. With \s beside it the class covers every
+        # character whatever either escape means, so ECMA-262's wider \s is
+        # harmless there — the `[\s\S]` any-character idiom. On its own it is
+        # the complement of Ruby's \s. Beside anything else it is refused.
+        return negated ? '[^\s\S]' : '[\s\S]' if space
+        return nil unless count == 1
+
+        negated ? "[#{SPACE}]" : "[^#{SPACE}]"
       end
 
       # One member of a class: its text and :char or :set.
@@ -184,8 +209,7 @@ module Permittable
         if scanner.skip(/s/) then [SPACE, :set]
         elsif scanner.scan(/[dDwW]/) then ["\\#{scanner.matched}", :set]
         # Both an escaped - and a backspace \b are valid in a Unicode-mode
-        # class, and mean what they mean in Ruby. \S is not spliceable: its
-        # complement cannot be written as members.
+        # class, and mean what they mean in Ruby.
         elsif scanner.scan(/[-b]/) then ["\\#{scanner.matched}", :char]
         else
           text = literal_escape(scanner)
