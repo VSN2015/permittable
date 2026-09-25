@@ -153,6 +153,16 @@ module Permittable
     # spelling, and its keys live in string tokens.
     COMMENT_TOKENS = %i[on_comment on_embdoc on_embdoc_beg on_embdoc_end].freeze
 
+    # A string/heredoc/regexp literal's CONTENT, as opposed to the Ruby
+    # syntax around it. Used by masked_source — see there for why this is
+    # kept apart from comments rather than treated the same way.
+    STRING_CONTENT_TOKENS = %i[on_tstring_content].freeze
+
+    # What a masked string/heredoc/regexp content token's characters become,
+    # except `(`/`)` (see mask_content): not a word character, so `params`,
+    # `permit`, `require`, and `expect` can never spell out of it.
+    MASK_CHAR = "\u0000".freeze
+
     module_function
 
     # `source` with its comments removed. A controller keeping a commented-out
@@ -164,12 +174,59 @@ module Permittable
     # syntactically odd file scans exactly as it did before rather than not at
     # all.
     def executable_source(source)
-      tokens = Ripper.lex(source)
-      return source if tokens.nil? || tokens.empty?
+      tokens = code_tokens(source)
+      return source unless tokens
 
-      tokens.reject { |token| COMMENT_TOKENS.include?(token[1]) }.map { |token| token[2] }.join
+      tokens.map { |token| token[2] }.join
     rescue StandardError
       source
+    end
+
+    # executable_source with every string/heredoc/regexp literal's CONTENT
+    # run through mask_content, same length so a MatchData's offsets against
+    # this text still locate the same characters in executable_source.
+    #
+    # A call spelled out as TEXT inside a string — a log line quoting
+    # `params.require(:admin).permit(:superuser)` for humans — has no
+    # `params`, `permit`, `require`, or `expect` left once masked, so
+    # PERMIT_CALL and EXPECT_CALL can no longer match it there; the same
+    # conflation as a `#` comment (see executable_source), just reached
+    # through a string literal instead. A REAL call's own string argument
+    # (`permit("name")`) still matches: `params`, `.`, `permit`, and the
+    # parens around it are code tokens, never string content, so masking
+    # never touches them — only the argument text inside the parens is
+    # masked here, and scan reads that text back out of executable_source by
+    # offset rather than off this string.
+    def masked_source(source)
+      tokens = code_tokens(source)
+      return source unless tokens
+
+      tokens.map { |token| STRING_CONTENT_TOKENS.include?(token[1]) ? mask_content(token[2]) : token[2] }.join
+    rescue StandardError
+      source
+    end
+
+    # One string/heredoc/regexp content token, masked: every character
+    # becomes MASK_CHAR except `(`/`)`, which are left alone. Keeping parens
+    # literal costs nothing PERMIT_CALL/EXPECT_CALL look for — the words
+    # they require are gone either way — and keeps a call already open
+    # before the string closing on the same paren it always did: a lenient
+    # lex can swallow real code into an unterminated string's content, exactly
+    # as a stray `"` does today (see the "mismatched quotes" scan spec), and
+    # masking every character there would eat the `)` that call is
+    # conservatively parsed with.
+    def mask_content(text)
+      text.gsub(/[^()]/, MASK_CHAR)
+    end
+
+    # The lexed tokens shared by executable_source and masked_source, with
+    # comments already dropped — nil when Ripper could not lex `source` at
+    # all, or found nothing.
+    def code_tokens(source)
+      tokens = Ripper.lex(source)
+      return nil if tokens.nil? || tokens.empty?
+
+      tokens.reject { |token| COMMENT_TOKENS.include?(token[1]) }
     end
 
     # Merge every `params.permit` and `params.expect` call found in the
@@ -201,9 +258,11 @@ module Permittable
     def scan(source, model: nil, exclude: [])
       result = Scan.new(root: nil, scalars: [], arrays: [], nested: {}, nested_arrays: {}, unparsed: [],
                         conflicts: [], undecided: [], route_params: [], rootless: [], other_envelopes: {}, calls: 0)
-      source = executable_source(source.to_s)
-      permits = matches(source, PERMIT_CALL).map { |match| permit_call(match) }
-      expects = matches(source, EXPECT_CALL).map { |match| expect_calls(match.begin(0), split_args(match[1])) }
+      raw = source.to_s
+      source = executable_source(raw)
+      masked = masked_source(raw)
+      permits = matches(masked, PERMIT_CALL).map { |match| permit_call(source, match) }
+      expects = matches(masked, EXPECT_CALL).map { |match| expect_calls(match.begin(0), split_args(group(source, match, 1))) }
       result.calls = permits.size + expects.size
       calls = (permits + expects).flatten.sort_by.with_index { |call, index| [call.position, index] }
       result.root = choose_root(calls, model&.name && default_root(model), exclude)
@@ -215,6 +274,17 @@ module Permittable
 
     def matches(source, pattern)
       source.to_enum(:scan, pattern).map { Regexp.last_match }
+    end
+
+    # The real text under one of masked_source's MatchData groups, read back
+    # out of `source` (executable_source, not masked_source) at the same
+    # offsets — nil when the group did not participate in the match. See
+    # masked_source for why a matched call's own text lives in `source`
+    # rather than in the MatchData itself.
+    def group(source, match, index)
+      return nil unless match.begin(index)
+
+      source[match.begin(index)...match.end(index)]
     end
 
     # Draft a contract for one controller: model inferred from
@@ -518,13 +588,18 @@ module Permittable
     end
 
     # A rooted permit call is quoted as the call itself, on one line, so its
-    # TODO can be found in the source it came from.
-    def permit_call(match)
-      args = split_args(match[2])
-      return Call.new(match.begin(0), nil, args, []) unless match[1]
+    # TODO can be found in the source it came from. `source` is
+    # executable_source: `match` was found by scanning masked_source, whose
+    # own text may hold placeholders rather than a real string argument's
+    # characters (see masked_source), so every group is read back out of
+    # `source` by position instead of off `match` directly.
+    def permit_call(source, match)
+      args = split_args(group(source, match, 2))
+      root = group(source, match, 1)
+      return Call.new(match.begin(0), nil, args, []) unless root
 
-      spelling = unparsed_arg(match[0]).gsub(/\(\s+/, "(").gsub(/\s+\)/, ")")
-      Call.new(match.begin(0), match[1].to_sym, args, [], spelling)
+      spelling = unparsed_arg(group(source, match, 0)).gsub(/\(\s+/, "(").gsub(/\s+\)/, ")")
+      Call.new(match.begin(0), root.to_sym, args, [], spelling)
     end
 
     # A rootless expect call — or, when its one key is a route param
