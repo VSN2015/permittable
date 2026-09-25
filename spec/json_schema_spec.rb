@@ -146,6 +146,39 @@ RSpec.describe Permittable::JsonSchema do
       expect(described_class.ecma_pattern(/\A[\b]\z/)).to eq('^[\b]$')
     end
 
+    # A literal - right after a completed range is not "a different range in
+    # Unicode mode" — both dialects read [a-c-e] as the set {a, b, c, -, e},
+    # rejecting "d". Regression: this used to be refused outright, so a
+    # common format: like /\A[a-zA-Z0-9-_]+\z/ published no pattern at all.
+    # Built via Regexp.new and quietly, like the other ambiguous-hyphen
+    # cases below, so the suite prints no regexp warnings.
+    it "keeps a literal - right after a completed range, in both engines" do
+      {
+        '\A[a-zA-Z0-9-_]+\z' => '^[a-zA-Z0-9-_]+$',
+        '\A[A-Za-z0-9-_.]+\z' => '^[A-Za-z0-9-_.]+$',
+        '\A[a-z0-9-_]{3,16}\z' => '^[a-z0-9-_]{3,16}$',
+        '\A[a-z-A-Z]\z' => '^[a-z-A-Z]$',
+        '\A[a-c-e]\z' => '^[a-c-e]$',
+        # The hyphen may itself reopen a range, chaining like Ruby does.
+        '\A[a-z--x]\z' => '^[a-z--x]$'
+      }.each do |source, expected|
+        regexp = quietly { Regexp.new(source) }
+        expect(described_class.ecma_pattern(regexp)).to eq(expected), "expected #{source} to translate to #{expected}"
+      end
+    end
+
+    # A class escape (\d, \D, \w, \W, \s, \S) can never sit next to a range
+    # hyphen in a real Regexp: Ruby itself raises building the source, on
+    # either side of the hyphen, so this can never reach the translator.
+    # ecma_pattern's own refusal for it (previous == :set) is a defensive
+    # backstop, not something a live disagreement between the two engines
+    # depends on.
+    it "cannot even construct a class escape beside a range hyphen, so its refusal in ecma_pattern is a backstop" do
+      ['[\d-z]', '[\s-z]', '[\w-z]', '[a-\d]', '[a-\S]'].each do |source|
+        expect { Regexp.new(source) }.to raise_error(RegexpError)
+      end
+    end
+
     # rubocop:disable-next Style/RedundantRegexpEscape -- the redundant escapes are what is under test
     it "un-escapes the identity escapes Unicode mode rejects, but keeps \\- inside a class" do
       expect(described_class.ecma_pattern(/\A\d{3}\-\d{4}\z/)).to eq('^\d{3}-\d{4}$')

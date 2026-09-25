@@ -149,8 +149,16 @@ module Permittable
       end
 
       # The rest of a class, `[` already consumed. Ranges are only carried
-      # between two single characters: `[\w-z]` and `[a-c-e]` are warnings or
-      # errors in Ruby and errors or different ranges in Unicode mode.
+      # between two single characters: `[\w-z]` is a RegexpError in Ruby on
+      # either side of the hyphen (a class escape cannot end or start a
+      # range), so that source can never reach this method as a real Regexp;
+      # the refusal for it below is a defensive backstop, not something a
+      # live disagreement between the two engines depends on. A hyphen right
+      # after a just-closed range, `[a-c-e]`, is NOT a different range in
+      # Unicode mode — both engines read it as the set {a, b, c, -, e},
+      # rejecting "d" — so it is carried as a literal member, which may
+      # itself reopen a range (`[a-z--x]`, Ruby's own reading of a second
+      # hyphen after the first).
       def char_class(scanner)
         negated = scanner.skip(/\^/)
         # A leading ] is a literal in Ruby and ends an empty class in ECMA-262.
@@ -164,7 +172,15 @@ module Permittable
           # A nested class or POSIX bracket, or an intersection.
           return nil if scanner.eos? || scanner.check(/\[|&&/)
 
-          if previous && scanner.check(/-(?!\])/)
+          if previous == :range && scanner.check(/-(?!\])/)
+            # A range cannot start from another range's own end: both
+            # engines read this hyphen as an ordinary member, not a new
+            # range operator. It may itself reopen a range on the next
+            # iteration, exactly as Ruby reads a repeated hyphen.
+            scanner.skip(/-/)
+            members << "-"
+            previous = :char
+          elsif previous && scanner.check(/-(?!\])/)
             return nil unless previous == :char
 
             scanner.skip(/-/)

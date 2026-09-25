@@ -31,41 +31,65 @@ module EcmaPatternSpec
   # App-style regexps, each with samples chosen to sit on the edge the
   # translation has to get right. The redundant escapes are the point: apps
   # write them, Ruby accepts them, and Unicode mode does not.
+  #
+  # The hyphen-after-range entries are built with Regexp.new and warnings
+  # off (Ruby's own parser warns about the ambiguous-looking `-`), so the
+  # suite prints no regexp warnings.
   # rubocop:disable-next Style/RedundantRegexpEscape, Style/RedundantRegexpCharacterClass
-  APP_REGEXPS = {
-    /\A\d{5}\z/ => %w[12345 1234],
-    /\A\d{3}\-\d{4}\z/ => %w[555-1234 5551234],
-    /\A[\w\-]+\z/ => ["a-b_c", "a b"],
-    /\A[\-+]?\d+\z/ => %w[-1 +1 1 --1],
-    /\A\#[0-9a-f]{6}\z/ => %w[#00ff00 00ff00],
-    /\A\ \z/ => [" ", "\u00a0"],
-    /\A[^@\s]+@[^@\s]+\z/ => ["jo@example.com", "jo @example.com", "jo\u00a0x@example.com", "jo\u2028@example.com"],
-    /\A\s*\z/ => ["", " \t\n\v\f\r", "\u00a0", "\ufeff", "\u2028", "\u3000"],
-    /\A\S+\z/ => ["abc", "a\u00a0b", "a b"],
-    /\A[\s\d]+\z/ => ["1 2", "1\u00a02"],
-    /\A.+\z/ => ["abc", "a\rb", "a\u2028b", "a\u2029b", "a\nb"],
-    /\A\\A\z/ => ["\\A", "A", ""],
-    /\A\\z\z/ => ["\\z", "z"],
-    /\A{\d}\z/ => ["{5}", "5"],
-    /\A\$\d+(?:\.\d{2})?\z/ => ["$5", "$5.00", "5"],
-    %r{\Ahttps?://\S+\z} => ["https://a.b/c", "https://a\u00a0b"],
-    /\A(?:foo|bar)\z/ => %w[foo bar baz],
-    # Braced and built from a string: Ruby rewrites \u0041 to a bare A in
-    # the source, even through Regexp.new, so only this form reaches the
-    # translation as an escape.
-    Regexp.new('\A\u{41}\x42\z') => %w[AB aB],
-    /\A[\s\S]+\z/ => ["a b", "\u00a0\n\u2028"],
-    /\A[^\s\S]\z/ => ["a", " "],
-    /\A[\S]+\z/ => ["ab", "a\u00a0b", "a b"],
-    /\A[^\S]\z/ => [" ", "\u00a0", "a"],
-    /\A[\b]\z/ => ["\b", "b"],
-    /\A(?<y>\d{2})-(?:ab)+\z/ => %w[12-abab 12-],
-    /\A[a-z]{2,3}?\z/ => %w[ab abc a],
-    /(?<=\$)\d+/ => %w[$5 5],
-    /\A[a\]]\z/ => ["a", "]", "b"],
-    /\A[a-c-]\z/ => %w[b - d],
-    /\A\0\z/ => ["\0", "0"]
-  }.freeze
+  APP_REGEXPS = begin
+    verbose = $VERBOSE
+    $VERBOSE = nil
+    {
+      /\A\d{5}\z/ => %w[12345 1234],
+      /\A\d{3}\-\d{4}\z/ => %w[555-1234 5551234],
+      /\A[\w\-]+\z/ => ["a-b_c", "a b"],
+      /\A[\-+]?\d+\z/ => %w[-1 +1 1 --1],
+      /\A\#[0-9a-f]{6}\z/ => %w[#00ff00 00ff00],
+      /\A\ \z/ => [" ", "\u00a0"],
+      /\A[^@\s]+@[^@\s]+\z/ => ["jo@example.com", "jo @example.com", "jo\u00a0x@example.com", "jo\u2028@example.com"],
+      /\A\s*\z/ => ["", " \t\n\v\f\r", "\u00a0", "\ufeff", "\u2028", "\u3000"],
+      /\A\S+\z/ => ["abc", "a\u00a0b", "a b"],
+      /\A[\s\d]+\z/ => ["1 2", "1\u00a02"],
+      /\A.+\z/ => ["abc", "a\rb", "a\u2028b", "a\u2029b", "a\nb"],
+      /\A\\A\z/ => ["\\A", "A", ""],
+      /\A\\z\z/ => ["\\z", "z"],
+      /\A{\d}\z/ => ["{5}", "5"],
+      /\A\$\d+(?:\.\d{2})?\z/ => ["$5", "$5.00", "5"],
+      %r{\Ahttps?://\S+\z} => ["https://a.b/c", "https://a\u00a0b"],
+      /\A(?:foo|bar)\z/ => %w[foo bar baz],
+      # Braced and built from a string: Ruby rewrites \u0041 to a bare A in
+      # the source, even through Regexp.new, so only this form reaches the
+      # translation as an escape.
+      Regexp.new('\A\u{41}\x42\z') => %w[AB aB],
+      /\A[\s\S]+\z/ => ["a b", "\u00a0\n\u2028"],
+      /\A[^\s\S]\z/ => ["a", " "],
+      /\A[\S]+\z/ => ["ab", "a\u00a0b", "a b"],
+      /\A[^\S]\z/ => [" ", "\u00a0", "a"],
+      /\A[\b]\z/ => ["\b", "b"],
+      /\A(?<y>\d{2})-(?:ab)+\z/ => %w[12-abab 12-],
+      /\A[a-z]{2,3}?\z/ => %w[ab abc a],
+      /(?<=\$)\d+/ => %w[$5 5],
+      /\A[a\]]\z/ => ["a", "]", "b"],
+      /\A[a-c-]\z/ => %w[b - d],
+      /\A\0\z/ => ["\0", "0"],
+      # A literal - right after a completed range: [a-c-e] is the set
+      # {a, b, c, -, e} in both engines, not "a different range in Unicode
+      # mode" — "d" is the negative case that proves it. Regression: this
+      # used to be refused outright, so /\A[a-zA-Z0-9-_]+\z/ (a common
+      # format:) exported no pattern at all.
+      Regexp.new('\A[a-zA-Z0-9-_]+\z') => %w[abc-XYZ_9 -_ @],
+      Regexp.new('\A[A-Za-z0-9-_.]+\z') => %w[abc-XYZ_9. -_. @],
+      Regexp.new('\A[a-z0-9-_]{3,16}\z') => %w[abc-9 ab abcdefghijklmnop],
+      Regexp.new('\A[a-z-A-Z]\z') => %w[a Z - d 5 _],
+      Regexp.new('\A[a-c-e]\z') => %w[a b c - e d f],
+      Regexp.new('\A[a-z-\d]\z') => %w[a - 5 d D _],
+      # The hyphen may itself reopen a range, chaining exactly as Ruby's own
+      # parser reads a repeated hyphen.
+      Regexp.new('\A[a-z--x]\z') => ["-", ".", "5", "Q", "_", "@", "{", "~"]
+    }
+  ensure
+    $VERBOSE = verbose
+  end.freeze
 
   PRESET_SAMPLES = {
     email: ["jo@example.com", "jo#x+y@example.com", "jo@example", "jo @example.com", "@example.com"],
