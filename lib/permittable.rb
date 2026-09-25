@@ -501,9 +501,22 @@ module Permittable
     def check_scalar_rules(field, value)
       return [:error, "length"] if field[:length] && !length_ok?(field[:length], value.length)
       return [:error, "inclusion"] if field[:in] && !included_in?(field[:in], value)
-      return [:error, "format"] if field[:format] && !field[:format].match?(value)
+      return [:error, "format"] if field[:format] && !format_match?(field[:format], value)
 
       check_custom(field[:validate], value)
+    end
+
+    # A Regexp RAISES rather than answers when a String's encoding cannot meet
+    # it — a UTF-8 pattern with non-ASCII characters against UTF-16,
+    # Shift_JIS or binary bytes (Encoding::CompatibilityError). A value the
+    # pattern cannot even be applied to has not been shown to match, so it is
+    # a `format` violation, the answer the client can act on. An app that
+    # takes other encodings on purpose (`skip_parameter_encoding`) sees what
+    # it saw before this rule, except that the crash is now a 422.
+    def format_match?(pattern, value)
+      pattern.match?(value)
+    rescue EncodingError, ArgumentError
+      false
     end
 
     # Free-form hash. The shape is deliberately undeclared, so the only
@@ -546,13 +559,21 @@ module Permittable
 
     def cast(type, value)
       return [:error, "invalid_type"] unless scalar_shaped?(value)
+      return public_send("cast_#{type}", value) unless value.is_a?(String)
+      # Bytes that are not valid in the String's OWN encoding are not text in
+      # any encoding: every String operation after the cast raises on them
+      # (`format:`, the normalize presets, an app's `validate:`). Rails'
+      # params builder guards a controller; a standalone Contract#call on a
+      # webhook payload has nothing in front of it, so `"caf\xC3"` was a 500.
+      return [:error, "invalid_type"] unless value.valid_encoding?
+      # A :string is handed back exactly as it arrived, in its own encoding.
+      # `skip_parameter_encoding` / `param_encoding` send a controller binary
+      # or Shift_JIS text ON PURPOSE, and converting it would hand the app
+      # something other than what it asked Rails for.
+      return cast_string(value) if type == :string
 
-      if value.is_a?(String)
-        value = utf8_text(value)
-        return [:error, "invalid_type"] unless value
-      end
-
-      public_send("cast_#{type}", value)
+      text = utf8_text(value)
+      text ? public_send("cast_#{type}", text) : [:error, "invalid_type"]
     end
 
     # Encodings whose bytes are READ as UTF-8 rather than converted: UTF-8
@@ -561,26 +582,18 @@ module Permittable
     # hands a payload over.
     UTF8_READABLE = [Encoding::UTF_8, Encoding::US_ASCII, Encoding::BINARY].freeze
 
-    # The String every cast and every later String operation works on, in
-    # UTF-8 — or nil when the input cannot be read as UTF-8 text at all.
+    # A UTF-8 copy of a String, for INSPECTION only — the text a number, a
+    # boolean or a date is parsed from — or nil when there is no UTF-8
+    # reading of it. The value handed back to the app is never this copy.
     #
-    # Nothing downstream can cope with anything else, and none of it fails
-    # politely. `format:`'s Regexp#match?, the squish/strip/downcase presets
-    # and an app's own `validate:` RAISE on invalid bytes; Rails' params
-    # builder refuses invalid UTF-8 before a controller runs, but a standalone
-    # Contract#call (a webhook payload) has nothing in front of it, so
-    # `"caf\xC3"` was a 500 where it deserved a 422. A String that is VALID
-    # but not UTF-8 fared worse: `Integer()` on UTF-16 raised
-    # Encoding::CompatibilityError, and `BigDecimal` read UTF-16 "12" byte by
-    # byte and returned 1 — a wrong answer where the others at least crashed.
+    # Parsing the String itself went wrong for any encoding but UTF-8:
+    # `Integer()` on UTF-16 "12" raised Encoding::CompatibilityError, and
+    # `BigDecimal` read the same String byte by byte and returned 1 — a wrong
+    # answer where the other at least crashed.
     #
-    # So binary and US-ASCII are read as UTF-8 (on a copy — the caller's
-    # String keeps its encoding), anything else is converted with `encode`,
-    # and a result that is not valid UTF-8, or a conversion that raises, is
-    # refused. Called from `cast`, the one door every scalar value goes
-    # through: a field, an `of:` element, a sub-field of an array of hashes,
-    # an authored `default:`. `normalize:` runs earlier and uses the same
-    # reading, so both see the same text.
+    # Binary and US-ASCII are read as UTF-8 (on a copy — the caller's String
+    # keeps its encoding), anything else is converted with `encode`, and a
+    # result that is not valid UTF-8, or a conversion that raises, is nil.
     def utf8_text(value)
       text = if value.encoding == Encoding::UTF_8 then value
              elsif UTF8_READABLE.include?(value.encoding) then value.dup.force_encoding(Encoding::UTF_8)
@@ -598,6 +611,8 @@ module Permittable
     # "caf\xC3" was copied raw into the 422 and rendering it raised
     # JSON::GeneratorError, and a UTF-16 key raised
     # Encoding::CompatibilityError while its path was being interpolated.
+    # Only undeclared keys come here (see permittable_unknown_key_violation):
+    # a declared key is the contract's own UTF-8 name.
     def reportable_text(value)
       utf8_text(value) || scrubbed_text(value)
     end
@@ -760,16 +775,28 @@ module Permittable
 
     # Presets only make sense on String input; a non-String value (JSON
     # numbers, booleans) skips normalization and goes straight to the cast.
-    # A String is normalized as the UTF-8 text the cast will read (see
-    # utf8_text). One that cannot be read is left as it came, for the cast
-    # to refuse: every preset raises on invalid bytes, and an app's own proc
-    # would be handed input it never agreed to see. It is not empty, so the
-    # absence rule in between cannot mistake it for a missing value.
+    #
+    # A String that is not valid in its own encoding is left as it came, for
+    # the cast to refuse: every preset raises on invalid bytes, and an app's
+    # own proc would be handed input it never agreed to see. It is not empty,
+    # so the absence rule in between cannot mistake it for a missing value.
+    #
+    # A VALID String in another encoding is normalized in that encoding —
+    # `:strip` works on binary and Shift_JIS alike — and when the normalizer
+    # cannot handle the encoding (`:squish` on UTF-16 raises
+    # Encoding::CompatibilityError) the value is left as it is rather than
+    # raising. Only for such a String: on UTF-8 or ASCII-only text nothing
+    # the encoding does can be the cause, so an error there is the app's own
+    # bug and is raised as one.
     def apply_normalize(normalizer, value)
       return value unless normalizer && value.is_a?(String)
+      return value unless value.valid_encoding?
 
-      text = utf8_text(value)
-      text ? normalizer.call(text) : value
+      normalizer.call(value)
+    rescue EncodingError, ArgumentError
+      raise if value.encoding == Encoding::UTF_8 || value.ascii_only?
+
+      value
     end
 
     # nil and "" are both ABSENT — see the module comment. The VALUE half of
@@ -1768,12 +1795,20 @@ module Permittable
     # uniqueness validator reports only `ids[1]`; the client fixes it,
     # resends, and only then learns of the duplicate. Running app code over
     # nils it never agreed to handle is the worse failure.
-    elements_valid = violations.length == before
+    #
+    # An undeclared key inside an element (`unknown: :error`) is not such a
+    # violation: it removes nothing from the element validate: sees, so it
+    # does not stop validate: from running.
+    #
+    # transform: is stricter, as on the scalar path: it runs only when
+    # NOTHING violated, validate: included — a transform may rely on what
+    # validate: checked (`Math.sqrt` after "all positive").
+    elements_valid = violations.drop(before).all? { |v| permittable_unknown_key_violation?(v) }
     if field[:validate] && elements_valid
       status, code = Coercion.check_custom(field[:validate], out)
       violations << permittable_violation(field, path, code) unless status == :ok
     end
-    out = field[:transform].call(out) if field[:transform] && elements_valid
+    out = field[:transform].call(out) if field[:transform] && violations.length == before
     out
   end
 
@@ -1838,9 +1873,9 @@ module Permittable
     return if extra.empty?
 
     if unknown == :error
-      extra.each { |key| violations << permittable_violation({}, permittable_path(path, key), "unknown") }
+      extra.each { |key| violations << permittable_unknown_key_violation(path, key) }
     elsif respond_to?(:logger) && logger
-      listed = permittable_prose_list(extra) { |key| permittable_path(path, key) }
+      listed = permittable_prose_list(extra) { |key| permittable_path(path, Coercion.reportable_text(key)) }
       logger.warn("#{LABEL}: unknown parameter(s) ignored by the ##{permittable_action_name} contract: #{listed}")
     end
   end
@@ -1883,13 +1918,26 @@ module Permittable
     source.except(key)
   end
 
-  # `key` can be the CLIENT's — an undeclared key on its way into a
-  # violation's `param` and the log line — so it is made reportable UTF-8
-  # here, the one place every path is built (see Coercion.reportable_text).
-  # A declared key is already UTF-8 and comes back as the same String.
   def permittable_path(path, key)
-    key = Coercion.reportable_text(key.to_s)
     path ? "#{path}.#{key}" : key
+  end
+
+  # The one place a CLIENT's key enters a path, so the only one converted to
+  # reportable UTF-8 (see Coercion.reportable_text) — every declared key a
+  # request walks through is the contract's own name and is left alone.
+  #
+  # The entry is also remembered by identity, which is how
+  # permittable_check_array tells an undeclared key from a sub-field that
+  # failed. The code alone cannot: a sub-field's validate: may itself
+  # return :unknown.
+  def permittable_unknown_key_violation(path, key)
+    entry = permittable_violation({}, permittable_path(path, Coercion.reportable_text(key)), "unknown")
+    (@permittable_unknown_key_violations ||= {}.compare_by_identity)[entry] = true
+    entry
+  end
+
+  def permittable_unknown_key_violation?(entry)
+    @permittable_unknown_key_violations&.key?(entry) || false
   end
 
   def permittable_action_name
