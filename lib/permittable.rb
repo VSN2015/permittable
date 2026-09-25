@@ -234,16 +234,25 @@ module Permittable
   # key of "x\nE, [...] ERROR -- : ..." wrote a second, forged log entry.
   # The set is every control character (\p{Cc}: C0, DEL and C1 — C1 because
   # U+0085 is NEL, a line break to many readers, and U+009B is the 8-bit
-  # CSI that starts a terminal escape) plus U+2028/U+2029, the two Unicode
-  # separators a JSON-lines or JavaScript reader splits a line on. Format
-  # characters such as the bidi overrides are left alone: they can reorder
-  # how a line displays, but not start a new one.
-  PROSE_UNSAFE = /[\p{Cc}\u2028\u2029]/
+  # CSI that starts a terminal escape); U+2028/U+2029, the two Unicode
+  # separators a JSON-lines or JavaScript reader splits a line on; and the
+  # bidi embedding, override and isolate characters (U+202A–U+202E,
+  # U+2066–U+2069), which start no line but can visually reorder one — and
+  # so move text across the closing quote of an escaped name.
+  PROSE_UNSAFE = /[\p{Cc}\u2028\u2029\u202A-\u202E\u2066-\u2069]/
+  # A name is also quoted when it merely LOOKS like prose structure: a quote
+  # anywhere could pass for (or close) an escaped name, and the list
+  # separator could pass for two names or for the ", and N more" count.
+  PROSE_AMBIGUOUS = /"|, /
   # \n, \r and \t, which a person recognises, get their short escape; any
   # other unsafe character is \uXXXX, which JSON, JavaScript and Ruby all
   # read the same way. The quote and backslash are escaped too, but only
   # inside an escaped (quoted) name, where they would otherwise be ambiguous.
   PROSE_ESCAPES = { "\n" => '\n', "\r" => '\r', "\t" => '\t', '"' => '\"', "\\" => '\\\\' }.freeze
+  # How much of a name the prose ever reads. Every character the rendering
+  # could show lies inside it even when each one is a 4-byte sequence in a
+  # binary key, so a 1 MB name is converted and scanned no further than this.
+  PROSE_SCAN_LIMIT = PROSE_ITEM_LIMIT * 4
 
   # The single proc Permittable::Railtie appends to config.filter_parameters.
   # Declared with an optional third parameter so its own arity is -3 and Rails
@@ -1539,42 +1548,53 @@ module Permittable
   end
 
   def permittable_violation_summary(violations)
+    # The param is the client-controlled part; the message (or code) is the
+    # developer's, so it is handed over separately and never escaped — a
+    # YAML `|` message ending in "\n" must not quote every name it follows.
     permittable_prose_list(violations) do |v|
-      v[:message] ? "#{v[:param]} #{v[:message]}" : "#{v[:param]} (#{v[:code]})"
+      [v[:param].to_s, v[:message] ? " #{v[:message]}" : " (#{v[:code]})"]
     end
   end
 
   # See PROSE_LIST_LIMIT. `unknown: :error` on a request carrying 50,000
   # undeclared keys used to produce a 50,000-item sentence — a megabyte of
   # log line, or of exception message handed to every error tracker.
-  # The block formats one item, and is called only for the items actually
-  # shown — the rest are counted, never rendered.
+  # The block returns one item's name, or [name, suffix], and is called
+  # only for the items actually shown — the rest are counted, never rendered.
   def permittable_prose_list(items)
-    shown = items.first(PROSE_LIST_LIMIT).map { |item| permittable_prose_item(yield(item)) }.join(", ")
+    shown = items.first(PROSE_LIST_LIMIT).map { |item| permittable_prose_item(*yield(item)) }.join(", ")
     return shown if items.length <= PROSE_LIST_LIMIT
 
     "#{shown}, and #{items.length - PROSE_LIST_LIMIT} more"
   end
 
-  # See PROSE_ITEM_LIMIT and PROSE_UNSAFE. Only a name that needs it is
-  # escaped, so every ordinary name — non-ASCII and backslashes included —
-  # prints byte-for-byte as before. An escaped name is always quoted, and a
-  # raw name that happens to START with a quote is escaped too: otherwise a
-  # literal `"a\nb"` sent as a key would print exactly like the escaped
-  # rendering of a real newline, and a reader could not tell them apart.
-  def permittable_prose_item(item)
-    text = permittable_prose_utf8(item)
-    return permittable_prose_escaped(text) if !text.valid_encoding? || text.start_with?('"') || text.match?(PROSE_UNSAFE)
+  # See PROSE_ITEM_LIMIT, PROSE_UNSAFE and PROSE_AMBIGUOUS. The item is the
+  # name plus the suffix, truncated as one. Only a name that needs it is
+  # quoted and escaped, judged by the part of it the truncated item would
+  # SHOW — a control character past the cut is not printed, so it quotes
+  # nothing. Every ordinary name therefore prints exactly as before, just
+  # always as UTF-8: a Windows-1252 or binary key is converted rather than
+  # written raw, and names of mixed encodings can be joined.
+  def permittable_prose_item(name, suffix = "")
+    text = permittable_prose_utf8(name[0, PROSE_SCAN_LIMIT])
+    suffix = permittable_prose_utf8(suffix)
+    more = !name[PROSE_SCAN_LIMIT].nil?
+    fits = !more && text.length + suffix.length <= PROSE_ITEM_LIMIT
+    shown = fits ? text : text[0, PROSE_ITEM_LIMIT - 3]
+    if !shown.valid_encoding? || shown.match?(PROSE_UNSAFE) || shown.match?(PROSE_AMBIGUOUS)
+      return permittable_prose_quoted(text, more, suffix)
+    end
 
-    item.length <= PROSE_ITEM_LIMIT ? item : "#{item[0, PROSE_ITEM_LIMIT - 3]}..."
+    fits ? "#{text}#{suffix}" : "#{"#{text}#{suffix}"[0, PROSE_ITEM_LIMIT - 3]}..."
   end
 
-  # The item is truncated by whole escapes, never through one: cutting the
+  # The name is truncated by whole escapes, never through one: cutting the
   # escaped text at a fixed width could print a dangling backslash, or half
-  # of a \uXXXX. The "..." goes outside the closing quote, so the quotes
-  # still delimit exactly what is shown. Only as many characters are escaped
-  # as can be shown, so a 1 MB name costs no more than a short one.
-  def permittable_prose_escaped(text)
+  # of a \uXXXX. When the name itself is cut, the "..." goes outside the
+  # closing quote, so the quotes still delimit exactly what is shown; when
+  # only the suffix is, the name stays whole. Only as many characters are
+  # escaped as can be shown.
+  def permittable_prose_quoted(text, more, suffix)
     budget = PROSE_ITEM_LIMIT - 2 # the two quotes
     pieces = []
     length = 0
@@ -1583,7 +1603,11 @@ module Permittable
       length += pieces.last.length
       break if length > budget
     end
-    return "\"#{pieces.join}\"" if length <= budget
+    if !more && length <= budget
+      quoted = "\"#{pieces.join}\""
+      return "#{quoted}#{suffix}" if quoted.length + suffix.length <= PROSE_ITEM_LIMIT
+      return "#{quoted}#{suffix[0, PROSE_ITEM_LIMIT - 3 - quoted.length]}..." if quoted.length <= PROSE_ITEM_LIMIT - 3
+    end
 
     length -= pieces.pop.length while length > budget - 3
     "\"#{pieces.join}\"..."

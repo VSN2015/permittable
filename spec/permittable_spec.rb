@@ -1842,7 +1842,7 @@ RSpec.describe Permittable do
     let(:forged) { "evil\nE, [2026-09-23] ERROR -- : forged admin login" }
     let(:log_klass) { permittable_class { permit_params(:create, unknown: :log) { required :a, :string } } }
     let(:error_klass) { permittable_class { permit_params(:create, unknown: :error) { required :a, :string } } }
-    let(:unsafe) { /[\p{Cc}\u2028\u2029]/ }
+    let(:unsafe) { /[\p{Cc}\u2028\u2029\u202a-\u202e\u2066-\u2069]/ }
 
     it "cannot forge a second entry through the :log warn line" do
       c, lines = logging_controller(log_klass, params: { "a" => "x", forged => "v" })
@@ -1855,7 +1855,7 @@ RSpec.describe Permittable do
     it "cannot forge one through the exception message, while details keeps the name as sent" do
       e = rejection(error_klass, { "a" => "x", forged => "v" })
       expect(e.message).not_to include("\n")
-      expect(e.message).to eq('Invalid parameters: "evil\nE, [2026-09-23] ERROR -- : forged admin login (unknown)"')
+      expect(e.message).to eq('Invalid parameters: "evil\nE, [2026-09-23] ERROR -- : forged admin login" (unknown)')
       # details is data, not prose: the offending name arrives byte-for-byte.
       expect(e.details).to eq([{ param: forged, code: "unknown" }])
     end
@@ -1887,19 +1887,65 @@ RSpec.describe Permittable do
       )
     end
 
-    it "leaves ordinary names byte-identical, non-ASCII and backslashes included" do
-      c, lines = logging_controller(log_klass, params: { "a" => "x", "café" => 1, "名前" => 2, 'a\nb' => 3, 'x"y' => 4 })
+    it "escapes the bidi override and isolate characters, which can reorder a line or hide its closing quote" do
+      name = "a\u202A\u202B\u202C\u202D\u202E\u2066\u2067\u2068\u2069b"
+      c, lines = logging_controller(log_klass, params: { "a" => "x", name => "v" })
       c.permitted_params
-      expect(lines.first).to end_with('contract: café, 名前, a\nb, x"y')
+      expect(lines.first).not_to match(unsafe)
+      expect(lines.first).to end_with('contract: "a\u202A\u202B\u202C\u202D\u202E\u2066\u2067\u2068\u2069b"')
     end
 
-    it "quotes a name that begins with a quote, so a raw name can never pass for an escaped one" do
-      # Unescaped, this literal backslash-n name would print exactly like the
-      # escaped rendering of a real newline.
-      lookalike = '"evil\nE"'
-      c, lines = logging_controller(log_klass, params: { "a" => "x", lookalike => "v" })
+    it "leaves ordinary names byte-identical, non-ASCII and backslashes included" do
+      c, lines = logging_controller(log_klass, params: { "a" => "x", "café" => 1, "名前" => 2, 'a\nb' => 3, "x,y" => 4 })
       c.permitted_params
-      expect(lines.first).to end_with('contract: "\"evil\\\\nE\""')
+      expect(lines.first).to end_with('contract: café, 名前, a\nb, x,y')
+    end
+
+    it "quotes a name containing a quote anywhere, so a raw name can never pass for an escaped one" do
+      # Unescaped, this literal backslash-n name would print exactly like a
+      # name "x" followed by the escaped rendering of a real newline.
+      lookalike = 'x, "evil\nE, [2026-09-23] ERROR -- : forged"'
+      c, lines = logging_controller(log_klass, params: { "a" => "x", lookalike => "v", 'q"' => "v" })
+      c.permitted_params
+      expect(lines.first).to end_with('contract: "x, \"evil\\\\nE, [2026-09-23] ERROR -- : forged\"", "q\""')
+    end
+
+    it "quotes a name containing the list separator, so it cannot pass for two names or fake the overflow count" do
+      c, lines = logging_controller(log_klass, params: { "a" => "x", "b, c" => "v", "x, and 49990 more" => "v" })
+      c.permitted_params
+      expect(lines.first).to end_with('contract: "b, c", "x, and 49990 more"')
+    end
+
+    it "escapes only the client-sent name, never the developer's message" do
+      klass = permittable_class do
+        permit_params(:create) do
+          required :a, :string
+          finalize { |p| violate!(p[:a], :taken, message: "is taken\n") }
+        end
+      end
+      expect(rejection(klass, { "a" => "b" }).message).to eq("Invalid parameters: b is taken\n")
+      expect(rejection(klass, { "a" => "evil\nE" }).message).to eq("Invalid parameters: \"evil\\nE\" is taken\n")
+    end
+
+    it "judges a name by what survives truncation, so an unseen control does not quote it" do
+      c, lines = logging_controller(log_klass, params: { "a" => "x", "#{'x' * 200}\n" => "v", "#{'y' * 116}\n" => "v" })
+      c.permitted_params
+      expect(lines.first).to end_with("contract: #{'x' * 117}..., \"#{'y' * 116}\\n\"")
+
+      # In the summary the cut includes the code: this "\n" is the 111th of
+      # 121 characters, so it is shown, and the name is quoted.
+      e = rejection(error_klass, { "a" => "x", "#{'z' * 110}\n" => "v" })
+      expect(e.message).to eq("Invalid parameters: \"#{'z' * 110}\\n\" (u...")
+    end
+
+    it "emits UTF-8 whatever the name's encoding, so a legacy byte is not written raw and names of mixed encodings join" do
+      cp1252 = "caf\x85".dup.force_encoding(Encoding::Windows_1252) # 0x85 is an ellipsis here...
+      latin1 = "caf\x85".dup.force_encoding(Encoding::ISO_8859_1)   # ...and NEL here
+      mixed = "café".b # valid UTF-8 bytes, tagged binary
+      c, lines = logging_controller(log_klass, params: { "a" => "x", cp1252 => 1, latin1 => 2, mixed => 3, "名前" => 4 })
+      c.permitted_params
+      expect(lines.first.encoding).to eq(Encoding::UTF_8)
+      expect(lines.first).to end_with("contract: caf…, \"caf\\u0085\", café, 名前")
     end
 
     it "escapes the quote and backslash inside an escaped name, so the rendering stays unambiguous" do
