@@ -1,13 +1,13 @@
 require "spec_helper"
 
-# Guards the JSON body path the rest of the suite depends on. activesupport
-# 8.1.3.1 calls JSON.parse(source, opts) positionally, json 3 rejects it, and
-# every application/json body failed while the suite stayed green: nothing
-# sent raw JSON through Rails' own parser at the time
-# (https://github.com/VSN2015/permittable/issues/58). IntegrationHarness's
-# `json:` and `raw_json:` now hand ActionDispatch the raw bytes, and these
-# examples pin that down: if the JSON parser breaks again, they fail with the
-# real cause rather than every `json:` spec failing somewhere downstream.
+# activesupport 8.1.3.1 calls JSON.parse(source, opts) positionally, json 3
+# rejects it, and every application/json body failed while the suite stayed
+# green: nothing sent raw JSON through Rails' own parser at the time
+# (https://github.com/VSN2015/permittable/issues/58). The `raw_json:` and
+# `json:` examples below pin down that IntegrationHarness hands ActionDispatch
+# raw bytes, that Rails' JSON parser decodes them into what the contract
+# validates, and that malformed input fails as a JSON::ParserError rather
+# than as a broken parser call.
 RSpec.describe "A raw application/json request body" do
   let(:controller) do
     IntegrationHarness.build_controller do
@@ -25,7 +25,7 @@ RSpec.describe "A raw application/json request body" do
     end
   end
 
-  it "decodes with ActiveSupport::JSON.decode, the call ActionDispatch's JSON parser makes" do
+  it "can be decoded by a bare ActiveSupport::JSON.decode call" do
     expect(ActiveSupport::JSON.decode('{"user":{"name":"Jo"}}')).to eq("user" => { "name" => "Jo" })
   end
 
