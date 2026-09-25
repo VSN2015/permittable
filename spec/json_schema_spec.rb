@@ -133,6 +133,33 @@ RSpec.describe Permittable::JsonSchema do
       expect { JSON.generate(float) }.not_to raise_error
     end
 
+    it "publishes an integral bound beyond Float::MAX exactly, matching master" do
+      # 10**400 has no double — `to_f` overflows it to Infinity — but a JSON
+      # integer literal has no size limit, and master published it outright:
+      # `minimum: 10**400`. The inward-nudge machinery routes a candidate
+      # bound through `to_f` to ask the field's own cast whether it is
+      # "honoured", which itself overflows to Infinity for a bound this
+      # large and used to walk the bound to Infinity and drop it — looser
+      # than master, not merely a labelled divergence.
+      huge = 10**400
+      expect(property("x") { optional :x, :float, in: huge.. }).to include("minimum" => huge)
+      expect(property("x") { optional :x, :float, in: ..(-huge) }).to include("maximum" => -huge)
+      expect(property("x") { optional :x, :decimal, in: BigDecimal("1e400").. }).to include("minimum" => huge)
+    end
+
+    it "omits a FRACTIONAL bound beyond Float::MAX, unlike an integral one" do
+      # BigDecimal("1e400") + 0.5 has no double either, but unlike an
+      # integral bound it has no arbitrary-precision JSON representation
+      # this exporter emits without going through Float — publishing it
+      # exactly would mean a raw decimal number literal rather than a Ruby
+      # Integer/Float, which this exporter does not produce. It is omitted,
+      # same as a genuinely infinite bound, and deliberately so (see
+      # CHANGELOG) rather than silently.
+      fractional = BigDecimal("1e400") + BigDecimal("0.5")
+      prop = property("x") { optional :x, :decimal, in: fractional.. }
+      expect(prop.keys.grep(/imum/i)).to be_empty
+    end
+
     it "omits a NaN bound, which compares to nothing" do
       # Ruby refuses a two-sided Range with a NaN end, but an endless one
       # builds — and NaN is no JSON number either.

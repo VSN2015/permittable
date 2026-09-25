@@ -229,11 +229,25 @@ module Permittable
     # would also accept a few doubles beyond the nearest one, those stay
     # unpublished.) A decimal of up to 15 significant digits — every price —
     # round-trips through a double, so it is emitted as written.
+    #
+    # An INTEGRAL bound past Float::MAX (`10**400`) needs none of this: a
+    # JSON number literal has no size limit, so it is exact as published,
+    # with no Float rounding to guard against in the first place. Asking the
+    # server would instead break it — the field's own cast runs the bound
+    # through `to_f`, which overflows a value this large to Infinity — so
+    # the loop below walked the bound to Infinity and dropped it, though
+    # master published it as `minimum: 10**400` outright. It is returned
+    # here before the loop runs. A FRACTIONAL bound past Float::MAX has no
+    # such escape (there is no arbitrary-precision JSON number this exporter
+    # emits without going through Float) and stays omitted, same as a
+    # genuinely infinite bound — see CHANGELOG.
     def json_bound(range, keyword, type)
       value = keyword == "minimum" ? range.begin : range.end
       return nil unless value.finite?
 
       bound = value.is_a?(Float) || value != value.to_i ? value.to_f : value.to_i
+      return bound if bound.is_a?(Integer) && !bound.to_f.finite?
+
       step = keyword == "minimum" ? :next_float : :prev_float
       # A fractional bound past Float::MAX converts to Infinity, which no
       # step moves; it is then as unrepresentable as an infinite one.
