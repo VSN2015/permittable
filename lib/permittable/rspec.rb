@@ -309,6 +309,8 @@ module Permittable
         when :of then of_mismatch(field, value)
         when :required then required_mismatch(field, value)
         when :format then format_mismatch(field, value)
+        # Compared cast, but reported as written.
+        when :in then option_mismatch(field, :in, value) unless field.key?(:in) && same_in?(field[:in], cast_in(field, value))
         when :virtual, :sensitive, :nullable then "expected the field to be #{key}, but it is not" unless field[key]
         else option_mismatch(field, key, value)
         end
@@ -349,6 +351,28 @@ module Permittable
         return if field[:format_name] == expected
 
         "expected format: :#{expected}, but the contract #{declared_format(field)}"
+      end
+
+      # A contract stores an `in:` list cast by the field's type, so
+      # `within(%i[draft published])` — the declaration repeated as written —
+      # is read the same way before comparing, by the same two functions the
+      # contract uses: what counts as a list (a Hash as its keys), then the
+      # cast. Anything that is not a list, or does not cast, is compared as
+      # given — a Range and a host's own allowlist are stored as given too.
+      def cast_in(field, expected)
+        members = field[:kind] == :scalar && Coercion.in_list(expected)
+        return expected unless members
+
+        status, cast = Coercion.cast_in_members(field[:type], members, nullable: field[:nullable])
+        status == :ok ? cast : expected
+      end
+
+      # A list's order and container say nothing about what it allows:
+      # `in: Post.statuses` is stored as a Set, and `within(%w[draft
+      # published])` names exactly its values.
+      def same_in?(declared, expected)
+        lists = [declared, expected].all? { |list| list.is_a?(Array) || list.is_a?(Set) }
+        lists ? declared.to_set == expected.to_set : declared == expected
       end
 
       def declared_format(field)

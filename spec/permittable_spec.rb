@@ -87,9 +87,218 @@ RSpec.describe Permittable do
       end
     end
 
-    it "rejects :in that does not respond to include?" do
+    it "rejects an :in that answers neither cover? nor include?" do
       expect { permittable_class { permit_params(:create) { required :a, :integer, in: 5 } } }
-        .to raise_error(ArgumentError, /:in for field :a must respond to include\?/)
+        .to raise_error(ArgumentError, /:in for field :a must be a Range, a list of values .*\(got 5\)/)
+    end
+
+    # String#include? is a substring test: in: "free pro" accepted "e", "fr"
+    # and "ee p" as plans.
+    it "rejects a String :in, which would have matched any substring" do
+      expect { permittable_class { permit_params(:create) { optional :plan, :string, in: "free pro" } } }
+        .to raise_error(ArgumentError, /:in for field :plan must be a Range, a list of values .*\(got "free pro"\).*substring/)
+    end
+
+    # The Rails enum idiom: `in: Post.statuses` is a HashWithIndifferentAccess
+    # of name => stored value, and Hash#include? asks about its keys.
+    it "reads a Hash :in as its keys, cast like any list" do
+      statuses = ActiveSupport::HashWithIndifferentAccess.new(draft: 0, published: 1)
+      decl = proc do
+        permit_params(:create) do
+          optional :status, :string, in: statuses
+          optional :tier,   :string, in: { free: "f", pro: "p" }
+        end
+      end
+      expect(permit({ status: "published", tier: "pro" }, &decl).to_h).to eq("status" => "published", "tier" => "pro")
+      expect(violations_for({ status: "0", tier: "f" }, &decl).details)
+        .to eq([{ param: "status", code: "inclusion" }, { param: "tier", code: "inclusion" }])
+      # A Set, so membership stays O(1) per request as Hash#include? was.
+      ins = permittable_class(&decl).permit_rule_for(:create)[:fields].map { |f| f[:in] }
+      expect(ins).to eq([Set["draft", "published"], Set["free", "pro"]])
+      expect(ins).to all(be_frozen)
+    end
+
+    it "keeps an :in that only answers include? exactly as given, uncast" do
+      allowlist = Object.new
+      def allowlist.include?(value) = value.to_s.start_with?("sku-")
+      decl = proc { permit_params(:create) { optional :sku, :string, in: allowlist } }
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in]).to be(allowlist)
+      expect(permit({ sku: "sku-1" }, &decl)[:sku]).to eq("sku-1")
+      expect(violations_for({ sku: "abc" }, &decl).details).to eq([{ param: "sku", code: "inclusion" }])
+    end
+
+    # Only Array, Set, Hash and Enumerator are lists. An app's own Enumerable
+    # with its own include? — a case-insensitive allowlist, a DB-backed
+    # registry — is used as given: never enumerated at class load, never
+    # replaced by an exact-match copy.
+    it "keeps an app's own Enumerable that defines include? as given, never enumerating it" do
+      plans = Class.new do
+        include Enumerable
+
+        def each = raise("enumerated at class load")
+        def include?(value) = %w[free pro].include?(value.to_s.downcase)
+      end.new
+      decl = proc { permit_params(:create) { optional :plan, :string, in: plans } }
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in]).to be(plans)
+      expect(permit({ plan: "PRO" }, &decl)[:plan]).to eq("PRO")
+      expect(violations_for({ plan: "gold" }, &decl).details).to eq([{ param: "plan", code: "inclusion" }])
+    end
+
+    # A Hash/Array/Set SUBCLASS overriding include? is the same story as the
+    # Enumerable above, by CLASS rather than by module: `case allowed; when
+    # Hash ...` matches with ===, which for a Class is is_a? — so a subclass
+    # matched the branch for its ancestor and had its override silently
+    # discarded, reading its raw contents (keys, elements) instead and
+    # inverting which values it actually accepts. Each is kept exactly as
+    # given, like any other object whose include? is the point.
+    it "keeps a Hash subclass's own include?, not its keys, when the override differs from Hash's" do
+      registry = Class.new(Hash) do
+        def include?(value) = value.to_s.start_with?("custom-")
+      end.new
+      registry[:unrelated] = 1
+      decl = proc { permit_params(:create) { optional :sku, :string, in: registry } }
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in]).to be(registry)
+      expect(permit({ sku: "custom-1" }, &decl)[:sku]).to eq("custom-1")
+      expect(violations_for({ sku: "unrelated" }, &decl).details).to eq([{ param: "sku", code: "inclusion" }])
+    end
+
+    it "keeps an Array subclass's own include?, not its elements" do
+      allowlist = Class.new(Array) do
+        def include?(value) = any? { |candidate| candidate.to_s.casecmp?(value.to_s) }
+      end.new(%w[free pro])
+      decl = proc { permit_params(:create) { optional :plan, :string, in: allowlist } }
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in]).to be(allowlist)
+      expect(permit({ plan: "PRO" }, &decl)[:plan]).to eq("PRO")
+      expect(violations_for({ plan: "gold" }, &decl).details).to eq([{ param: "plan", code: "inclusion" }])
+    end
+
+    it "keeps a Set subclass's own include?, not its elements" do
+      fuzzy = Class.new(Set) do
+        def include?(value) = any? { |candidate| candidate.to_s.include?(value.to_s) }
+      end.new(%w[free pro])
+      decl = proc { permit_params(:create) { optional :plan, :string, in: fuzzy } }
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in]).to be(fuzzy)
+      expect(permit({ plan: "p" }, &decl)[:plan]).to eq("p")
+      expect(violations_for({ plan: "gold" }, &decl).details).to eq([{ param: "plan", code: "inclusion" }])
+    end
+
+    # A plain Hash's keys are still cast to a Set for O(1) membership, and
+    # HashWithIndifferentAccess — a Hash SUBCLASS — is the one deliberate
+    # exception to the rule above: its include? override only canonicalises
+    # the argument (String/Symbol) before the same key lookup, so its keys
+    # are still exactly its members. It is what a Rails enum's own reader
+    # (`Post.statuses`) actually returns.
+    it "still reads a plain Hash and a HashWithIndifferentAccess as their keys" do
+      decl = proc do
+        permit_params(:create) do
+          optional :status, :string, in: { draft: 0, published: 1 }
+          optional :tier, :string, in: ActiveSupport::HashWithIndifferentAccess.new(free: "f", pro: "p")
+        end
+      end
+      fields = permittable_class(&decl).permit_rule_for(:create)[:fields]
+      expect(fields.map { |f| f[:in] }).to eq([Set["draft", "published"], Set["free", "pro"]])
+    end
+
+    # The approved snapshot: a list is cast once, so a later `PLANS << "gold"`
+    # is not seen. An app that needs a live list passes its own include?
+    # object, which is read on every request.
+    it "snapshots an Array :in at class load" do
+      plans = %w[free pro]
+      klass = permittable_class { permit_params(:create) { optional :plan, :string, in: plans } }
+      plans << "gold"
+      e = klass.new(params: { plan: "gold" })
+      e.define_singleton_method(:action_name) { "create" }
+      expect(e.permittable_violations).to eq([{ param: "plan", code: "inclusion" }])
+    end
+
+    # A lazy list left lazy was cast per request, and the cast's early return
+    # escaped its block there as a LocalJumpError — a 500.
+    it "forces a lazy :in to a list once, at class load" do
+      decl = proc { permit_params(:create) { optional :n, :integer, in: %w[1 2 3].lazy.map(&:itself) } }
+      field = permittable_class(&decl).permit_rule_for(:create)[:fields].first
+      expect(field[:in]).to eq([1, 2, 3]).and be_frozen
+      expect(permit({ n: "2" }, &decl)[:n]).to eq(2)
+      expect(violations_for({ n: "4" }, &decl).details).to eq([{ param: "n", code: "inclusion" }])
+      expect { permittable_class { permit_params(:create) { optional :n, :integer, in: %w[1 x].lazy.map(&:itself) } } }
+        .to raise_error(ArgumentError, /:in for field :n contains "x"/)
+    end
+
+    # ActiveSupport compares a Time (or DateTime) with a Date as instants,
+    # the Date standing for its midnight UTC — so that instant was the only
+    # one that ever matched. It is read as that UTC date; any other instant
+    # never matched a request, and fails like any never-matching member.
+    it "reads a Time or DateTime member of a :date field as its date only at midnight UTC" do
+      decl = proc do
+        permit_params(:create) do
+          optional :day, :date, in: [Time.utc(2026, 9, 5), DateTime.new(2026, 9, 6, 5, 0, 0, "+05:00")]
+        end
+      end
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in])
+        .to eq([Date.new(2026, 9, 5), Date.new(2026, 9, 6)])
+      expect(permit({ day: "2026-09-05" }, &decl)[:day]).to eq(Date.new(2026, 9, 5))
+      expect(permit({ day: "2026-09-06" }, &decl)[:day]).to eq(Date.new(2026, 9, 6))
+
+      [Time.utc(2026, 9, 5, 10), Time.new(2026, 9, 5, 0, 0, 0, "+05:00"), DateTime.new(2026, 9, 6, 23)].each do |member|
+        expect { permittable_class { permit_params(:create) { optional :day, :date, in: [member] } } }
+          .to raise_error(ArgumentError, /:in for field :day contains .*, which is not a valid :date \(not midnight UTC/)
+      end
+    end
+
+    # On a nullable field an explicit null is accepted before in: is ever
+    # consulted, so a nil member only restates that; elsewhere it is a member
+    # no request could equal.
+    it "drops a nil :in member on a nullable field, and refuses it on any other" do
+      decl = proc { permit_params(:create) { optional :tier, :string, in: [nil, "pro"], nullable: true } }
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in]).to eq(["pro"])
+      expect(permit({ tier: "pro" }, &decl)[:tier]).to eq("pro")
+      expect(permit({ tier: nil }, &decl).to_h).to eq("tier" => nil)
+      expect { permittable_class { permit_params(:create) { optional :tier, :string, in: [nil, "pro"] } } }
+        .to raise_error(ArgumentError, /:in for field :tier contains nil.*declare nullable: true/)
+    end
+
+    it "rejects an :in member that the field's own type cannot cast" do
+      expect { permittable_class { permit_params(:create) { optional :n, :integer, in: %w[1 two] } } }
+        .to raise_error(ArgumentError, /:in for field :n contains "two", which is not a valid :integer \(invalid_type\)/)
+      expect { permittable_class { permit_params(:create) { optional :day, :date, in: ["2026-02-30"] } } }
+        .to raise_error(ArgumentError, /:in for field :day contains "2026-02-30", which is not a valid :date/)
+    end
+
+    it "rejects an :in Range whose endpoints the field's values cannot be compared with" do
+      expect { permittable_class { permit_params(:create) { optional :n, :integer, in: "1".."5" } } }
+        .to raise_error(ArgumentError, /:in for field :n is a Range of String \("1"\.\."5"\), which a :integer value cannot be compared/)
+      expect { permittable_class { permit_params(:create) { optional :s, :string, in: 1..5 } } }
+        .to raise_error(ArgumentError, /:in for field :s is a Range of Integer/)
+      expect { permittable_class { permit_params(:create) { optional :price, :decimal, in: .."9.99" } } }
+        .to raise_error(ArgumentError, /:in for field :price is a Range of String/)
+    end
+
+    it "accepts a Range whose endpoints compare with the field's values, without rewriting it" do
+      decl = proc do
+        permit_params(:create) do
+          optional :ratio, :float,   in: 0..Float::INFINITY
+          optional :price, :decimal, in: 0..100
+          optional :n,     :integer, in: 1.5..3
+          optional :day,   :date,    in: (Date.new(2026, 1, 1)..)
+          # ActiveSupport teaches Date#<=> to compare with a Time.
+          optional :at,    :datetime, in: (Date.new(2026, 1, 1)..)
+        end
+      end
+      fields = permittable_class(&decl).permit_rule_for(:create)[:fields]
+      expect(fields.map { |f| f[:in] })
+        .to eq([0..Float::INFINITY, 0..100, 1.5..3, (Date.new(2026, 1, 1)..), (Date.new(2026, 1, 1)..)])
+    end
+
+    # A NaN endpoint compares to nothing, by design — whatever it stands
+    # beside, not just the field's own values — so it is not evidence of a
+    # wrong-TYPED bound (a String range on an :integer) the way this check
+    # otherwise exists to catch. It loads exactly like an infinite endpoint
+    # already does; the exporter separately omits it, since it is never
+    # `finite?`.
+    it "accepts a NaN endpoint rather than reading it as an incomparable type" do
+      expect { permittable_class { permit_params(:create) { optional :x, :float, in: Float::NAN.. } } }
+        .not_to raise_error
+      expect { permittable_class { permit_params(:create) { optional :x, :decimal, in: ..BigDecimal("NaN") } } }
+        .not_to raise_error
     end
 
     it "rejects a bound no value could satisfy, rather than failing every request" do
@@ -787,6 +996,41 @@ RSpec.describe Permittable do
 
       e = violations_for({ plan: "gold" }) { permit_params(:create) { required :plan, :string, in: %w[free pro] } }
       expect(e.details.first[:code]).to eq("inclusion")
+    end
+
+    # The members used to be compared as authored against the CAST value, so
+    # a :string field listing Symbols rejected every request — while its
+    # exported enum, which stringifies Symbols, advertised the very values it
+    # refused.
+    it "casts in: members with the field's own type, so Symbols work on a :string field" do
+      decl = proc { permit_params(:create) { optional :status, :string, in: %i[draft published], default: "draft" } }
+      expect(permit({ status: "published" }, &decl)[:status]).to eq("published")
+      expect(permit({}, &decl)[:status]).to eq("draft")
+      expect(violations_for({ status: "archived" }, &decl).details).to eq([{ param: "status", code: "inclusion" }])
+    end
+
+    it "casts String in: members on an :integer field, and any listed spelling on a :date field" do
+      decl = proc { permit_params(:create) { optional :n, :integer, in: %w[1 2 3] } }
+      expect(permit({ n: "2" }, &decl)[:n]).to eq(2)
+      expect(permit({ n: 3 }, &decl)[:n]).to eq(3)
+      expect(violations_for({ n: "4" }, &decl).details).to eq([{ param: "n", code: "inclusion" }])
+
+      decl = proc { permit_params(:create) { optional :day, :date, in: ["2026-09-05", Date.new(2026, 9, 6)] } }
+      expect(permit({ day: "Sep 5, 2026" }, &decl)[:day]).to eq(Date.new(2026, 9, 5))
+      expect(permit({ day: "2026-09-06" }, &decl)[:day]).to eq(Date.new(2026, 9, 6))
+    end
+
+    it "stores the cast members frozen, deduplicated, and in the container they were given in" do
+      decl = proc do
+        permit_params(:create) do
+          optional :n,    :integer, in: ["1", 1, "01", 2]
+          optional :tier, :string,  in: Set[:free, :pro]
+        end
+      end
+      n, tier = permittable_class(&decl).permit_rule_for(:create)[:fields]
+      expect(n[:in]).to eq([1, 2]).and be_frozen
+      expect(tier[:in]).to eq(Set["free", "pro"]).and be_frozen
+      expect(tier[:in]).to all(be_frozen)
     end
 
     it "checks format on strings" do
@@ -2689,6 +2933,15 @@ RSpec.describe Permittable do
             m = enum_model
             expect(&declaring(m) { optional :status, :string, in: m.statuses.keys }).not_to raise_error
             expect(&declaring(m) { optional :status, :string, in: %w[pending] }).not_to raise_error
+          end
+
+          # The guard reads the in: the contract stores — a Hash already read
+          # as its keys, Symbols already cast to the Strings a request sends —
+          # so it agrees with what the field will actually accept.
+          it "accepts the enum's own mapping, or its names as Symbols, as the in:" do
+            m = enum_model
+            expect(&declaring(m) { optional :status, :string, in: m.statuses }).not_to raise_error
+            expect(&declaring(m) { optional :status, :string, in: %i[pending shipped] }).not_to raise_error
           end
 
           it "requires the in: — without it, an unknown name would pass and then raise on assignment" do

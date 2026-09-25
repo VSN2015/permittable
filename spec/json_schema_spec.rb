@@ -77,6 +77,86 @@ RSpec.describe Permittable::JsonSchema do
       expect(property("pct") { optional :pct, :integer, in: 0...100 }).to include("minimum" => 0, "exclusiveMaximum" => 100)
     end
 
+    # The enum is built from the members as the RUNTIME holds them — cast by
+    # the field's own type at class load — so it cannot advertise a value the
+    # server refuses, nor publish "1" for a field whose JSON type is integer.
+    it "exports the cast members, in the field's own JSON type" do
+      expect(property("status") { optional :status, :string, in: %i[draft published] }["enum"]).to eq(%w[draft published])
+      expect(property("n") { optional :n, :integer, in: %w[1 2 3] }["enum"]).to eq([1, 2, 3])
+      expect(property("day") { optional :day, :date, in: [Date.new(2026, 9, 5)] }["enum"]).to eq(["2026-09-05"])
+      expect(property("status") { optional :status, :string, in: { draft: 0, published: 1 } }["enum"]).to eq(%w[draft published])
+    end
+
+    # Re-encoding a cast Time drops what iso8601 does not print: a member
+    # written with fractional seconds exported as the whole second, which
+    # the server then refused. A String member is therefore published as
+    # written, and every published member must be one the server accepts.
+    it "exports a String-authored :date/:datetime member as written, and the server accepts each one" do
+      contract = Permittable::Contract.define do
+        optional :at,  :datetime, in: ["2026-09-05T10:00:00.25Z", "2026-09-05T15:00:00+05:00", Time.utc(2026, 1, 1)]
+        optional :day, :date,     in: ["Sep 5, 2026", Date.new(2026, 9, 6)]
+      end
+      props = described_class.rule(contract.permittable_contracts.first)["properties"]
+      expect(props["at"]["enum"]).to eq(["2026-09-05T10:00:00.25Z", "2026-09-05T15:00:00+05:00", "2026-01-01T00:00:00Z"])
+      expect(props["day"]["enum"]).to eq(["Sep 5, 2026", "2026-09-06"])
+      props.each do |name, schema|
+        schema["enum"].each do |member|
+          expect(contract.call(name => member).violations).to be_empty, "#{name}: #{member.inspect} was refused"
+        end
+      end
+    end
+
+    # A Time/DateTime/TimeWithZone member is re-encoded, so it must keep the
+    # sub-second digits it has — whole seconds named an instant the server
+    # refused.
+    it "exports a sub-second Time-like :datetime member with its fractional digits, and the server accepts it" do
+      members = [Time.utc(2026, 9, 5, 10, 0, Rational(1, 4)), DateTime.new(2026, 9, 5, 11, 0, Rational(123_456_789, 10**9)),
+                 Time.utc(2026, 9, 5, 12).in_time_zone("Tokyo") + Rational(1, 1000), Time.utc(2026, 9, 5, 13)]
+      contract = Permittable::Contract.define { optional :at, :datetime, in: members }
+      enum = described_class.rule(contract.rule)["properties"]["at"]["enum"]
+      expect(enum).to eq(["2026-09-05T10:00:00.25Z", "2026-09-05T11:00:00.123456789Z",
+                          "2026-09-05T12:00:00.001Z", "2026-09-05T13:00:00Z"])
+      enum.each { |member| expect(contract.call(at: member).violations).to be_empty, "#{member} was refused" }
+    end
+
+    it "exports an :in that only answers include? as custom validation, not as an enum" do
+      allowlist = Object.new
+      def allowlist.include?(_value) = true
+      prop = property("sku") { optional :sku, :string, in: allowlist }
+      expect(prop).not_to have_key("enum")
+      expect(prop["x-permittable-custom-validation"]).to be(true)
+
+      plans = Class.new do
+        include Enumerable
+
+        def each(&) = %w[free pro].each(&)
+        def include?(value) = %w[free pro].include?(value.to_s.downcase)
+      end.new
+      prop = property("plan") { optional :plan, :string, in: plans }
+      expect(prop).not_to have_key("enum")
+      expect(prop["x-permittable-custom-validation"]).to be(true)
+    end
+
+    # A Hash/Array/Set subclass overriding include? is opaque exactly like
+    # the plain-Object and Enumerable allowlists above — its raw contents
+    # (keys, elements) are not what it actually matches, so no enum can
+    # honestly be published for it.
+    it "exports a Hash/Array/Set subclass overriding include? as custom validation too" do
+      # Non-empty: assert_satisfiable! reads any object's own empty? at
+      # class load, and this Hash subclass inherits Hash's — unrelated to
+      # its overridden include?, but a truly empty one would already fail
+      # that check on its own, before ever reaching the list/opaque split.
+      registry = Class.new(Hash) { def include?(value) = value.to_s.start_with?("custom-") }.new
+      registry[:unrelated] = 1
+      allowlist = Class.new(Array) { def include?(value) = any? { |c| c.to_s.casecmp?(value.to_s) } }.new(%w[pro])
+      fuzzy = Class.new(Set) { def include?(value) = any? { |c| c.to_s.include?(value.to_s) } }.new(%w[pro])
+      [registry, allowlist, fuzzy].each do |allowed|
+        prop = property("sku") { optional :sku, :string, in: allowed }
+        expect(prop).not_to have_key("enum")
+        expect(prop["x-permittable-custom-validation"]).to be(true)
+      end
+    end
+
     it "emits BigDecimal bounds as JSON numbers, which is all minimum/maximum may be" do
       # The natural way to bound a price. Routed through the authored-value
       # re-encoding, the bounds came out as the strings "0.01" / "999.99" —

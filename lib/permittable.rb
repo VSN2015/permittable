@@ -865,6 +865,109 @@ module Permittable
       value.nil? || (value.is_a?(String) && value.empty?)
     end
 
+    # An `in:` list as the runtime holds it: every member cast by the field's
+    # own type, because included_in? compares the CAST request value against
+    # it. Comparing against the members as authored meant `in: %i[draft
+    # published]` on a :string field (and `in: %w[1 2 3]` on an :integer one)
+    # held values no cast could ever produce, and rejected every request.
+    #
+    # `normalize:` is deliberately not applied — it rewrites what a client
+    # sent, not what the contract author wrote. Duplicates the cast collapses
+    # ("1" and 1 on an :integer) are dropped, and a Set stays a Set, so an
+    # author who chose one for its O(1) include? keeps it. A nil member is
+    # dropped on a nullable field, where an explicit null is accepted before
+    # in: is ever consulted; anywhere else it is a member no value can equal,
+    # and is an error like any other.
+    #
+    # `members` is what in_list returned. Returns [:ok, cast, published] —
+    # `published` being what an exported enum lists, see published_in_member
+    # — or [:error, offending_member, code]. Shared by ContractBuilder and the
+    # RSpec matcher's `within` chain so the two cannot read a list differently.
+    def cast_in_members(type, members, nullable: false)
+      pairs = []
+      members.each do |member|
+        next if member.nil? && nullable
+
+        status, value = cast_in_member(type, member)
+        return [:error, member, value] unless status == :ok
+
+        pairs << [value, published_in_member(type, member, value)]
+      end
+      pairs = pairs.uniq(&:first)
+      cast_members = pairs.map(&:first)
+      [:ok, members.is_a?(Set) ? cast_members.to_set : cast_members, pairs.map(&:last)]
+    end
+
+    # The members of an `in:` that is a LIST, or nil when it is not one.
+    # Only Array, Set, Hash and Enumerator count, and only when the object's
+    # OWN class provides the collection's ordinary include? — not a Hash,
+    # Array or Set SUBCLASS overriding it (a case-insensitive allowlist, a
+    # fuzzy Set, a registry matching some other way entirely). `case allowed;
+    # when Hash ...` matches with ===, which for a Class is is_a?, so a
+    # subclass would otherwise match its ancestor's branch and have its
+    # override silently discarded — read for its raw keys/elements instead,
+    # which can invert which values it actually accepts. It is left opaque
+    # instead, exactly like any other object whose include? is the point
+    # (see resolve_in!) and enumerating it may be expensive (a DB-backed
+    # registry).
+    #
+    # A Hash lists its KEYS, which is what Hash#include? asks about — the
+    # Rails enum idiom, `in: Post.statuses` — and, like a Set, is stored as a
+    # Set, so membership stays O(1) per request.
+    # ActiveSupport::HashWithIndifferentAccess is the one Hash subclass
+    # accepted anyway: its include? override only canonicalises the argument
+    # (String/Symbol) before the SAME key lookup, so its keys are still
+    # exactly its members — and it is what a Rails enum's own reader
+    # (`Post.statuses`) actually returns.
+    # Enumerator::Lazy is the same story on the Enumerator side: Lazy
+    # overrides chain methods like map and select, but not include?, so it
+    # is still read as a list — and forced to an Array here, once, since
+    # left lazy it would be cast on every request instead of at class load.
+    def in_list(allowed)
+      case allowed
+      when Hash then allowed.keys.to_set if plain_hash?(allowed)
+      when Set then allowed if allowed.instance_of?(Set)
+      when Array then allowed.to_a if allowed.instance_of?(Array)
+      when Enumerator then allowed.to_a if allowed.method(:include?).owner == Enumerable
+      end
+    end
+
+    def plain_hash?(allowed)
+      allowed.instance_of?(Hash) || allowed.instance_of?(ActiveSupport::HashWithIndifferentAccess)
+    end
+
+    # A Symbol is read as its String: it is how Ruby spells a constant
+    # string, and a request never carries one, so no cast accepts it as is.
+    def cast_in_member(type, member)
+      member = member.to_s if member.is_a?(Symbol)
+      return instant_as_date(member) if type == :date && (member.is_a?(Time) || member.is_a?(DateTime))
+
+      cast(type, member)
+    end
+
+    # A Time or DateTime member of a :date field. ActiveSupport compares one
+    # with a Date as INSTANTS, the Date standing for its midnight UTC, so
+    # that instant is the only one that ever equalled a request's date. It
+    # is read as that UTC date; any other instant never matched anything,
+    # and is refused like any member no request could equal. (cast_date
+    # would keep a DateTime whole — it IS a Date — and refuse a Time.)
+    def instant_as_date(member)
+      utc = member.to_time.getutc
+      return [:error, "not midnight UTC, so it never equals a date"] unless utc == utc.beginning_of_day
+
+      [:ok, utc.to_date]
+    end
+
+    # What an exported enum lists for one member: the cast value, re-encoded
+    # as JSON — except a :date/:datetime member authored as a String, which
+    # is published AS WRITTEN. Re-encoding a cast Time prints whole seconds,
+    # so "2026-09-05T10:00:00.25Z" was published as "…10:00:00Z", a value
+    # the server refuses. The authored String went through the very cast a
+    # request does, so the server accepts it by construction.
+    def published_in_member(type, member, value)
+      member.is_a?(String) && %i[date datetime].include?(type) ? member : value
+    end
+
     # Range#include? walks discrete ranges; cover? is the O(1) bounds check
     # and the right semantics for validation.
     def included_in?(allowed, value)
@@ -887,6 +990,13 @@ module Permittable
                      nullable].freeze
     ARRAY_OPTS  = %i[of length default validate virtual sensitive required transform message desc example
                      nullable].freeze
+
+    # One value of each scalar type as a cast produces it, for asking whether
+    # an `in:` Range's endpoints can be compared with that type at all.
+    RANGE_PROBES = {
+      string: "", integer: 0, float: 0.0, decimal: BigDecimal("0"), boolean: true,
+      date: Date.new(2000, 1, 1), datetime: Time.utc(2000)
+    }.freeze
 
     attr_reader :finalizer
 
@@ -1050,14 +1160,7 @@ module Permittable
         raise ArgumentError, "#{LABEL}: field :#{name} is required and cannot have a :default (default implies optional)"
       end
 
-      if field.key?(:in)
-        unless field[:in].respond_to?(:include?)
-          raise ArgumentError, "#{LABEL}: :in for field :#{name} must respond to include? (Range or Array)"
-        end
-
-        assert_satisfiable!(name, :in, field[:in])
-      end
-
+      resolve_in!(field) if field.key?(:in)
       validate_string_only_opts!(field)
       validate_length!(name, field[:length]) if field.key?(:length)
       validate_required_length!(field)
@@ -1068,6 +1171,96 @@ module Permittable
       validate_authored_value!(field, :default)
       validate_authored_value!(field, :example)
       validate_message!(field)
+    end
+
+    # `in:` is a Range (bounds-checked with cover?), a list of values, or an
+    # object of the host's own that answers include? — kept exactly as given,
+    # since nothing here can know what it accepts. It used to be anything
+    # answering include?, which let a String through, and String#include? is
+    # a SUBSTRING test: `in: "free pro"` accepted "e", "fr" and "ee p". A
+    # String is refused here, along with anything answering neither.
+    #
+    # A list (see Coercion.in_list — a Hash lists its keys) is stored cast by
+    # the field's type (see Coercion.cast_in_members), so request-time
+    # matching, the exported enum, the RSpec matcher and the column guard's
+    # enum rule all read the members the runtime compares against. A member
+    # no request value could ever equal is a contract mistake, and fails here
+    # rather than as an `inclusion` on every request.
+    def resolve_in!(field)
+      name = field[:name]
+      allowed = field[:in]
+      if allowed.is_a?(Range)
+        assert_comparable_range!(field, allowed)
+      elsif (members = Coercion.in_list(allowed))
+        cast_in_members!(field, members)
+      elsif allowed.is_a?(String) || !allowed.respond_to?(:include?)
+        raise ArgumentError, "#{LABEL}: :in for field :#{name} must be a Range, a list of values (an Array, Set, " \
+                             "or a Hash read as its keys), or an object answering include? " \
+                             "(got #{allowed.inspect})#{string_in_hint(allowed)}"
+      end
+      assert_satisfiable!(name, :in, field[:in])
+    end
+
+    def string_in_hint(allowed)
+      return "" unless allowed.is_a?(String)
+
+      " — String#include? would accept any substring; list the values instead, e.g. in: %w[#{allowed}]"
+    end
+
+    # `published` is stored only where it differs from the cast members (a
+    # String-authored :date/:datetime member), so it is read as an override.
+    def cast_in_members!(field, members)
+      status, cast, published = Coercion.cast_in_members(field[:type], members, nullable: field[:nullable])
+      unless status == :ok
+        # cast is the offending member here, and published its error code.
+        # nil is the one member written on purpose, meaning "null is allowed"
+        # — but an absent value never reaches in:, so the fix is worth naming.
+        hint = cast.nil? ? " — an absent value never reaches in:; declare nullable: true to accept an explicit null" : ""
+        raise ArgumentError, "#{LABEL}: :in for field :#{field[:name]} contains #{cast.inspect}, " \
+                             "which is not a valid :#{field[:type]} (#{published})#{hint}"
+      end
+
+      field[:in] = freeze_in_members(cast)
+      field[:in_published] = freeze_authored(published) unless published == cast.to_a
+    end
+
+    def freeze_in_members(members)
+      members.is_a?(Set) ? members.to_set { |member| freeze_authored(member) }.freeze : freeze_authored(members)
+    end
+
+    # A Range is kept exactly as written, unlike a list: casting its
+    # endpoints would change what it means. `0..Float::INFINITY` on a :float
+    # and `1.5..3` on an :integer are real bounds whose endpoints no cast
+    # accepts, and a :decimal's `0..100` would become BigDecimal endpoints
+    # that export as the STRING "0.0" where `minimum` needs a number.
+    #
+    # What does fail every request is an endpoint the cast value cannot be
+    # compared with — `"1".."5"` on an :integer, `1..5` on a :string,
+    # `.."9.99"` on a :decimal. cover? then answers false for every value, so
+    # that is caught here. The probe asks exactly what cover? will — begin
+    # <=> value, then value <=> end — so whatever the host's own <=> allows
+    # (ActiveSupport lets a Date range bound a :datetime) is allowed here too.
+    def assert_comparable_range!(field, range)
+      probe = RANGE_PROBES.fetch(field[:type])
+      # A NaN endpoint compares to nothing, by design, whatever it stands
+      # beside — not evidence of a wrong-TYPED bound (a String range on an
+      # :integer), which is what this check exists to catch. It is left
+      # alone here exactly as an infinite endpoint already is (INFINITY
+      # compares fine); the exporter separately omits it, since it is
+      # never `finite?`.
+      # Wrapped in an Array so a `false` endpoint still reads as found.
+      stray = if !range.begin.nil? && !nan?(range.begin) && (range.begin <=> probe).nil? then [range.begin]
+              elsif !range.end.nil? && !nan?(range.end) && (probe <=> range.end).nil? then [range.end]
+              end
+      return unless stray
+
+      raise ArgumentError, "#{LABEL}: :in for field :#{field[:name]} is a Range of #{stray.first.class} " \
+                           "(#{range.inspect}), which a :#{field[:type]} value cannot be compared with — " \
+                           "no value could satisfy it; write the bounds as :#{field[:type]} values"
+    end
+
+    def nan?(value)
+      value.respond_to?(:nan?) && value.nan?
     end
 
     def validate_json_opts!(field)

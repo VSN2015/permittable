@@ -292,7 +292,7 @@ Which options are legal depends on the field kind — anything else raises at cl
 
 | Option | Scalar | Array | Nested | Meaning |
 |---|:---:|:---:|:---:|---|
-| `in:` | ✅ | — | — | Allowed values: a `Range` (bounds-checked with `cover?`) or an `Array` |
+| `in:` | ✅ | — | — | Allowed values: a `Range` (bounds-checked with `cover?`), a list (a plain `Array`, `Set`, `Enumerator`, or `Hash` read as its keys — so `in: Post.statuses` works), or any other object answering `include?` (used as given, and read on every request) — including a Hash/Array/Set **subclass that overrides `include?`**, whose override is kept rather than read for its raw contents. A list is cast with the field's own type and **snapshotted** at class load, so `in: %i[draft published]` on a `:string` and `in: %w[1 2 3]` on an `:integer` match what a request casts to — and a later `PLANS << "gold"` is not seen; pass your own `include?` object for a live list. A `nil` member is dropped on a `nullable:` field |
 | `format:` | ✅¹ | — | — | Regexp the value must match, or a [preset name](#format-presets): `:email`, `:uuid`, `:url`, `:slug`, `:hostname` |
 | `length:` | ✅¹ | ✅ | — | `Range` or `Integer`. Character count on strings, **element count** on arrays, where it short-circuits — see [the field DSL](#the-field-dsl) |
 | `normalize:` | ✅¹ | — | — | `:squish`, `:strip`, `:downcase`, `:upcase`, `:email`, or a Proc. Runs **first** — before the absence rule, so a value that normalizes to `""` is absent |
@@ -910,7 +910,7 @@ RSpec.describe UsersController do
 end
 ```
 
-Chains: `for_action`, `as`, `as_array(of:)`, `required` / `optional`, `within` (`in:`), `matching` (`format:`), `with_length`, `with_default`, `virtual`, `sensitive`, `nullable`. Dotted paths walk nested blocks and array-of-hash blocks alike (`"line_items.sku"`).
+Chains: `for_action`, `as`, `as_array(of:)`, `required` / `optional`, `within` (`in:`, cast by the field's type just as the contract's list is, so `within(%i[draft published])` repeats the declaration as written), `matching` (`format:`), `with_length`, `with_default`, `virtual`, `sensitive`, `nullable`. Dotted paths walk nested blocks and array-of-hash blocks alike (`"line_items.sku"`).
 
 The negated form asserts one thing: **the contract does not declare the param**. It therefore takes no qualifiers — `not_to permit_param(:admin).required` would pass both when `:admin` is undeclared and when it is declared optional, a false positive in exactly the kind of assertion that guards a security property, so it raises and names the positive form to write instead (`to permit_param(:admin).for_action(:create).optional`). It needs a rule to check against: when no rule covers the action, it fails and says so rather than passing for any param whatsoever. `for_action` resolves exactly as a request would, though, so a mistyped `for_action(:craete)` is only caught when the controller has no catch-all: a rule declared with no actions (`permit_params { ... }`, including one inherited from a base controller) covers `#craete` too, and the assertion is then checked against that rule. A standalone `Permittable::Contract` covers every action. It also fails where the contract lets a key through without declaring it — a path running into an opaque `:json` field (`"meta.admin"` under `optional :meta, :json`), within the field's `max_depth:` — or where the path repeats the `root:` (`"user.email"` under `root: :user`; paths are relative to the root, so that one is `permit_param(:email)`). Paths may be written in the runtime's own violation form, `"line_items[0].sku"`.
 
@@ -1020,7 +1020,7 @@ A `format:` regexp that does not translate to ECMA-262 is looser in the same way
 | `:string` `:integer` `:float` `:boolean` | `string` / `integer` / `number` / `boolean` |
 | `:date` / `:datetime` | `string` + `format: date` / `date-time` |
 | `:decimal` | `type: ["string", "number"]` + `format: decimal` (string is the precision-safe encoding) |
-| `in:` Array / numeric Range | `enum` / `minimum` + `maximum` (exclusive ends honoured) |
+| `in:` list / numeric Range | `enum` of the cast members (a `:date`/`:datetime` member written as a String is published as written) / `minimum` + `maximum` (exclusive ends honoured). An `in:` object that only answers `include?` is flagged `x-permittable-custom-validation` |
 | `length:` | `minLength`/`maxLength` on strings, `minItems`/`maxItems` on arrays |
 | `format:` | `pattern`, valid under the `u` flag Ajv compiles with: `\A`/`\z` become `^`/`$`, `\s` and `.` are spelled out as the classes they are in Ruby (ECMA-262's `\s` also matches NBSP and U+2028; its `.` also stops at `\r`), and redundant escapes like `\-` and `\#` are written bare |
 | `default:` / `desc:` / `example:` | `default` / `description` / `examples` |
@@ -1088,7 +1088,8 @@ A bad contract is a programmer error, so it fails when the class loads — never
 - An unknown `normalize:` or `format:` preset, listing the presets
 - A `format:` that is neither a `Regexp` nor a preset name
 - `format:`, `length:`, or `normalize:` on a non-`:string` field
-- `length:` that isn't a non-negative `Integer` or a `Range`; `in:` that doesn't respond to `include?`
+- `length:` that isn't a non-negative `Integer` or a `Range`; an `in:` that is a `String` (`String#include?` would match any substring — `in: "free pro"` accepted `"e"`), or that is neither a `Range` nor answers `include?`
+- An `in:` member the field's own type can't cast (`in: %w[1 two]` on an `:integer`, `nil` on a field that isn't `nullable:`, or a `Time` on a `:date` field that isn't exactly midnight UTC), or an `in:` `Range` whose endpoints a value of the field's type can't be compared with (`in: "1".."5"` on an `:integer`) — either would reject every request as `inclusion`
 - A bound **no value could satisfy**: a reversed or empty `Range` (`in: 65..18`, `length: 5..2`, `length: 3...3`), an empty `in:` set, or a `length:` of 0 on a `required` field (where `""` already violates as `missing`)
 - `validate:` or `transform:` that isn't callable
 - A `default:` or `example:` that violates its own field's contract, or an array `default:`/`example:` whose elements violate `of:` — or, for an array declared with a **block**, an element that isn't a hash the block would accept

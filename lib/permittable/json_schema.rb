@@ -117,7 +117,7 @@ module Permittable
     def scalar_schema(field)
       schema = SCALAR_SCHEMAS.fetch(field[:type]).dup
       apply_format_name!(schema, field)
-      apply_in!(schema, field[:in], type: field[:type])
+      apply_in!(schema, field)
       apply_string_bounds!(schema, field)
       apply_pattern!(schema, field[:format])
       schema
@@ -155,11 +155,18 @@ module Permittable
       schema
     end
 
-    def apply_in!(schema, allowed, type:)
+    # A list is stored cast by the field's type, so its enum is what the
+    # runtime compares against; `in_published` overrides the members an
+    # exact re-encoding would get wrong (see Coercion.published_in_member).
+    # An object that only answers include? says nothing a schema can list —
+    # annotate flags it as custom validation instead.
+    def apply_in!(schema, field)
+      allowed = field[:in]
       return unless allowed
+      return if opaque_in?(allowed)
 
       unless allowed.is_a?(Range)
-        schema["enum"] = allowed.map { |v| json_value(v) }
+        schema["enum"] = (field[:in_published] || allowed).map { |v| json_value(v) }
         return
       end
       # Runtime bounds-checks Ranges with cover?; numeric endpoints map onto
@@ -169,6 +176,7 @@ module Permittable
         schema["x-permittable-range"] = allowed.inspect
         return
       end
+      type = field[:type]
       min = json_bound(allowed, "minimum", type) if allowed.begin
       schema["minimum"] = min if min
       keyword = allowed.exclude_end? ? "exclusiveMaximum" : "maximum"
@@ -260,6 +268,12 @@ module Permittable
       keyword == "exclusiveMaximum" ? bound.to_f.prev_float : bound
     end
 
+    # A host's own include?-answering object, kept by the contract as given —
+    # the same predicate the contract used to decide it was not a list.
+    def opaque_in?(allowed)
+      !allowed.nil? && !allowed.is_a?(Range) && Coercion.in_list(allowed).nil?
+    end
+
     def apply_string_bounds!(schema, field)
       return unless field[:type] == :string
 
@@ -321,7 +335,7 @@ module Permittable
         schema["writeOnly"] = true
         schema["x-permittable-sensitive"] = true
       end
-      schema["x-permittable-custom-validation"] = true if field[:validate]
+      schema["x-permittable-custom-validation"] = true if field[:validate] || opaque_in?(field[:in])
       schema["x-permittable-transformed"] = true if field[:transform]
       apply_normalize!(schema, field)
       schema
@@ -351,13 +365,23 @@ module Permittable
       # the same re-encoding as any other authored scalar.
       when Hash then value.to_h { |k, v| [k.to_s, json_value(v)] }
       when BigDecimal then value.to_s("F")
-      when Time then value.utc.iso8601
+      when Time then exact_iso8601(value.getutc)
       # DateTime subclasses Date, so it must match first.
-      when DateTime then value.to_time.utc.iso8601
+      when DateTime then exact_iso8601(value.to_time.getutc)
       when Date then value.iso8601
       when Symbol then value.to_s
       else value
       end
+    end
+
+    # iso8601 prints whole seconds unless told otherwise, and a sub-second
+    # instant re-encoded that way names a DIFFERENT instant — one an `in:`
+    # listing the original refuses. So as many fractional digits as the
+    # value has, up to the nanoseconds Time#nsec can report.
+    def exact_iso8601(time)
+      nsec = time.nsec
+      digits = nsec.zero? ? 0 : 9 - nsec.to_s.rjust(9, "0")[/0*\z/].length
+      time.iso8601(digits)
     end
   end
 end

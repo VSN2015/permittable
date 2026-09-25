@@ -65,6 +65,46 @@ RSpec.describe "Permittable RSpec matchers" do
     expect(message).to include("in: 1..5")
   end
 
+  # The contract stores in: members cast by the field's type, so the chain
+  # casts its own argument the same way: `within` can repeat the declaration
+  # as written, or name the values the runtime actually holds.
+  it "checks within against the cast in: members, casting its own argument the same way" do
+    contract = Permittable::Contract.define do
+      optional :status, :string,  in: %i[draft published]
+      optional :n,      :integer, in: %w[1 2 3]
+    end
+    expect(contract).to permit_param(:status).within(%i[draft published])
+    expect(contract).to permit_param(:status).within(%w[draft published])
+    expect(contract).to permit_param(:n).within([1, 2, 3])
+    expect(contract).to permit_param(:n).within(%w[1 2 3])
+
+    message = failure_of { expect(contract).to permit_param(:n).within(%w[1 2]) }
+    expect(message).to include('expected in: ["1", "2"], but the contract declares in: [1, 2, 3]')
+    message = failure_of { expect(contract).to permit_param(:n).within(%w[one]) }
+    expect(message).to include("declares in: [1, 2, 3]")
+  end
+
+  it "reads within's argument exactly as the contract reads in: — a Hash as its keys, an allowlist as itself" do
+    allowlist = Object.new
+    def allowlist.include?(_value) = true
+    registry = Class.new(Hash) { def include?(value) = value.to_s.start_with?("custom-") }.new
+    registry[:unrelated] = 1
+    contract = Permittable::Contract.define do
+      optional :status, :string, in: { draft: 0, published: 1 }
+      optional :sku,    :string, in: allowlist
+      optional :tier,   :string, in: [nil, "pro"], nullable: true
+      optional :code,   :string, in: registry
+    end
+    expect(contract).to permit_param(:status).within({ draft: 0, published: 1 })
+    expect(contract).to permit_param(:status).within(%w[draft published])
+    expect(contract).to permit_param(:sku).within(allowlist)
+    expect(contract).to permit_param(:tier).within([nil, "pro"])
+    # A Hash subclass overriding include? is opaque, so within compares it
+    # as given — not by casting its keys, which would silently accept the
+    # wrong values.
+    expect(contract).to permit_param(:code).within(registry)
+  end
+
   it "checks required and optional" do
     expect(controller).to permit_param(:email).for_action(:create).required
     expect(controller).to permit_param(:age).for_action(:create).optional

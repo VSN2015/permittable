@@ -115,6 +115,31 @@ module SchemaConformance
         [{ "plan" => nil }, :null_is_absence]
       ]
     },
+    "enums authored in another type than the field's" => {
+      # Symbols on a :string field and Strings on an :integer field. Both used
+      # to reject EVERY request while the exported enum advertised values
+      # the server refused — the exact disagreement this spec exists to catch.
+      contract: proc {
+        optional :status, :string, in: %i[draft published]
+        optional :n, :integer, in: %w[1 2 3]
+      },
+      payloads: [
+        [{ "status" => "draft" }, :agree],
+        [{ "status" => "archived" }, :agree],
+        [{ "n" => 2 }, :agree],
+        [{ "n" => 4 }, :agree],
+        [{ "n" => "2" }, :coerced_encoding]
+      ]
+    },
+    "a :datetime enum written with fractional seconds" => {
+      # Re-encoding the cast Time printed whole seconds, publishing a member
+      # the server refused; the String is now published as written.
+      contract: proc { optional :at, :datetime, in: ["2026-09-05T10:00:00.25Z"] },
+      payloads: [
+        [{ "at" => "2026-09-05T10:00:00.25Z" }, :agree],
+        [{ "at" => "2026-09-05T10:00:00Z" }, :agree]
+      ]
+    },
     "an exclusive range" => {
       contract: proc { optional :pct, :integer, in: 0...100 },
       payloads: [[{ "pct" => 0 }, :agree], [{ "pct" => 99 }, :agree], [{ "pct" => 100 }, :agree]]
