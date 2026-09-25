@@ -310,6 +310,7 @@ module Permittable
         when :required then required_mismatch(field, value)
         when :format then format_mismatch(field, value)
         # Compared cast, but reported as written.
+        when :default then default_mismatch(field, value)
         when :in then option_mismatch(field, :in, value) unless field.key?(:in) && same_in?(field[:in], cast_in(field, value))
         when :virtual, :sensitive, :nullable then "expected the field to be #{key}, but it is not" unless field[key]
         else option_mismatch(field, key, value)
@@ -351,6 +352,41 @@ module Permittable
         return if field[:format_name] == expected
 
         "expected format: :#{expected}, but the contract #{declared_format(field)}"
+      end
+
+      def default_mismatch(field, expected)
+        option_mismatch(field, :default, expected) unless field.key?(:default) && field[:default] == cast_default(field, expected)
+      end
+
+      # A contract stores its `default:` as the field reads it — cast,
+      # normalized, and for an array read by the request walker — so
+      # `with_default("18")` on an :integer, the declaration repeated as
+      # written, is read the same way before comparing, by the same code. A
+      # value that does not read cleanly is compared as given, and the
+      # failure shows both sides.
+      #
+      # A field declaring `transform:` stores its default AS AUTHORED instead
+      # (see validate_authored_value!/validate_array_authored_value!), so
+      # `expected` is compared bare, not cast — the matcher would otherwise
+      # compare a cast value against an uncast stored one and never match.
+      def cast_default(field, expected)
+        return expected if field[:transform]
+
+        case field[:kind]
+        when :scalar
+          # Copied first, like a request's String, so a mutating `normalize:`
+          # proc cannot rewrite the spec's own literal (the same reason
+          # validate_authored_value! copies before normalizing).
+          own = expected.is_a?(String) ? expected.dup : expected
+          status, value = Coercion.cast(field[:type], Coercion.apply_normalize(field[:normalize], own))
+          status == :ok ? value : expected
+        when :array
+          return expected unless expected.is_a?(Array)
+
+          value, violations = AuthoredValues.read_array(field, expected)
+          violations.empty? ? value : expected
+        else expected
+        end
       end
 
       # A contract stores an `in:` list cast by the field's type, so

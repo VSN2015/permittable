@@ -122,9 +122,14 @@ require "permittable/filter_parameter_registry"
 # absence. `normalize:` runs BEFORE that rule rather than inside the cast, so
 # there is exactly one reading of absence and a value that normalizes to empty
 # ("   " under :squish) cannot satisfy a required field by becoming "". An
-# authored `default:`/`example:` is stored normalized — the form it was
-# validated in — and deep-frozen on a copy, so no request can corrupt it for
-# the next.
+# authored `default:`/`example:` is stored as the contract reads it —
+# normalized and cast, so `default: "18"` on an :integer is 18, and an
+# array's read by the request walker itself. The one exception is a field
+# declaring `transform:`: its default is stored exactly AS AUTHORED, never
+# cast — `transform:` never runs on a default either (see OUTPUT RESHAPING),
+# so author such a default already in the shape the action should receive.
+# Either way it is deep-frozen on a copy, and each request gets its own deep
+# copy, so no request can corrupt it for the next.
 #
 # `nullable: true` splits that rule in two for one field, which is how a PATCH
 # clears a column: a key the client never sent stays absent (defaults apply,
@@ -174,7 +179,14 @@ require "permittable/filter_parameter_registry"
 #     and validation to reshape that field's output, e.g.
 #     `transform: ->(v) { v.split(",") }` turns a validated delimited String
 #     into an Array. Runs only on request-supplied values: absent fields stay
-#     absent and `default:` values are authored in final shape.
+#     absent, and a `default:` is handed out exactly AS AUTHORED — validated
+#     against the field's own contract at class load (as any default is), but
+#     neither cast nor transformed — so a request sending a field's default
+#     gets the transformed value, a request omitting it the untransformed one.
+#     Author a default already in the shape the action should receive:
+#     `transform: ->(v) { v.to_i }, default: 25` on a :string field hands both
+#     paths the Integer 25. A field with no `transform:` still gets its
+#     default cast (see the module-level default:/example: paragraph above).
 #   * `finalize do |p| ... end` (once per contract) — runs after every field
 #     validated cleanly, receives the result hash, and must return the
 #     (possibly restructured) Hash: combine parallel fields, build value
@@ -568,11 +580,20 @@ module Permittable
     # nesting (`max_depth:`). Shared with macro-time `default:`/`example:`
     # checking, like check_scalar.
     def check_json(field, value)
+      status, code = check_json_bounds(field, value)
+      return [status, code] unless status == :ok
+
+      check_custom(field[:validate], value)
+    end
+
+    # The structural half of check_json, which the request walker runs on
+    # its own so that it can copy an accepted hash before app code sees it.
+    def check_json_bounds(field, value)
       return [:error, "invalid_type"] unless value.is_a?(Hash)
       return [:error, "length"] if field[:length] && !length_ok?(field[:length], value.length)
       return [:error, "depth"] if field[:max_depth] && depth_exceeds?(value, field[:max_depth])
 
-      check_custom(field[:validate], value)
+      [:ok, value]
     end
 
     # Container nesting, with the field's own hash as level 1. An Array counts
@@ -683,9 +704,20 @@ module Permittable
       true
     end
 
+    # A String is returned as given. The request walker has already copied
+    # it on the way in (Permittable#permittable_normalized), before
+    # `normalize:` could see it — copying here as well would allocate twice
+    # per value and still come too late for a mutating `normalize:` proc.
     def cast_string(value)
       case value
       when String then [:ok, value]
+      # BigDecimal#to_s defaults to engineering notation ("0.15e1" for 1.5) —
+      # stdlib's own rendering, only ever masked in a host that has loaded
+      # Rails' active_support/core_ext/big_decimal/conversions, which patches
+      # the default format to "F". A :decimal default:/example: cast through
+      # here (a plain :string field, not :decimal itself) must render the same
+      # way regardless of whether that patch happens to be loaded.
+      when BigDecimal then [:ok, value.to_s("F")]
       when Numeric, true, false then [:ok, value.to_s]
       else [:error, "invalid_type"]
       end
@@ -1396,85 +1428,67 @@ module Permittable
 
     # An authored value (`default:`, or a documentation `example:`) must
     # satisfy the field's own contract — catching a lie at class load beats
-    # shipping it to every request (or publishing it in generated docs).
-    # The authored value is STORED normalized, because that is the form it was
-    # validated in: `default: "  free  "` with `normalize: :squish` was
-    # checked as "free" and used to be handed to requests as "  free  ".
+    # shipping it to every request (or publishing it in generated docs) —
+    # which is checked here by normalizing and casting it, same as a request's
+    # value. `default: "  free  "` with `normalize: :squish` is checked as
+    # "free"; `default: "18"` on an :integer is checked as 18.
+    #
+    # What is STORED from that differs by whether the field has `transform:`.
+    # With none, the cast result is stored — the form a request sending the
+    # same value gets, and what used to be thrown away: `default: "18"` used
+    # to be handed to every request omitting it as the String "18", and
+    # `:boolean, default: "false"` gave the app a truthy String.
+    # With a `transform:`, the value is stored exactly AS AUTHORED instead —
+    # `transform:` never runs on a default (see AuthoredValues), so casting it
+    # here would silently change its type out from under an author who, per
+    # the README, writes such a default in the shape the action should
+    # receive: `default: 25` beside `transform: ->(v) { v.to_i }` on a
+    # :string field means the app gets the Integer 25 either way, whether the
+    # request sent "25" (cast then transformed) or omitted the field
+    # (authored as the already-final Integer).
     def validate_authored_value!(field, opt)
       return unless field.key?(opt)
       return if authored_nil!(field, opt)
 
-      value = Coercion.apply_normalize(field[:normalize], field[opt])
-      status, code = Coercion.check_scalar(field, value)
-      raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{code})" unless status == :ok
+      # Copied first, like a request's String, so a mutating `normalize:`
+      # proc cannot rewrite the host's own literal.
+      authored = field[opt].is_a?(String) ? field[opt].dup : field[opt]
+      value = Coercion.apply_normalize(field[:normalize], authored)
+      status, result = Coercion.check_scalar(field, value)
+      raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{result})" unless status == :ok
 
-      field[opt] = freeze_authored(value)
+      field[opt] = freeze_authored(field[:transform] ? field[opt] : result)
     end
 
+    # An array's authored value is validated by the REQUEST walker itself
+    # (see AuthoredValues) exactly as validate_authored_value! validates a
+    # scalar's: elements cast, nested hashes and arrays read at every depth, a
+    # sub-field's own default: filled in, `""` on a nullable sub-field made
+    # the explicit nil a request would get, keys the block does not declare
+    # dropped (as `unknown: :ignore` drops them), and the array's own
+    # `validate:` run over the result. A hand-rolled one-level check used to
+    # cast only the top level of each element, and got every one of those
+    # wrong.
+    #
+    # What is STORED follows the same split as a scalar's: without
+    # `transform:`, the walker's read (exactly what a request sending it
+    # gets); with one, the array exactly AS AUTHORED — the walker still runs,
+    # so a declaration mistake (an element `validate:` refuses, a sub-field
+    # default out of bounds) still fails at class load, but its cast result
+    # is discarded rather than stored. `transform:` itself is deliberately
+    # never run on a default either way — see AuthoredValues.
     def validate_array_authored_value!(field, opt)
       value = field[opt]
       return if authored_nil!(field, opt)
       raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} must be an Array" unless value.is_a?(Array)
-      if field[:length] && !Coercion.length_ok?(field[:length], value.length)
-        raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} violates its own contract (length)"
+
+      read, violations = AuthoredValues.read_array(field, value)
+      unless violations.empty?
+        raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} violates its own contract: " \
+                             "#{AuthoredValues.summary(violations)}"
       end
 
-      validate_array_elements!(field, opt, value) if field[:of]
-      validate_array_element_hashes!(field, opt, value) if field[:fields]
-      field[opt] = freeze_authored(value)
-    end
-
-    # The nested-block counterpart of the of: element check below. Without it
-    # `field[:of]` was nil for a block array, so its `default:` skipped
-    # validation entirely and whatever was authored went straight to every
-    # request that omitted the key. Shallow in the same way the of: check is:
-    # required sub-fields must be present and scalar ones must satisfy their
-    # own contract, which is what an authored value gets wrong.
-    def validate_array_element_hashes!(field, opt, value)
-      value.each do |element|
-        unless element.is_a?(Hash)
-          raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} contains #{element.class} " \
-                               "where the block declares a hash"
-        end
-
-        # Wrapped the way permittable_check_element wraps an element at
-        # request time, so class load reads keys exactly as a request does.
-        indifferent = ActiveSupport::HashWithIndifferentAccess.new(element)
-        field[:fields].each { |sub| validate_array_element_field!(field, opt, indifferent, sub) }
-      end
-    end
-
-    def validate_array_element_field!(field, opt, element, sub)
-      # Normalized before absence is read, and absence read with the runtime's
-      # own rule: a default: is applied WITHOUT revalidation, so anything this
-      # check waves through is handed to the app unexamined — and "" here used
-      # to mean a default could carry the very value a client is refused.
-      value = Coercion.apply_normalize(sub[:normalize], element[sub[:name]])
-      if Coercion.absent_value?(value)
-        # nullable: splits that rule exactly as permittable_explicit_null?
-        # does — a key present but empty is an explicit null, not an absence.
-        return if sub[:nullable] && element.key?(sub[:name])
-        return unless sub[:required]
-
-        raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} is missing :#{sub[:name]}, " \
-                             "which the block declares as required"
-      end
-      return unless sub[:kind] == :scalar
-
-      status, code = Coercion.check_scalar(sub, value)
-      return if status == :ok
-
-      raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} has :#{sub[:name]} " \
-                           "violating its own contract (#{code})"
-    end
-
-    def validate_array_elements!(field, opt, value)
-      value.each do |element|
-        status, code = Coercion.cast(field[:of], element)
-        next if status == :ok
-
-        raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} contains an element violating of: :#{field[:of]} (#{code})"
-      end
+      field[opt] = freeze_authored(field[:transform] ? value : read)
     end
 
     # A contract is frozen data, but `@fields.map(&:freeze)` freezes only the
@@ -1853,6 +1867,10 @@ module Permittable
     end
     return ActiveSupport::HashWithIndifferentAccess.new unless source
 
+    # Deliberately NOT deep-copied, unlike the enforce path's result: this is
+    # the pre-contract app's own params, and `params.permit` hands its Strings
+    # back by reference too — copying here would change behaviour in the one
+    # mode whose promise is that nothing changes.
     passed = ActiveSupport::HashWithIndifferentAccess.new(source)
     rule[:root] ? passed : passed.except(*MONITOR_DROPPED_KEYS)
   end
@@ -2085,7 +2103,7 @@ module Permittable
       # Already normalized by permittable_normalized, before the absence rule.
       permittable_check_whole(field, Coercion.check_scalar(field, value), full, result, violations: violations)
     when :json
-      permittable_check_whole(field, Coercion.check_json(field, value), full, result, violations: violations)
+      permittable_check_whole(field, permittable_check_json(field, value), full, result, violations: violations)
     when :nested
       if value.is_a?(Hash)
         result[key] = permittable_check_hash(field[:fields], ActiveSupport::HashWithIndifferentAccess.new(value),
@@ -2102,14 +2120,27 @@ module Permittable
     end
   end
 
+  # Coercion.check_json, with the copy the result needs made in the middle.
+  # The opaque hash is handed over whole, and HashWithIndifferentAccess
+  # rebuilt its containers but not the Strings inside them, so it is
+  # deep-copied for the reason permittable_normalized copies a String — but
+  # only once it is within its bounds. Copying first meant a megabyte
+  # payload refused on `length:` or `max_depth:` was copied in full just to
+  # be refused, undoing the early exit those bounds exist for.
+  def permittable_check_json(field, value)
+    status, code = Coercion.check_json_bounds(field, value)
+    return [status, code] unless status == :ok
+
+    Coercion.check_custom(field[:validate], value.deep_dup)
+  end
+
   # The shared tail of the two kinds whose entire value is checked in one
   # call — a scalar, or an opaque hash. A clean value is transformed into the
   # result; anything else records its code.
   def permittable_check_whole(field, outcome, full, result, violations:)
     status, out = outcome
     if status == :ok
-      out = field[:transform].call(out) if field[:transform]
-      result[field[:name].to_s] = out
+      result[field[:name].to_s] = permittable_transform(field, out)
     else
       violations << permittable_violation(field, full, out)
     end
@@ -2155,8 +2186,16 @@ module Permittable
       status, code = Coercion.check_custom(field[:validate], out)
       violations << permittable_violation(field, path, code) unless status == :ok
     end
-    out = field[:transform].call(out) if field[:transform] && violations.length == before
-    out
+    # Transform only a fully-valid array — a partially-nil one (element
+    # violations) would hand user code garbage it never agreed to see.
+    violations.length == before ? permittable_transform(field, out) : out
+  end
+
+  # The one place a field's `transform:` is applied — a seam, so that
+  # AuthoredValues can walk an authored default through this same walker
+  # without running app code over it at class load.
+  def permittable_transform(field, value)
+    field[:transform] ? field[:transform].call(value) : value
   end
 
   def permittable_check_element(field, element, path, unknown:, violations:)
@@ -2169,7 +2208,7 @@ module Permittable
                                     path: path, unknown: unknown, top_level: false, violations: violations)
     end
 
-    status, out = Coercion.cast(field[:of], element)
+    status, out = Coercion.cast(field[:of], permittable_own(element))
     return out if status == :ok
 
     violations << permittable_violation(field, path, out)
@@ -2183,18 +2222,34 @@ module Permittable
   # corruption strict coercion exists to refuse, delivered by the gem's own
   # preset. Only scalars take normalize:, and apply_normalize is itself a
   # no-op without one, so it owns that decision for every caller.
+  #
+  # It is also where a request's String stops being the request's. Nothing
+  # the walker hands to app code — `normalize:`, `validate:`, `transform:`,
+  # the result — may alias the caller's params, or `permitted_params[:name]
+  # << "x"` (or `normalize: ->(v) { v.strip! || v }`) rewrites the caller's
+  # Hash or ActionController::Parameters behind the app's back. Copying at
+  # the walker's input, ahead of normalize:, makes it one copy per String;
+  # String#dup shares a long String's buffer copy-on-write, so the copy is
+  # cheap until someone writes to it. `of:` elements get the same treatment
+  # in permittable_check_element, and a :json hash in permittable_check_json.
   def permittable_normalized(field, value)
-    Coercion.apply_normalize(field[:normalize], value)
+    Coercion.apply_normalize(field[:normalize], permittable_own(value))
+  end
+
+  def permittable_own(value)
+    value.is_a?(String) ? value.dup : value
   end
 
   # An authored default belongs to the contract, which is frozen data (see
-  # ContractBuilder#freeze_authored). HashWithIndifferentAccess copies a
-  # frozen Array or Hash as it assigns it, but stores a String as-is — so
-  # that one is copied here, leaving every value in the result the app's own
+  # ContractBuilder#freeze_authored), so every request gets a deep copy of it.
+  # Copying only a top-level String was not enough: HashWithIndifferentAccess
+  # copies a frozen Array or Hash as it assigns it, but not what is INSIDE
+  # one, so `permitted_params[:tags].first << "x"` on an `of: :string`
+  # default — or any edit to a String in a :json default — raised
+  # FrozenError. A deep copy leaves every value in the result the app's own
   # to mutate.
   def permittable_default(field)
-    value = field[:default]
-    value.is_a?(String) ? value.dup : value
+    field[:default].deep_dup
   end
 
   # nil and "" are both ABSENT — see the module comment.
@@ -2303,6 +2358,10 @@ module Permittable
     self.class.name
   end
 end
+
+# Class-load reading of an authored array default:/example: — the request
+# walker itself, so it needs the concern's body loaded.
+require "permittable/authored_values"
 
 # Contract exporters — the other readers of the frozen contract registry.
 # Loaded after the module body so OpenAPI can see the concern's own methods.

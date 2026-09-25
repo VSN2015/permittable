@@ -74,6 +74,17 @@ check "casts, defaults, normalizes and finalizes" do
   assert params["source"] == "smoke", params.inspect
 end
 
+check "casts a BigDecimal for :string in plain notation, not the scientific default #to_s gives" do
+  # Rails patches BigDecimal#to_s to default to "F" (active_support/core_ext/
+  # big_decimal/conversions, pulled in by active_record) — masking this bug
+  # in the main spec suite the same way 0.8.0's TimeWithZone regression was
+  # masked. This process loads only permittable, so BigDecimal#to_s is still
+  # stdlib's own scientific-by-default rendering, and only an explicit
+  # to_s("F") in cast_string sees it.
+  priced = Permittable::Contract.define { optional :price, :string, default: BigDecimal("1.5") }
+  assert priced.call!({})["price"] == "1.5", priced.call!({}).inspect
+end
+
 check "nested plain hashes convert without the Rails core extensions" do
   # The 0.5.1 regression: HashWithIndifferentAccess needs the Hash core ext
   # to convert nested plain Hashes, which Rails apps load indirectly.

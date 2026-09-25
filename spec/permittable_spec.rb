@@ -21,6 +21,14 @@ RSpec.describe Permittable do
     controller(permittable_class(&declaration), params: params, action: action).permitted_params
   end
 
+  # FakeController wraps a Hash in HashWithIndifferentAccess; this hands the
+  # concern a real ActionController::Parameters instead, as Rails would.
+  def permit_parameters(parameters, &declaration)
+    c = controller(permittable_class(&declaration))
+    c.params = parameters
+    c.permitted_params
+  end
+
   def violations_for(params, action: "create", &declaration)
     permit(params, action: action, &declaration)
     raise "expected InvalidParameters"
@@ -339,7 +347,7 @@ RSpec.describe Permittable do
             end
           end
         end
-      end.to raise_error(ArgumentError, /:default for array :items.*is missing :sku/)
+      end.to raise_error(ArgumentError, /:default for array :items violates its own contract: items\[0\]\.sku \(missing\)/)
 
       expect do
         permittable_class do
@@ -349,7 +357,7 @@ RSpec.describe Permittable do
             end
           end
         end
-      end.to raise_error(ArgumentError, /:default for array :items.*:sku.*invalid_type/)
+      end.to raise_error(ArgumentError, /:default for array :items violates its own contract: items\[0\]\.sku \(invalid_type\)/)
 
       expect do
         permittable_class do
@@ -374,7 +382,7 @@ RSpec.describe Permittable do
             end
           end
         end
-      end.to raise_error(ArgumentError, /:default for array :items.*is missing :sku/)
+      end.to raise_error(ArgumentError, /:default for array :items violates its own contract: items\[0\]\.sku \(missing\)/)
 
       # normalize: runs BEFORE the absence rule at request time; a default
       # that normalizes to empty is absent for the same reason.
@@ -386,7 +394,7 @@ RSpec.describe Permittable do
             end
           end
         end
-      end.to raise_error(ArgumentError, /:default for array :items.*is missing :sku/)
+      end.to raise_error(ArgumentError, /:default for array :items violates its own contract: items\[0\]\.sku \(missing\)/)
     end
 
     it "accepts an empty value a block array's default: is allowed to carry" do
@@ -451,7 +459,7 @@ RSpec.describe Permittable do
       expect { permittable_class { permit_params(:create) { array :a, default: "x" } } }
         .to raise_error(ArgumentError, /:default for array :a must be an Array/)
       expect { permittable_class { permit_params(:create) { array :a, of: :integer, default: ["x"] } } }
-        .to raise_error(ArgumentError, /contains an element violating of: :integer/)
+        .to raise_error(ArgumentError, /:default for array :a violates its own contract: a\[0\] \(invalid_type\)/)
     end
 
     it "rejects a default that violates the field's own contract" do
@@ -482,7 +490,7 @@ RSpec.describe Permittable do
       expect { permittable_class { permit_params(:create) { optional :plan, :string, in: %w[free pro], example: "gold" } } }
         .to raise_error(ArgumentError, /:example for field :plan violates its own contract \(inclusion\)/)
       expect { permittable_class { permit_params(:create) { array :ids, of: :integer, example: ["x"] } } }
-        .to raise_error(ArgumentError, /:example for array :ids contains an element violating of: :integer/)
+        .to raise_error(ArgumentError, /:example for array :ids violates its own contract: ids\[0\] \(invalid_type\)/)
       expect { permittable_class { permit_params(:create) { required(:a, example: {}) { required :b } } } }
         .to raise_error(ArgumentError, /unknown option\(s\) :example for field :a/)
     end
@@ -1226,27 +1234,28 @@ RSpec.describe Permittable do
       expect(violations_for({ s: "AB" }, &decl).details).to eq([{ param: "s", code: "format" }])
     end
 
-    # A String subclass so it satisfies scalar_shaped?/is_a?(String) while
-    # recording how many times its own encoding was scanned. Ordinary UTF-8
-    # input is the fast path in Coercion.cast: the value IS already the text
-    # a non-:string type parses from, so validity need be scanned once, not
-    # once directly and once more inside utf8_text for the same object.
-    let(:counting_string) do
-      Class.new(String) do
-        attr_reader :valid_encoding_calls
-
-        def valid_encoding?
-          @valid_encoding_calls = (@valid_encoding_calls || 0) + 1
-          super
+    it "scans a UTF-8 String's encoding only once per cast, for a non-:string type" do
+      # A shared counter, not an instance variable on the string itself: the
+      # walker copies a request's String before Coercion.cast ever sees it
+      # (permittable_own, so the result never aliases the caller's params),
+      # and `dup` makes a new instance with its own ivars — so counting on
+      # the ORIGINAL object would show zero calls no matter how many times
+      # the (correctly, once-scanned) copy was checked. The invariant this
+      # pins is Coercion.cast's own: the value IS already the text a
+      # non-:string type parses from, so validity need be scanned once, not
+      # once directly and once more inside utf8_text for the same object —
+      # regardless of which object identity ends up doing the scanning.
+      calls = []
+      counting_string = Class.new(String) do
+        define_method(:valid_encoding?) do
+          calls << object_id
+          super()
         end
       end
-    end
-
-    it "scans a UTF-8 String's encoding only once per cast, for a non-:string type" do
       value = counting_string.new("12")
       result = permit({ n: value }) { permit_params(:create) { required :n, :integer } }
       expect(result[:n]).to eq(12)
-      expect(value.valid_encoding_calls).to eq(1)
+      expect(calls.length).to eq(1)
     end
   end
 
@@ -1416,6 +1425,208 @@ RSpec.describe Permittable do
         permit_params(:create) { optional :plan, :string, normalize: :squish, default: "  free  " }
       end
       expect(result[:plan]).to eq("free")
+    end
+
+    it "delivers a default: cast, exactly as a request sending the same value would get it" do
+      decl = proc do
+        permit_params(:create) do
+          optional :age, :integer, default: "18"
+          optional :opt_in, :boolean, default: "false"
+          optional :price, :decimal, default: 1.5
+          optional :day, :date, default: "2026-01-05"
+          array :ids, of: :integer, default: %w[1 2]
+          array :items, default: [{ "sku" => "a", "qty" => "2" }] do
+            required :sku, :string
+            optional :qty, :integer
+          end
+        end
+      end
+      defaulted = permit({}, &decl)
+      sent = permit({ age: "18", opt_in: "false", price: 1.5, day: "2026-01-05", ids: %w[1 2],
+                      items: [{ sku: "a", qty: "2" }] }, &decl)
+
+      expect(defaulted[:age]).to eq(18)
+      expect(defaulted[:opt_in]).to be(false)
+      expect(defaulted[:price]).to be_a(BigDecimal).and eq(BigDecimal("1.5"))
+      expect(defaulted[:day]).to eq(Date.new(2026, 1, 5))
+      expect(defaulted[:ids]).to eq([1, 2])
+      expect(defaulted[:items].map(&:to_h)).to eq([{ "sku" => "a", "qty" => 2 }])
+      expect(defaulted).to eq(sent)
+    end
+
+    it "renders a BigDecimal default: for :string in plain notation, not cast_string's generic scientific to_s" do
+      klass = permittable_class { permit_params(:create) { optional :price, :string, default: BigDecimal("1.5") } }
+      expect(controller(klass).permitted_params[:price]).to eq("1.5")
+    end
+
+    it "hands out a transform: field's default: exactly as authored — master's documented behaviour — " \
+       "while a field with no transform: still gets it cast" do
+      klass = permittable_class do
+        permit_params(:create) do
+          optional :limit,     :string, default: 25
+          optional :page_size, :string, transform: ->(v) { v.to_i }, default: 25
+          optional :expires,   :datetime, default: "2026-01-05"
+          optional :on,        :datetime, transform: ->(t) { t.to_date }, default: Date.new(2026, 1, 5)
+          array    :counts,    of: :string, default: [1, 2]
+          array    :ids,       of: :string, transform: ->(a) { a.map(&:to_i) }, default: [1, 2]
+        end
+      end
+      result = controller(klass).permitted_params
+
+      expect(result[:limit]).to eql("25")
+      expect(result[:page_size]).to eql(25)
+      expect(result[:expires]).to eq(Time.utc(2026, 1, 5)).and be_a(Time)
+      expect(result[:on]).to eq(Date.new(2026, 1, 5)).and be_a(Date)
+      expect(result[:counts]).to eq(%w[1 2])
+      expect(result[:ids]).to eq([1, 2])
+    end
+
+    it "reads a block array's default: with the request walker, at every depth" do
+      klass = permittable_class do
+        permit_params(:create) do
+          array :items, default: [{ "sku" => "a", "note" => "", "extra" => 1,
+                                    "dims" => { "w" => "3" }, "tags" => %w[1 2] }] do
+            required :sku, :string
+            optional :note, :string, nullable: true
+            optional :qty, :integer, default: 1
+            optional(:dims) { optional :w, :integer }
+            array :tags, of: :integer
+          end
+        end
+      end
+      defaulted = controller(klass).permitted_params
+      sent = controller(klass, params: { items: [{ sku: "a", note: "", extra: 1, dims: { w: "3" }, tags: %w[1 2] }] })
+             .permitted_params
+
+      expect(defaulted[:items]).to eq([{ "sku" => "a", "note" => nil, "qty" => 1, "dims" => { "w" => 3 }, "tags" => [1, 2] }])
+      expect(defaulted).to eq(sent)
+    end
+
+    it "runs an array's own validate: over its authored default:, as a request's array gets it" do
+      expect do
+        permittable_class do
+          permit_params(:create) { array :ids, of: :integer, validate: ->(v) { v.uniq == v || :duplicates }, default: %w[1 1] }
+        end
+      end.to raise_error(ArgumentError, /:default for array :ids violates its own contract: ids \(duplicates\)/)
+    end
+
+    it "never runs an app's transform: over a default:, at class load or on the way out" do
+      calls = []
+      klass = permittable_class do
+        permit_params(:create) do
+          optional :plan, :string, default: "free", transform: ->(v) { (calls << :plan) && v.upcase }
+          array :items, default: [{ "sku" => "a" }], transform: ->(v) { (calls << :items) && v } do
+            required :sku, :string, transform: ->(v) { (calls << :sku) && v.upcase }
+          end
+        end
+      end
+      result = controller(klass).permitted_params
+
+      expect(result[:plan]).to eq("free")
+      expect(result[:items].map(&:to_h)).to eq([{ "sku" => "a" }])
+      expect(calls).to be_empty
+    end
+
+    it "casts an authored example: the same way, so docs publish the value a request would carry" do
+      klass = permittable_class do
+        permit_params(:create) do
+          optional :age, :integer, example: "21"
+          array :ids, of: :integer, example: %w[3]
+        end
+      end
+      fields = klass.permittable_contracts.last[:fields]
+      expect(fields.map { |f| f[:example] }).to eq([21, [3]])
+    end
+
+    it "hands out a default: with nothing frozen inside it, however deep" do
+      klass = permittable_class do
+        permit_params(:create) do
+          array :tags, of: :string, default: ["a"]
+          optional :meta, :json, default: { "k" => "v", "list" => ["x"], "deep" => { "d" => "e" } }
+          array :items, default: [{ "sku" => "a" }] do
+            required :sku, :string
+          end
+        end
+      end
+      first = controller(klass).permitted_params
+      expect { first[:tags].first << "!" }.not_to raise_error
+      expect { first[:meta]["k"] << "!" }.not_to raise_error
+      expect { first[:meta]["list"] << "y" }.not_to raise_error
+      expect { first[:meta]["deep"]["d"] << "!" }.not_to raise_error
+      expect { first[:items].first["sku"] << "!" }.not_to raise_error
+
+      second = controller(klass).permitted_params
+      expect(second[:tags]).to eq(["a"])
+      expect(second[:meta].to_h).to eq("k" => "v", "list" => ["x"], "deep" => { "d" => "e" })
+      expect(second[:items].map(&:to_h)).to eq([{ "sku" => "a" }])
+    end
+  end
+
+  describe "the result never aliases the request's own strings" do
+    it "copies a String value, so mutating the result leaves params untouched" do
+      params = { name: +"bob", tags: [+"a"], meta: { "note" => +"n" } }
+      result = permit(params) do
+        permit_params(:create) do
+          required :name, :string
+          array :tags, of: :string
+          optional :meta, :json
+        end
+      end
+      result[:name] << "!"
+      result[:tags].first << "!"
+      result[:meta]["note"] << "!"
+
+      expect(params).to eq(name: "bob", tags: ["a"], meta: { "note" => "n" })
+    end
+
+    it "hands transform: a copy, so a mutating transform cannot rewrite params" do
+      params = { name: +"  bob  " }
+      result = permit(params) { permit_params(:create) { required :name, :string, transform: ->(v) { v.strip! || v } } }
+
+      expect(result[:name]).to eq("bob")
+      expect(params[:name]).to eq("  bob  ")
+    end
+
+    it "hands normalize: a copy too, whether params is a Hash or ActionController::Parameters" do
+      decl = proc { permit_params(:create) { required :name, :string, normalize: ->(v) { v.strip! || v } } }
+
+      hash = { name: +"  bob  " }
+      expect(permit(hash, &decl)[:name]).to eq("bob")
+      expect(hash[:name]).to eq("  bob  ")
+
+      params = ActionController::Parameters.new(name: +"  bob  ")
+      expect(permit_parameters(params, &decl)[:name]).to eq("bob")
+      expect(params[:name]).to eq("  bob  ")
+    end
+
+    it "copies from ActionController::Parameters as from a Hash" do
+      params = ActionController::Parameters.new(name: +"bob", tags: [+"a"], meta: { "note" => +"n" })
+      result = permit_parameters(params) do
+        permit_params(:create) do
+          required :name, :string
+          array :tags, of: :string
+          optional :meta, :json
+        end
+      end
+      result[:name] << "!"
+      result[:tags].first << "!"
+      result[:meta]["note"] << "!"
+
+      expect(params.to_unsafe_h).to eq("name" => "bob", "tags" => ["a"], "meta" => { "note" => "n" })
+    end
+
+    it "copies a :json value only once it is within its bounds, so a rejected payload is never copied" do
+      copies = 0
+      leaf = Object.new
+      leaf.define_singleton_method(:deep_dup) { (copies += 1) && self }
+      decl = proc { permit_params(:create) { optional :meta, :json, length: 0..1 } }
+
+      expect(violations_for({ meta: { "a" => leaf, "b" => 1 } }, &decl).details)
+        .to eq([{ param: "meta", code: "length" }])
+      expect(copies).to eq(0)
+
+      permit({ meta: { "a" => leaf } }, &decl)
+      expect(copies).to eq(1)
     end
   end
 
@@ -1867,7 +2078,7 @@ RSpec.describe Permittable do
 
     it "refuses an authored default: that is itself outside the bound, at class load" do
       expect { permittable_class { permit_params(:create) { array :t, of: :string, length: 0..1, default: %w[a b] } } }
-        .to raise_error(ArgumentError, /:default for array :t violates its own contract \(length\)/)
+        .to raise_error(ArgumentError, /:default for array :t violates its own contract: t \(length\)/)
       expect { permittable_class { permit_params(:create) { array :t, of: :string, length: 0..2, example: %w[a b] } } }
         .not_to raise_error
     end
@@ -3079,7 +3290,7 @@ RSpec.describe Permittable do
       expect(violations_for({ ids: "1;2" }, &decl).details).to eq([{ param: "ids", code: "format" }])
     end
 
-    it "does NOT run on defaults (they are authored in final shape) or absent fields" do
+    it "does NOT run on defaults (stored as the contract reads them, untransformed) or absent fields" do
       decl = proc do
         permit_params(:create) { optional :ids, :string, default: "authored", transform: ->(v) { v.split(",") } }
       end
