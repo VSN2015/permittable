@@ -1681,8 +1681,18 @@ module Permittable
     # The param is the client-controlled part; the message (or code) is the
     # developer's, so it is handed over separately and never escaped — a
     # YAML `|` message ending in "\n" must not quote every name it follows.
+    #
+    # An unknown-key violation's `param:` is already reportable_text — valid
+    # UTF-8, but scrubbed to U+FFFD wherever the key wasn't. That is right
+    # for `details`/instrumentation (a machine reads it and only needs it not
+    # to crash `to_json`), but prose can do better: permittable_prose_utf8
+    # keeps a legacy byte transcodable and an invalid one visible as \xNN
+    # rather than replacing it, so prose reads the RAW key when one was
+    # saved (see permittable_unknown_key_violation), and falls back to the
+    # param for any other violation.
     permittable_prose_list(violations) do |v|
-      [v[:param].to_s, v[:message] ? " #{v[:message]}" : " (#{v[:code]})"]
+      name = @permittable_unknown_key_raw&.[](v) || v[:param].to_s
+      [name, v[:message] ? " #{v[:message]}" : " (#{v[:code]})"]
     end
   end
 
@@ -2019,7 +2029,7 @@ module Permittable
     if unknown == :error
       extra.each { |key| violations << permittable_unknown_key_violation(path, key) }
     elsif respond_to?(:logger) && logger
-      listed = permittable_prose_list(extra) { |key| permittable_path(path, Coercion.reportable_text(key)) }
+      listed = permittable_prose_list(extra) { |key| permittable_path(path, permittable_prose_utf8(key)) }
       logger.warn("#{LABEL}: unknown parameter(s) ignored by the ##{permittable_action_name} contract: #{listed}")
     end
   end
@@ -2077,6 +2087,12 @@ module Permittable
   def permittable_unknown_key_violation(path, key)
     entry = permittable_violation({}, permittable_path(path, Coercion.reportable_text(key)), "unknown")
     (@permittable_unknown_key_violations ||= {}.compare_by_identity)[entry] = true
+    # Prose (the exception message) gets the richer transcoding instead of
+    # `param:`'s scrubbed-to-U+FFFD text — see permittable_violation_summary.
+    # permittable_prose_utf8, not Coercion.reportable_text, is what keeps the
+    # concatenation with `path` (the contract's own UTF-8 field names) from
+    # raising Encoding::CompatibilityError, the same as the :log line below.
+    (@permittable_unknown_key_raw ||= {}.compare_by_identity)[entry] = permittable_path(path, permittable_prose_utf8(key))
     entry
   end
 

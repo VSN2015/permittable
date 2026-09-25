@@ -750,7 +750,10 @@ RSpec.describe Permittable do
         c.define_singleton_method(:logger) { logger }
 
         expect(c.permitted_params.to_h).to eq("name" => "a")
-        expect(messages.join).to include("caf�", "ok").and(be_valid_encoding)
+        # The prose-escaping fix in #63 makes this MORE informative than a
+        # plain U+FFFD replacement: the invalid byte is shown as \xC3 rather
+        # than lost, but it still never raises and is always valid UTF-8.
+        expect(messages.join).to include('caf\xC3', "ok").and(be_valid_encoding)
       end
 
       it "converts only the undeclared keys, never the declared ones a request walks through" do
@@ -2372,6 +2375,17 @@ RSpec.describe Permittable do
       c, lines = logging_controller(log_klass, params: { "a" => "x", invalid => 1, binary => 2 })
       c.permitted_params
       expect(lines.first).to end_with('contract: "bad\xFF\xFEkey", "raw\xC0"')
+    end
+
+    it "shows the same rich transcoding in the exception message as in the log line, while details stays the plainer, JSON-safe form" do
+      unmapped = "caf\xE9\x81".dup.force_encoding(Encoding::Windows_1252)
+      e = rejection(error_klass, { "a" => "x", unmapped => 1 })
+      expect(e.message).to eq('Invalid parameters: "café\x81" (unknown)')
+      # details/instrumentation stay valid UTF-8 (Coercion.reportable_text,
+      # scrubbed to U+FFFD) — a machine reading them only needs them not to
+      # crash to_json, not to be maximally legible.
+      expect(e.details).to contain_exactly({ param: "café\u{FFFD}", code: "unknown" })
+      expect { e.details.to_json }.not_to raise_error
     end
   end
 
