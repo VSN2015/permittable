@@ -298,6 +298,52 @@ RSpec.describe Permittable::Audit do
         missing_actions: 0
       )
     end
+
+    # rails_routes expands `scope "(:locale)"` into one descriptor per URL,
+    # each tagged with the route it came from. The table lists both — each is
+    # a real URL — but they are one route, and one unguarded POST must not
+    # count as two.
+    it "counts the paths expanded from one route once" do
+      sourced = routes.each_with_index.map { |route, index| route.merge(route: index) }
+      localized = sourced + [{ controller: "users", action: "create", verb: "post", path: "/{locale}/users", route: 1 },
+                             { controller: "legacy", action: "create", verb: "post", path: "/{locale}/legacy", route: 4 }]
+      expanded = described_class.entries(controllers: [users, bare_class("legacy")], routes: localized)
+      expect(expanded.length).to eq(7)
+      expect(described_class.summary(expanded)).to eq(described_class.summary(entries))
+    end
+
+    # Two routes to the same action are two ways in, not one: each unguarded
+    # POST is its own gap, and `[strict]` must count both. A hand-built
+    # descriptor with no `route:` is its own route.
+    it "counts distinct routes to the same action separately" do
+      admin = routes + [{ controller: "legacy", action: "create", verb: "post", path: "/admin/legacy" }]
+      counts = described_class.summary(described_class.entries(controllers: [users, bare_class("legacy")],
+                                                               routes: admin))
+      expect(counts).to include(actions: 6, uncovered: 4, uncovered_with_body: 3)
+    end
+
+    # `route:` is a position within ONE rails_routes call, so two lists
+    # concatenated (an app plus a mounted engine) reuse the same small
+    # integers. Route 0 of one controller is not route 0 of another.
+    it "keeps a reused route index on different controllers apart" do
+      app = [{ controller: "legacy", action: "create", verb: "post", path: "/legacy", route: 0 }]
+      engine = [{ controller: "imports", action: "create", verb: "post", path: "/imports", route: 0 }]
+      found = described_class.entries(controllers: [bare_class("legacy"), bare_class("imports")],
+                                      routes: app + engine)
+      expect(described_class.summary(found)).to include(actions: 2, uncovered_with_body: 2)
+    end
+
+    it "tells a route's expanded paths from a second route, reading a real route set" do
+      route_set = ActionDispatch::Routing::RouteSet.new
+      route_set.draw do
+        scope("(:locale)") { post "legacy", to: "legacy#create" }
+        post "admin/legacy", to: "legacy#create"
+      end
+      descriptors = Permittable::OpenAPI.rails_routes(Struct.new(:routes).new(route_set))
+      found = described_class.entries(controllers: [bare_class("legacy")], routes: descriptors)
+      expect(found.map(&:path)).to contain_exactly("/legacy", "/{locale}/legacy", "/admin/legacy")
+      expect(described_class.summary(found)).to include(actions: 2, uncovered_with_body: 2)
+    end
   end
 
   describe ".format" do
@@ -311,6 +357,29 @@ RSpec.describe Permittable::Audit do
       expect(report).to include("3 without a contract")
       expect(report).to include("2 of those accept a request body")
       expect(report).to include("users#archive")
+    end
+
+    # The summary counts routes, the table lists rows; when the two differ,
+    # the report gives both numbers and names each.
+    it "says how many rows the table lists when one route expands to several" do
+      sourced = routes.each_with_index.map { |route, index| route.merge(route: index) }
+      localized = sourced + [{ controller: "legacy", action: "create", verb: "post", path: "/{locale}/legacy", route: 4 }]
+      expanded = described_class.entries(controllers: [users, bare_class("legacy")], routes: localized)
+      report = described_class.format(expanded)
+      expect(report).to include("5 routed actions in 6 rows: ")
+      expect(described_class.format(entries)).to include("5 routed actions: ")
+    end
+
+    # A row is a verb on a path, not a path: PATCH and PUT on the two locale
+    # variants are four rows over two distinct paths, so the number printed
+    # must be labelled as rows.
+    it "counts rows, not distinct paths, when a route answers several verbs" do
+      route_set = ActionDispatch::Routing::RouteSet.new
+      route_set.draw { scope("(:locale)") { resources :posts, only: :update } }
+      descriptors = Permittable::OpenAPI.rails_routes(Struct.new(:routes).new(route_set))
+      found = described_class.entries(controllers: [bare_class("posts")], routes: descriptors)
+      expect(found.map(&:path).uniq.length).to eq(2)
+      expect(described_class.format(found)).to include("2 routed actions in 4 rows: ")
     end
 
     it "says so plainly when there is nothing to report" do
