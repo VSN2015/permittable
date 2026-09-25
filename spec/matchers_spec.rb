@@ -259,6 +259,50 @@ RSpec.describe "Permittable RSpec matchers" do
       .to include("inside the opaque :json field :meta, which declares nothing about its keys")
   end
 
+  it "honours max_depth: below an opaque :json field, counting [n] as a level" do
+    bounded = Class.new(FakeController) do
+      include Permittable
+
+      permit_params(:create, root: :user) do
+        optional :meta, :json, max_depth: 1
+        optional :deep, :json, max_depth: 3
+      end
+    end
+    expect(bounded).to permit_param("meta.a")
+    expect(bounded).not_to permit_param("meta.a.b")
+    expect(failure_of { expect(bounded).to permit_param("meta.a.b") })
+      .to include("deeper than the opaque :json field :meta allows (max_depth: 1)")
+    expect(bounded).to permit_param("deep.list[0].x")
+    expect(bounded).not_to permit_param("deep.list[0].x.y")
+    expect(bounded).not_to permit_param("user.meta.a.b")
+  end
+
+  it "resets per-run state, so a reused matcher judges each subject afresh" do
+    opaque = Class.new(FakeController) do
+      include Permittable
+
+      permit_params(:create) { optional :meta, :json }
+    end
+    plain = Class.new(FakeController) do
+      include Permittable
+
+      permit_params(:create) { optional :name, :string }
+    end
+    matcher = permit_param("meta.admin")
+    expect(matcher.matches?(opaque)).to be(true)
+    expect(matcher.does_not_match?(plain)).to be(true)
+    expect(matcher.matches?(plain)).to be(false)
+    expect(matcher.failure_message).to include("not declared")
+  end
+
+  it "reads the runtime's own [n] path form" do
+    expect(controller).to permit_param("line_items[0].sku").for_action(:create)
+    expect(failure_of { expect(controller).not_to permit_param("line_items[0].sku").for_action(:create) })
+      .to include("the contract declares it")
+    expect(failure_of { expect(controller).not_to permit_param("user.line_items[12].sku").for_action(:create) })
+      .to include("relative to root: :user")
+  end
+
   it "fails a root-prefixed path with a hint, instead of listing what is declared" do
     message = failure_of { expect(controller).to permit_param("user.email").for_action(:create) }
     expect(message).to include("paths are relative to root: :user")
@@ -266,7 +310,7 @@ RSpec.describe "Permittable RSpec matchers" do
   end
 
   it "rejects an empty or malformed dotted path with an ArgumentError" do
-    ["", "a.", ".a", "a..b"].each do |path|
+    ["", "a.", ".a", "a..b", "[0]", "a[x]", "a]"].each do |path|
       expect { expect(controller).to permit_param(path).for_action(:create) }
         .to raise_error(ArgumentError, /\APermittable: .*#{Regexp.escape(path.inspect)}/)
       expect { expect(controller).not_to permit_param(path).for_action(:create) }

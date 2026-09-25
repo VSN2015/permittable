@@ -19,8 +19,8 @@ module Permittable
   # pass both when :admin is undeclared and when it is declared optional,
   # which is a false positive in exactly the assertion most likely to guard
   # a security property. It raises instead, and names the positive form to
-  # write. It reads the contract, not the runtime mode: a rule in monitor
-  # mode passes undeclared keys through to the action regardless.
+  # write. It reads the contract, not the runtime mode: under a rule in
+  # monitor mode, permitted_params hands back undeclared keys regardless.
   #
   # `for_action` picks the rule exactly like a request would
   # (`permit_rule_for`); it may be omitted only when the controller declares
@@ -33,13 +33,14 @@ module Permittable
 
     class PermitParamMatcher
       OPTION_LABELS = { in: "in:", format: "format:", length: "length:", default: "default:" }.freeze
+      # One path segment: a name plus any [n] indexes (the runtime's form).
+      SEGMENT = /\A([^\[\]]+)((?:\[\d+\])*)\z/
 
       def initialize(path)
         @path = path.to_s
         @segments = path_segments!(@path)
         @action = nil
         @expected = {}
-        @mismatches = []
       end
 
       # -- chains -----------------------------------------------------------
@@ -119,14 +120,16 @@ module Permittable
 
       # Negation is only unambiguous without qualifiers ("not declared"),
       # and only meaningful against a rule that exists: a mistyped
-      # `for_action(:craete)` resolves to no rule, which declares nothing, so
-      # a lenient not_to would pass for any param whatsoever. The subject is
+      # `for_action(:craete)` with no catch-all rule resolves to no rule,
+      # which declares nothing, so a lenient not_to would pass for any param
+      # whatsoever. (With a catch-all it resolves there, as a request
+      # would, and is checked against that rule.) The subject is
       # resolved first so a wrong subject is the error reported.
       def does_not_match?(subject) # rubocop:disable Naming/PredicatePrefix -- the RSpec protocol name
         @subject = resolve_subject(subject)
         raise ArgumentError, negated_qualifier_message unless @expected.empty?
 
-        locate == :undeclared
+        %i[undeclared too_deep].include?(locate)
       end
 
       def failure_message
@@ -134,6 +137,9 @@ module Permittable
         case @status
         when :no_rule then "#{subject} it #{@problem}"
         when :root_prefixed then "#{subject} #{root_prefix_hint}"
+        when :too_deep
+          "#{subject} it is deeper than the opaque :json field #{label_for(@opaque[:path])} allows " \
+          "(max_depth: #{@opaque[:field][:max_depth]})"
         when :undeclared
           "#{subject} it is not declared (declared: #{(@missing_among || []).map { |f| f[:name] }.join(', ')})"
         else "#{subject}:\n  #{@mismatches.join("\n  ")}"
@@ -145,7 +151,7 @@ module Permittable
         case @status
         when :no_rule then "#{subject} it #{@problem}, so there is no rule to check the param against"
         when :opaque
-          "#{subject} it is inside the opaque :json field #{label_for(@opaque_path)}, which lets any nested key through"
+          "#{subject} it is inside the opaque :json field #{label_for(@opaque[:path])}, which lets any nested key through"
         when :root_prefixed then "#{subject} #{root_prefix_hint} — which the contract lets through"
         else "#{subject} the contract declares it"
         end
@@ -176,16 +182,20 @@ module Permittable
 
       # The one lookup both directions share. Sets @status to :no_rule,
       # :declared, :opaque (the path runs into a :json field, which accepts
-      # any nested key without declaring it), :root_prefixed (the path
-      # starts with the rule's root: and resolves without it), or
-      # :undeclared.
+      # any nested key without declaring it), :too_deep (it runs into one
+      # deeper than its max_depth: allows), :root_prefixed (the path starts
+      # with the rule's root: and resolves without it), or :undeclared.
+      # Every per-run ivar is reset first: a matcher object can be reused
+      # on another subject, and must not answer from the previous run.
       def locate
+        @rule = @field = @opaque = @problem = @missing_among = nil
+        @mismatches = []
         @rule = resolve_rule(@subject)
         return @status = :no_rule unless @rule
 
         @field = resolve_field(@rule[:fields], @segments)
         @status = if @field then :declared
-                  elsif @opaque_path then :opaque
+                  elsif @opaque then opaque_within_depth? ? :opaque : :too_deep
                   elsif root_prefixed? then :root_prefixed
                   else :undeclared
                   end
@@ -216,9 +226,10 @@ module Permittable
       # Walks a dotted path through nested blocks and array-of-hash blocks
       # alike, since both carry their sub-fields under :fields. A :json
       # field is opaque: it has no :fields, yet lets any nested key through,
-      # so a path running past one is recorded rather than called missing.
+      # so a path running past one is recorded rather than called missing,
+      # along with how many container levels the rest of the path needs.
       def resolve_field(fields, segments, depth = 0)
-        name = segments[depth].to_sym
+        name = segments[depth][:name].to_sym
         field = fields.find { |f| f[:name] == name }
         if field.nil?
           @missing_among = fields
@@ -227,44 +238,64 @@ module Permittable
         return field if depth == segments.length - 1
 
         if field[:kind] == :json
-          @opaque_path = segments.take(depth + 1).join(".")
+          @opaque = { path: segments.take(depth + 1).map { |seg| seg[:name] }.join("."), field: field,
+                      steps: steps_below(segments, depth) }
           return nil
         end
 
         resolve_field(field[:fields] || [], segments, depth + 1)
       end
 
+      # Each key or [n] step past the :json field descends into one more
+      # container — the same count the runtime's max_depth: check makes,
+      # where the field's own Hash is the first level and arrays count too.
+      def steps_below(segments, depth)
+        (segments.length - depth - 1) + segments.drop(depth).sum { |seg| seg[:indexes] }
+      end
+
+      def opaque_within_depth?
+        limit = @opaque[:field][:max_depth]
+        limit.nil? || @opaque[:steps] <= limit
+      end
+
       # Paths are relative to root:, so "user.email" under `root: :user`
       # names params[:user][:user][:email]. When dropping the prefix would
-      # resolve (to a declared field, or into an opaque :json one), that is
-      # almost certainly what was meant — and silently passing a negated
-      # expectation on it would be a false pass.
+      # resolve (to a declared field, or into an opaque :json one within its
+      # max_depth:), that is almost certainly what was meant — and silently
+      # passing a negated expectation on it would be a false pass.
       def root_prefixed?
         root = @rule[:root]
-        return false unless root && @segments.length > 1 && @segments.first == root.to_s
+        return false unless root && @segments.length > 1 && @segments.first[:name] == root.to_s
 
         missing_among = @missing_among
-        found = resolve_field(@rule[:fields], @segments.drop(1)) || @opaque_path
+        found = resolve_field(@rule[:fields], @segments.drop(1)) || (@opaque && opaque_within_depth?)
         @missing_among = missing_among
-        @opaque_path = nil
-        !found.nil?
+        @opaque = nil
+        found ? true : false
       end
 
       def root_prefix_hint
-        "paths are relative to root: :#{@rule[:root]}, so write permit_param(#{label_for(@segments.drop(1).join('.'))})"
+        relative = @segments.drop(1).map { |seg| seg[:raw] }.join(".")
+        "paths are relative to root: :#{@rule[:root]}, so write permit_param(#{label_for(relative)})"
       end
 
       def opaque_qualifier_mismatch
-        "it is inside the opaque :json field #{label_for(@opaque_path)}, which declares nothing about its keys — " \
-          "assert qualifiers on #{label_for(@opaque_path)} itself"
+        "it is inside the opaque :json field #{label_for(@opaque[:path])}, which declares nothing about its keys — " \
+          "assert qualifiers on #{label_for(@opaque[:path])} itself"
       end
 
+      # Accepts the runtime's own path form too — violation details say
+      # "line_items[0].sku" — so a path copied from one resolves: the [n]
+      # indexes are dropped for the walk and kept only as depth.
       def path_segments!(path)
-        segments = path.split(".", -1)
-        return segments unless segments.empty? || segments.any?(&:empty?)
+        raws = path.split(".", -1)
+        matches = raws.map { |raw| SEGMENT.match(raw) }
+        if raws.empty? || matches.any?(&:nil?)
+          raise ArgumentError, "#{LABEL}: permit_param needs a param name or a dotted path like " \
+                               "\"address.zip\" or \"line_items[0].sku\" (got #{path.inspect})"
+        end
 
-        raise ArgumentError, "#{LABEL}: permit_param needs a param name or a dotted path like " \
-                             "\"address.zip\" (got #{path.inspect})"
+        raws.zip(matches).map { |raw, m| { name: m[1], indexes: m[2].count("["), raw: raw } }
       end
 
       def collect_mismatches(field)
