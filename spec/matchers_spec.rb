@@ -576,6 +576,14 @@ RSpec.describe "Permittable RSpec matchers" do
       expect(contract).to reject_params({ a: "x" }).with_violation("a", :invalid_type)
     end
 
+    it "matches a standalone Contract's own unknown: :error strictness — no top-level exemption" do
+      contract = Permittable::Contract.define(unknown: :error) { required :a, :integer }
+      expect(contract.call({ a: "1", controller: "x" }).invalid?).to be(true)
+
+      expect(contract).to reject_params(a: "1", controller: "x").with_violation("controller", :unknown)
+      expect(contract).not_to accept_params(a: "1", controller: "x")
+    end
+
     it "describes itself readably" do
       expect(accept_params({}).for_action(:create).description).to eq("accept those params for #create")
       expect(reject_params({}).with_violation("a", :missing).description)
