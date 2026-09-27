@@ -242,6 +242,17 @@ RSpec.describe Permittable::Generator do
       scan = described_class.scan("def broken( ; params.permit(:name)")
       expect(scan.scalars).to eq(%i[name])
     end
+
+    it "does not read a permit call spelled out inside a string literal" do
+      scan = described_class.scan(<<~RUBY)
+        def create
+          logger.warn "legacy path hit: params.require(:admin).permit(:superuser)"
+        end
+      RUBY
+      expect(scan.root).to be_nil
+      expect(scan.scalars).to eq([])
+      expect(scan.calls).to eq(0)
+    end
   end
 
   describe ".draft from a model's columns" do
