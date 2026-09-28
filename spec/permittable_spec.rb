@@ -511,6 +511,15 @@ RSpec.describe Permittable do
       expect(violations_for({ n: "4.5" }) { permit_params(:create) { required :n, :integer } }.details.first[:code]).to eq("invalid_type")
     end
 
+    it "rejects underscore digit separators and surrounding whitespace for :integer" do
+      # Integer() treats both as harmless formatting for a SOURCE LITERAL —
+      # neither is how a client spells a number in a request body.
+      ["1_8", " 99 "].each do |value|
+        e = violations_for({ n: value }) { permit_params(:create) { required :n, :integer } }
+        expect(e.details).to eq([{ param: "n", code: "invalid_type" }]), "for #{value.inspect}"
+      end
+    end
+
     it "accepts a whole Float for :integer but rejects a fractional one (JSON numbers)" do
       klass = permittable_class { permit_params(:create) { required :n, :integer } }
       expect(controller(klass, params: { n: 42.0 }).permitted_params[:n]).to eq(42)
@@ -693,6 +702,15 @@ RSpec.describe Permittable do
       # accepted these while :float did not.
       %w[NaN Infinity -Infinity].each do |value|
         expect(rejected(:d, value, &decl)).to eq([{ param: "d", code: "invalid_type" }]), "for #{value}"
+      end
+    end
+
+    it "rejects underscore digit separators and surrounding whitespace for :float and :decimal" do
+      # Float()/BigDecimal() treat both as harmless formatting for a SOURCE
+      # LITERAL, same leniency as the :integer version of this rule above.
+      ["1_8.5", " 1.5 "].each do |value|
+        expect(rejected(:f, value, &decl)).to eq([{ param: "f", code: "invalid_type" }]), "for :float #{value.inspect}"
+        expect(rejected(:d, value, &decl)).to eq([{ param: "d", code: "invalid_type" }]), "for :decimal #{value.inspect}"
       end
     end
 

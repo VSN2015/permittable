@@ -744,6 +744,17 @@ module Permittable
       end
     end
 
+    # Kernel#Integer/Float and BigDecimal() all accept underscore digit
+    # separators and surrounding whitespace — a convenience for a NUMBER
+    # LITERAL IN RUBY SOURCE, not for a request body. "1_8" is not how a
+    # client spells eighteen, and " 99 " is not how one spells ninety-nine;
+    # silently accepting either is the same kind of leniency as the
+    # NaN/Infinity/`0e10` cases below, just arriving from a different door.
+    # Checked against the raw String before any of those delegate, so a
+    # non-canonical spelling never reaches them at all.
+    INTEGER_FORMAT = /\A[+-]?\d+\z/
+    NUMERIC_FORMAT = /\A[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?\z/
+
     def cast_integer(value)
       case value
       when Integer then [:ok, value]
@@ -751,7 +762,7 @@ module Permittable
       # RangeError, which the ArgumentError rescue below does not catch), and
       # no integer is what either one sent. Same rule as finite_float.
       when Float then value.finite? && value == value.truncate ? [:ok, value.to_i] : [:error, "invalid_type"]
-      when String then [:ok, Integer(value, 10)]
+      when String then value.match?(INTEGER_FORMAT) ? [:ok, Integer(value, 10)] : [:error, "invalid_type"]
       else [:error, "invalid_type"]
       end
     rescue ArgumentError
@@ -761,7 +772,7 @@ module Permittable
     def cast_float(value)
       case value
       when Numeric then finite_float(value.to_f)
-      when String then finite_float(Float(value), source: value)
+      when String then value.match?(NUMERIC_FORMAT) ? finite_float(Float(value), source: value) : [:error, "invalid_type"]
       else [:error, "invalid_type"]
       end
     rescue ArgumentError
@@ -792,7 +803,8 @@ module Permittable
 
     def cast_decimal(value)
       case value
-      when Numeric, String then finite_decimal(BigDecimal(value.to_s))
+      when Numeric then finite_decimal(BigDecimal(value.to_s))
+      when String then value.match?(NUMERIC_FORMAT) ? finite_decimal(BigDecimal(value)) : [:error, "invalid_type"]
       else [:error, "invalid_type"]
       end
     rescue ArgumentError
