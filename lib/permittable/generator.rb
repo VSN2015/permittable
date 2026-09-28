@@ -400,6 +400,15 @@ module Permittable
     # top (draft_column) must not share this rescue: an error there would
     # otherwise discard EVERY column — the draft silently falls back to a
     # scan alone, or to nothing — for what is one column's problem.
+    #
+    # The rescue is scoped to ActiveRecord::ActiveRecordError, same as
+    # ColumnGuard.schema_reachable? and for the same reason: a genuinely
+    # unreachable schema (no database yet, table not migrated) degrades to
+    # no columns, but a real bug — a broken custom type adapter, a NameError
+    # from a typo — must keep surfacing instead of quietly emitting an empty
+    # draft. The defined? guard keeps this gem loadable without
+    # activerecord, same as schema_reachable? (a host without it duck-types
+    # `model:` and cannot raise an ActiveRecordError in the first place).
     def schema_columns(model)
       return nil unless model.respond_to?(:columns)
       return nil unless model.table_exists?
@@ -408,7 +417,9 @@ module Permittable
       # into its column names; a nil primary key becomes [].
       skipped = SKIPPED_COLUMNS + Array(model.primary_key).map(&:to_s)
       model.columns.reject { |c| skipped.include?(c.name) }
-    rescue StandardError
+    rescue StandardError => e
+      raise unless defined?(ActiveRecord::ActiveRecordError) && e.is_a?(ActiveRecord::ActiveRecordError)
+
       nil
     end
 

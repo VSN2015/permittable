@@ -588,6 +588,18 @@ RSpec.describe Permittable::Generator do
         allow(GenUnreachable).to receive(:columns).and_raise(ActiveRecord::StatementInvalid, "no such table")
         expect(described_class.draft(model: GenUnreachable)).to be_nil
       end
+
+      it "lets a real bug from schema access propagate instead of drafting an empty contract" do
+        # Same rescue scope as ColumnGuard.schema_reachable?: only
+        # ActiveRecord::ActiveRecordError is swallowed (a genuinely
+        # unreachable schema). Anything else — a broken custom type
+        # adapter, a real app bug — must surface loudly rather than
+        # quietly falling back to "no columns".
+        stub_const("GenMisconfigured", Class.new(TestModel) { self.table_name = "gen_vehicles" })
+        allow(GenMisconfigured).to receive(:columns).and_raise(NoMethodError, "undefined method `type' for nil")
+        expect { described_class.draft(model: GenMisconfigured) }
+          .to raise_error(NoMethodError, /undefined method `type'/)
+      end
     end
 
     context "with STI and optimistic locking" do
