@@ -607,6 +607,25 @@ RSpec.describe Permittable::OpenAPI do
         expect(description).to include(code)
       end
     end
+
+    # ERROR_SCHEMA/PROBLEM_SCHEMA are frozen, but only shallowly (Ruby's
+    # #freeze never recurses), so a caller mutating a nested level of a
+    # document's components — an easy mistake, since the rest of the
+    # document is caller-owned data — was silently corrupting the shared
+    # constant itself, for every document generated for the rest of the
+    # process.
+    it "hands out an independent copy of the error schema, not the frozen constant by reference" do
+      klass = controller_class { permit_params(:create) { required :name, :string } }
+      doc = described_class.document(controllers: [klass])
+      message_schema = doc["components"]["schemas"]["PermittableInvalidParameters"]["properties"]["error"]["properties"]["message"]
+
+      expect { message_schema["description"] = "MUTATED" }.not_to raise_error
+
+      fresh = described_class.document(controllers: [klass])
+      fresh_message_schema = fresh["components"]["schemas"]["PermittableInvalidParameters"]["properties"]["error"]["properties"]["message"]
+      expect(fresh_message_schema).not_to have_key("description")
+      expect(described_class::ERROR_SCHEMA["properties"]["error"]["properties"]["message"]).not_to have_key("description")
+    end
   end
 
   describe "the golden document" do
