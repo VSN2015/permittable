@@ -484,6 +484,29 @@ RSpec.describe Permittable::Generator do
         expect(violations(klass, { gen_odd_enum: { "first-status" => "ajar" } }, action: "update"))
           .to eq([{ param: "gen_odd_enum.first-status", code: "inclusion" }])
       end
+
+      it "reaches an enum whose pluralized accessor the model does not answer to, so the draft loads" do
+        stub_const("GenOrderNoReader", Class.new(TestModel) do
+          self.table_name = "gen_orders"
+          if ActiveRecord.version >= Gem::Version.new("7.0")
+            enum :status, { pending: 0, shipped: 1 }
+          else
+            enum status: { pending: 0, shipped: 1 }
+          end
+          # Simulate an accessor renamed or excluded out from under the enum:
+          # "statuses" matches the identifier regex, but the model no longer
+          # responds to it.
+          singleton_class.send(:undef_method, :statuses)
+        end)
+
+        draft = described_class.draft(model: GenOrderNoReader)
+        expect(draft).to include('optional :status, :string, in: GenOrderNoReader.defined_enums["status"].keys')
+
+        klass = load_draft(draft)
+        expect(violations(klass, { gen_order_no_reader: { status: "shipped" } }, action: "update")).to eq([])
+        expect(violations(klass, { gen_order_no_reader: { status: "lost" } }, action: "update"))
+          .to eq([{ param: "gen_order_no_reader.status", code: "inclusion" }])
+      end
     end
 
     context "with defaults the model declares rather than the database" do

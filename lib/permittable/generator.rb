@@ -507,7 +507,11 @@ module Permittable
     # can be CALLED as `Model.name`: a `first-status` enum's
     # `Order.first-statuses.keys` parses as `Order.first - statuses.keys`,
     # which runs a query when the draft loads. defined_enums reaches the
-    # same mapping by name.
+    # same mapping by name. The model is also checked for the accessor
+    # itself (mirrors ColumnGuard.enum_keys_expr): a name can pluralize to a
+    # valid identifier that the model does not actually answer to — renamed
+    # or otherwise excluded — and calling it would raise NoMethodError when
+    # the draft loads.
     def enum_for(model, name)
       return nil unless model.respond_to?(:defined_enums)
 
@@ -515,7 +519,11 @@ module Permittable
       return nil unless mapping
 
       plural = name.pluralize
-      accessor = METHOD_NAME.match?(plural) ? "#{model.name}.#{plural}" : "#{model.name}.defined_enums[#{name.inspect}]"
+      accessor = if METHOD_NAME.match?(plural) && model.respond_to?(plural)
+                   "#{model.name}.#{plural}"
+                 else
+                   "#{model.name}.defined_enums[#{name.inspect}]"
+                 end
       { mapping: mapping, accessor: accessor }
     end
 
