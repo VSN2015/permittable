@@ -196,5 +196,19 @@ RSpec.describe Permittable::FieldGroup do
       permittable_class { permit_params(:create) { use group } }
       expect(Permittable.filter_parameter_registry.include?("ssn")).to be(true)
     end
+
+    it "freezes a shared field's message: so mutating one contract's violation can't corrupt another's" do
+      group = Permittable.fields { required :age, :integer, message: { missing: "age please" } }
+      contract_a = Permittable::Contract.define { use group }
+      contract_b = Permittable::Contract.define { use group }
+
+      msg = contract_a.call({}).violations.first[:message]
+      expect(msg).to eq("age please")
+      expect { msg << " NOW" }.to raise_error(FrozenError)
+
+      msg_b = contract_b.call({}).violations.first[:message]
+      expect(msg_b).to eq("age please")
+      expect(msg_b).to equal(msg) # same shared object — proves it stayed intact, not just re-fetched
+    end
   end
 end
