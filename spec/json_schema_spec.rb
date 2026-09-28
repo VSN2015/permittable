@@ -509,6 +509,17 @@ RSpec.describe Permittable::JsonSchema do
       expect(props["tags"]["x-permittable-transformed"]).to be(true)
     end
 
+    it "omits default:/example: from a sensitive: field, which is otherwise the one output channel meant for sharing" do
+      prop = property("ssn") { optional :ssn, :string, sensitive: true, default: "000-00-0000", example: "078-05-1120" }
+      expect(prop).to eq("type" => "string", "writeOnly" => true, "x-permittable-sensitive" => true)
+      expect(prop).not_to have_key("default")
+      expect(prop).not_to have_key("examples")
+
+      # The non-sensitive case is unaffected.
+      plain = property("note") { optional :note, :string, default: "n/a", example: "reviewed" }
+      expect(plain).to include("default" => "n/a", "examples" => ["reviewed"])
+    end
+
     it "exports normalize: as x-permittable-normalize — the preset's name, or true for a custom proc" do
       # The server checks the NORMALIZED value, so minLength/maxLength/pattern
       # describe a string the client never sends. The step is not a keyword
@@ -591,12 +602,21 @@ RSpec.describe Permittable::JsonSchema do
 
     it "annotates it like any other field" do
       schema = property("metadata") do
+        optional :metadata, :json, desc: "Opaque client state", default: { "seeded" => true }, example: { "k" => "v" }
+      end
+      expect(schema).to include("type" => "object", "description" => "Opaque client state",
+                                "default" => { "seeded" => true }, "examples" => [{ "k" => "v" }])
+    end
+
+    it "omits default:/example: — like any other field kind — when it is also sensitive:" do
+      schema = property("metadata") do
         optional :metadata, :json, desc: "Opaque client state", sensitive: true,
                                    default: { "seeded" => true }, example: { "k" => "v" }
       end
       expect(schema).to include("type" => "object", "description" => "Opaque client state",
-                                "writeOnly" => true, "x-permittable-sensitive" => true,
-                                "default" => { "seeded" => true }, "examples" => [{ "k" => "v" }])
+                                "writeOnly" => true, "x-permittable-sensitive" => true)
+      expect(schema).not_to have_key("default")
+      expect(schema).not_to have_key("examples")
     end
 
     it "adds null to a nullable opaque object" do

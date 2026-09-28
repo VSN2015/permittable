@@ -343,10 +343,22 @@ module Permittable
     # (silently changing a value outside any :decimal schema's justification)
     # or coerced through Float, where a non-finite BigDecimal (Infinity, NaN)
     # would crash JSON.generate.
+    #
+    # A `sensitive:` field's `default:`/`example:` are OMITTED rather than
+    # published: this exported document is the one channel meant to leave
+    # the app (client-generator tooling, a public docs endpoint), unlike the
+    # request log a `sensitive:` value is otherwise only redacted from, so
+    # shipping the real value here would defeat the redaction entirely.
+    # Omitting — rather than a placeholder string — matches how every other
+    # untranslatable or opaque fact in this file is handled: left out, with
+    # the `x-permittable-*` extension (here, `writeOnly`/`x-permittable-
+    # sensitive`) as the only signal that something is missing.
     def annotate(schema, field)
       decimal_mode = field[:kind] == JSON_TYPE ? :string : :number
-      schema["default"] = json_value(field[:default], decimal: decimal_mode) if field.key?(:default)
-      schema["examples"] = [json_value(field[:example], decimal: decimal_mode)] if field.key?(:example)
+      unless field[:sensitive]
+        schema["default"] = json_value(field[:default], decimal: decimal_mode) if field.key?(:default)
+        schema["examples"] = [json_value(field[:example], decimal: decimal_mode)] if field.key?(:example)
+      end
       schema["description"] = field[:desc] if field[:desc]
       if field[:sensitive]
         schema["writeOnly"] = true
