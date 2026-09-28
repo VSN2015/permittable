@@ -114,8 +114,14 @@ module Permittable
       schema
     end
 
+    # deep_dup, not dup: SCALAR_SCHEMAS entries like :decimal nest a live Array
+    # ("type" => %w[string number]) inside the frozen top-level Hash. .freeze
+    # is shallow, so a shallow .dup here would hand every :decimal field's
+    # exported schema the SAME Array — nullify! appending "null" to one
+    # field's "type" would then mutate the shared constant, misdocumenting
+    # every :decimal field exported afterward in the process as nullable.
     def scalar_schema(field)
-      schema = SCALAR_SCHEMAS.fetch(field[:type]).dup
+      schema = SCALAR_SCHEMAS.fetch(field[:type]).deep_dup
       apply_format_name!(schema, field)
       apply_in!(schema, field)
       apply_string_bounds!(schema, field)
@@ -151,7 +157,11 @@ module Permittable
       min, max = length_bounds(field[:length])
       schema["minItems"] = min if min
       schema["maxItems"] = max if max
-      schema["items"] = field[:fields] ? object(field[:fields], unknown: unknown) : SCALAR_SCHEMAS.fetch(field[:of]).dup
+      # deep_dup here for the same reason as scalar_schema: a scalar `of:`
+      # otherwise hands every array field the SAME nested Array/Hash from
+      # SCALAR_SCHEMAS.
+      schema["items"] =
+        field[:fields] ? object(field[:fields], unknown: unknown) : SCALAR_SCHEMAS.fetch(field[:of]).deep_dup
       schema
     end
 
