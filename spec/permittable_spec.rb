@@ -1532,6 +1532,21 @@ RSpec.describe Permittable do
       expect(calls).to be_empty
     end
 
+    it "runs a sub-field's own transform: over an array default:, matching an equivalent explicit request" do
+      klass = permittable_class do
+        permit_params(:create) do
+          array :line_items, default: [{ "price" => "10.00" }] do
+            optional :price, :decimal, transform: ->(v) { v * 100 }
+          end
+        end
+      end
+      defaulted = controller(klass).permitted_params
+      sent = controller(klass, params: { line_items: [{ price: "10.00" }] }).permitted_params
+
+      expect(defaulted[:line_items].map(&:to_h)).to eq([{ "price" => BigDecimal("1000") }])
+      expect(defaulted).to eq(sent)
+    end
+
     it "casts an authored example: the same way, so docs publish the value a request would carry" do
       klass = permittable_class do
         permit_params(:create) do
