@@ -2357,7 +2357,10 @@ module Permittable
 
     declared = fields.map { |f| f[:name].to_s }
     extra = hash.keys.map(&:to_s) - declared
-    extra -= UNCHECKED_TOP_LEVEL_KEYS + permittable_request_supplied_keys if top_level
+    if top_level
+      extra -= UNCHECKED_TOP_LEVEL_KEYS + permittable_request_supplied_keys
+      extra -= [permittable_configured_csrf_key].compact
+    end
     return if extra.empty?
 
     if unknown == :error
@@ -2380,6 +2383,25 @@ module Permittable
     return [] unless respond_to?(:request) && request.respond_to?(:path_parameters)
 
     request.path_parameters.keys.map(&:to_s)
+  end
+
+  # FORM_KEYS bakes in "authenticity_token" — Rails' DEFAULT CSRF parameter
+  # name — but `config.action_controller.request_forgery_protection_token`
+  # lets an app rename it, and an app that does trips `unknown: :error` on
+  # every ordinary form submission: exactly the bug FORM_KEYS exists to
+  # prevent, just spelled with the app's own key instead of the default one.
+  # The configured name isn't knowable at class-load time (it can vary per
+  # controller, and Rails may not have finished initializing yet), so it's
+  # read fresh here off the live controller instead of folded into a frozen
+  # constant. `request_forgery_protection_token` comes from
+  # ActionController::RequestForgeryProtection, included by ActionController
+  # ::Base; a plain params duck or a standalone Contract has no such method
+  # and exempts nothing beyond FORM_KEYS's own "authenticity_token".
+  def permittable_configured_csrf_key
+    return nil unless respond_to?(:request_forgery_protection_token)
+
+    token = request_forgery_protection_token
+    token && token.to_s
   end
 
   # A rootless contract's input without ParamsWrapper's copy of the body,
