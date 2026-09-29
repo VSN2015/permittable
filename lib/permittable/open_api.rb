@@ -115,8 +115,16 @@ module Permittable
       Permittable.error_format == :problem
     end
 
+    # ERROR_SCHEMA/PROBLEM_SCHEMA are frozen, but `.freeze` is shallow — only
+    # the top-level Hash is frozen, not the Hashes nested inside it — so
+    # handing either constant out by reference let a caller mutate a nested
+    # level of ITS document and permanently corrupt the shared constant for
+    # every document generated for the rest of the process. `deep_dup` (the
+    # same ActiveSupport helper the contract registry uses to copy authored
+    # default:/example: values before freezing, see permittable.rb) gives
+    # every caller its own independent copy instead.
     def error_schema
-      problem_format? ? PROBLEM_SCHEMA : ERROR_SCHEMA
+      (problem_format? ? PROBLEM_SCHEMA : ERROR_SCHEMA).deep_dup
     end
 
     def error_media_type
