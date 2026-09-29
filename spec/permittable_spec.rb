@@ -2303,6 +2303,30 @@ RSpec.describe Permittable do
 
         expect(seen).to eq(["ssn"])
       end
+
+      it "reads sensitive_parameter_sinks under the same mutex on_sensitive_parameter appends under" do
+        # on_sensitive_parameter's `<<` is guarded by @registry_mutex. On MRI
+        # the GVL papers over an unguarded reader racing that append, but on
+        # JRuby/TruffleRuby (real Rails deployment targets) a class-loading
+        # `sensitive: true` contract reading the Array concurrently with a
+        # sink being installed is an unsynchronized concurrent mutation during
+        # iteration. Rather than try to force that timing-dependent failure,
+        # assert the invariant that rules it out: every read of
+        # sensitive_parameter_sinks happens while @registry_mutex is held,
+        # exactly like the append does.
+        mutex = Permittable.instance_variable_get(:@registry_mutex)
+        Permittable.filter_parameter_registry # pre-warm: its own lazy-init locking would otherwise confound the reads we're recording below
+        lock_states = []
+        allow(Permittable).to receive(:sensitive_parameter_sinks).and_wrap_original do |original, *args|
+          lock_states << mutex.locked?
+          original.call(*args)
+        end
+
+        permittable_class { permit_params(:create) { optional :sink_race_probe, :string, sensitive: true } }
+
+        expect(lock_states).not_to be_empty
+        expect(lock_states).to all(be(true))
+      end
     end
 
     describe "the filter proc the Railtie appends" do

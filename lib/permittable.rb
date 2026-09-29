@@ -403,7 +403,14 @@ module Permittable
       # replay of #names — otherwise a sink deduplicating by value would hold
       # both :ssn and "ssn".
       name = name.to_s.downcase
-      sensitive_parameter_sinks.each { |sink| sink.call(name) } unless name.empty?
+      unless name.empty?
+        # sensitive_parameter_sinks is the same process-global Array
+        # on_sensitive_parameter appends to under @registry_mutex. Reading it
+        # here without that lock is an unsynchronized concurrent mutation
+        # during iteration on any Ruby without a GVL — a thread class-loading
+        # a sensitive: true contract can race a thread installing a sink.
+        @registry_mutex.synchronize { sensitive_parameter_sinks.dup }.each { |sink| sink.call(name) }
+      end
       nil
     end
 
