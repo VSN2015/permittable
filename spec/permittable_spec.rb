@@ -3650,6 +3650,26 @@ RSpec.describe Permittable do
       expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "rogue", "code" => "unknown" }])
     end
 
+    it "unknown: :error does not flag a CSRF param renamed via request_forgery_protection_token" do
+      controller = IntegrationHarness.build_controller do
+        self.request_forgery_protection_token = :csrf_token
+
+        include Permittable
+
+        permit_params :create, unknown: :error do
+          required :name, :string
+        end
+
+        def create
+          render json: permitted_params
+        end
+      end
+      result = IntegrationHarness.dispatch(controller, :create,
+                                           method: "POST", params: { name: "Jo", csrf_token: "tok" })
+      expect(result.status).to eq(200)
+      expect(JSON.parse(result.body)).to eq("name" => "Jo")
+    end
+
     describe "unknown: :error on a rootless contract, with a real request" do
       # `wrap:` names the wrapper key: a String, as Rails derives it from
       # controller_name, or a Symbol, as the Rails docs write
