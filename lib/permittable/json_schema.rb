@@ -114,12 +114,14 @@ module Permittable
       schema
     end
 
-    # deep_dup, not dup: SCALAR_SCHEMAS entries like :decimal nest a live Array
-    # ("type" => %w[string number]) inside the frozen top-level Hash. .freeze
-    # is shallow, so a shallow .dup here would hand every :decimal field's
-    # exported schema the SAME Array — nullify! appending "null" to one
-    # field's "type" would then mutate the shared constant, misdocumenting
-    # every :decimal field exported afterward in the process as nullable.
+    # deep_dup, not dup: .freeze is shallow, so the Array nested in an entry
+    # like :decimal ("type" => %w[string number]) stays live inside the frozen
+    # top-level Hash, and a shallow .dup would hand every :decimal field's
+    # exported schema that SAME Array. Nothing in this file mutates it in
+    # place (nullify! rebinds "type" to a new Array), but the exported
+    # document is caller-owned data, and a caller appending to it would
+    # otherwise silently rewrite the constant for every schema exported
+    # afterward in the process.
     def scalar_schema(field)
       schema = SCALAR_SCHEMAS.fetch(field[:type]).deep_dup
       apply_format_name!(schema, field)
