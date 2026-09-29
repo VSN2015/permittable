@@ -42,6 +42,19 @@ RSpec.describe Permittable::JsonSchema do
       expect(props["day"]).to eq("type" => "string", "format" => "date")
       expect(props["at"]).to eq("type" => "string", "format" => "date-time")
     end
+
+    it "deep-dups a SCALAR_SCHEMAS entry, so mutating one field's exported type array never leaks " \
+       "into the frozen constant or any other field's schema" do
+      type_array = property("d") { optional :d, :decimal }["type"]
+      expect(type_array).not_to equal(Permittable::JsonSchema::SCALAR_SCHEMAS[:decimal]["type"])
+
+      type_array << "null"
+
+      expect(Permittable::JsonSchema::SCALAR_SCHEMAS[:decimal]["type"]).to eq(%w[string number])
+      expect(property("d2") { optional :d2, :decimal }["type"]).to eq(%w[string number])
+    ensure
+      Permittable::JsonSchema::SCALAR_SCHEMAS[:decimal]["type"].delete("null")
+    end
   end
 
   describe "required and absence semantics" do
@@ -668,6 +681,19 @@ RSpec.describe Permittable::JsonSchema do
       items = schema["properties"]["line_items"]["items"]
       expect(items["required"]).to eq(%w[sku quantity])
       expect(items["properties"]["quantity"]).to include("minimum" => 1, "maximum" => 99)
+    end
+
+    it "deep-dups a SCALAR_SCHEMAS entry for `of:`, so mutating one array field's items type never leaks " \
+       "into the frozen constant or any other field's schema" do
+      items_type = property("ds") { array :ds, of: :decimal }["items"]["type"]
+      expect(items_type).not_to equal(Permittable::JsonSchema::SCALAR_SCHEMAS[:decimal]["type"])
+
+      items_type << "null"
+
+      expect(Permittable::JsonSchema::SCALAR_SCHEMAS[:decimal]["type"]).to eq(%w[string number])
+      expect(property("ds2") { array :ds2, of: :decimal }["items"]["type"]).to eq(%w[string number])
+    ensure
+      Permittable::JsonSchema::SCALAR_SCHEMAS[:decimal]["type"].delete("null")
     end
   end
 
