@@ -1580,8 +1580,10 @@ module Permittable
     # gets); with one, the array exactly AS AUTHORED — the walker still runs,
     # so a declaration mistake (an element `validate:` refuses, a sub-field
     # default out of bounds) still fails at class load, but its cast result
-    # is discarded rather than stored. `transform:` itself is deliberately
-    # never run on a default either way — see AuthoredValues.
+    # is discarded rather than stored. The array's OWN `transform:` is
+    # deliberately never run on a default either way; a SUB-FIELD's
+    # `transform:` still runs during that walk, so "the walker's read" above
+    # really is what an equivalent request produces — see AuthoredValues.
     def validate_array_authored_value!(field, opt)
       value = field[opt]
       return if authored_nil!(field, opt)
