@@ -1621,7 +1621,11 @@ module Permittable
     def validate_message!(field)
       spec = field[:message]
       return if spec.nil?
-      return if spec.is_a?(String)
+
+      if spec.is_a?(String)
+        field[:message] = freeze_authored(spec)
+        return
+      end
 
       valid_hash = spec.is_a?(Hash) && !spec.empty? &&
                    spec.all? { |code, text| (code.is_a?(Symbol) || code.is_a?(String)) && text.is_a?(String) }
@@ -1630,7 +1634,7 @@ module Permittable
                              "or a Hash of violation code => String (e.g. { missing: \"is required\" })"
       end
 
-      field[:message] = spec.transform_keys(&:to_sym).freeze
+      field[:message] = freeze_authored(spec.transform_keys(&:to_sym))
     end
   end
 
