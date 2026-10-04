@@ -195,7 +195,7 @@ Adopting on an existing API with live traffic? Skip ahead to [Adopting on a live
 - **[Adopting on a live API](#adopting-on-a-live-api)**
   - [Monitor mode](#monitor-mode-roll-out-without-rejecting)
   - [Generating draft contracts](#generating-draft-contracts-permittablegenerate)
-  - [Auditing coverage](#auditing-coverage-permittableaudit)
+  - [Auditing coverage](#auditing-coverage-permittableaudit) · [Ignoring controllers and actions](#ignoring-controllers-and-actions)
 - **[Beyond the controller](#beyond-the-controller)**
   - [Testing contracts](#testing-contracts-rspec-matchers)
   - [Standalone contracts](#standalone-contracts-no-controller)
@@ -832,6 +832,8 @@ bin/rails permittable:generate                      # every controller without a
 bin/rails "permittable:generate[UsersController]"   # one controller, even if covered
 ```
 
+The sweep skips what the audit [ignores](#ignoring-controllers-and-actions): controllers whose source is outside `Rails.root` (so ActiveStorage's direct uploads controller is not drafted), and anything in `Permittable.audit_ignore`. A `controller#action` entry leaves only that action out of the controller's draft. Naming a controller drafts it regardless, the same way it drafts a covered one.
+
 For each controller the task infers the model from `controller_name` (columns give types, NOT NULL gives `required`), scans the controller source for `params.require(...).permit(...)` and `params.expect(...)` calls (permitted keys give the field list and the `root:`), and prints a paste-ready draft:
 
 ```ruby
@@ -934,11 +936,60 @@ match "*path", to: ->(_env) { [404, { "content-type" => "text/plain" }, ["Not Fo
 
 A `config.exceptions_app = routes` setup (`match "/404", to: "errors#not_found", via: :all`) shows the same rows. It needs only `via: :get`, because on 6.1 and later `ShowExceptions` re-dispatches the error request as a GET.
 
-Under `[strict]` the task aborts on these rows, so the only choices today are to route the catch-all GET-only, as above, or to run the audit without `[strict]` until the ignore list ([#69](https://github.com/VSN2015/permittable/issues/69)) lands. Don't declare a contract on the catch-all to silence the gate. Under monitor mode it validates eagerly, so a malformed JSON POST answers 400 instead of 404. The OpenAPI export would also gain a fake `/{path}` endpoint.
+Under `[strict]` the task aborts on these rows. Either route the catch-all GET-only, as above, or add `application#not_found` to the [ignore list](#ignoring-controllers-and-actions). Don't declare a contract on the catch-all to silence the gate. Under monitor mode it validates eagerly, so a malformed JSON POST answers 400 instead of 404. The OpenAPI export would also gain a fake `/{path}` endpoint.
 
 The table lists a row for every verb on every path; the summary counts routes. A route with an optional segment, such as anything under `scope "(:locale)"`, lists each path it expands to (`/users` and `/{locale}/users`), but it is one route, so one unguarded `POST` counts once and the summary line says `N routed actions in M rows`. Rows are collapsed by controller, action, route index and verb; the index is a position within one `rails_routes` call, so audit concatenated route lists (an app's and an engine's) separately, or give them distinct `route:` values. Two separate routes to the same action (`post "/users"` and `post "/admin/users"`) count as two, because each one is a way in.
 
-Controllers that never included `Permittable` are audited too — those are the ones worth finding. Everything is plain Ruby over the frozen registry plus route descriptors, so `Permittable::Audit.entries(controllers:, routes:)` works without Rails.
+Controllers that never included `Permittable` are audited too — those are the ones worth finding. Everything is plain Ruby over the frozen registry plus route descriptors, so `Permittable::Audit.entries(controllers:, routes:)` works without Rails. It takes `ignore:` and `root:` too, which default to `Permittable.audit_ignore` and `Rails.root` (see below).
+
+#### Ignoring controllers and actions
+
+Some routed endpoints are not yours to guard. Two are common enough to fail almost every `[strict]` run: ActiveStorage's direct uploads controller (a `POST` with no contract), and the catch-all 404 above, whose `via: :all` adds `POST`, `PUT` and `PATCH` rows. List them in an initializer:
+
+```ruby
+# config/initializers/permittable.rb
+Permittable.audit_ignore = [
+  "active_storage/direct_uploads", # every action of the controller
+  "application#not_found"          # one action, on every verb it is routed on
+]
+```
+
+An entry is a controller path the way Rails routes it (the controller half of `bin/rails routes`, such as `admin/users`), or `controller#action`. Entries must be strings, checked when you assign the list:
+
+- A class name raises `ArgumentError` naming the path you meant: `"ActiveStorage::DirectUploadsController"` → did you mean `"active_storage/direct_uploads"`?
+- A class raises too. Naming one in an initializer would autoload the controller during boot, which Zeitwerk refuses for a reloadable controller.
+- A `Regexp` raises. A pattern would also ignore controllers added after it, and catching a new unguarded endpoint is the point of the gate.
+
+Assign the whole list. It is frozen, so add to it with `Permittable.audit_ignore += ["webhooks#receive"]`, which is validated too.
+
+**Controllers outside `Rails.root` are ignored by default.** These are engines and gems: ActiveStorage, ActionMailbox, Devise, and Rails' own `rails/*` controllers. An app can't keep a contract in a gem's controller. The audit locates a controller by the file that defines its class (`Module#const_source_location`). A gem installed inside the app still counts as a gem; `bundle config path vendor/bundle` does this, and so do CI caches. A controller whose source can't be located is audited. To audit gem controllers like your own:
+
+```ruby
+Permittable.audit_ignore_outside_root = false
+```
+
+That default already covers ActiveStorage. Naming it, as above, keeps it ignored if you turn the default off. To put a gem's endpoint under the gate, subclass its controller in `app/controllers` (for Devise, `devise_for :users, controllers: { sessions: "users/sessions" }`). The subclass is the app's, so it is audited.
+
+Ignored endpoints leave the counts and never fail `[strict]`, but they stay in the report. Each reason gets its own section, with one line per action and the verbs it is routed on. An entry that matches no routed action (a typo, or a route since removed) is listed as well. Otherwise a typo would ignore nothing, and nothing would say so. With the initializer above plus a mistyped `"admin/report"`, the end of the report reads:
+
+```
+Ignored by Permittable.audit_ignore (left out of the counts above):
+  active_storage/direct_uploads#create  POST
+  application#not_found                 DELETE, GET, PATCH, POST, PUT
+
+Ignored as outside the app root (set Permittable.audit_ignore_outside_root = false to audit them):
+  active_storage/blobs/redirect#show  GET
+  active_storage/disk#show            GET
+  active_storage/disk#update          PUT
+  rails/health#show                   GET
+
+Permittable.audit_ignore entries that match no routed action (a typo, or a route since removed?):
+  admin/report
+```
+
+An unmatched entry is reported, not failed: a mistyped `application#not_foud` leaves the catch-all's rows in the count, so `[strict]` fails on those, and this list says why.
+
+`permittable:generate` honours the same list (see [generating draft contracts](#generating-draft-contracts-permittablegenerate)).
 
 ---
 
@@ -1144,12 +1195,14 @@ A `format:` regexp that does not translate to ECMA-262 is looser in the same way
 | `Permittable.error_format` / `=` | `:envelope` (default) or `:problem` — see [RFC 9457 problem+json](#rfc-9457-problemjson) |
 | `Permittable.problem_base_uri` / `=` | Base URI for problem `type` members |
 | `Permittable.check_column_types` / `=` | Opt in to the [type half of the drift guard](#checking-types-too-opt-in) (default `false`) |
+| `Permittable.audit_ignore` / `=` | Controller paths and `controller#action` strings the audit and the generator [leave out](#ignoring-controllers-and-actions) (default `[]`) |
+| `Permittable.audit_ignore_outside_root` / `=` | Also leave out controllers whose source is outside `Rails.root` (default `true`) |
 | `Permittable.fields(&block)` | A reusable [field group](#reusing-fields-permittablefields-and-use) — splice it into a contract with `use` |
 | `Permittable::InvalidParameters` | Raised on violation; carries `#details` and `#status` |
 | `Permittable::JsonSchema` | Contract data → JSON Schema fragments (`.rule`, `.object`, `.field`) |
 | `Permittable::OpenAPI` | OpenAPI 3.1 assembly (`.document`, `.operations_for`, `.request_body_for`, `.components`) |
-| `Permittable::Generator` | Contract drafting (`.draft`, `.for_controller`, `.scan`) — see [generating draft contracts](#generating-draft-contracts-permittablegenerate) |
-| `Permittable::Audit` | Coverage across the route set (`.entries`, `.summary`, `.stale`, `.format`) — see [auditing coverage](#auditing-coverage-permittableaudit) |
+| `Permittable::Generator` | Contract drafting (`.draft`, `.for_controller`, `.scan`, `.targets`) — see [generating draft contracts](#generating-draft-contracts-permittablegenerate) |
+| `Permittable::Audit` | Coverage across the route set (`.entries`, `.summary`, `.stale`, `.format`, `.ignore_reason`, `.unmatched_ignores`) — see [auditing coverage](#auditing-coverage-permittableaudit) |
 | `Permittable::Contract` | [Standalone contracts](#standalone-contracts-no-controller) (`.define`, `#call`, `#call!`, `#json_schema`, `#rule`, `#fields`) |
 | `Permittable::FieldGroup` | A [reusable field list](#reusing-fields-permittablefields-and-use) (`#fields`, `#names`) — built by `Permittable.fields` |
 | `Permittable::Matchers` | RSpec matchers via `require "permittable/rspec"` — `permit_param` for the declaration, `accept_params`/`reject_params` for the behaviour. See [testing contracts](#testing-contracts-rspec-matchers) |

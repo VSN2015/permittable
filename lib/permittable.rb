@@ -218,6 +218,10 @@ module Permittable
   UNKNOWN_MODES = %i[ignore log error].freeze
   MODES = %i[enforce monitor].freeze
   ERROR_FORMATS = %i[envelope problem].freeze
+  # A Permittable.audit_ignore entry: a controller path the way Rails names
+  # it (lowercase, `/`-separated — "active_storage/direct_uploads"),
+  # optionally followed by "#action".
+  AUDIT_IGNORE_ENTRY = %r{\A[a-z0-9_]+(?:/[a-z0-9_]+)*(?:#\w+)?\z}
   # Rails merges routing bookkeeping into params; a top-level (root: false)
   # unknown-keys check must not flag them.
   ROUTING_KEYS = %w[controller action format].freeze
@@ -512,6 +516,55 @@ module Permittable
       @check_column_types = value
     end
 
+    # Routed actions that `permittable:audit` leaves out of its counts and of
+    # `[strict]`, and that `permittable:generate` does not draft for — the
+    # endpoints that are not the app's to guard:
+    #
+    #   Permittable.audit_ignore = %w[active_storage/direct_uploads application#not_found]
+    #
+    # Each entry is a controller path as Rails routes it (every action of that
+    # controller) or "controller#action" (that one action, on every verb — a
+    # `via: :all` catch-all is one entry). Ignored actions are still listed,
+    # in a section of their own, and an entry that matches no routed action is
+    # listed too: an ignore list nothing checks would hide its own typos.
+    #
+    # Strings only, checked here. A class name is the likeliest mistake and
+    # the error names the path meant; a Class is refused because naming one
+    # in an initializer autoloads it at boot, which Zeitwerk refuses for a
+    # reloadable controller; a Regexp is refused because a pattern would also
+    # ignore controllers written AFTER it, and catching a new unguarded
+    # endpoint is what the gate is for. Validated as a whole before anything
+    # is stored, so a rejected list leaves the previous one in place. nil
+    # clears it.
+    def audit_ignore
+      @audit_ignore || [].freeze
+    end
+
+    def audit_ignore=(entries)
+      entries = Array(entries).map { |entry| audit_ignore_entry(entry) }
+      @audit_ignore = entries.uniq.freeze
+    end
+
+    # Whether the audit and the generator also leave out every controller
+    # whose source is outside Rails.root — engines and gems: ActiveStorage,
+    # ActionMailbox, Rails's own rails/* controllers. On by default, since an
+    # app cannot add a contract to a gem's controller; those are listed in
+    # the report under their own reason rather than dropped. Turn it off to
+    # audit them like the app's own:
+    #
+    #   Permittable.audit_ignore_outside_root = false
+    #
+    # See Audit.outside_root? for how a controller is located.
+    def audit_ignore_outside_root
+      @audit_ignore_outside_root.nil? || @audit_ignore_outside_root
+    end
+
+    def audit_ignore_outside_root=(value)
+      raise ArgumentError, "#{LABEL}: audit_ignore_outside_root must be true or false" unless [true, false].include?(value)
+
+      @audit_ignore_outside_root = value
+    end
+
     # App-wide fallback copy for a violation code, looked up through I18n
     # under permittable.errors.<code> ("missing", "inclusion", or any Symbol
     # a validate: returned). Consulted only when the field declares no
@@ -525,6 +578,24 @@ module Permittable
 
       message = ::I18n.t("permittable.errors.#{code}", default: nil)
       message.is_a?(String) ? message : nil
+    end
+
+    private
+
+    # One audit_ignore entry, frozen, or an ArgumentError that says what an
+    # entry looks like — and, for a class or a class name, which path it
+    # meant: `ActiveStorage::DirectUploadsController` is the path
+    # "active_storage/direct_uploads", the same derivation Rails's own
+    # controller_path makes.
+    def audit_ignore_entry(entry)
+      return entry.dup.freeze if entry.is_a?(String) && AUDIT_IGNORE_ENTRY.match?(entry)
+
+      meant = entry.controller_path if entry.is_a?(Class) && entry.respond_to?(:controller_path)
+      meant ||= entry.underscore.delete_suffix("_controller") if entry.is_a?(String) && entry.match?(/\A[A-Z]\w*(::[A-Z]\w*)*\z/)
+      raise ArgumentError,
+            "#{LABEL}: audit_ignore takes controller paths as Rails routes them (\"active_storage/direct_uploads\") " \
+            "or \"controller#action\" (\"application#not_found\"), got #{entry.inspect}" \
+            "#{" — did you mean #{meant.inspect}?" if meant}"
     end
   end
 
