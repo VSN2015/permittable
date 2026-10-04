@@ -541,7 +541,8 @@ RSpec.describe Permittable::Audit do
         expect(table).not_to include("legacy")
         expect(table).not_to include("webhooks")
         expect(report).to include("4 routed actions: 1 enforced, 1 in monitor mode, 2 without a contract")
-        expect(report).to include("1 of those accept a request body")
+        expect(described_class.summary(found)[:uncovered_with_body]).to eq(1)
+        expect(report).to match(/1 of those accepts? a request body/)
       end
 
       it "still reports when every routed action is ignored" do

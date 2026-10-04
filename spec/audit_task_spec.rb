@@ -58,6 +58,9 @@ RSpec.describe "permittable:audit and permittable:generate with an ignore list",
   RUBY
 
   AUDIT_TASK_SCRIPT = <<~RUBY.freeze
+    # Before rails, for the reason lib/permittable.rb gives: activesupport
+    # <= 7.0.8.4 raises NameError on load unless logger is already loaded.
+    require "logger"
     require "json"
     require "stringio"
     require "rails"
