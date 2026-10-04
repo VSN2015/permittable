@@ -3829,6 +3829,149 @@ RSpec.describe Permittable do
           "name" => "Jo", "rogue" => 1, "id" => "1", "user" => { "name" => "Jo", "rogue" => 1 }
         )
       end
+
+      # Rails' own stack puts ParamsWrapper in ActionController::Base, behind
+      # an ApplicationController's Permittable. A Metal controller that
+      # includes it in a subclass puts it IN FRONT, so its process_action
+      # wraps first — and a probe hooked on process_action then saw only the
+      # wrapped params, and every wrapped JSON request was a 422 again.
+      it "does not flag the copy when ParamsWrapper comes before Permittable in the ancestor chain" do
+        base = Class.new(ActionController::Metal) do
+          include Permittable
+
+          permit_params :create, unknown: :error do
+            required :name, :string
+          end
+
+          def create
+            self.content_type = "application/json"
+            self.response_body = JSON.generate(permitted_params)
+          rescue Permittable::InvalidParameters => e
+            self.status = 422
+            self.response_body = JSON.generate(e.details)
+          end
+        end
+        controller = Class.new(base) do
+          include ActionController::ParamsWrapper
+
+          wrap_parameters :user, format: [:json]
+        end
+        expect(controller.ancestors.index(ActionController::ParamsWrapper))
+          .to be < controller.ancestors.index(Permittable)
+
+        result = IntegrationHarness.dispatch(controller, :create, method: "POST", json: { name: "Jo" })
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)).to eq("name" => "Jo")
+
+        # A client's own `user` is still the client's in this order too.
+        result = IntegrationHarness.dispatch(controller, :create, method: "POST",
+                                                                  json: { name: "Jo", user: { admin: true } })
+        expect(result.status).to eq(422)
+        expect(JSON.parse(result.body)).to eq([{ "param" => "user", "code" => "unknown" }])
+      end
+
+      it "never turns the hook that records the wrapper key into an action" do
+        metal = Class.new(ActionController::Metal) { include Permittable }
+        expect(build_rootless_controller(wrap: "user") { optional :name, :string }.action_methods)
+          .not_to include("process")
+        expect(metal.action_methods).not_to include("process")
+      end
+
+      # The probe is a content-type lookup and a params read, and only a
+      # contract that reads its input without the copy acts on its answer.
+      # ParamsWrapper asks `_wrapper_enabled?` once itself, on every request,
+      # so any second ask is the probe's.
+      describe "probing the request for the wrapper's copy" do
+        def dispatch_counting_probes(controller, action, **request)
+          instance = controller.new
+          asked = 0
+          allow(instance).to receive(:_wrapper_enabled?).and_wrap_original do |original|
+            asked += 1
+            original.call
+          end
+          result = IntegrationHarness.dispatch(controller, action, instance: instance, **request)
+          [result, asked]
+        end
+
+        it "is skipped on a controller none of whose contracts would act on the answer" do
+          controller = IntegrationHarness.build_controller do
+            include Permittable
+
+            wrap_parameters :user, format: [:json]
+            permit_params(:create, root: :user, unknown: :error) { required :name, :string }
+            permit_params(:update, unknown: :ignore) { optional :name, :string }
+
+            def create
+              render json: permitted_params
+            end
+
+            def update
+              render json: permitted_params
+            end
+          end
+          result, asked = dispatch_counting_probes(controller, :create, method: "POST", json: { name: "Jo" })
+          expect(result.status).to eq(200)
+          expect(asked).to eq(1)
+
+          result, asked = dispatch_counting_probes(controller, :update, method: "PATCH", json: { name: "Jo" })
+          expect(result.status).to eq(200)
+          expect(JSON.parse(result.body)).to eq("name" => "Jo")
+          expect(asked).to eq(1)
+        end
+
+        # An unconfigured wrapper has no formats and so never wraps, and its
+        # options carry no controller to derive a name from: asking for its
+        # key raised, which ParamsWrapper itself never does with no formats.
+        it "is skipped when ParamsWrapper wraps no format, even for a contract that would act on it" do
+          controller = build_rootless_controller { optional :name, :string }
+          result, asked = dispatch_counting_probes(controller, :update, method: "PATCH", json: { name: "Jo" })
+          expect(result.status).to eq(200)
+          expect(JSON.parse(result.body)).to eq("name" => "Jo")
+          expect(asked).to eq(1)
+        end
+
+        it "runs when a rootless contract checks unknown keys" do
+          controller = build_rootless_controller(wrap: "user") { optional :name, :string }
+          result, asked = dispatch_counting_probes(controller, :update, method: "PATCH", json: { name: "Jo" })
+          expect(result.status).to eq(200)
+          expect(asked).to eq(2)
+        end
+
+        # The copy is dropped for a field of the wrapper's name whatever the
+        # unknown: mode, so ignoring unknown keys must not skip the probe.
+        it "runs for a scalar field named like the wrapper key under unknown: :ignore" do
+          controller = build_rootless_controller(wrap: "feedback", unknown: :ignore) do
+            optional :rating, :integer
+            optional :feedback, :string
+          end
+          result, asked = dispatch_counting_probes(controller, :update, method: "PATCH", json: { rating: 5 })
+          expect(result.status).to eq(200)
+          expect(JSON.parse(result.body)).to eq("rating" => 5)
+          expect(asked).to eq(2)
+        end
+
+        # permitted_params(:create) reads another action's contract, and by
+        # the time an action body runs ParamsWrapper has wrapped — too late to
+        # ask. So the gate is every contract on the controller, not only the
+        # one covering the action being processed.
+        it "runs for a contract read from another action than the one being processed" do
+          controller = IntegrationHarness.build_controller do
+            include Permittable
+
+            wrap_parameters :user, format: [:json]
+            permit_params(:create, unknown: :error) { required :name, :string }
+            permit_params(:update, root: :user) { required :name, :string }
+
+            def update
+              render json: permitted_params(:create)
+            end
+          end
+          result, asked = dispatch_counting_probes(controller, :update, method: "PATCH", json: { name: "Jo" })
+          expect(result.status).to eq(200)
+          expect(JSON.parse(result.body)).to eq("name" => "Jo")
+          expect(asked).to eq(2)
+        end
+      end
     end
 
     it "transform + finalize replace a params-mutating before_action end to end" do

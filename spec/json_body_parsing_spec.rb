@@ -51,4 +51,17 @@ RSpec.describe "A raw application/json request body" do
     expect { IntegrationHarness.dispatch(controller, :create, method: "POST", raw_json: '{"user":') }
       .to raise_error(ActionDispatch::Http::Parameters::ParseError) { |e| expect(e.cause).to be_a(JSON::ParserError) }
   end
+
+  it "is the harness's only body: alongside params: (or json: with raw_json:) the harness refuses the call" do
+    # Rack::MockRequest ignores :params once :input is set, and json: used to
+    # overwrite raw_json:, so either pair silently sent one body and dropped
+    # the other — a spec could pass without the request it describes.
+    form = { user: { name: "Form" } }
+    [{ params: form, json: { user: { name: "Jo" } } },
+     { params: form, raw_json: '{"user":{"name":"Jo"}}' },
+     { json: { user: { name: "Jo" } }, raw_json: '{"user":{"name":"Jo"}}' }].each do |bodies|
+      expect { IntegrationHarness.dispatch(controller, :create, method: "POST", **bodies) }
+        .to raise_error(ArgumentError, /one request body/)
+    end
+  end
 end
