@@ -105,8 +105,9 @@ RSpec.describe Permittable::Audit do
 
     # Rails dispatches a request to the first route matching its path and
     # verb. The audit reads the same descriptors as the export, so it lists
-    # each verb on a path under the one action Rails sends it to.
-    context "when an explicit route and a via: :all route share a path" do
+    # each verb on a path under the action Rails sends it to, and keeps every
+    # route a constraint could still pass a request on to.
+    context "when routes share a path and verb" do
       def descriptors(&draw)
         route_set = ActionDispatch::Routing::RouteSet.new
         route_set.draw(&draw)
@@ -140,6 +141,35 @@ RSpec.describe Permittable::Audit do
         expect(found.map(&:action).uniq).to eq(["receive"])
         expect(found.map(&:verb)).to contain_exactly("get", "post", "put", "patch", "delete")
         expect(described_class.stale(controllers: [webhooks], routes: routes)).to eq("webhooks" => ["index"])
+      end
+
+      # The audit is a gate, so a constrained route must never hide the one
+      # behind it: Rails sends every request the constraint turns away (here,
+      # every non-admin POST) to the uncovered action, and dropping that row
+      # would let `[strict]` pass over unguarded input.
+      it "keeps counting an uncovered route behind a constrained one on the same path" do
+        admin = Class.new { def self.matches?(_request) = true }
+        guarded = controller_class("admin/settings") { permit_params(:update) { optional :theme, :string } }
+        routes = descriptors do
+          constraints(admin) { post "settings", to: "admin/settings#update" }
+          post "settings", to: "settings#update"
+        end
+        found = described_class.entries(controllers: [guarded, bare_class("settings")], routes: routes)
+
+        expect(found.map { |e| [e.controller, e.covered?] }).to eq([["admin/settings", true], ["settings", false]])
+        expect(described_class.summary(found)).to include(actions: 2, uncovered_with_body: 1)
+      end
+
+      it "keeps a route behind a segment-constrained one reachable, so its contract is not stale" do
+        posts = controller_class("posts") { permit_params(:by_slug) { optional :preview, :boolean } }
+        routes = descriptors do
+          get "posts/:id", to: "posts#show", constraints: { id: /\d+/ }
+          get "posts/:id", to: "posts#by_slug"
+        end
+
+        expect(described_class.entries(controllers: [posts], routes: routes).map(&:action))
+          .to contain_exactly("show", "by_slug")
+        expect(described_class.stale(controllers: [posts], routes: routes)).to eq({})
       end
     end
 

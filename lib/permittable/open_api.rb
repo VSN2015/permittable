@@ -262,9 +262,10 @@ module Permittable
         # controller already claimed is not written over: the loser stays
         # visible under x-permittable-controllers, where an operation with no
         # route at all lands, rather than disappearing from the document.
-        # rails_routes already keeps one route per path and verb (see
-        # drop_shadowed), so only hand-built descriptors, or two route lists
-        # concatenated, reach this with a claimed slot.
+        # rails_routes already drops a route that an unconstrained one ahead
+        # of it answers (see drop_shadowed), so a claimed slot comes from a
+        # route behind a constrained one, from two route lists concatenated,
+        # or from hand-built descriptors.
         free = action == "*" ? [] : targets.fetch(owner, []).reject { |path, verb| paths.dig(path, verb) }
         if free.empty?
           holder = (unrouted[key] ||= {})
@@ -404,18 +405,31 @@ module Permittable
       end
     end
 
-    # Keeps, for each verb and concrete path, only the first route's
-    # descriptor (rails_routes calls it last). Journey sorts the routes
-    # matching a request by precedence, their position in the route set, and
-    # dispatches to the first. So with `get "hooks", to: "webhooks#index"`
-    # drawn ahead of `match "hooks", to: "webhooks#receive", via: :all`,
-    # GET /hooks is index's and receive answers only the other four verbs;
-    # drawn the other way round, index is never reached at all. Describing
-    # the later route anyway put a phantom `GET /hooks receive` row in the
-    # audit, and let the export hand that slot to whichever of the two
-    # operations it placed first. Both read their routes from rails_routes,
-    # so dropping it there keeps them in agreement with each other and with
-    # Rails. A route drawn twice folds into one the same way.
+    # Drops every descriptor for a verb and concrete path that an earlier,
+    # unconstrained route already answers (rails_routes calls it last).
+    # Journey sorts the routes matching a request by precedence, their
+    # position in the route set, and dispatches to the first. So with
+    # `get "hooks", to: "webhooks#index"` drawn ahead of
+    # `match "hooks", to: "webhooks#receive", via: :all`, GET /hooks is
+    # index's and receive answers only the other four verbs; drawn the other
+    # way round, index is never reached at all. Describing the later route
+    # anyway put a phantom `GET /hooks receive` row in the audit, and let the
+    # export hand that slot to whichever of the two operations it placed
+    # first. Both read their routes from rails_routes, so dropping it there
+    # keeps them in agreement with each other and with Rails. A route drawn
+    # twice folds into one the same way.
+    #
+    # Only a route that answers EVERY request for its path and verb hides
+    # the ones behind it (see unconditional?). A constrained route answers
+    # what its constraint lets through and passes the rest on, so with
+    # `constraints(AdminConstraint) { post "settings", ... }` ahead of
+    # `post "settings", to: "settings#update"`, every non-admin POST reaches
+    # settings#update. The audit is a gate, and a hidden route there is a
+    # false pass, so the conservative rule errs towards listing: a
+    # constrained route is described as before but never drops anything,
+    # even when its constraint happens to admit everything. In the export
+    # both routes may then claim one slot, and the second takes the existing
+    # fallback (see place_operations).
     #
     # Descriptors arrive in route order (then verb, then optional variant),
     # so the first one seen is the first route. Precedence is a property of
@@ -424,16 +438,48 @@ module Permittable
     # and a list concatenated from an app's and an engine's must not let one
     # shadow the other.
     #
-    # Known limits. Only identical templates are compared. A constraint
-    # (`id: /\d+/`, a subdomain, a lambda) can pass a URL on to a later route
-    # with the same template, and the descriptors cannot see it, so that
-    # later route is dropped. Templates that differ at all, even only in a
-    # variable's name, are both kept, so `users/:id` constrained to digits
-    # ahead of `users/:slug` lists both. And only controller routes shadow:
-    # a redirect or a Rack endpoint is not described at all, so a controller
+    # Two more limits, both towards listing more. Only identical templates
+    # are compared, so templates that differ at all, even only in a
+    # variable's name, are both kept. And only controller routes shadow: a
+    # redirect or a Rack endpoint is not described at all, so a controller
     # route behind one on the same path is still listed.
+    #
+    # `shadows:` is this method's input only; it is stripped from what it
+    # returns, so callers see the descriptor shape they always have.
     def drop_shadowed(descriptors)
-      descriptors.uniq { |descriptor| descriptor.values_at(:verb, :path) }
+      answered = Set.new
+      descriptors.each_with_object([]) do |descriptor, kept|
+        slot = descriptor.values_at(:verb, :path)
+        next if answered.include?(slot)
+
+        answered << slot if descriptor[:shadows]
+        kept << descriptor.except(:shadows)
+      end
+    end
+
+    # Rails's own non-greedy requirement on a glob segment (`*rest`), /.+?/
+    # on 6.1 and /.+?/m from 7.0. It narrows nothing.
+    GLOB_DEFAULTS = [/.+?/, /.+?/m].freeze
+
+    # Whether a route answers its path and verb for every request, so that no
+    # later route with the same template can be reached for them. Rails
+    # records a constraint in one of three places on the Journey route, the
+    # same on 6.1 and 8.1: a segment requirement (`id: /\d+/`, a
+    # `scope "(:locale)", locale: /en|fr/`) in `path.requirements`; a request
+    # constraint (subdomain, host) in `constraints`; and a constraint object
+    # or lambda, inline or from a `constraints(...)` block, as an app wrapped
+    # in Mapper::Constraints whose list is not empty. `defaults:` are not
+    # constraints and land in none of these. The glob default is not counted
+    # either (Journey::Route#requirements drops it the same way). A route
+    # that cannot answer these questions, such as a hand-built duck, counts
+    # as constrained: unsure, it hides nothing.
+    def unconditional?(route)
+      return false unless route.respond_to?(:constraints) && route.respond_to?(:app) &&
+                          route.path.respond_to?(:requirements)
+
+      wrapped = route.app.respond_to?(:constraints) ? route.app.constraints : []
+      route.constraints.empty? && wrapped.empty? &&
+        route.path.requirements.each_value.all? { |requirement| GLOB_DEFAULTS.include?(requirement) }
     end
 
     # What a `via: :all` route answers, in the "|"-joined form Journey uses
@@ -458,8 +504,9 @@ module Permittable
     # tell one route's expanded variants from a second route that happens to
     # reach the same action. The exporter ignores it.
     #
-    # A verb on a path that an earlier route already answers is left out:
-    # Rails never dispatches it to the later route (see drop_shadowed).
+    # A verb on a path that an earlier, unconstrained route already answers
+    # is left out: Rails never dispatches it to the later route (see
+    # drop_shadowed).
     def rails_routes(app)
       descriptors = app.routes.routes.each_with_index.flat_map do |route, index|
         requirements = route.requirements
@@ -472,12 +519,14 @@ module Permittable
         verb = ALL_VERBS if verb.empty?
 
         path = route.path.spec.to_s.sub("(.:format)", "").gsub(/[:*](\w+)/) { "{#{Regexp.last_match(1)}}" }
+        # Read once per route; drop_shadowed reads it, then strips it.
+        shadows = unconditional?(route)
         # One route can answer several verbs (`match via: [:patch, :put]`, and
         # the PATCH|PUT pair resources generates); documenting only the first
         # dropped the others from the export entirely.
         verb.split("|").map do |single|
           { controller: requirements[:controller], action: requirements[:action],
-            verb: single.downcase, path: path, route: index }
+            verb: single.downcase, path: path, route: index, shadows: shadows }
         end
       end
       expanded = descriptors.flat_map do |descriptor|

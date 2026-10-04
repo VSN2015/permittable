@@ -679,10 +679,50 @@ RSpec.describe Permittable::OpenAPI do
         )
       end
 
-      # Only identical templates are compared. A constraint can let a URL
-      # through to the second of two routes, and the descriptors cannot see
-      # it, so templates that differ (even only by a variable's name) are
-      # both kept rather than guessed at.
+      # A constrained route answers only what its constraint lets through and
+      # passes the rest on to the routes behind it, so it hides nothing.
+      # Hiding a reachable route would be a false pass in the audit gate.
+      it "keeps a route behind one with a segment constraint on the same template" do
+        app = rails_app do
+          get "posts/:id", to: "posts#show", constraints: { id: /\d+/ }
+          get "posts/:id", to: "posts#by_slug"
+        end
+        expect(described_class.rails_routes(app).map { |r| [r[:action], r[:path]] })
+          .to eq([%w[show /posts/{id}], %w[by_slug /posts/{id}]])
+      end
+
+      it "keeps a route behind one with a subdomain constraint" do
+        app = rails_app do
+          get "dashboard", to: "api/dashboards#show", constraints: { subdomain: "api" }
+          get "dashboard", to: "dashboards#show"
+        end
+        expect(described_class.rails_routes(app).map { |r| r[:controller] }).to eq(%w[api/dashboards dashboards])
+      end
+
+      it "keeps a route behind one wrapped in a constraint object or a lambda" do
+        admin = Class.new { def self.matches?(_request) = true }
+        app = rails_app do
+          constraints(admin) { post "settings", to: "admin/settings#update" }
+          post "settings", to: "settings#update", constraints: ->(_request) { true }
+          post "settings", to: "fallback#update"
+        end
+        expect(described_class.rails_routes(app).map { |r| r[:controller] })
+          .to eq(%w[admin/settings settings fallback])
+      end
+
+      # A glob always carries Rails's own non-greedy requirement, which
+      # narrows nothing: the glob route still answers every request it
+      # matches, and the duplicate behind it is never reached.
+      it "still lets an unconstrained glob route hide a duplicate behind it" do
+        app = rails_app do
+          get "files/*rest", to: "files#show"
+          get "files/*rest", to: "files#download"
+        end
+        expect(described_class.rails_routes(app).map { |r| r[:action] }).to eq(["show"])
+      end
+
+      # Only identical templates are compared. Templates that differ, even
+      # only in a variable's name, are both kept rather than guessed at.
       it "keeps both routes when their templates differ, even if one URL could reach either" do
         app = rails_app do
           get "users/:id", to: "users#show", constraints: { id: /\d+/ }
