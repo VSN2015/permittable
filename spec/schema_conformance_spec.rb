@@ -159,8 +159,17 @@ module SchemaConformance
       payloads: [[{ "code" => "abc" }, :agree], [{ "code" => "ab" }, :agree], [{ "code" => "abcd" }, :agree]]
     },
     "a format" => {
+      # \A and \z export as ECMA-262's ^ and $, which anchor the whole input
+      # just as the server's do, so a newline either side is rejected by both.
+      # (Read as Ruby, the exported ^ and $ would anchor a line and accept it.)
       contract: proc { optional :zip, :string, format: /\A\d{5}\z/ },
-      payloads: [[{ "zip" => "10000" }, :agree], [{ "zip" => "1000" }, :agree], [{ "zip" => "abcde" }, :agree]]
+      payloads: [
+        [{ "zip" => "10000" }, :agree],
+        [{ "zip" => "1000" }, :agree],
+        [{ "zip" => "abcde" }, :agree],
+        [{ "zip" => "10000\n" }, :agree],
+        [{ "zip" => "\n10000" }, :agree]
+      ]
     },
     "a nullable field, where an explicit null IS a value" => {
       # The counterpart to :null_is_absence — `nullable:` makes the null a

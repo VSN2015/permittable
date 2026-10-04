@@ -40,7 +40,7 @@ module EcmaPatternSpec
     verbose = $VERBOSE
     $VERBOSE = nil
     {
-      /\A\d{5}\z/ => %w[12345 1234],
+      /\A\d{5}\z/ => ["12345", "1234", "12345\n", "\n12345"], # rubocop:disable Style/WordArray -- the newlines are under test
       /\A\d{3}\-\d{4}\z/ => %w[555-1234 5551234],
       /\A[\w\-]+\z/ => ["a-b_c", "a b"],
       /\A[\-+]?\d+\z/ => %w[-1 +1 1 --1],
@@ -52,9 +52,9 @@ module EcmaPatternSpec
       /\A[\s\d]+\z/ => ["1 2", "1\u00a02"],
       /\A.+\z/ => ["abc", "a\rb", "a\u2028b", "a\u2029b", "a\nb"],
       /\A\\A\z/ => ["\\A", "A", ""],
-      /\A\\z\z/ => ["\\z", "z"],
+      /\A\\z\z/ => ["\\z", "z", "\\z\n"],
       /\A{\d}\z/ => ["{5}", "5"],
-      /\A\$\d+(?:\.\d{2})?\z/ => ["$5", "$5.00", "5"],
+      /\A\$\d+(?:\.\d{2})?\z/ => ["$5", "$5.00", "5", "$5\n"],
       %r{\Ahttps?://\S+\z} => ["https://a.b/c", "https://a\u00a0b"],
       /\A(?:foo|bar)\z/ => %w[foo bar baz],
       # Braced and built from a string: Ruby rewrites \u0041 to a bare A in
@@ -168,6 +168,20 @@ RSpec.describe "Exported patterns under ECMA-262's u flag" do
       expect(@verdicts[label]["results"]).to eq(ruby),
                                              "#{label} → #{schema['pattern'].inspect} disagrees with Ruby on #{samples.inspect}: " \
                                              "Ruby #{ruby.inspect}, ECMA-262 #{@verdicts[label]['results'].inspect}"
+    end
+  end
+
+  # schema_conformance_spec measures every exported schema with TinyJsonSchema,
+  # so the instrument has to read a pattern the way this engine does, not the
+  # way Ruby would (#48). Otherwise it reports a divergence the document does
+  # not contain, and reads a real one exactly as the server does, so it can
+  # never catch it.
+  it "exports patterns TinyJsonSchema reads exactly as ECMA-262 does" do
+    @cases.each do |label, (_, schema, samples)|
+      tiny = samples.map { |s| TinyJsonSchema.valid?({ "pattern" => schema["pattern"] }, s) }
+      expect(tiny).to eq(@verdicts[label]["results"]),
+                      "TinyJsonSchema reads #{schema['pattern'].inspect} (#{label}) differently from ECMA-262 on " \
+                      "#{samples.inspect}: TinyJsonSchema #{tiny.inspect}, ECMA-262 #{@verdicts[label]['results'].inspect}"
     end
   end
 end
