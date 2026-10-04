@@ -406,6 +406,97 @@ RSpec.describe Permittable::OpenAPI do
       end
     end
 
+    # OpenAPI forbids two path templates that differ only in variable names.
+    # One route's own variants were deduped, but two routes could still
+    # spell one URL shape two ways, and `scope "(:locale)"` makes that
+    # common: its root is `/{locale}` and its `get ":slug"` is `/{slug}`.
+    context "with routes whose templates differ only in variable names" do
+      def route_set_with(&draw)
+        ActionDispatch::Routing::RouteSet.new.tap { |route_set| route_set.draw(&draw) }
+      end
+
+      def routes_of(route_set)
+        described_class.rails_routes(Struct.new(:routes).new(route_set))
+      end
+
+      before do
+        stub_const("HomeController", Class.new(ActionController::Metal))
+        stub_const("PagesController", Class.new(ActionController::Metal))
+      end
+
+      let(:home) { controller_class(path: "home") { permit_params(:index) { optional :page, :integer } } }
+      let(:pages) do
+        controller_class(path: "pages") { permit_params(:show, :create) { optional :page, :integer } }
+      end
+
+      # pages is passed first: the route set, not the controller list,
+      # decides who Rails dispatches `GET /foo` to.
+      it "keeps the template Rails dispatches to and lists the route it shadows there" do
+        route_set = route_set_with do
+          scope("(:locale)") do
+            root to: "home#index"
+            get ":slug", to: "pages#show"
+          end
+        end
+        expect(route_set.recognize_path("/foo")).to eq(controller: "home", action: "index", locale: "foo")
+
+        doc = described_class.document(controllers: [pages, home], routes: routes_of(route_set))
+        expect(doc["paths"].keys).to contain_exactly("/", "/{locale}", "/{locale}/{slug}")
+        expect(doc["paths"]["/{locale}"]["get"]["x-permittable-shadows"])
+          .to eq([{ "path" => "/{slug}", "controller" => "pages", "action" => "show" }])
+      end
+
+      # A constraint on the earlier route makes the later one reachable for
+      # the values it rejects, but OpenAPI still holds one of the two.
+      it "still emits one template when a constraint lets the shadowed route through" do
+        route_set = route_set_with do
+          scope("(:locale)", locale: /en|fr/) do
+            root to: "home#index"
+            get ":slug", to: "pages#show"
+          end
+        end
+        expect(route_set.recognize_path("/en")).to eq(controller: "home", action: "index", locale: "en")
+        expect(route_set.recognize_path("/foo")).to eq(controller: "pages", action: "show", slug: "foo")
+
+        doc = described_class.document(controllers: [pages, home], routes: routes_of(route_set))
+        expect(doc["paths"].keys).to contain_exactly("/", "/{locale}", "/{locale}/{slug}")
+        expect(doc["paths"]["/{locale}"]["get"]["x-permittable-shadows"])
+          .to eq([{ "path" => "/{slug}", "controller" => "pages", "action" => "show" }])
+      end
+
+      # Rails picks a route by verb before it fills segments, so a POST to
+      # `/foo` is not shadowed by a GET root. It shares the path, under the
+      # spelling of the route Rails lists first, and keeps its own.
+      it "places another verb's route under the shared template, keeping its own spelling visible" do
+        route_set = route_set_with do
+          scope("(:locale)") do
+            root to: "home#index"
+            post ":slug", to: "pages#create"
+          end
+        end
+        expect(route_set.recognize_path("/foo", method: :post)).to eq(controller: "pages", action: "create", slug: "foo")
+
+        doc = described_class.document(controllers: [pages, home], routes: routes_of(route_set))
+        expect(doc["paths"].keys).to contain_exactly("/", "/{locale}", "/{locale}/{slug}")
+        create = doc["paths"]["/{locale}"]["post"]
+        expect(create["operationId"]).to eq("pages_create")
+        expect(create["x-permittable-path"]).to eq("/{slug}")
+        expect(create["parameters"].map { |parameter| parameter["name"] }).to eq(["locale"])
+        expect(doc["paths"]["/{locale}"]["get"]).not_to have_key("x-permittable-shadows")
+      end
+
+      it "collapses hand-built descriptors the same way, in the order they are given" do
+        doc = described_class.document(
+          controllers: [pages, home],
+          routes: [{ controller: "home", action: "index", verb: "get", path: "/{a}" },
+                   { controller: "pages", action: "show", verb: "get", path: "/{b}" }]
+        )
+        expect(doc["paths"].keys).to eq(["/{a}"])
+        expect(doc["paths"]["/{a}"]["get"]["operationId"]).to eq("home_index")
+        expect(doc["x-permittable-controllers"]["pages"]).to have_key("show")
+      end
+    end
+
     it "defaults info and omits x-permittable-controllers when everything is routed" do
       klass = controller_class { permit_params(:create) { required :name, :string } }
       doc = described_class.document(controllers: [klass],
@@ -416,6 +507,13 @@ RSpec.describe Permittable::OpenAPI do
   end
 
   describe ".rails_routes" do
+    # One GET route to e#v whose path.spec is `spec`, Journey-shaped.
+    def app_with_spec(spec)
+      path = Struct.new(:spec).new(spec)
+      route = Struct.new(:requirements, :verb, :path).new({ controller: "e", action: "v" }, "GET", path)
+      Struct.new(:routes).new(Struct.new(:routes).new([route]))
+    end
+
     it "extracts controller/action/verb/path descriptors from a Journey-shaped route set" do
       journey_route = Struct.new(:requirements, :verb, :path)
       journey_path = Struct.new(:spec)
@@ -520,9 +618,10 @@ RSpec.describe Permittable::OpenAPI do
         expect(described_class.rails_routes(app).map { |r| r[:path] }).to eq(["/", "/{locale}"])
       end
 
-      # `x(/:a)(/:b)` with one segment present is always matched as :a — the
-      # :b-only variant is the same URL shape under another name, and OpenAPI
-      # forbids two templates that differ only in their variable names.
+      # Unconstrained, `x(/:a)(/:b)` with one segment present is matched as
+      # :a — the :b-only variant is the same URL shape under another name,
+      # and OpenAPI forbids two templates that differ only in their variable
+      # names.
       it "drops a variant that coincides with one already emitted" do
         app = app_with { get "x(/:a)(/:b)", to: "x#y" }
         expect(described_class.rails_routes(app).map { |r| r[:path] })
@@ -564,6 +663,124 @@ RSpec.describe Permittable::OpenAPI do
             expect(declared).to all(include("required" => true))
           end
         end
+      end
+
+      # What Rails dispatches is the claim, so these ask the router first.
+      context "where Rails decides which variant a URL is" do
+        before { stub_const("XController", Class.new(ActionController::Metal)) }
+
+        def paths_of(app)
+          described_class.rails_routes(app).map { |r| r[:path] }
+        end
+
+        # With `a: /\d+/`, `/x/foo` fails :a and Rails binds it as :b, so the
+        # :b-only variant is a real URL. OpenAPI still holds one of the two
+        # templates; the one Rails tries first is kept, and the other is
+        # named on it rather than dropped without a trace.
+        it "lists a same-shape variant that a constraint keeps reachable on the variant Rails tries first" do
+          app = app_with { get "x(/:a)(/:b)", to: "x#y", constraints: { a: /\d+/ } }
+          expect(app.routes.recognize_path("/x/1")).to eq(controller: "x", action: "y", a: "1")
+          expect(app.routes.recognize_path("/x/foo")).to eq(controller: "x", action: "y", b: "foo")
+
+          descriptors = described_class.rails_routes(app)
+          expect(descriptors.map { |r| r[:path] }).to eq(["/x", "/x/{a}", "/x/{a}/{b}"])
+          expect(descriptors.to_h { |r| [r[:path], r[:shadows]] })
+            .to eq("/x" => nil, "/x/{a}" => ["/x/{b}"], "/x/{a}/{b}" => nil)
+
+          klass = controller_class(path: "x") { permit_params(:y) { optional :page, :integer } }
+          doc = described_class.document(controllers: [klass], routes: descriptors)
+          expect(doc["paths"]["/x/{a}"]["get"]["x-permittable-shadows"])
+            .to eq([{ "path" => "/x/{b}", "controller" => "x", "action" => "y" }])
+        end
+
+        it "lists nothing when the parameters' constraints cannot tell the variants apart" do
+          app = app_with { get "x(/:a)(/:b)", to: "x#y", constraints: { a: /\d+/, b: /\d+/ } }
+          expect(app.routes.recognize_path("/x/1")).to eq(controller: "x", action: "y", a: "1")
+          expect(described_class.rails_routes(app)).to all(satisfy { |r| !r.key?(:shadows) })
+        end
+
+        # `/x/new` is :a = "new" to Rails: an optional parameter ahead of an
+        # optional literal takes the literal's text, so the literal-only
+        # variant documented a URL that never reaches the action that way.
+        it "drops a literal variant that Rails binds to an earlier optional parameter" do
+          app = app_with { get "x(/:a)(/new)", to: "x#y" }
+          expect(app.routes.recognize_path("/x/new")).to eq(controller: "x", action: "y", a: "new")
+          expect(paths_of(app)).to eq(["/x", "/x/{a}", "/x/{a}/new"])
+        end
+
+        it "keeps that literal variant when the parameter's constraint rejects the literal" do
+          app = app_with { get "x(/:a)(/new)", to: "x#y", constraints: { a: /\d+/ } }
+          expect(app.routes.recognize_path("/x/new")).to eq(controller: "x", action: "y")
+          expect(paths_of(app)).to eq(["/x", "/x/new", "/x/{a}", "/x/{a}/new"])
+        end
+
+        # The literal first: Rails tries it before the parameter, so both
+        # variants are reachable and both are distinct OpenAPI templates.
+        it "keeps a literal variant that comes before the parameter" do
+          app = app_with { get "x(/new)(/:a)", to: "x#y" }
+          expect(app.routes.recognize_path("/x/new")).to eq(controller: "x", action: "y")
+          expect(app.routes.recognize_path("/x/foo")).to eq(controller: "x", action: "y", a: "foo")
+          expect(paths_of(app)).to eq(["/x", "/x/{a}", "/x/new", "/x/new/{a}"])
+        end
+      end
+
+      # Reading `route.path.spec.to_s` back as a string threw away what
+      # Journey had parsed: an escaped parenthesis is part of a literal in
+      # the tree, but prints as a bare one. Rails' own DSL escapes a
+      # backslash before parsing, so `get "esc\\(v\\)"` is a group to Rails
+      # too; the parser reaches the literal form for any route built from a
+      # Journey pattern directly.
+      it "reads an escaped parenthesis in the parsed route as a literal, not a group" do
+        app = app_with_spec(ActionDispatch::Journey::Parser.parse("/esc\\(v\\)(.:format)"))
+        expect(described_class.rails_routes(app).map { |r| r[:path] }).to eq(["/esc(v)"])
+      end
+
+      # The DSL escapes "|", so only a parsed pattern has one; Journey allows
+      # it only inside a group, which still may be absent.
+      it "reads an alternation in the parsed route as its alternatives, in order" do
+        app = app_with_spec(ActionDispatch::Journey::Parser.parse("/x/(a|b)(.:format)"))
+        expect(described_class.rails_routes(app).map { |r| r[:path] }).to eq(["/x/", "/x/b", "/x/a"])
+      end
+
+      it "templates a wildcard inside an optional group" do
+        app = app_with { get "files(/*path)", to: "files#show" }
+        expect(described_class.rails_routes(app).map { |r| r[:path] }).to eq(["/files", "/files/{path}"])
+      end
+
+      it "follows Rails' own reading of a backslash drawn through the DSL" do
+        stub_const("EController", Class.new(ActionController::Metal))
+        app = app_with { get "esc\\(v\\)", to: "e#v" }
+        expect(app.routes.recognize_path("/esc%5C")).to eq(controller: "e", action: "v")
+        expect(described_class.rails_routes(app).map { |r| r[:path] }).to eq(["/esc%5C", "/esc%5Cv%5C"])
+      end
+
+      # One route, two verbs: the variants are the same for both, so they are
+      # worked out once. The order is verb by verb, as before, because
+      # operationId numbering follows it.
+      it "expands each route once, before splitting it by verb" do
+        app = app_with { match "x(/:a)", to: "x#y", via: %i[patch put] }
+        expect(described_class).to receive(:optional_variants).once.and_call_original
+        expect(described_class.rails_routes(app).map { |r| [r[:verb], r[:path]] })
+          .to eq([%w[patch /x], %w[patch /x/{a}], %w[put /x], %w[put /x/{a}]])
+      end
+    end
+
+    # A Journey-shaped Struct may carry its spec as a plain string. It is
+    # read with Journey's escapes, and a parenthesis with no partner is an
+    # error rather than a silently truncated path.
+    context "with a spec given as a string" do
+      def paths_for(spec)
+        described_class.rails_routes(app_with_spec(spec)).map { |r| r[:path] }
+      end
+
+      it "expands groups and honours escaped parentheses" do
+        expect(paths_for("/a(/:b)(.:format)")).to eq(["/a", "/a/{b}"])
+        expect(paths_for("/esc\\(v\\)(.:format)")).to eq(["/esc(v)"])
+      end
+
+      it "refuses an unbalanced parenthesis instead of truncating the path" do
+        expect { paths_for("/un)matched(.:format)") }.to raise_error(ArgumentError, %r{/un\)matched})
+        expect { paths_for("/un(matched(.:format)") }.to raise_error(ArgumentError, %r{/un\(matched})
       end
     end
   end
