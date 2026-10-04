@@ -10,8 +10,9 @@ require "open3"
 # global state (Rails.application is a singleton, initializers run once) and
 # must not leak into the rest of the suite.
 RSpec.describe "Permittable::Railtie in a booted Rails application", :integration do
-  # The gem supports hosts with no Rails at all, and the compatibility gemfiles
-  # do not all carry railties, so skip rather than fail where it is absent.
+  # The gem supports hosts with no Rails at all, so skip rather than fail where
+  # railties is absent. Every gemfile in this repo does carry it, though, so a
+  # pending example here in CI means one has lost its railties pin.
   before(:all) do
     require "rails"
   rescue LoadError
@@ -19,6 +20,10 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
   end
 
   BOOT_SCRIPT = <<~RUBY.freeze
+    # Before rails, for the reason lib/permittable.rb gives: activesupport
+    # <= 7.0.8.4 raises NameError on load unless logger is already loaded. A
+    # real app on those versions needs this same line in config/boot.rb.
+    require "logger"
     require "json"
     require "tmpdir"
     require "rails"
@@ -111,6 +116,7 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
       # it the array carries no Regexp at all, so this is the signal that the
       # probe really is exercising the modern default.
       precompiled: filters.any? { |f| f.is_a?(Regexp) },
+      rails_version: Rails.gem_version.to_s,
       tasks: Rake::Task.tasks.map(&:name).grep(/^permittable:/).sort
     )
   RUBY
@@ -139,7 +145,11 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
     # Precompilation joins patterns by source but partitions procs out and
     # keeps them, so the count is still the assertion that the append is
     # idempotent across repeated initializer runs.
-    expect(boot["precompiled"]).to be(true), "the probe app is not exercising precompilation"
+    # precompile_filter_parameters arrived in Rails 7.1, so on 6.1 and 7.0
+    # there is no precompilation to survive; the count must hold regardless.
+    if Gem::Version.new(boot["rails_version"]) >= Gem::Version.new("7.1")
+      expect(boot["precompiled"]).to be(true), "the probe app is not exercising precompilation"
+    end
     expect(boot["procs"]).to eq(1)
   end
 

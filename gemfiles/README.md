@@ -3,7 +3,10 @@
 The gemspec advertises a range of ActiveSupport versions; these gemfiles are how
 that claim is tested rather than assumed. Each pins one `activesupport` line
 (plus the `actionpack` / `activerecord` that drive the integration and
-schema-drift specs, and the `sqlite3` that version of ActiveRecord accepts).
+schema-drift specs, the `railties` that boots a real app for the Railtie specs,
+and the `sqlite3` that version of ActiveRecord accepts). Don't drop `railties`:
+the Railtie specs skip rather than fail without it, so the job would stay green
+while no longer testing the `filter_parameters` wiring or the rake tasks.
 
 Run one locally:
 

@@ -177,7 +177,7 @@ DEPENDENCIES
   benchmark-ips (~> 2.13)
   json (< 3)
   permittable!
-  railties (>= 5.0, < 9)
+  railties (>= 6.1, < 9)
   rake
   rspec (~> 3.12)
   rubocop (~> 1.91)
