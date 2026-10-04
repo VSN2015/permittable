@@ -289,6 +289,76 @@ RSpec.describe Permittable::Audit do
       end
       expect(described_class.stale(controllers: [renamed], routes: routes)).to eq("users" => ["archive"])
     end
+
+    # permittable_contracts is a class_attribute, so a subclass carries every
+    # rule its parent declared. Judged one class at a time, a shared base
+    # (routed to nothing) and each subclass routed to a different slice of
+    # its actions all read as stale.
+    context "when subclasses inherit the contract" do
+      def subclass(parent, name)
+        Class.new(parent).tap { |klass| klass.define_singleton_method(:controller_path) { name } }
+      end
+
+      let(:base) do
+        controller_class("api/base") do
+          permit_params(:create) { required :a, :string }
+          permit_params(:update) { required :b, :string }
+        end
+      end
+      let(:accounts) { subclass(base, "api/accounts") }
+      let(:posts) { subclass(base, "api/posts") }
+      let(:split_routes) do
+        [{ controller: "api/accounts", action: "create", verb: "post", path: "/accounts" },
+         { controller: "api/posts", action: "update", verb: "patch", path: "/posts/{id}" }]
+      end
+
+      it "does not report a shared base whose subclass routes the action" do
+        shared = controller_class("api/base") { permit_params(:create) { required :a, :string } }
+        child = subclass(shared, "api/users")
+        users_routes = [{ controller: "api/users", action: "create", verb: "post", path: "/users" }]
+        expect(described_class.stale(controllers: [shared, child], routes: users_routes)).to eq({})
+      end
+
+      it "counts an action as reached when any controller carrying the contract routes it" do
+        expect(described_class.stale(controllers: [base, accounts, posts], routes: split_routes)).to eq({})
+      end
+
+      # Not under every subclass too, and not dropped because no subclass
+      # declared it: an inherited rule nothing routes is still stale.
+      it "reports a contract no carrier routes once, under the class that declared it" do
+        expect(described_class.stale(controllers: [base, accounts], routes: split_routes.first(1)))
+          .to eq("api/base" => ["update"])
+      end
+
+      it "counts the base's own routes when it is routed as well as subclassed" do
+        routed_base = [split_routes.first, { controller: "api/base", action: "update", verb: "patch", path: "/base/{id}" }]
+        expect(described_class.stale(controllers: [base, accounts], routes: routed_base)).to eq({})
+      end
+
+      # Inheritance runs one way: a request to the parent never resolves
+      # through a rule only its subclass declared.
+      it "does not let a parent's routes keep a subclass's own contract alive" do
+        posts.permit_params(:archive) { required :c, :string }
+        parent_archive = split_routes + [{ controller: "api/base", action: "archive", verb: "post", path: "/base" }]
+        expect(described_class.stale(controllers: [base, accounts, posts], routes: parent_archive))
+          .to eq("api/posts" => ["archive"])
+      end
+
+      it "still treats a route the carrier would 404 as no route" do
+        accounts.define_singleton_method(:action_methods) { Set.new(%w[index]) }
+        expect(described_class.stale(controllers: [base, accounts, posts], routes: split_routes))
+          .to eq("api/base" => ["create"])
+      end
+
+      # The declaring class carries its rule whether or not it was passed, so
+      # a report naming it never contradicts its own routes.
+      it "judges an inherited contract by its declaring class even when only a subclass is passed" do
+        routed_base = [split_routes.first, { controller: "api/base", action: "update", verb: "patch", path: "/base/{id}" }]
+        expect(described_class.stale(controllers: [accounts], routes: routed_base)).to eq({})
+        expect(described_class.stale(controllers: [accounts], routes: split_routes.first(1)))
+          .to eq("api/base" => ["update"])
+      end
+    end
   end
 
   describe ".summary" do
@@ -380,6 +450,17 @@ RSpec.describe Permittable::Audit do
       found = described_class.entries(controllers: [bare_class("posts")], routes: descriptors)
       expect(found.map(&:path).uniq.length).to eq(2)
       expect(described_class.format(found)).to include("2 routed actions in 4 rows: ")
+    end
+
+    # The README quotes the plural lines; a count of one must not read as
+    # "1 of those accept".
+    it "agrees in number when a summary count is one" do
+      one = controller_class("users") { permit_params(:create, model: nil) { required :name, :string } }
+      report = described_class.format(described_class.entries(controllers: [one], routes: routes.first(3)))
+      expect(report).to include("\n  1 of those accepts a request body — untrusted input reaches the action unchecked\n")
+      expect(report).to include("\n  1 covered action declares no model:, so no schema-drift guard runs for it\n")
+      expect(described_class.format(entries))
+        .to include("\n  2 covered actions declare no model:, so no schema-drift guard runs for them\n")
     end
 
     it "says so plainly when there is nothing to report" do

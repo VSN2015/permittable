@@ -144,18 +144,62 @@ module Permittable
     # kind is in no summary bucket, so without this it would vanish from the
     # report's conclusions. Catch-all rules declare no actions, so they never
     # appear here.
+    #
+    # Judged per RULE, not per class: permittable_contracts is a
+    # class_attribute, so a subclass carries every rule its parent declared,
+    # and judging each class alone listed a shared base (routed to nothing)
+    # and every subclass routed to a different slice of its actions. A rule's
+    # action is stale only when NO controller carrying that rule reaches it —
+    # the class that declared it, or any descendant among `controllers:` — and
+    # it is listed once, under the declaring class, where the fix is made.
+    # Counting only the rules a class added itself would not do: the shared
+    # base still has no routes. Shadowing is not judged: an action some
+    # carrier reaches is not stale, even if that carrier declares its own rule
+    # for it, just as a rule redeclared within one class never was.
     def stale(controllers:, routes:)
       routes = routes.to_a
-      controllers.each_with_object({}) do |controller, found|
+      reaches = Hash.new { |memo, controller| memo[controller] = reach_lookup(controller, routes) }
+      carriers(controllers).each_with_object({}) do |(rule, held_by), found|
+        declarer = declaring_class(held_by.first, rule)
+        holders = held_by | [declarer]
+        left = rule[:actions].reject { |action| holders.any? { |controller| reaches[controller][action] } }
+        next if left.empty?
+
+        key = OpenAPI.controller_key(declarer) || declarer.inspect
+        found[key] = (found.fetch(key, []) + left).uniq
+      end
+    end
+
+    # rule => the given controllers carrying it, in first-seen order. Keyed by
+    # IDENTITY: permit_params hands a subclass its parent's rule objects, while
+    # two classes declaring the same fields build equal but distinct rules.
+    def carriers(controllers)
+      controllers.each_with_object({}.compare_by_identity) do |controller, held|
         next unless controller.respond_to?(:permittable_contracts)
 
-        key = OpenAPI.controller_key(controller) || controller.inspect
-        routed = routes.select { |route| route[:controller].to_s == key }.map { |route| route[:action].to_s }
-        declared = controller.permittable_contracts.flat_map { |rule| rule[:actions] }.uniq
-        missing = missing_lookup(controller)
-        left = declared.select { |action| !routed.include?(action) || missing[action] }
-        found[key] = left unless left.empty?
+        controller.permittable_contracts.each { |rule| (held[rule] ||= []) << controller }
       end
+    end
+
+    # action => whether a request for it reaches `controller`: routed there,
+    # and not to an action Rails would 404. Lazy, so the resolver is asked
+    # only about actions some contract declares.
+    def reach_lookup(controller, routes)
+      key = OpenAPI.controller_key(controller) || controller.inspect
+      routed = routes.select { |route| route[:controller].to_s == key }.to_set { |route| route[:action].to_s }
+      missing = missing_lookup(controller)
+      Hash.new { |memo, action| memo[action] = routed.include?(action) && !missing[action] }
+    end
+
+    # The highest ancestor still carrying `rule` — the class whose
+    # permit_params declared it, whether or not it was among `controllers:`.
+    def declaring_class(controller, rule)
+      controller = controller.superclass while controller.respond_to?(:superclass) && carries?(controller.superclass, rule)
+      controller
+    end
+
+    def carries?(controller, rule)
+      controller.respond_to?(:permittable_contracts) && controller.permittable_contracts.any? { |held| held.equal?(rule) }
     end
 
     # The numbers worth putting in a CI log. `uncovered_with_body` is the one
@@ -242,9 +286,14 @@ module Permittable
     # say WHY they differ: an optional segment's variants are the usual
     # reason, but two concatenated route lists sharing a controller, action
     # and index collapse the same way.
+    #
+    # Each line agrees with its own count: "1 of those accepts", "1 covered
+    # action declares ... for it". `rows` needs no singular — it only prints
+    # when it exceeds the route count, so it is at least 2.
     def summary_lines(counts, rows: counts[:actions])
       body = counts[:uncovered_with_body]
       missing = counts[:missing_actions]
+      models = counts[:unguarded_models]
       # Its own bucket, so the head line still adds up to the route count.
       not_found = ", #{missing} not found (Rails 404s #{missing == 1 ? 'it' : 'them'})" unless missing.zero?
       listed = " in #{rows} rows" unless rows == counts[:actions]
@@ -253,9 +302,10 @@ module Permittable
         "#{counts[:actions]} routed action#{'s' unless counts[:actions] == 1}#{listed}: " \
         "#{counts[:enforced]} enforced, #{counts[:monitored]} in monitor mode, " \
         "#{counts[:uncovered]} without a contract#{not_found}",
-        "  #{body} of those accept a request body#{' — untrusted input reaches the action unchecked' unless body.zero?}",
-        "  #{counts[:unguarded_models]} covered action#{'s' unless counts[:unguarded_models] == 1} " \
-        "declare no model:, so no schema-drift guard runs for them"
+        "  #{body} of those accept#{'s' if body == 1} a request body" \
+        "#{' — untrusted input reaches the action unchecked' unless body.zero?}",
+        "  #{models} covered action#{models == 1 ? ' declares' : 's declare'} no model:, " \
+        "so no schema-drift guard runs for #{models == 1 ? 'it' : 'them'}"
       ].join("\n")
     end
 
