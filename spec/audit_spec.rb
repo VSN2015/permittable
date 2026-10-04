@@ -103,6 +103,46 @@ RSpec.describe Permittable::Audit do
       expect(described_class.summary(found)[:uncovered_with_body]).to eq(3)
     end
 
+    # Rails dispatches a request to the first route matching its path and
+    # verb. The audit reads the same descriptors as the export, so it lists
+    # each verb on a path under the one action Rails sends it to.
+    context "when an explicit route and a via: :all route share a path" do
+      def descriptors(&draw)
+        route_set = ActionDispatch::Routing::RouteSet.new
+        route_set.draw(&draw)
+        Permittable::OpenAPI.rails_routes(Struct.new(:routes).new(route_set))
+      end
+
+      it "lists GET under the explicit route drawn first, with no phantom via: :all row" do
+        routes = descriptors do
+          get "hooks", to: "webhooks#index"
+          match "hooks", to: "webhooks#receive", via: :all
+        end
+        found = described_class.entries(controllers: [bare_class("webhooks")], routes: routes)
+
+        expect(found.map { |e| [e.verb, e.action] }).to contain_exactly(
+          %w[get index], %w[post receive], %w[put receive], %w[patch receive], %w[delete receive]
+        )
+        expect(described_class.format(found)).not_to match(%r{GET\s+/hooks\s+receive})
+        expect(described_class.summary(found)).to include(actions: 5, uncovered_with_body: 3)
+      end
+
+      # Rails never reaches the explicit route, so neither does the audit, and
+      # a contract left on its action guards nothing.
+      it "drops an explicit route an earlier via: :all route shadows, and calls its contract stale" do
+        webhooks = controller_class("webhooks") { permit_params(:index) { optional :page, :integer } }
+        routes = descriptors do
+          match "hooks", to: "webhooks#receive", via: :all
+          get "hooks", to: "webhooks#index"
+        end
+        found = described_class.entries(controllers: [webhooks], routes: routes)
+
+        expect(found.map(&:action).uniq).to eq(["receive"])
+        expect(found.map(&:verb)).to contain_exactly("get", "post", "put", "patch", "delete")
+        expect(described_class.stale(controllers: [webhooks], routes: routes)).to eq("webhooks" => ["index"])
+      end
+    end
+
     context "when a routed action has no action method" do
       # `resources :posts` routes all seven actions whether or not the
       # controller defines them; Rails 404s the ones it does not.

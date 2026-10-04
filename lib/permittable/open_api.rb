@@ -234,10 +234,10 @@ module Permittable
     end
 
     # Where one operation sits in the document: a path+verb slot under
-    # `paths`, or an action under x-permittable-controllers (verb nil).
-    # `holder[field]` is the placed operation; `id` its natural operationId;
-    # `owner` the [controller key, action] it documents.
-    OperationSlot = Struct.new(:holder, :field, :verb, :id, :owner)
+    # `paths`, or an action under x-permittable-controllers (verb and path
+    # nil). `holder[field]` is the placed operation; `id` its natural
+    # operationId; `owner` the [controller key, action] it documents.
+    OperationSlot = Struct.new(:holder, :field, :verb, :id, :owner, :path)
 
     # { [controller, action] => [[path, verb], ...] }, in route order. Built
     # once, with each verb normalised once: matching every operation against
@@ -251,8 +251,9 @@ module Permittable
             .transform_values { |matching| matching.map { |route| [route[:path], verb_of(route)] }.uniq }
     end
 
-    # Places every operation and returns the slots it filled, in placement
-    # order (controller, action, route), for assign_unique_operation_ids.
+    # Places every operation and returns the slots it filled, for
+    # assign_unique_operation_ids, which ranks them by what they are: the
+    # order they are returned in names nothing.
     def place_operations(controller, operations, targets, paths, unrouted)
       key = controller_key(controller) || controller.inspect
       operations.each_with_object([]) do |(action, operation), slots|
@@ -261,6 +262,9 @@ module Permittable
         # controller already claimed is not written over: the loser stays
         # visible under x-permittable-controllers, where an operation with no
         # route at all lands, rather than disappearing from the document.
+        # rails_routes already keeps one route per path and verb (see
+        # drop_shadowed), so only hand-built descriptors, or two route lists
+        # concatenated, reach this with a claimed slot.
         free = action == "*" ? [] : targets.fetch(owner, []).reject { |path, verb| paths.dig(path, verb) }
         if free.empty?
           holder = (unrouted[key] ||= {})
@@ -270,7 +274,7 @@ module Permittable
           free.each do |path, verb|
             holder = (paths[path] ||= {})
             holder[verb] = with_path_parameters(operation, path)
-            slots << OperationSlot.new(holder, verb, verb, operation["operationId"], owner)
+            slots << OperationSlot.new(holder, verb, verb, operation["operationId"], owner, path)
           end
         end
       end
@@ -290,12 +294,24 @@ module Permittable
     # known before any is renamed and all of them are reserved, so a suffix
     # can never take a name that is another operation's own id — that
     # operation would otherwise be renamed for a collision it never had.
-    # Within a colliding group the first slot keeps the plain id. Another
-    # takes its verb (users_update_put) when that verb differs from the plain
-    # id's and the suffixed id is free; otherwise it is numbered
-    # (posts_create_2 for a second POST, users_update_2 for a second PATCH).
-    # The suffix names how the slot differs from the plain one, so a verb
-    # the two share would say nothing true.
+    # Within a colliding group the slot collision_order ranks first keeps the
+    # plain id. Another takes its verb (users_update_put) when that verb
+    # differs from the plain id's and the suffixed id is free; otherwise it
+    # is numbered in rank order (posts_create_2 for a second POST,
+    # users_update_2 for a second PATCH). The suffix names how the slot
+    # differs from the plain one, so a verb the two share would say nothing
+    # true.
+    #
+    # The rank is read off each slot's operation, path and verb, never off
+    # the order the slots were found in, and groups are visited in id order
+    # (so even a suffix two groups could both spell goes the same way every
+    # time). Reordering routes.rb or loading a controller earlier therefore
+    # renames nothing. What no scheme can avoid is a NEW collider: it takes a
+    # suffix or, ranking ahead, takes the plain id from the slot that held
+    # it, and every numbered slot ranked behind it moves along one. So
+    # adding, removing or renaming a colliding route, action or controller
+    # can still rename the other members of its group — never an id that
+    # stands alone.
     #
     # Unrouted operations take part: x-permittable-controllers is in the same
     # document and feeds the same generators. They yield the plain id to a
@@ -304,7 +320,7 @@ module Permittable
       slots = slots.select(&:id)
       taken = slots.to_set(&:id)
       next_number = Hash.new(2)
-      slots.group_by(&:id).each_value do |group|
+      slots.group_by(&:id).sort_by(&:first).each do |_id, group|
         next if group.one?
 
         plain, *renamed = collision_order(group)
@@ -320,20 +336,39 @@ module Permittable
       end
     end
 
-    # Routed before unrouted, then placement order: controller, action, route.
-    # Within one operation a PUT sorts after its PATCH, because
-    # `match via: [:put, :patch]` lists PUT first where `resources` lists
-    # PATCH first, and without this one pair of routes would name the PATCH
-    # method two ways. Across operations the order alone decides: a PATCH in
-    # a later controller does not take the plain id from an earlier PUT.
+    # The rank within one colliding group. Routed before unrouted. Then by
+    # operation, its controller path and then its action compared as
+    # strings, so one operation's slots stay together and admin/users#index
+    # ranks ahead of admin_users#index whichever controller loaded first; a
+    # PATCH in one operation does not take the plain id from a PUT in
+    # another. Within one operation, the shallowest path first (fewest
+    # segments, then the path as a string), so `/posts` ranks ahead of
+    # `/{locale}/posts` and `/users/{id}` ahead of
+    # `/orgs/{org_id}/users/{id}`. Then the verb, in VERB_RANK order, which
+    # puts PATCH ahead of PUT: `match via: [:put, :patch]` lists PUT first
+    # where `resources` lists PATCH first, and without it one pair of routes
+    # would name the PATCH method two ways.
+    #
+    # Every key is a property of the slot itself, and no two slots share all
+    # of them (an operation fills a path+verb slot once, and has at most one
+    # unrouted entry), so the rank never falls back on the order the slots
+    # arrived in. That order (controller load order, then route order) is
+    # what used to decide, and why reordering routes.rb could rename a
+    # generated client method.
     def collision_order(group)
-      patched = group.select { |slot| slot.verb == "patch" }.to_set(&:owner)
-      first_at = {}
-      group.each_with_index { |slot, index| first_at[slot.owner] ||= index }
-      group.each_with_index.sort_by do |slot, index|
-        put_after_patch = slot.verb == "put" && patched.include?(slot.owner) ? 1 : 0
-        [slot.verb ? 0 : 1, first_at[slot.owner], put_after_patch, index]
-      end.map(&:first)
+      group.sort_by do |slot|
+        path = slot.path.to_s
+        [slot.verb ? 0 : 1, slot.owner, path.count("/"), path, verb_rank(slot.verb)]
+      end
+    end
+
+    # The order rails_routes expands `via: :all` into, with PATCH moved ahead
+    # of PUT (see collision_order). A verb a hand-built descriptor names
+    # beyond these ranks after them, alphabetically.
+    VERB_RANK = %w[get post patch put delete].freeze
+
+    def verb_rank(verb)
+      [VERB_RANK.index(verb) || VERB_RANK.length, verb.to_s]
     end
 
     # The next free "#{id}_n", n from 2. The counter per id means no number
@@ -369,6 +404,38 @@ module Permittable
       end
     end
 
+    # Keeps, for each verb and concrete path, only the first route's
+    # descriptor (rails_routes calls it last). Journey sorts the routes
+    # matching a request by precedence, their position in the route set, and
+    # dispatches to the first. So with `get "hooks", to: "webhooks#index"`
+    # drawn ahead of `match "hooks", to: "webhooks#receive", via: :all`,
+    # GET /hooks is index's and receive answers only the other four verbs;
+    # drawn the other way round, index is never reached at all. Describing
+    # the later route anyway put a phantom `GET /hooks receive` row in the
+    # audit, and let the export hand that slot to whichever of the two
+    # operations it placed first. Both read their routes from rails_routes,
+    # so dropping it there keeps them in agreement with each other and with
+    # Rails. A route drawn twice folds into one the same way.
+    #
+    # Descriptors arrive in route order (then verb, then optional variant),
+    # so the first one seen is the first route. Precedence is a property of
+    # ONE route set, which is why this runs inside each rails_routes call and
+    # not in the readers: an engine's routes are relative to its mount point,
+    # and a list concatenated from an app's and an engine's must not let one
+    # shadow the other.
+    #
+    # Known limits. Only identical templates are compared. A constraint
+    # (`id: /\d+/`, a subdomain, a lambda) can pass a URL on to a later route
+    # with the same template, and the descriptors cannot see it, so that
+    # later route is dropped. Templates that differ at all, even only in a
+    # variable's name, are both kept, so `users/:id` constrained to digits
+    # ahead of `users/:slug` lists both. And only controller routes shadow:
+    # a redirect or a Rack endpoint is not described at all, so a controller
+    # route behind one on the same path is still listed.
+    def drop_shadowed(descriptors)
+      descriptors.uniq { |descriptor| descriptor.values_at(:verb, :path) }
+    end
+
     # What a `via: :all` route answers, in the "|"-joined form Journey uses
     # for a route with several verbs.
     ALL_VERBS = "GET|POST|PUT|PATCH|DELETE".freeze
@@ -390,6 +457,9 @@ module Permittable
     # from, so a reader counting routes rather than paths (Audit.summary) can
     # tell one route's expanded variants from a second route that happens to
     # reach the same action. The exporter ignores it.
+    #
+    # A verb on a path that an earlier route already answers is left out:
+    # Rails never dispatches it to the later route (see drop_shadowed).
     def rails_routes(app)
       descriptors = app.routes.routes.each_with_index.flat_map do |route, index|
         requirements = route.requirements
@@ -410,9 +480,10 @@ module Permittable
             verb: single.downcase, path: path, route: index }
         end
       end
-      descriptors.flat_map do |descriptor|
+      expanded = descriptors.flat_map do |descriptor|
         optional_variants(descriptor[:path]).map { |variant| descriptor.merge(path: variant) }
       end
+      drop_shadowed(expanded)
     end
 
     # Every concrete path an optionally-grouped template stands for:
@@ -423,12 +494,12 @@ module Permittable
     # two templates differing only in variable names. Variants are built with
     # each group present first, so the one Rails would match is the one kept;
     # the list is then reversed, which puts every group's ABSENT variant
-    # first at every nesting level. That order matters to the operationId
-    # dedupe (assign_unique_operation_ids, which numbers colliding ids in
-    # route order): the variants of one route share an operation, and it is
-    # that dedupe, not this expansion, that makes their ids unique. Absent
-    # first means `/posts` keeps `posts_create` and `/{locale}/posts` takes
-    # the suffix.
+    # first at every nesting level, the order the document lists them in.
+    # The variants of one route share an operation, and it is the operationId
+    # dedupe (assign_unique_operation_ids), not this expansion, that makes
+    # their ids unique. It ranks the shallowest path first whatever order the
+    # variants arrive in, so `/posts` keeps `posts_create` and
+    # `/{locale}/posts` takes the suffix.
     def optional_variants(path)
       variants, = expand_optional_groups(path, 0)
       variants.map { |variant| variant.empty? ? "/" : variant }

@@ -11,6 +11,14 @@ RSpec.describe Permittable::OpenAPI do
     end
   end
 
+  # A real route set drawn from a routes.rb-style block, in the shape
+  # rails_routes reads: the overlap bugs lived in what Rails generates.
+  def rails_app(&draw)
+    route_set = ActionDispatch::Routing::RouteSet.new
+    route_set.draw(&draw)
+    Struct.new(:routes).new(route_set)
+  end
+
   # Every operationId in the document, the unrouted ones included: the
   # whole document is one namespace to a client generator.
   def operation_ids(doc)
@@ -153,6 +161,46 @@ RSpec.describe Permittable::OpenAPI do
       expect(doc["x-permittable-controllers"]["clones"]).to have_key("create")
     end
 
+    # Rails dispatches GET /hooks to the explicit route drawn ahead of the
+    # `via: :all` one. Declaring `receive` first used to hand it that slot,
+    # documenting a GET the server never routes to it and pushing `index`
+    # out of `paths`.
+    it "documents a verb on a shared path under the route Rails dispatches it to" do
+      klass = controller_class(path: "webhooks") do
+        permit_params(:receive) { optional :event, :string }
+        permit_params(:index) { optional :page, :integer }
+      end
+      app = rails_app do
+        get "hooks", to: "webhooks#index"
+        match "hooks", to: "webhooks#receive", via: :all
+      end
+      doc = described_class.document(controllers: [klass], routes: described_class.rails_routes(app))
+
+      expect(doc["paths"]["/hooks"].transform_values { |operation| operation["operationId"] }).to eq(
+        "get" => "webhooks_index", "post" => "webhooks_receive", "patch" => "webhooks_receive_patch",
+        "put" => "webhooks_receive_put", "delete" => "webhooks_receive_delete"
+      )
+      expect(doc).not_to have_key("x-permittable-controllers")
+    end
+
+    # The other way round, the `via: :all` route answers GET too, and the
+    # explicit route behind it is never reached: its operation is unrouted.
+    it "leaves an operation unrouted when an earlier via: :all route shadows its only route" do
+      klass = controller_class(path: "webhooks") do
+        permit_params(:index) { optional :page, :integer }
+        permit_params(:receive) { optional :event, :string }
+      end
+      app = rails_app do
+        match "hooks", to: "webhooks#receive", via: :all
+        get "hooks", to: "webhooks#index"
+      end
+      doc = described_class.document(controllers: [klass], routes: described_class.rails_routes(app))
+
+      expect(doc["paths"]["/hooks"].keys).to contain_exactly("get", "post", "put", "patch", "delete")
+      expect(doc["paths"]["/hooks"]["get"]["operationId"]).to eq("webhooks_receive")
+      expect(doc["x-permittable-controllers"]["webhooks"].keys).to eq(["index"])
+    end
+
     # OpenAPI requires operationId to be unique across the document, and
     # generated clients name their methods after it. `resources` routes
     # update as PATCH and PUT, and `admin/users` and `admin_users` fold to
@@ -165,6 +213,99 @@ RSpec.describe Permittable::OpenAPI do
 
       def route(controller, action, verb, path)
         { controller: controller, action: action, verb: verb, path: path }
+      end
+
+      # { [path, verb] => id } for routed operations and
+      # { [controller, action] => id } for unrouted ones: where every id sits.
+      def ids_by_place(doc)
+        routed = doc["paths"].flat_map { |path, operations| operations.map { |verb, op| [[path, verb], op["operationId"]] } }
+        unrouted = doc.fetch("x-permittable-controllers", {}).flat_map do |key, operations|
+          operations.map { |action, op| [[key, action], op["operationId"]] }
+        end
+        (routed + unrouted).to_h
+      end
+
+      # Every id is a method name in a generated client. Reordering routes.rb,
+      # or a controller loading earlier, changes nothing Rails serves, so it
+      # must not rename a method either: which collider keeps the plain id,
+      # and which suffix each other one takes, is read off the operation,
+      # path and verb, never off the order they were found in.
+      it "names every collider the same whatever order routes and controllers arrive in" do
+        controllers = [
+          index_controller("admin/users", :index),
+          index_controller("admin_users", :index),
+          index_controller("admin", "users_index"),
+          controller_class(path: "legacy") { permit_params(:create) { required :name, :string } },
+          controller_class(path: "posts") { permit_params(:update) { required :title, :string } },
+          controller_class(path: "webhooks") { permit_params(:receive) { optional :event, :string } }
+        ]
+        routes = [
+          route("admin_users", "index", "get", "/admin_users"),
+          route("admin/users", "index", "get", "/admin/users"),
+          route("legacy", "create", "post", "/admin/legacy"),
+          route("legacy", "create", "post", "/legacy"),
+          route("posts", "update", "put", "/orgs/{org_id}/posts/{id}"),
+          route("posts", "update", "patch", "/orgs/{org_id}/posts/{id}"),
+          route("posts", "update", "put", "/posts/{id}"),
+          route("posts", "update", "patch", "/posts/{id}"),
+          route("webhooks", "receive", "post", "/hooks"),
+          route("webhooks", "receive", "get", "/hooks")
+        ]
+        expected = {
+          # Between operations: controller path, then action, as strings.
+          ["/admin/users", "get"] => "admin_users_index",
+          ["/admin_users", "get"] => "admin_users_index_2",
+          %w[admin users_index] => "admin_users_index_3",
+          # Within one: the shallowest path, then GET, POST, PATCH, PUT, DELETE.
+          ["/legacy", "post"] => "legacy_create",
+          ["/admin/legacy", "post"] => "legacy_create_2",
+          ["/posts/{id}", "patch"] => "posts_update",
+          ["/posts/{id}", "put"] => "posts_update_put",
+          ["/orgs/{org_id}/posts/{id}", "patch"] => "posts_update_2",
+          ["/orgs/{org_id}/posts/{id}", "put"] => "posts_update_3",
+          ["/hooks", "get"] => "webhooks_receive",
+          ["/hooks", "post"] => "webhooks_receive_post"
+        }
+        random = Random.new(68)
+        orders = [[controllers, routes], [controllers.reverse, routes.reverse]] +
+                 Array.new(8) { [controllers.shuffle(random: random), routes.shuffle(random: random)] }
+
+        orders.each do |listed_controllers, listed_routes|
+          doc = described_class.document(controllers: listed_controllers, routes: listed_routes)
+          expect(ids_by_place(doc)).to eq(expected)
+        end
+      end
+
+      # The same guarantee through a real route set: two routes.rb files that
+      # draw the same routes in a different order, one of them listing a
+      # route's verbs the other way round.
+      it "keeps every id when routes.rb draws the same routes in another order" do
+        controllers = [
+          controller_class(path: "legacy") { permit_params(:create) { required :name, :string } },
+          controller_class(path: "users") { permit_params(:update) { required :name, :string } },
+          controller_class(path: "webhooks") { permit_params(:receive) { optional :event, :string } }
+        ]
+        one = rails_app do
+          post "admin/legacy", to: "legacy#create"
+          post "legacy", to: "legacy#create"
+          match "hooks", to: "webhooks#receive", via: %i[post get]
+          resources(:orgs, only: []) { resources :users, only: :update }
+          resources :users, only: :update
+        end
+        other = rails_app do
+          resources :users, only: :update
+          resources(:orgs, only: []) { resources :users, only: :update }
+          match "hooks", to: "webhooks#receive", via: %i[get post]
+          post "legacy", to: "legacy#create"
+          post "admin/legacy", to: "legacy#create"
+        end
+        ids = [one, other].map do |app|
+          ids_by_place(described_class.document(controllers: controllers, routes: described_class.rails_routes(app)))
+        end
+
+        expect(ids.last).to eq(ids.first)
+        expect(ids.first).to include(["/legacy", "post"] => "legacy_create", ["/hooks", "get"] => "webhooks_receive",
+                                     ["/users/{id}", "patch"] => "users_update")
       end
 
       it "gives the second verb of a shared route its own operationId" do
@@ -270,7 +411,7 @@ RSpec.describe Permittable::OpenAPI do
       end
 
       # PATCH-over-PUT is about one operation's two verbs. Between two
-      # operations, controller order decides, whichever verbs they carry.
+      # operations, their controller paths decide, whichever verbs they carry.
       it "does not let a PATCH in one operation take the plain id from a PUT in another" do
         doc = described_class.document(
           controllers: [controller_class(path: "admin/users") { permit_params(:update) { required :name, :string } },
@@ -488,6 +629,69 @@ RSpec.describe Permittable::OpenAPI do
       )
     end
 
+    # Rails hands a request to the FIRST route matching its path and verb, so
+    # a later route is never reached for that pair. Describing it anyway put
+    # a phantom row in the audit and let the export document an operation
+    # where Rails dispatches another.
+    context "when routes overlap" do
+      it "leaves a via: :all route only the verbs no earlier route answers on its path" do
+        app = rails_app do
+          get "hooks", to: "webhooks#index"
+          match "hooks", to: "webhooks#receive", via: :all
+        end
+        expect(described_class.rails_routes(app)).to eq(
+          [{ controller: "webhooks", action: "index", verb: "get", path: "/hooks", route: 0 }] +
+          %w[post put patch delete].map do |verb|
+            { controller: "webhooks", action: "receive", verb: verb, path: "/hooks", route: 1 }
+          end
+        )
+      end
+
+      it "drops a later explicit route that an earlier via: :all route already answers" do
+        app = rails_app do
+          match "hooks", to: "webhooks#receive", via: :all
+          get "hooks", to: "webhooks#index"
+        end
+        expect(described_class.rails_routes(app).map { |r| [r[:action], r[:verb]] })
+          .to eq(%w[get post put patch delete].map { |verb| ["receive", verb] })
+      end
+
+      it "keeps only the first route to a path and verb, whatever action the others name" do
+        app = rails_app do
+          post "users", to: "users#create"
+          post "users", to: "users#create"
+          post "users", to: "signups#create"
+        end
+        expect(described_class.rails_routes(app))
+          .to eq([{ controller: "users", action: "create", verb: "post", path: "/users", route: 0 }])
+      end
+
+      # `/posts` is the earlier route's; `/{locale}/posts` is still the
+      # optional scope's, since no earlier route answers it.
+      it "compares the concrete paths an optional segment expands to" do
+        app = rails_app do
+          get "posts", to: "home#index"
+          scope("(:locale)") { get "posts", to: "posts#index" }
+        end
+        expect(described_class.rails_routes(app)).to eq(
+          [{ controller: "home", action: "index", verb: "get", path: "/posts", route: 0 },
+           { controller: "posts", action: "index", verb: "get", path: "/{locale}/posts", route: 1 }]
+        )
+      end
+
+      # Only identical templates are compared. A constraint can let a URL
+      # through to the second of two routes, and the descriptors cannot see
+      # it, so templates that differ (even only by a variable's name) are
+      # both kept rather than guessed at.
+      it "keeps both routes when their templates differ, even if one URL could reach either" do
+        app = rails_app do
+          get "users/:id", to: "users#show", constraints: { id: /\d+/ }
+          get "users/:slug", to: "users#by_slug"
+        end
+        expect(described_class.rails_routes(app).map { |r| r[:action] }).to eq(%w[show by_slug])
+      end
+    end
+
     # A real route set rather than a Journey-shaped Struct: the bug was in
     # the spec strings Rails actually generates, so the test reads those.
     context "with optional segments" do
@@ -529,10 +733,9 @@ RSpec.describe Permittable::OpenAPI do
           .to eq(["/x", "/x/{a}", "/x/{a}/{b}"])
       end
 
-      # Order is part of the contract: the operationId dedupe
-      # (assign_unique_operation_ids) numbers colliding ids in route order, so
-      # the path without the segment must come first to keep the plain id
-      # (`/posts` is `posts_create`, not `_2`).
+      # Order is part of the contract: it is the order the document lists the
+      # paths in. (It no longer decides operationIds: the dedupe ranks the
+      # shallowest path first itself, so `/posts` is `posts_create`.)
       # Each group reads absent-before-present, outer groups before inner, and
       # the order does not change which coinciding variant survives
       # (`/p/{q}`, not `/p/{s}`).
