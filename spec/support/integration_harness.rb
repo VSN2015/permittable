@@ -25,11 +25,21 @@ module IntegrationHarness
   # would, with no route set needed. Either way the body is parsed by
   # ActionDispatch's own JSON parser, never pre-parsed. `raw_json:` sends a
   # String body verbatim, for input `json:` cannot produce (malformed JSON).
+  # A request has one body, so at most one of the three may be given: with
+  # `:input` set Rack::MockRequest ignores `:params`, and `json:` would
+  # overwrite `raw_json:`, so a pair used to send one body and silently drop
+  # the other. Put form-style fields in `query:` alongside a JSON body.
   # `instance:` dispatches on that controller object instead of a fresh one
   # per request, to pin down state that must not survive from one request to
   # the next.
   def dispatch(controller_class, action, method: "GET", query: "", params: nil, json: nil, raw_json: nil,
                path_params: nil, instance: nil)
+    bodies = { params: params, json: json, raw_json: raw_json }.compact
+    if bodies.size > 1
+      raise ArgumentError, "IntegrationHarness.dispatch sends one request body, " \
+                           "got #{bodies.keys.map { |k| "#{k}:" }.join(' and ')}"
+    end
+
     opts = { method: method }
     opts[:params] = params if params
     raw_json = JSON.generate(json) if json

@@ -1,3 +1,5 @@
+require "strscan"
+
 # A deliberately small JSON Schema validator, covering exactly the keywords
 # Permittable::JsonSchema emits and nothing else. It exists so the suite can
 # check the gem's headline claim — that an exported schema cannot drift from
@@ -50,8 +52,51 @@ module TinyJsonSchema
     out = []
     out << "#{path}: minLength" if schema["minLength"] && value.length < schema["minLength"]
     out << "#{path}: maxLength" if schema["maxLength"] && value.length > schema["maxLength"]
-    out << "#{path}: pattern" if schema["pattern"] && !Regexp.new(schema["pattern"]).match?(value)
+    out << "#{path}: pattern" if schema["pattern"] && !ruby_regexp(schema["pattern"]).match?(value)
     out
+  end
+
+  # `pattern` is an ECMA-262 regexp, and Regexp.new would read it as Ruby.
+  # The two dialects disagree on the anchors: without the m flag, ECMA-262's
+  # ^ and $ anchor the whole input, while Ruby's anchor a LINE. Compiled
+  # verbatim, "^abc$" (the export of /\Aabc\z/) accepts "abc\n", which the
+  # server and every real validator reject. The instrument would then report
+  # a looser schema than the document actually publishes. Worse, it would
+  # read a real regression, Ruby's own ^ exported verbatim, exactly as the
+  # server does, so it could never catch one (#48).
+  #
+  # So this undoes EcmaPattern's anchor translation: ^ becomes \A and $
+  # becomes \z. Not \Z, because ECMA-262's $ never matches before a trailing
+  # newline. It tokenizes the way EcmaPattern does rather than with a gsub.
+  # An escape pair is one unit, so \^ and \$ stay literals, while the $ in
+  # \\$ (an escaped backslash, then the anchor) is still an anchor. A class
+  # is one unit, read up to its first unescaped ], so its leading ^ still
+  # negates and a ^ or $ elsewhere in it stays a literal.
+  #
+  # Every other token is copied as is. EcmaPattern emits only tokens both
+  # dialects read alike, which is why it rewrites . and \s into explicit
+  # classes, so the anchors are the whole difference. ecma_pattern_spec holds
+  # this method to that, against node, over every pattern it exports.
+  #
+  # Compiled with warnings off. Ruby warns about a hyphen after a range, as in
+  # [a-c-e], which ECMA-262 reads exactly as Ruby does (EcmaPattern exports it
+  # on purpose), so the warning would only be noise in the suite's output.
+  def ruby_regexp(pattern)
+    scanner = StringScanner.new(pattern)
+    out = +""
+    until scanner.eos?
+      out << if scanner.skip(/\^/) then '\A'
+             elsif scanner.skip(/\$/) then '\z'
+             else scanner.scan(/\\./m) || scanner.scan(/\[(?:\\.|[^\\\]])*\]/m) || scanner.getch
+             end
+    end
+    verbose = $VERBOSE
+    begin
+      $VERBOSE = nil
+      Regexp.new(out)
+    ensure
+      $VERBOSE = verbose
+    end
   end
 
   def number_errors(schema, value, path)

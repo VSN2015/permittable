@@ -218,6 +218,10 @@ module Permittable
   UNKNOWN_MODES = %i[ignore log error].freeze
   MODES = %i[enforce monitor].freeze
   ERROR_FORMATS = %i[envelope problem].freeze
+  # A Permittable.audit_ignore entry: a controller path the way Rails names
+  # it (lowercase, `/`-separated — "active_storage/direct_uploads"),
+  # optionally followed by "#action".
+  AUDIT_IGNORE_ENTRY = %r{\A[a-z0-9_]+(?:/[a-z0-9_]+)*(?:#\w+)?\z}
   # Rails merges routing bookkeeping into params; a top-level (root: false)
   # unknown-keys check must not flag them.
   ROUTING_KEYS = %w[controller action format].freeze
@@ -238,7 +242,7 @@ module Permittable
   MONITOR_DROPPED_KEYS = ROUTING_KEYS
   # The field kinds that can hold ParamsWrapper's copy of a body — a hash. A
   # rootless contract declaring the wrapper key as one of these reads the
-  # copy deliberately, so it is kept (see permittable_without_wrapper_copy).
+  # copy deliberately, so it is kept (see permittable_drops_wrapper_copy?).
   WRAPPER_CONTAINER_KINDS = [:nested, JSON_TYPE].freeze
   # A log line and an exception message are PROSE, written for a person. They
   # list at most this many names and count the rest, so one request cannot
@@ -512,6 +516,55 @@ module Permittable
       @check_column_types = value
     end
 
+    # Routed actions that `permittable:audit` leaves out of its counts and of
+    # `[strict]`, and that `permittable:generate` does not draft for — the
+    # endpoints that are not the app's to guard:
+    #
+    #   Permittable.audit_ignore = %w[active_storage/direct_uploads application#not_found]
+    #
+    # Each entry is a controller path as Rails routes it (every action of that
+    # controller) or "controller#action" (that one action, on every verb — a
+    # `via: :all` catch-all is one entry). Ignored actions are still listed,
+    # in a section of their own, and an entry that matches no routed action is
+    # listed too: an ignore list nothing checks would hide its own typos.
+    #
+    # Strings only, checked here. A class name is the likeliest mistake and
+    # the error names the path meant; a Class is refused because naming one
+    # in an initializer autoloads it at boot, which Zeitwerk refuses for a
+    # reloadable controller; a Regexp is refused because a pattern would also
+    # ignore controllers written AFTER it, and catching a new unguarded
+    # endpoint is what the gate is for. Validated as a whole before anything
+    # is stored, so a rejected list leaves the previous one in place. nil
+    # clears it.
+    def audit_ignore
+      @audit_ignore || [].freeze
+    end
+
+    def audit_ignore=(entries)
+      entries = Array(entries).map { |entry| audit_ignore_entry(entry) }
+      @audit_ignore = entries.uniq.freeze
+    end
+
+    # Whether the audit and the generator also leave out every controller
+    # whose source is outside Rails.root — engines and gems: ActiveStorage,
+    # ActionMailbox, Rails's own rails/* controllers. On by default, since an
+    # app cannot add a contract to a gem's controller; those are listed in
+    # the report under their own reason rather than dropped. Turn it off to
+    # audit them like the app's own:
+    #
+    #   Permittable.audit_ignore_outside_root = false
+    #
+    # See Audit.outside_root? for how a controller is located.
+    def audit_ignore_outside_root
+      @audit_ignore_outside_root.nil? || @audit_ignore_outside_root
+    end
+
+    def audit_ignore_outside_root=(value)
+      raise ArgumentError, "#{LABEL}: audit_ignore_outside_root must be true or false" unless [true, false].include?(value)
+
+      @audit_ignore_outside_root = value
+    end
+
     # App-wide fallback copy for a violation code, looked up through I18n
     # under permittable.errors.<code> ("missing", "inclusion", or any Symbol
     # a validate: returned). Consulted only when the field declares no
@@ -525,6 +578,24 @@ module Permittable
 
       message = ::I18n.t("permittable.errors.#{code}", default: nil)
       message.is_a?(String) ? message : nil
+    end
+
+    private
+
+    # One audit_ignore entry, frozen, or an ArgumentError that says what an
+    # entry looks like — and, for a class or a class name, which path it
+    # meant: `ActiveStorage::DirectUploadsController` is the path
+    # "active_storage/direct_uploads", the same derivation Rails's own
+    # controller_path makes.
+    def audit_ignore_entry(entry)
+      return entry.dup.freeze if entry.is_a?(String) && AUDIT_IGNORE_ENTRY.match?(entry)
+
+      meant = entry.controller_path if entry.is_a?(Class) && entry.respond_to?(:controller_path)
+      meant ||= entry.underscore.delete_suffix("_controller") if entry.is_a?(String) && entry.match?(/\A[A-Z]\w*(::[A-Z]\w*)*\z/)
+      raise ArgumentError,
+            "#{LABEL}: audit_ignore takes controller paths as Rails routes them (\"active_storage/direct_uploads\") " \
+            "or \"controller#action\" (\"application#not_found\"), got #{entry.inspect}" \
+            "#{" — did you mean #{meant.inspect}?" if meant}"
     end
   end
 
@@ -1891,38 +1962,74 @@ module Permittable
     )
   end
 
-  private
-
   # ParamsWrapper copies a JSON body under the controller's wrapper key
   # (`user` for UsersController) — on by default in a Rails app — and a
   # rootless contract then saw that copy as an unknown top-level key on every
-  # well-formed request. Whether the copy is Rails' own has to be read HERE,
-  # before ParamsWrapper#process_action (next in the chain) runs: once it has
-  # wrapped, `_wrapper_enabled?` answers false, because params now carry the
-  # key. Asking afterwards could not tell Rails' copy from a client that sent
-  # `user` itself, which is exactly the key the check must still flag.
-  # Private, like the method it wraps — a public one would become an action.
-  # A plain duck has no process_action and no ParamsWrapper, so this never
-  # runs there, and the guards keep an actionpack-free host inert.
+  # well-formed request. Whether the copy is Rails' own has to be read before
+  # ParamsWrapper#process_action wraps: afterwards `_wrapper_enabled?` answers
+  # false, because params now carry the key, and nothing left in the request
+  # tells Rails' copy from a client that sent `user` itself, which is exactly
+  # the key the check must still flag. (Comparing the key's value with what
+  # the wrapper would have built only guesses: a client can send that value.)
+  #
+  # So it is read here, in `process`, not in process_action. Every
+  # process_action, ParamsWrapper's included, runs inside
+  # AbstractController::Base#process, so no module order can put the
+  # wrapping first. A process_action hook relied on Rails' own order:
+  # ActionController::Base includes ParamsWrapper, so an
+  # ApplicationController's Permittable runs before it. A Metal controller
+  # that includes ParamsWrapper AFTER Permittable (in a subclass, say) ran
+  # ParamsWrapper's process_action first, and every wrapped JSON request was
+  # a 422 again.
+  #
+  # Public, like the method it wraps, so a caller that sends `process`
+  # explicitly still can. It never becomes an action:
+  # AbstractController::Base#process is a public method of every abstract
+  # controller class (Metal, Base, API), and action_methods leaves those out
+  # as internal. On a plain duck, which has no ParamsWrapper, the guards
+  # make it a pass-through to whatever `process` the host has.
   # Assigned on every request, never only when true: a controller instance
   # dispatched twice would otherwise carry one request's exemption into the
   # next, where a `user` the client did send would pass as Rails' copy.
-  def process_action(*)
+  def process(...)
     @permittable_wrapper_key = permittable_wrapper_copy_key
     super
   end
 
-  # The wrapper key, if ParamsWrapper is about to copy the body under it;
-  # nil otherwise. `_wrapper_enabled?` alone is not enough: it asks the
-  # string-keyed params for the key AS CONFIGURED, so `wrap_parameters :user`
-  # — the form the Rails docs use — answers "not sent" even when the client
-  # sent `user` itself, and Rails wraps anyway. Asking the same params for
-  # the String keeps that client's key the client's, whichever spelling the
-  # host chose.
-  def permittable_wrapper_copy_key
-    return unless respond_to?(:_wrapper_enabled?, true) && respond_to?(:_wrapper_key, true) && _wrapper_enabled?
+  private
 
-    key = _wrapper_key.to_s
+  # The wrapper key, if ParamsWrapper is about to copy the body under it and
+  # a contract on this controller would act on that; nil otherwise.
+  #
+  # The request is asked only when the answer can matter. A controller none
+  # of whose contracts reads its input without the copy (see
+  # permittable_drops_wrapper_copy?) — only rooted contracts, say, or the
+  # default `unknown: :ignore` with no field of the wrapper's name — paid a
+  # content-type lookup and a params read on every request for nothing.
+  # Everything the gate reads is class-level (the wrapper's formats and name,
+  # and the contracts), so a skipped probe touches nothing of the request.
+  # The formats come first, in ParamsWrapper's own order: with none it never
+  # wraps and never asks for its name — which it could not give, an
+  # unconfigured wrapper having no controller to derive one from. The
+  # contract gate is ALL of the controller's contracts, not only the one
+  # covering this action: permitted_params(:create) can read another
+  # action's contract from inside #update, and by then ParamsWrapper has
+  # wrapped and the question can no longer be answered.
+  #
+  # `_wrapper_enabled?` asks the params for the key as configured. Rails'
+  # params are indifferent on every supported version, so that already
+  # covers `wrap_parameters :user` and "user" alike. Asking again for the
+  # String keeps a client's `user` the client's on a plain string-keyed
+  # params Hash too — one a test seeds into the request directly — where
+  # :user would answer "not sent" and ParamsWrapper would wrap anyway.
+  def permittable_wrapper_copy_key
+    return unless %i[_wrapper_enabled? _wrapper_formats _wrapper_key].all? { |name| respond_to?(name, true) }
+    return if _wrapper_formats.empty?
+
+    key = _wrapper_key&.to_s
+    return unless key && self.class.permittable_contracts.any? { |rule| permittable_drops_wrapper_copy?(rule, key) }
+    return unless _wrapper_enabled?
+
     key unless request.parameters.key?(key)
   end
 
@@ -1944,7 +2051,7 @@ module Permittable
     source = permittable_root_hash(rule, violations)
     result = ActiveSupport::HashWithIndifferentAccess.new
     if source
-      checked = rule[:root] ? source : permittable_without_wrapper_copy(rule[:fields], source)
+      checked = permittable_without_wrapper_copy(rule, source)
       result = permittable_check_hash(rule[:fields], checked, path: rule[:root] ? rule[:root].to_s : nil,
                                                               unknown: rule[:unknown], top_level: !rule[:root], violations: violations)
     end
@@ -2429,28 +2536,39 @@ module Permittable
     token && token.to_s
   end
 
-  # A rootless contract's input without ParamsWrapper's copy of the body,
-  # when Rails made one (see process_action). Removed rather than merely
-  # exempted from the unknown-keys check, because the client never sent that
-  # key: a contract that happens to declare a scalar or array field of the
+  # A contract's input without ParamsWrapper's copy of the body, when Rails
+  # made one (see process) and the contract reads its input without it (see
+  # permittable_drops_wrapper_copy?). Removed rather than merely exempted
+  # from the unknown-keys check, because the client never sent that key: a
+  # contract that happens to declare a scalar or array field of the
   # wrapper's name (`optional :feedback, :string` on FeedbackController)
   # would otherwise validate Rails' copy of the whole body as that field — a
-  # false 422 invalid_type for a well-formed request.
-  #
-  # Kept, though, when the contract declares that key as a hash container (a
-  # nested block or :json): that rootless contract is reading the copy ON
-  # PURPOSE, a root: spelled as a field, and it worked that way before the
-  # copy was ever dropped — dropping it would turn every such request into
-  # `user missing`. Top level only, where the copy lives; a rooted contract
-  # reads the copy as its root, which is exactly what ParamsWrapper is for.
-  # What is checked changes, not what monitor mode hands back: its raw
-  # pass-through still carries the copy, as the pre-contract app's params did.
-  def permittable_without_wrapper_copy(fields, source)
+  # false 422 invalid_type for a well-formed request. Top level only, where
+  # the copy lives. What is checked changes, not what monitor mode hands
+  # back: its raw pass-through still carries the copy, as the pre-contract
+  # app's params did.
+  def permittable_without_wrapper_copy(rule, source)
     key = @permittable_wrapper_key
-    return source unless key
-    return source if fields.any? { |f| f[:name].to_s == key && WRAPPER_CONTAINER_KINDS.include?(f[:kind]) }
+    key && permittable_drops_wrapper_copy?(rule, key) ? source.except(key) : source
+  end
 
-    source.except(key)
+  # Whether `rule` reads its input without ParamsWrapper's copy under `key`
+  # — and so whether the probe's answer changes anything for it, which is
+  # why permittable_wrapper_copy_key asks this too before touching the
+  # request. Not for a rooted contract: it reads the copy as its root, which
+  # is exactly what ParamsWrapper is for. Not for a rootless one declaring
+  # `key` as a hash container (a nested block or :json) either: that
+  # contract is reading the copy ON PURPOSE, a root: spelled as a field, and
+  # it worked that way before the copy was ever dropped — dropping it would
+  # turn every such request into `user missing`. Any other field of that
+  # name would validate the copy, so the copy goes whatever the unknown:
+  # mode. Undeclared, it would only be flagged as unknown, which
+  # `unknown: :ignore` never does, so there the copy changes nothing.
+  def permittable_drops_wrapper_copy?(rule, key)
+    return false if rule[:root]
+
+    field = rule[:fields].find { |f| f[:name].to_s == key }
+    field ? !WRAPPER_CONTAINER_KINDS.include?(field[:kind]) : rule[:unknown] != :ignore
   end
 
   def permittable_path(path, key)

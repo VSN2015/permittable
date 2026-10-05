@@ -297,15 +297,39 @@ module Permittable
     # nil, until one drafts or none is left: a draft rooted at the other
     # envelope in the file is a better starting point than no draft, and it
     # is what master drafted.
-    def for_controller(controller, source: nil, model: nil)
+    #
+    # `except:` names actions of DEFAULT_ACTIONS to leave out of the draft —
+    # the ones Permittable.audit_ignore names (see targets). With none left
+    # there is nothing to draft.
+    def for_controller(controller, source: nil, model: nil, except: [])
+      return nil if (DEFAULT_ACTIONS - except.map(&:to_sym)).empty?
+
       model ||= infer_model(controller)
       excluded = []
       loop do
         scan = scan(source, model: model, exclude: excluded)
-        result = draft(model: model, scan: scan)
+        result = draft(model: model, scan: scan, except: except)
         return result if result || !scan.found? || excluded.include?(scan.root)
 
         excluded << scan.root
+      end
+    end
+
+    # What `permittable:generate` drafts when no controller is named, as
+    # { controller => actions to leave out of its draft }: every controller
+    # with no contract yet, less what the audit ignores (Audit.ignore_reason).
+    # ActiveStorage's direct uploads controller is the case this exists for —
+    # it was drafted, and a contract pasted into a gem's controller is not
+    # one the app can keep. A "controller#action" entry takes only that
+    # action out of the draft, and a controller with no drafted action left
+    # is skipped. Naming a controller to the task drafts it regardless, the
+    # way it drafts a covered one.
+    def targets(controllers, ignore: Permittable.audit_ignore, root: Audit.app_root)
+      controllers.each_with_object({}) do |controller, found|
+        next if controller.respond_to?(:permittable_contracts) && controller.permittable_contracts.any?
+
+        skipped = DEFAULT_ACTIONS.select { |action| Audit.ignore_reason(controller, action, ignore: ignore, root: root) }
+        found[controller] = skipped unless skipped == DEFAULT_ACTIONS
       end
     end
 
@@ -314,16 +338,18 @@ module Permittable
     # or when neither can declare a single field, since a contract of only
     # TODO lines raises `a contract must declare at least one field` the
     # moment it is pasted.
-    def draft(model: nil, scan: nil)
+    def draft(model: nil, scan: nil, except: [])
       columns = columns_for(model)
       scan = nil unless scan&.found?
       return nil unless columns || scan
-      return column_draft(model, columns.values, []) unless scan
+      return column_draft(model, columns.values, [], except: except) unless scan
 
       shared = scanned_lines(scan, listed_columns(columns, :shared))
-      return fallback_draft(model, scan, columns) unless declares_field?(shared)
+      return fallback_draft(model, scan, columns, except: except) unless declares_field?(shared)
 
-      render(root: scan.root, model: columns && model) { |rule| scanned_lines(scan, listed_columns(columns, rule)) }
+      render(root: scan.root, model: columns && model, except: except) do |rule|
+        scanned_lines(scan, listed_columns(columns, rule))
+      end
     end
 
     # The columns as one rule drafts them (see DraftColumn#in_rule), each
@@ -356,7 +382,7 @@ module Permittable
     # `permit(policy(@post).permitted_attributes)` the scanner skips — says
     # nothing about the body, so it gets the model's root, as master drafted.
     # With no columns either there is nothing loadable to draft, so nil.
-    def fallback_draft(model, scan, columns)
+    def fallback_draft(model, scan, columns, except: [])
       return nil unless columns
 
       root = scan.root || (rootless_body?(scan) ? nil : default_root(model))
@@ -365,7 +391,7 @@ module Permittable
       # As in drop_drafted_todos: a rootless key the columns now declare is
       # not also a "not in this contract" TODO.
       scan = scan.dup.tap { |copy| copy.rootless = Array(scan.rootless).reject { |arg| drafted.key?(scalar_key(arg).to_s) } }
-      column_draft(model, drafted.values, scan_todo_lines(scan), root: root)
+      column_draft(model, drafted.values, scan_todo_lines(scan), root: root, except: except)
     end
 
     # Whether a rootless scan's calls carried at least one body field —
@@ -377,8 +403,10 @@ module Permittable
 
     # A draft from the columns, or nil when none of them has a contract type
     # to declare it with (render returns nil for a body of comments only).
-    def column_draft(model, columns, todos, root: default_root(model))
-      render(root: root, model: model) { |rule| column_lines(columns.map { |column| column.in_rule(rule) }) + todos }
+    def column_draft(model, columns, todos, root: default_root(model), except: [])
+      render(root: root, model: model, except: except) do |rule|
+        column_lines(columns.map { |column| column.in_rule(rule) }) + todos
+      end
     end
 
     def infer_model(controller)
@@ -1005,12 +1033,20 @@ module Permittable
     # no field, which raises `a contract must declare at least one field`
     # when pasted. There is then nothing loadable to draft: nil, as for no
     # knowledge at all, which the rake task already skips.
-    def render(root:, model:, &lines)
+    #
+    # An action in `except` is dropped from the rule that declares it, and a
+    # rule left with no action is dropped: excepting :create from a split
+    # draft leaves the :update rule as drafted, with nothing required.
+    def render(root:, model:, except: [], &lines)
       shared = lines.call(:shared)
       return nil if shared.all? { |line| line.start_with?("#") }
 
       update = lines.call(:update)
       rules = shared == update ? [[DEFAULT_ACTIONS, shared]] : [[%i[create], lines.call(:create)], [%i[update], update]]
+      skipped = except.map(&:to_sym)
+      rules = rules.filter_map { |actions, body| [actions - skipped, body] unless (actions - skipped).empty? }
+      return nil if rules.empty?
+
       bodies = rules.map do |actions, body|
         "#{signature(root: root, model: model, actions: actions)}\n#{body.map { |line| "  #{line}\n" }.join}end\n"
       end

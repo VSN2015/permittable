@@ -18,7 +18,7 @@ gem "benchmark-ips", "~> 2.13", require: false
 # spec/json_body_parsing_spec.rb passes on json 3.
 # https://github.com/VSN2015/permittable/issues/58
 gem "json", "< 3"
-gem "railties", ">= 5.0", "< 9"
+gem "railties", ">= 6.1", "< 9"
 gem "rspec", "~> 3.12"
 gem "simplecov", "~> 1.2"
 gem "sqlite3", "~> 2.9.4"

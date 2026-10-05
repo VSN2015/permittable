@@ -1460,5 +1460,82 @@ RSpec.describe Permittable::Generator do
       controller = Class.new { def self.controller_name = "no_such_things" }
       expect(described_class.for_controller(controller, source: "def index; end")).to be_nil
     end
+
+    # An action on Permittable.audit_ignore (see .targets) is left out of the
+    # draft rather than drafted and then ignored.
+    context "with actions excepted" do
+      let(:controller) { Class.new { def self.controller_name = "gen_posts" } }
+
+      it "drafts only the rule for the action left, when the draft splits" do
+        draft = described_class.for_controller(controller, except: [:create])
+        expect(draft.scan(/permit_params :\w+/)).to eq(["permit_params :update"])
+        expect(draft).to include("optional :title, :string")
+        expect(draft).not_to include("required")
+
+        draft = described_class.for_controller(controller, except: [:update])
+        expect(draft.scan(/permit_params :\w+/)).to eq(["permit_params :create"])
+        expect(draft).to include("required :title, :string")
+        expect(load_draft(draft)).not_to be_nil
+      end
+
+      it "narrows a shared rule to the action left" do
+        rootless = Class.new { def self.controller_name = "no_such_things" }
+        draft = described_class.for_controller(rootless, source: "params.permit(:q)", except: [:create])
+        expect(draft).to include("permit_params :update, mode: :monitor do")
+      end
+
+      it "drafts nothing when every action is excepted" do
+        expect(described_class.for_controller(controller, except: %i[create update])).to be_nil
+      end
+    end
+  end
+
+  # What `permittable:generate` drafts when no controller is named: each
+  # controller with no contract yet, and the actions to leave out of its
+  # draft — none of what the audit ignores, so ActiveStorage's direct
+  # uploads controller is no longer drafted.
+  describe ".targets" do
+    def named_controller(path, &body)
+      Class.new(FakeController, &body).tap do |klass|
+        klass.define_singleton_method(:controller_path) { path }
+        klass.define_singleton_method(:name) { "#{path.camelize}Controller" }
+      end
+    end
+
+    let(:users) { named_controller("users") }
+    let(:uploads) { named_controller("active_storage/direct_uploads") }
+    let(:covered) do
+      named_controller("orders") do
+        include Permittable
+
+        permit_params(:create) { required :sku, :string }
+      end
+    end
+
+    after { Permittable.audit_ignore = nil }
+
+    it "skips covered controllers and controllers on the ignore list" do
+      targets = described_class.targets([users, uploads, covered], ignore: ["active_storage/direct_uploads"], root: nil)
+      expect(targets).to eq(users => [])
+    end
+
+    it "leaves an ignored action out of its controller's draft" do
+      expect(described_class.targets([users], ignore: ["users#create"], root: nil)).to eq(users => [:create])
+    end
+
+    it "skips a controller whose drafted actions are all ignored" do
+      expect(described_class.targets([users], ignore: %w[users#create users#update], root: nil)).to eq({})
+    end
+
+    it "skips a controller whose source is outside the app root" do
+      allow(Permittable::Audit).to receive(:source_path).and_call_original
+      allow(Permittable::Audit).to receive(:source_path).with(uploads).and_return("/gems/activestorage/app/x.rb")
+      expect(described_class.targets([users, uploads], ignore: [], root: "/srv/app")).to eq(users => [])
+    end
+
+    it "reads Permittable.audit_ignore by default" do
+      Permittable.audit_ignore = ["users"]
+      expect(described_class.targets([users])).to eq({})
+    end
   end
 end

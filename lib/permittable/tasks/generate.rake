@@ -3,7 +3,8 @@
 # params.expect calls in its source. Drafts go to stdout (paste-ready); the
 # summary goes to stderr.
 #
-#   bin/rails permittable:generate                      # every uncovered controller
+#   bin/rails permittable:generate                      # every uncovered controller not
+#                                                       # left out by Permittable.audit_ignore
 #   bin/rails "permittable:generate[UsersController]"   # one controller, even if covered
 namespace :permittable do
   desc "Draft Permittable contracts from models and existing permit calls"
@@ -15,23 +16,25 @@ namespace :permittable do
     bases << ActionController::API if defined?(ActionController::API)
     controllers = bases.flat_map(&:descendants).uniq.select(&:name)
 
+    # { controller => actions to leave out of its draft }. A named controller
+    # is drafted whole, even if covered or ignored; the sweep skips both, and
+    # leaves out what Permittable.audit_ignore names (see Generator.targets).
     if task_args[:controller]
       controllers = controllers.select { |c| c.name == task_args[:controller] }
       abort "Permittable: no controller named #{task_args[:controller]} was found" if controllers.empty?
+      targets = controllers.to_h { |c| [c, []] }
     else
-      controllers = controllers.reject do |c|
-        c.respond_to?(:permittable_contracts) && c.permittable_contracts.any?
-      end
+      targets = Permittable::Generator.targets(controllers)
     end
 
-    drafted = controllers.sort_by(&:name).count do |controller|
+    drafted = targets.sort_by { |controller, _| controller.name }.count do |controller, except|
       path = begin
         Object.const_source_location(controller.name)&.first
       rescue StandardError
         nil
       end
       source = path && File.exist?(path) ? File.read(path) : nil
-      snippet = Permittable::Generator.for_controller(controller, source: source)
+      snippet = Permittable::Generator.for_controller(controller, source: source, except: except)
       next false unless snippet
 
       puts ["# ====", controller.name, path && "(#{path})", "===="].compact.join(" ")

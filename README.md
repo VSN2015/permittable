@@ -195,7 +195,7 @@ Adopting on an existing API with live traffic? Skip ahead to [Adopting on a live
 - **[Adopting on a live API](#adopting-on-a-live-api)**
   - [Monitor mode](#monitor-mode-roll-out-without-rejecting)
   - [Generating draft contracts](#generating-draft-contracts-permittablegenerate)
-  - [Auditing coverage](#auditing-coverage-permittableaudit)
+  - [Auditing coverage](#auditing-coverage-permittableaudit) · [Ignoring controllers and actions](#ignoring-controllers-and-actions)
 - **[Beyond the controller](#beyond-the-controller)**
   - [Testing contracts](#testing-contracts-rspec-matchers)
   - [Standalone contracts](#standalone-contracts-no-controller)
@@ -832,6 +832,8 @@ bin/rails permittable:generate                      # every controller without a
 bin/rails "permittable:generate[UsersController]"   # one controller, even if covered
 ```
 
+The sweep skips what the audit [ignores](#ignoring-controllers-and-actions): controllers whose source is outside `Rails.root` (so ActiveStorage's direct uploads controller is not drafted), and anything in `Permittable.audit_ignore`. A `controller#action` entry leaves only that action out of the controller's draft. Naming a controller drafts it regardless, the same way it drafts a covered one.
+
 For each controller the task infers the model from `controller_name` (columns give types, NOT NULL gives `required`), scans the controller source for `params.require(...).permit(...)` and `params.expect(...)` calls (permitted keys give the field list and the `root:`), and prints a paste-ready draft:
 
 ```ruby
@@ -921,9 +923,9 @@ Three things it tells you that nothing else does:
 
 - **Which write actions are unguarded.** A `GET` without a contract is usually fine; a `POST` without one is untrusted input reaching the action unchecked. That count is the number `[strict]` fails on, which makes the task a CI gate: *no new unguarded write endpoint*.
 - **Which contracts aren't enforcing yet.** The audit runs inside the app, so unlike the exported OpenAPI it resolves the **effective** mode — a rule's own `mode:` first, then your app-wide `Permittable.mode`. This is the [monitor-mode](#monitor-mode-roll-out-without-rejecting) rollout dashboard.
-- **Which contracts have gone stale.** A contract declared for an action no route reaches, or for a routed action Rails would 404, is a renamed or deleted action that left its contract behind.
+- **Which contracts have gone stale.** A contract declared for an action no route reaches, or for a routed action Rails would 404, is a renamed or deleted action that left its contract behind. A contract on a shared base controller is stale only when no controller that inherits it reaches the action, and it is listed once, under the class that declares it.
 
-A route that lists several verbs is audited once per verb. A `match ... via: :all` route is expanded into exactly GET, POST, PUT, PATCH and DELETE, and listed once for each. `resources` routes all seven actions whether or not they exist. A route that Rails would 404 reads `action not found`: no method (inherited ones count), no `action_missing`, and no template to render implicitly. It is not counted against `[strict]` or as coverage. It stays in the table rather than disappearing. The template check uses the class-level view paths and the default lookup details. So a template that is only found at request time reads `action not found`, for example one behind a `prepend_view_path` in a `before_action`, or one that exists only as a variant.
+A route that lists several verbs is audited once per verb. A `match ... via: :all` route is expanded into exactly GET, POST, PUT, PATCH and DELETE, and listed once for each. Rails sends a request to the first route that matches its path and verb, and the audit lists what Rails dispatches. With `get "hooks", to: "webhooks#index"` before `match "hooks", to: "webhooks#receive", via: :all`, `GET /hooks` is listed under `index` only, and `receive` gets the other four verbs. Turn the two around and the `get` route is never reached, so it is not listed, and a contract on `index` shows as stale. The same rule removes a route declared twice, and the OpenAPI export applies it too. Only an unconstrained route hides the routes behind it, and only on the identical path. A route with a constraint can pass a request on: a segment requirement (`id: /\d+/`), a subdomain or host, or a constraint object or lambda. So the routes after it stay listed, even when the constraint happens to admit every request. With `constraints(AdminConstraint) { post "settings", ... }` ahead of `post "settings", to: "settings#update"`, every non-admin `POST` reaches `settings#update`, so its row stays and `[strict]` still counts it. The audit errs towards an extra row rather than a hidden route. Paths that differ at all, even only in a variable's name (`users/:id` and `users/:slug`), are both listed. `resources` routes all seven actions whether or not they exist. A route that Rails would 404 reads `action not found`: no method (inherited ones count), no `action_missing`, and no template to render implicitly. It is not counted against `[strict]` or as coverage. It stays in the table rather than disappearing. The template check uses the class-level view paths and the default lookup details. So a template that is only found at request time reads `action not found`, for example one behind a `prepend_view_path` in a `before_action`, or one that exists only as a variant.
 
 A catch-all 404 route (`match "*path", to: "application#not_found", via: :all`) shows its POST, PUT and PATCH rows as accepting a body. They do accept one: every stray body reaches the controller. Route only GET to the controller (Rails answers HEAD from it). Send the other verbs to a plain Rack endpoint, which never parses the body and which the audit does not list:
 
@@ -934,11 +936,60 @@ match "*path", to: ->(_env) { [404, { "content-type" => "text/plain" }, ["Not Fo
 
 A `config.exceptions_app = routes` setup (`match "/404", to: "errors#not_found", via: :all`) shows the same rows. It needs only `via: :get`, because on 6.1 and later `ShowExceptions` re-dispatches the error request as a GET.
 
-Under `[strict]` the task aborts on these rows, so the only choices today are to route the catch-all GET-only, as above, or to run the audit without `[strict]` until the ignore list ([#69](https://github.com/VSN2015/permittable/issues/69)) lands. Don't declare a contract on the catch-all to silence the gate. Under monitor mode it validates eagerly, so a malformed JSON POST answers 400 instead of 404. The OpenAPI export would also gain a fake `/{path}` endpoint.
+Under `[strict]` the task aborts on these rows. Either route the catch-all GET-only, as above, or add `application#not_found` to the [ignore list](#ignoring-controllers-and-actions). Don't declare a contract on the catch-all to silence the gate. Under monitor mode it validates eagerly, so a malformed JSON POST answers 400 instead of 404. The OpenAPI export would also gain a fake `/{path}` endpoint.
 
 The table lists a row for every verb on every path; the summary counts routes. A route with an optional segment, such as anything under `scope "(:locale)"`, lists each path it expands to (`/users` and `/{locale}/users`), but it is one route, so one unguarded `POST` counts once and the summary line says `N routed actions in M rows`. Rows are collapsed by controller, action, route index and verb; the index is a position within one `rails_routes` call, so audit concatenated route lists (an app's and an engine's) separately, or give them distinct `route:` values. Two separate routes to the same action (`post "/users"` and `post "/admin/users"`) count as two, because each one is a way in.
 
-Controllers that never included `Permittable` are audited too — those are the ones worth finding. Everything is plain Ruby over the frozen registry plus route descriptors, so `Permittable::Audit.entries(controllers:, routes:)` works without Rails.
+Controllers that never included `Permittable` are audited too — those are the ones worth finding. Everything is plain Ruby over the frozen registry plus route descriptors, so `Permittable::Audit.entries(controllers:, routes:)` works without Rails. It takes `ignore:` and `root:` too, which default to `Permittable.audit_ignore` and `Rails.root` (see below).
+
+#### Ignoring controllers and actions
+
+Some routed endpoints are not yours to guard. Two are common enough to fail almost every `[strict]` run: ActiveStorage's direct uploads controller (a `POST` with no contract), and the catch-all 404 above, whose `via: :all` adds `POST`, `PUT` and `PATCH` rows. List them in an initializer:
+
+```ruby
+# config/initializers/permittable.rb
+Permittable.audit_ignore = [
+  "active_storage/direct_uploads", # every action of the controller
+  "application#not_found"          # one action, on every verb it is routed on
+]
+```
+
+An entry is a controller path the way Rails routes it (the controller half of `bin/rails routes`, such as `admin/users`), or `controller#action`. Entries must be strings, checked when you assign the list:
+
+- A class name raises `ArgumentError` naming the path you meant: `"ActiveStorage::DirectUploadsController"` → did you mean `"active_storage/direct_uploads"`?
+- A class raises too. Naming one in an initializer would autoload the controller during boot, which Zeitwerk refuses for a reloadable controller.
+- A `Regexp` raises. A pattern would also ignore controllers added after it, and catching a new unguarded endpoint is the point of the gate.
+
+Assign the whole list. It is frozen, so add to it with `Permittable.audit_ignore += ["webhooks#receive"]`, which is validated too.
+
+**Controllers outside `Rails.root` are ignored by default.** These are engines and gems: ActiveStorage, ActionMailbox, Devise, and Rails' own `rails/*` controllers. An app can't keep a contract in a gem's controller. The audit locates a controller by the file that defines its class (`Module#const_source_location`). A gem installed inside the app still counts as a gem; `bundle config path vendor/bundle` does this, and so do CI caches. A controller whose source can't be located is audited. To audit gem controllers like your own:
+
+```ruby
+Permittable.audit_ignore_outside_root = false
+```
+
+That default already covers ActiveStorage. Naming it, as above, keeps it ignored if you turn the default off. To put a gem's endpoint under the gate, subclass its controller in `app/controllers` (for Devise, `devise_for :users, controllers: { sessions: "users/sessions" }`). The subclass is the app's, so it is audited.
+
+Ignored endpoints leave the counts and never fail `[strict]`, but they stay in the report. Each reason gets its own section, with one line per action and the verbs it is routed on. An entry that matches no routed action (a typo, or a route since removed) is listed as well. Otherwise a typo would ignore nothing, and nothing would say so. With the initializer above plus a mistyped `"admin/report"`, the end of the report reads:
+
+```
+Ignored by Permittable.audit_ignore (left out of the counts above):
+  active_storage/direct_uploads#create  POST
+  application#not_found                 DELETE, GET, PATCH, POST, PUT
+
+Ignored as outside the app root (set Permittable.audit_ignore_outside_root = false to audit them):
+  active_storage/blobs/redirect#show  GET
+  active_storage/disk#show            GET
+  active_storage/disk#update          PUT
+  rails/health#show                   GET
+
+Permittable.audit_ignore entries that match no routed action (a typo, or a route since removed?):
+  admin/report
+```
+
+An unmatched entry is reported, not failed: a mistyped `application#not_foud` leaves the catch-all's rows in the count, so `[strict]` fails on those, and this list says why.
+
+`permittable:generate` honours the same list (see [generating draft contracts](#generating-draft-contracts-permittablegenerate)).
 
 ---
 
@@ -1037,7 +1088,7 @@ bin/rails permittable:openapi                       # JSON to stdout
 bin/rails "permittable:openapi[openapi/api.json]"   # write to a file
 ```
 
-The task eager-loads the app (also exercising the drift guard), collects every controller with contracts, and maps documented actions onto `paths` via the route set. `OPENAPI_TITLE` / `OPENAPI_VERSION` override the `info` block. Pipe the output through Swagger UI, Redoc, Postman, or [`openapi-typescript`](https://github.com/openapi-ts/openapi-typescript) and your frontend gets compile-time types for every request body.
+The task eager-loads the app (also exercising the drift guard), collects every controller with contracts, and maps documented actions onto `paths` via the route set. Each path and verb is documented under the action Rails dispatches it to, which is the first route that matches. So an explicit `get` before a `via: :all` route on the same path keeps `GET`, and a route behind an earlier, unconstrained one with the same path and verb is not documented under that verb. A constrained route hides nothing ([the audit](#auditing-coverage-permittableaudit) explains why). When two routes then claim one path and verb, the second operation lands under `x-permittable-controllers`. `OPENAPI_TITLE` / `OPENAPI_VERSION` override the `info` block. Pipe the output through Swagger UI, Redoc, Postman, or [`openapi-typescript`](https://github.com/openapi-ts/openapi-typescript) and your frontend gets compile-time types for every request body.
 
 Or build fragments programmatically — no Rails required:
 
@@ -1061,10 +1112,14 @@ Every operation references shared components for the [error envelope](#violation
 | One operation under two verbs (the separate PATCH and PUT routes `resources` draws to `update`, or one `match ..., via: [:patch, :put]` route) | `users_update` on PATCH, `users_update_put` on PUT |
 | The pair again at a second path (`resources :orgs { resources :users }`) | `users_update_2` on the second PATCH, `users_update_3` on the second PUT |
 | One operation under every verb (with `via: :all` routes, which the exporter documents under each verb) | `webhooks_receive` on GET, then `webhooks_receive_post`, `_put`, `_patch`, `_delete` |
-| One operation at two paths under one verb (with the optional-segment expansion: `(/:locale)/posts` is documented at `/posts` and `/{locale}/posts`) | `posts_create` on the first path in route order, `posts_create_2` on the other |
-| Two controllers that fold to one id (`admin/users` and `admin_users`, both GET) | `admin_users_index` on the first controller, `admin_users_index_2` on the second |
+| One operation at two paths under one verb (with the optional-segment expansion: `(/:locale)/posts` is documented at `/posts` and `/{locale}/posts`) | `posts_create` on the shallower path, `posts_create_2` on the other |
+| Two controllers that fold to one id (`admin/users` and `admin_users`, both GET) | `admin_users_index` on `admin/users`, whose controller path sorts first, and `admin_users_index_2` on `admin_users` |
 
-One place keeps the plain id. A routed operation comes before one under `x-permittable-controllers`, which takes part because it is in the same document. After that, controller, action and route order decide. Within one operation, PATCH comes before PUT whichever the route lists first, so `match via: [:put, :patch]` and `resources` name the PATCH method the same way. Between two operations only the order counts, whatever the verbs. Every other place gets its verb appended when that verb differs from the plain id's verb and the result is free. Otherwise it gets the next free number, from `_2`. So a second PATCH is `users_update_2`, not `users_update_patch`, and a second POST is `posts_create_2`. **The stability rule:** an id that only one operation would carry never changes, even when a suffix elsewhere would spell it; that suffix is numbered instead. So a change to routes or controllers can rename only operations that collide, never one that stands alone. A route declared twice is placed once, and a controller passed twice is documented once, so neither collides with itself.
+One place keeps the plain id. The exporter ranks the places by what they are, never by the order it finds them in. A routed operation comes before one under `x-permittable-controllers`, which takes part because it is in the same document. Then operations are ranked by controller path, then action, compared as strings, whatever their verbs. Within one operation, the shallowest path comes first (the fewest segments, then alphabetical order), then the verb: GET, POST, PATCH, PUT, DELETE. So PATCH comes before PUT whichever the route lists first, and `match via: [:put, :patch]` and `resources` name the PATCH method the same way. Every other place gets its verb appended when that verb differs from the plain id's verb and the result is free. Otherwise it gets the next free number in rank order, from `_2`. So a second PATCH is `users_update_2`, not `users_update_patch`, and a second POST is `posts_create_2`. A route declared twice is placed once, and a controller passed twice is documented once, so neither collides with itself.
+
+**The stability rules.** An id that only one operation would carry never changes, even when a suffix elsewhere would spell it; that suffix is numbered instead. Reordering `routes.rb`, or a controller that loads earlier, renames nothing, because the rank never reads that order. (The exception is two routes that answer the same path and verb. Their order decides which one Rails dispatches to, and the export follows Rails. When the first of them is constrained, both are kept, controller order picks which operation takes the slot, and the other lands under `x-permittable-controllers`.)
+
+**What can still rename a generated method: a change to a colliding group.** No scheme can keep every id when a new collider arrives, because one of them must take a suffix. A new route, action or controller whose id collides gets a suffix. If it ranks first, it takes the plain id from the place that had it instead. Every numbered place ranked after it moves along by one. Removing or renaming a collider moves the others the same way. Only the members of the colliding group can be renamed, never an id that stands alone. If a client must never change, remove the collision: give the operations distinct controller paths or action names.
 
 Output is deterministic (fixed key order, declaration-order properties), so the generated file can be committed and reviewed as a diff — a contract change shows up in the same PR as its documentation change.
 
@@ -1146,12 +1201,14 @@ A `format:` regexp that does not translate to ECMA-262 is looser in the same way
 | `Permittable.error_format` / `=` | `:envelope` (default) or `:problem` — see [RFC 9457 problem+json](#rfc-9457-problemjson) |
 | `Permittable.problem_base_uri` / `=` | Base URI for problem `type` members |
 | `Permittable.check_column_types` / `=` | Opt in to the [type half of the drift guard](#checking-types-too-opt-in) (default `false`) |
+| `Permittable.audit_ignore` / `=` | Controller paths and `controller#action` strings the audit and the generator [leave out](#ignoring-controllers-and-actions) (default `[]`) |
+| `Permittable.audit_ignore_outside_root` / `=` | Also leave out controllers whose source is outside `Rails.root` (default `true`) |
 | `Permittable.fields(&block)` | A reusable [field group](#reusing-fields-permittablefields-and-use) — splice it into a contract with `use` |
 | `Permittable::InvalidParameters` | Raised on violation; carries `#details` and `#status` |
 | `Permittable::JsonSchema` | Contract data → JSON Schema fragments (`.rule`, `.object`, `.field`) |
 | `Permittable::OpenAPI` | OpenAPI 3.1 assembly (`.document`, `.operations_for`, `.request_body_for`, `.components`) |
-| `Permittable::Generator` | Contract drafting (`.draft`, `.for_controller`, `.scan`) — see [generating draft contracts](#generating-draft-contracts-permittablegenerate) |
-| `Permittable::Audit` | Coverage across the route set (`.entries`, `.summary`, `.stale`, `.format`) — see [auditing coverage](#auditing-coverage-permittableaudit) |
+| `Permittable::Generator` | Contract drafting (`.draft`, `.for_controller`, `.scan`, `.targets`) — see [generating draft contracts](#generating-draft-contracts-permittablegenerate) |
+| `Permittable::Audit` | Coverage across the route set (`.entries`, `.summary`, `.stale`, `.format`, `.ignore_reason`, `.unmatched_ignores`) — see [auditing coverage](#auditing-coverage-permittableaudit) |
 | `Permittable::Contract` | [Standalone contracts](#standalone-contracts-no-controller) (`.define`, `#call`, `#call!`, `#json_schema`, `#rule`, `#fields`) |
 | `Permittable::FieldGroup` | A [reusable field list](#reusing-fields-permittablefields-and-use) (`#fields`, `#names`) — built by `Permittable.fields` |
 | `Permittable::Matchers` | RSpec matchers via `require "permittable/rspec"` — `permit_param` for the declaration, `accept_params`/`reject_params` for the behaviour. See [testing contracts](#testing-contracts-rspec-matchers) |

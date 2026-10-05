@@ -103,6 +103,76 @@ RSpec.describe Permittable::Audit do
       expect(described_class.summary(found)[:uncovered_with_body]).to eq(3)
     end
 
+    # Rails dispatches a request to the first route matching its path and
+    # verb. The audit reads the same descriptors as the export, so it lists
+    # each verb on a path under the action Rails sends it to, and keeps every
+    # route a constraint could still pass a request on to.
+    context "when routes share a path and verb" do
+      def descriptors(&draw)
+        route_set = ActionDispatch::Routing::RouteSet.new
+        route_set.draw(&draw)
+        Permittable::OpenAPI.rails_routes(Struct.new(:routes).new(route_set))
+      end
+
+      it "lists GET under the explicit route drawn first, with no phantom via: :all row" do
+        routes = descriptors do
+          get "hooks", to: "webhooks#index"
+          match "hooks", to: "webhooks#receive", via: :all
+        end
+        found = described_class.entries(controllers: [bare_class("webhooks")], routes: routes)
+
+        expect(found.map { |e| [e.verb, e.action] }).to contain_exactly(
+          %w[get index], %w[post receive], %w[put receive], %w[patch receive], %w[delete receive]
+        )
+        expect(described_class.format(found)).not_to match(%r{GET\s+/hooks\s+receive})
+        expect(described_class.summary(found)).to include(actions: 5, uncovered_with_body: 3)
+      end
+
+      # Rails never reaches the explicit route, so neither does the audit, and
+      # a contract left on its action guards nothing.
+      it "drops an explicit route an earlier via: :all route shadows, and calls its contract stale" do
+        webhooks = controller_class("webhooks") { permit_params(:index) { optional :page, :integer } }
+        routes = descriptors do
+          match "hooks", to: "webhooks#receive", via: :all
+          get "hooks", to: "webhooks#index"
+        end
+        found = described_class.entries(controllers: [webhooks], routes: routes)
+
+        expect(found.map(&:action).uniq).to eq(["receive"])
+        expect(found.map(&:verb)).to contain_exactly("get", "post", "put", "patch", "delete")
+        expect(described_class.stale(controllers: [webhooks], routes: routes)).to eq("webhooks" => ["index"])
+      end
+
+      # The audit is a gate, so a constrained route must never hide the one
+      # behind it: Rails sends every request the constraint turns away (here,
+      # every non-admin POST) to the uncovered action, and dropping that row
+      # would let `[strict]` pass over unguarded input.
+      it "keeps counting an uncovered route behind a constrained one on the same path" do
+        admin = Class.new { def self.matches?(_request) = true }
+        guarded = controller_class("admin/settings") { permit_params(:update) { optional :theme, :string } }
+        routes = descriptors do
+          constraints(admin) { post "settings", to: "admin/settings#update" }
+          post "settings", to: "settings#update"
+        end
+        found = described_class.entries(controllers: [guarded, bare_class("settings")], routes: routes)
+
+        expect(found.map { |e| [e.controller, e.covered?] }).to eq([["admin/settings", true], ["settings", false]])
+        expect(described_class.summary(found)).to include(actions: 2, uncovered_with_body: 1)
+      end
+
+      it "keeps a route behind a segment-constrained one reachable, so its contract is not stale" do
+        posts = controller_class("posts") { permit_params(:by_slug) { optional :preview, :boolean } }
+        routes = descriptors do
+          get "posts/:id", to: "posts#show", constraints: { id: /\d+/ }
+          get "posts/:id", to: "posts#by_slug"
+        end
+
+        expect(described_class.entries(controllers: [posts], routes: routes).map(&:action))
+          .to contain_exactly("show", "by_slug")
+        expect(described_class.stale(controllers: [posts], routes: routes)).to eq({})
+      end
+    end
+
     context "when a routed action has no action method" do
       # `resources :posts` routes all seven actions whether or not the
       # controller defines them; Rails 404s the ones it does not.
@@ -289,6 +359,76 @@ RSpec.describe Permittable::Audit do
       end
       expect(described_class.stale(controllers: [renamed], routes: routes)).to eq("users" => ["archive"])
     end
+
+    # permittable_contracts is a class_attribute, so a subclass carries every
+    # rule its parent declared. Judged one class at a time, a shared base
+    # (routed to nothing) and each subclass routed to a different slice of
+    # its actions all read as stale.
+    context "when subclasses inherit the contract" do
+      def subclass(parent, name)
+        Class.new(parent).tap { |klass| klass.define_singleton_method(:controller_path) { name } }
+      end
+
+      let(:base) do
+        controller_class("api/base") do
+          permit_params(:create) { required :a, :string }
+          permit_params(:update) { required :b, :string }
+        end
+      end
+      let(:accounts) { subclass(base, "api/accounts") }
+      let(:posts) { subclass(base, "api/posts") }
+      let(:split_routes) do
+        [{ controller: "api/accounts", action: "create", verb: "post", path: "/accounts" },
+         { controller: "api/posts", action: "update", verb: "patch", path: "/posts/{id}" }]
+      end
+
+      it "does not report a shared base whose subclass routes the action" do
+        shared = controller_class("api/base") { permit_params(:create) { required :a, :string } }
+        child = subclass(shared, "api/users")
+        users_routes = [{ controller: "api/users", action: "create", verb: "post", path: "/users" }]
+        expect(described_class.stale(controllers: [shared, child], routes: users_routes)).to eq({})
+      end
+
+      it "counts an action as reached when any controller carrying the contract routes it" do
+        expect(described_class.stale(controllers: [base, accounts, posts], routes: split_routes)).to eq({})
+      end
+
+      # Not under every subclass too, and not dropped because no subclass
+      # declared it: an inherited rule nothing routes is still stale.
+      it "reports a contract no carrier routes once, under the class that declared it" do
+        expect(described_class.stale(controllers: [base, accounts], routes: split_routes.first(1)))
+          .to eq("api/base" => ["update"])
+      end
+
+      it "counts the base's own routes when it is routed as well as subclassed" do
+        routed_base = [split_routes.first, { controller: "api/base", action: "update", verb: "patch", path: "/base/{id}" }]
+        expect(described_class.stale(controllers: [base, accounts], routes: routed_base)).to eq({})
+      end
+
+      # Inheritance runs one way: a request to the parent never resolves
+      # through a rule only its subclass declared.
+      it "does not let a parent's routes keep a subclass's own contract alive" do
+        posts.permit_params(:archive) { required :c, :string }
+        parent_archive = split_routes + [{ controller: "api/base", action: "archive", verb: "post", path: "/base" }]
+        expect(described_class.stale(controllers: [base, accounts, posts], routes: parent_archive))
+          .to eq("api/posts" => ["archive"])
+      end
+
+      it "still treats a route the carrier would 404 as no route" do
+        accounts.define_singleton_method(:action_methods) { Set.new(%w[index]) }
+        expect(described_class.stale(controllers: [base, accounts, posts], routes: split_routes))
+          .to eq("api/base" => ["create"])
+      end
+
+      # The declaring class carries its rule whether or not it was passed, so
+      # a report naming it never contradicts its own routes.
+      it "judges an inherited contract by its declaring class even when only a subclass is passed" do
+        routed_base = [split_routes.first, { controller: "api/base", action: "update", verb: "patch", path: "/base/{id}" }]
+        expect(described_class.stale(controllers: [accounts], routes: routed_base)).to eq({})
+        expect(described_class.stale(controllers: [accounts], routes: split_routes.first(1)))
+          .to eq("api/base" => ["update"])
+      end
+    end
   end
 
   describe ".summary" do
@@ -382,8 +522,340 @@ RSpec.describe Permittable::Audit do
       expect(described_class.format(found)).to include("2 routed actions in 4 rows: ")
     end
 
+    # The README quotes the plural lines; a count of one must not read as
+    # "1 of those accept".
+    it "agrees in number when a summary count is one" do
+      one = controller_class("users") { permit_params(:create, model: nil) { required :name, :string } }
+      report = described_class.format(described_class.entries(controllers: [one], routes: routes.first(3)))
+      expect(report).to include("\n  1 of those accepts a request body — untrusted input reaches the action unchecked\n")
+      expect(report).to include("\n  1 covered action declares no model:, so no schema-drift guard runs for it\n")
+      expect(described_class.format(entries))
+        .to include("\n  2 covered actions declare no model:, so no schema-drift guard runs for them\n")
+    end
+
     it "says so plainly when there is nothing to report" do
       expect(described_class.format([], stale: {})).to include("no routed actions")
+    end
+  end
+
+  # Endpoints that are not the app's to guard — ActiveStorage's direct
+  # uploads, a catch-all 404 — leave the counts and [strict], but never the
+  # report: each is listed in a section of its own, with the reason.
+  describe "the ignore list" do
+    after do
+      Permittable.audit_ignore = nil
+      Permittable.audit_ignore_outside_root = true
+    end
+
+    describe "Permittable.audit_ignore" do
+      it "is empty until configured" do
+        expect(Permittable.audit_ignore).to eq([])
+      end
+
+      it "takes controller paths as Rails names them, and controller#action" do
+        Permittable.audit_ignore = %w[active_storage/direct_uploads application#not_found application#not_found]
+        expect(Permittable.audit_ignore).to eq(%w[active_storage/direct_uploads application#not_found])
+        expect(Permittable.audit_ignore).to be_frozen
+      end
+
+      # Frozen, so nothing joins the list without passing the writer's check.
+      it "is added to with +=, not in place" do
+        Permittable.audit_ignore = ["legacy"]
+        expect { Permittable.audit_ignore << "webhooks" }.to raise_error(FrozenError)
+        Permittable.audit_ignore += ["webhooks#receive"]
+        expect(Permittable.audit_ignore).to eq(%w[legacy webhooks#receive])
+        expect { Permittable.audit_ignore += ["Webhooks"] }.to raise_error(ArgumentError)
+      end
+
+      it "resets to empty when set to nil" do
+        Permittable.audit_ignore = ["legacy"]
+        Permittable.audit_ignore = nil
+        expect(Permittable.audit_ignore).to eq([])
+      end
+
+      # The likeliest mistake is the class name for the path, which would
+      # otherwise match nothing and ignore nothing.
+      it "rejects a class name, naming the controller path it meant" do
+        expect { Permittable.audit_ignore = ["ActiveStorage::DirectUploadsController"] }
+          .to raise_error(ArgumentError, %r{did you mean "active_storage/direct_uploads"\?})
+      end
+
+      # A class named in an initializer autoloads it during boot, which
+      # Zeitwerk refuses for a reloadable controller — so the path it is.
+      it "rejects a controller class, naming its path" do
+        klass = controller_class("legacy/invoices")
+        expect { Permittable.audit_ignore = [klass] }
+          .to raise_error(ArgumentError, %r{did you mean "legacy/invoices"\?})
+      end
+
+      it "rejects anything else, and keeps the list it had" do
+        Permittable.audit_ignore = ["legacy"]
+        [%r{\Aadmin/}, :application, " application", "/admin/users", "application#", "a#b#c", ""].each do |bad|
+          expect { Permittable.audit_ignore = [bad] }.to raise_error(ArgumentError, /audit_ignore/)
+        end
+        expect(Permittable.audit_ignore).to eq(["legacy"])
+      end
+    end
+
+    describe "Permittable.audit_ignore_outside_root" do
+      it "is on by default" do
+        expect(Permittable.audit_ignore_outside_root).to be(true)
+      end
+
+      it "takes only true or false" do
+        Permittable.audit_ignore_outside_root = false
+        expect(Permittable.audit_ignore_outside_root).to be(false)
+        expect { Permittable.audit_ignore_outside_root = "no" }.to raise_error(ArgumentError, /true or false/)
+      end
+    end
+
+    describe "a controller on the list" do
+      let(:found) do
+        described_class.entries(controllers: [users, bare_class("legacy")], routes: routes, ignore: ["legacy"])
+      end
+
+      it "marks every routed action of it ignored, and says why" do
+        expect(found.select(&:ignored?).map { |e| [e.controller, e.action, e.ignored] })
+          .to eq([["legacy", "create", :configured]])
+        expect(found.reject(&:ignored?).map(&:controller).uniq).to eq(["users"])
+      end
+
+      it "leaves it out of the counts" do
+        expect(described_class.summary(found))
+          .to include(actions: 4, uncovered: 2, uncovered_with_body: 1, unguarded_models: 2)
+      end
+
+      it "reads Permittable.audit_ignore by default" do
+        Permittable.audit_ignore = ["legacy"]
+        defaulted = described_class.entries(controllers: [users, bare_class("legacy")], routes: routes)
+        expect(defaulted.find { |e| e.controller == "legacy" }.ignored).to eq(:configured)
+      end
+    end
+
+    # `match "*path", to: "application#not_found", via: :all` answers every
+    # verb, so POST, PUT and PATCH read as accepting a body. Naming the action
+    # ignores the catch-all and nothing else on ApplicationController.
+    describe "a controller#action on the list" do
+      let(:descriptors) do
+        route_set = ActionDispatch::Routing::RouteSet.new
+        route_set.draw do
+          post "feedback", to: "application#feedback"
+          match "*path", to: "application#not_found", via: :all
+        end
+        Permittable::OpenAPI.rails_routes(Struct.new(:routes).new(route_set))
+      end
+      let(:found) do
+        described_class.entries(controllers: [bare_class("application")], routes: descriptors,
+                                ignore: ["application#not_found"])
+      end
+
+      it "ignores every verb of the catch-all, and only the catch-all" do
+        expect(found.select(&:ignored?).map(&:action).uniq).to eq(["not_found"])
+        expect(found.select(&:ignored?).map(&:verb)).to include("post", "put", "patch")
+        expect(found.reject(&:ignored?).map { |e| [e.action, e.verb] }).to eq([%w[feedback post]])
+      end
+
+      # The rake task's [strict] fails on exactly this number.
+      it "takes the catch-all out of the strict count" do
+        unignored = described_class.entries(controllers: [bare_class("application")], routes: descriptors, ignore: [])
+        expect(described_class.summary(unignored)[:uncovered_with_body]).to be > 1
+        expect(described_class.summary(found)[:uncovered_with_body]).to eq(1)
+      end
+    end
+
+    it "passes [strict] when every gap left is an ignored one" do
+      found = described_class.entries(controllers: [users, bare_class("legacy")], routes: routes,
+                                      ignore: %w[legacy users#update])
+      expect(found.count { |e| e.ignored? && e.body? && !e.covered? }).to eq(2)
+      expect(described_class.summary(found)[:uncovered_with_body]).to eq(0)
+    end
+
+    describe "in the report" do
+      let(:found) do
+        hook_routes = %w[get post].map { |verb| { controller: "webhooks", action: "receive", verb: verb, path: "/hooks" } }
+        described_class.entries(controllers: [users, bare_class("legacy"), bare_class("webhooks")],
+                                routes: routes + hook_routes, ignore: %w[legacy webhooks#receive])
+      end
+      let(:report) { described_class.format(found, unmatched: []) }
+
+      it "lists ignored actions in a section of their own, with their verbs and the reason" do
+        expect(report).to include(<<~TEXT)
+
+          Ignored by Permittable.audit_ignore (left out of the counts above):
+            legacy#create     POST
+            webhooks#receive  GET, POST
+        TEXT
+      end
+
+      it "keeps them out of the table and the summary" do
+        table = report.split("\n\n").first
+        expect(table).not_to include("legacy")
+        expect(table).not_to include("webhooks")
+        expect(report).to include("4 routed actions: 1 enforced, 1 in monitor mode, 2 without a contract")
+        expect(described_class.summary(found)[:uncovered_with_body]).to eq(1)
+        expect(report).to match(/1 of those accepts? a request body/)
+      end
+
+      it "still reports when every routed action is ignored" do
+        all = described_class.entries(controllers: [bare_class("legacy")], routes: routes, ignore: ["legacy"])
+        expect(described_class.format(all, unmatched: [])).to include("0 routed actions", "legacy#create")
+      end
+    end
+
+    # An entry that matches nothing does nothing, so a typo would leave the
+    # gap it was meant to close — or, worse, read as closed. It is listed.
+    describe "an entry that matches nothing" do
+      it "is found by .unmatched_ignores" do
+        expect(described_class.unmatched_ignores(entries, ignore: %w[legacy legacy#create legacy#craete leagcy]))
+          .to eq(%w[legacy#craete leagcy])
+      end
+
+      it "counts a match among ignored entries too" do
+        found = described_class.entries(controllers: [bare_class("legacy")], routes: routes, ignore: ["legacy"])
+        expect(described_class.unmatched_ignores(found, ignore: %w[legacy legacy#create])).to eq([])
+      end
+
+      it "is listed in the report, from Permittable.audit_ignore by default" do
+        Permittable.audit_ignore = %w[legacy users#craete]
+        report = described_class.format(described_class.entries(controllers: [users, bare_class("legacy")],
+                                                                routes: routes))
+        expect(report).to include("\nPermittable.audit_ignore entries that match no routed action " \
+                                  "(a typo, or a route since removed?):\n  users#craete\n")
+      end
+
+      it "does not fail [strict] on its own" do
+        found = described_class.entries(controllers: [users], routes: routes.first(4), ignore: %w[users#update nope])
+        expect(described_class.summary(found)[:uncovered_with_body]).to eq(0)
+      end
+    end
+
+    # Engines and gems — ActiveStorage, ActionMailbox, Rails's own rails/*
+    # controllers — are not the app's to guard, so a controller whose source
+    # is outside the app root is ignored by default. Located by the constant's
+    # own definition, so these load real files.
+    describe "controllers outside the app root" do
+      around do |example|
+        Dir.mktmpdir do |dir|
+          @dir = dir
+          @loaded = []
+          example.run
+        ensure
+          @loaded.each { |name| Object.send(:remove_const, name) if Object.const_defined?(name, false) }
+        end
+      end
+
+      let(:root) { File.join(@dir, "app") }
+
+      # A named controller defined by a real file at `relative` under the
+      # tmpdir, so const_source_location has a definition site to report.
+      def controller_file(relative, const, path)
+        file = File.join(@dir, relative)
+        FileUtils.mkdir_p(File.dirname(file))
+        File.write(file, <<~RUBY)
+          class #{const} < FakeController
+            def self.controller_path = #{path.inspect}
+
+            def create; end
+          end
+        RUBY
+        load file
+        @loaded << const
+        Object.const_get(const)
+      end
+
+      let(:app_controller) do
+        controller_file("app/app/controllers/audit_widgets_controller.rb", "AuditWidgetsController", "widgets")
+      end
+      let(:engine_controller) do
+        controller_file("gems/uploader/app/controllers/audit_uploads_controller.rb", "AuditUploadsController",
+                        "uploader/uploads")
+      end
+      let(:upload_routes) do
+        [{ controller: "widgets", action: "create", verb: "post", path: "/widgets" },
+         { controller: "uploader/uploads", action: "create", verb: "post", path: "/rails/uploads" }]
+      end
+
+      def ignored(found)
+        found.to_h { |e| [e.controller, e.ignored] }
+      end
+
+      it "ignores a controller defined outside the root, and only that one" do
+        found = described_class.entries(controllers: [app_controller, engine_controller], routes: upload_routes,
+                                        ignore: [], root: root)
+        expect(ignored(found)).to eq("widgets" => nil, "uploader/uploads" => :outside_root)
+        expect(described_class.summary(found)[:uncovered_with_body]).to eq(1)
+      end
+
+      it "lists it under its own reason in the report" do
+        found = described_class.entries(controllers: [app_controller, engine_controller], routes: upload_routes,
+                                        ignore: [], root: root)
+        expect(described_class.format(found, unmatched: []))
+          .to include("\nIgnored as outside the app root (set Permittable.audit_ignore_outside_root = false " \
+                      "to audit them):\n  uploader/uploads#create  POST\n")
+      end
+
+      # bundler-cache on CI, and Docker images, install gems under the app's
+      # own vendor/bundle — inside the root, and still not the app's code.
+      it "ignores a gem installed inside the root" do
+        gem_dir = File.join(root, "vendor", "bundle", "ruby", "3.2.0")
+        vendored = controller_file("app/vendor/bundle/ruby/3.2.0/gems/uploader/app/controllers/audit_vendored_controller.rb",
+                                   "AuditVendoredController", "uploader/uploads")
+        allow(Gem).to receive(:path).and_return([gem_dir])
+        found = described_class.entries(controllers: [vendored], routes: upload_routes.last(1), ignore: [], root: root)
+        expect(ignored(found)).to eq("uploader/uploads" => :outside_root)
+      end
+
+      # A GEM_HOME set to the app, or above it, cannot tell a gem's file from
+      # the app's; trusting it would ignore every controller and pass [strict].
+      it "does not trust a gem directory that holds the root itself" do
+        allow(Gem).to receive(:path).and_return([@dir, root])
+        found = described_class.entries(controllers: [app_controller], routes: upload_routes.first(1), ignore: [],
+                                        root: root)
+        expect(ignored(found)).to eq("widgets" => nil)
+      end
+
+      it "names the configured reason when a controller is both, so its entry is not unmatched" do
+        found = described_class.entries(controllers: [engine_controller], routes: upload_routes.last(1),
+                                        ignore: ["uploader/uploads"], root: root)
+        expect(ignored(found)).to eq("uploader/uploads" => :configured)
+        expect(described_class.unmatched_ignores(found, ignore: ["uploader/uploads"])).to eq([])
+      end
+
+      # For a gate, a false alarm beats a missed endpoint.
+      it "audits a controller whose source cannot be located" do
+        found = described_class.entries(controllers: [bare_class("legacy")], routes: routes, ignore: [], root: root)
+        expect(found.none?(&:ignored?)).to be(true)
+      end
+
+      it "falls back to the controller's own methods when its constant cannot be located" do
+        anonymous = Class.new(FakeController) { def self.controller_path = "uploader/uploads" }
+        # A location outside the root is the point, so not __FILE__/__LINE__.
+        outside = File.join(@dir, "gems/uploader/anonymous.rb")
+        anonymous.class_eval("def create; end", outside, 1) # rubocop:disable Style/EvalWithLocation
+        found = described_class.entries(controllers: [anonymous], routes: upload_routes.last(1), ignore: [], root: root)
+        expect(ignored(found)).to eq("uploader/uploads" => :outside_root)
+      end
+
+      it "takes the root from Rails.root by default" do
+        app = root
+        stub_const("Rails", Module.new.tap { |m| m.define_singleton_method(:root) { Pathname.new(app) } })
+        expect(described_class.app_root).to eq(root)
+        found = described_class.entries(controllers: [app_controller, engine_controller], routes: upload_routes)
+        expect(ignored(found)).to eq("widgets" => nil, "uploader/uploads" => :outside_root)
+      end
+
+      it "audits everything when Permittable.audit_ignore_outside_root is off" do
+        stub_const("Rails", Module.new.tap { |m| m.define_singleton_method(:root) { Pathname.new("/srv/app") } })
+        Permittable.audit_ignore_outside_root = false
+        expect(described_class.app_root).to be_nil
+        found = described_class.entries(controllers: [engine_controller], routes: upload_routes.last(1))
+        expect(found.none?(&:ignored?)).to be(true)
+      end
+
+      it "has no root, so ignores nothing as outside it, without Rails" do
+        hide_const("Rails")
+        expect(described_class.app_root).to be_nil
+      end
     end
   end
 end
