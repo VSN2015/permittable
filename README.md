@@ -12,6 +12,7 @@
 
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
+  <a href="#complete-example">Complete example</a> ·
   <a href="#guide">Guide</a> ·
   <a href="#adopting-on-a-live-api">Adopting on a live API</a> ·
   <a href="#beyond-the-controller">Beyond the controller</a> ·
@@ -167,12 +168,13 @@ end
 
 That is the whole integration. Violations render the 422 envelope automatically, `model: Order` verifies the fields against the `orders` table when the class loads, and every rejected request emits an `invalid_parameters.permittable` notification.
 
-Adopting on an existing API with live traffic? Skip ahead to [Adopting on a live API](#adopting-on-a-live-api): the gem can draft the contracts for you, and run them in a report-only mode until you are ready to enforce.
+Adopting on an existing API with live traffic? Skip ahead to [Adopting on a live API](#adopting-on-a-live-api): the gem can draft the contracts for you, and run them in a report-only mode until you are ready to enforce. Want to see every option at once? See the [complete example](#complete-example).
 
 > **Naming note:** some legacy stacks (InheritedResources) define their own `permitted_params`. Don't include both on one controller.
 
 ## Contents
 
+- **[Complete example](#complete-example)**: every option in one events API
 - **[Guide](#guide)**
   - [How a request flows](#how-a-request-flows)
   - [Declaring a contract](#declaring-a-contract)
@@ -203,6 +205,317 @@ Adopting on an existing API with live traffic? Skip ahead to [Adopting on a live
 - **[Reference](#reference)**
   - [API](#api) · [Errors caught at class load](#errors-caught-at-class-load) · [Compatibility](#compatibility)
 - [Development](#development) · [License](#license)
+
+---
+
+## Complete example
+
+Every feature in one place: a small events API that uses every field type, every field option, every `permit_params` option and every app-wide setting. Nothing here is required. Copy the parts you need, and follow the links into the [Guide](#guide) for the details.
+
+**1. App-wide settings.** All of them are optional.
+
+```ruby
+# config/initializers/permittable.rb
+
+# Roll out without rejecting: PERMITTABLE_MODE=monitor reports violations and lets the request through.
+Permittable.mode = ENV.fetch("PERMITTABLE_MODE", "enforce").to_sym
+
+# Render RFC 9457 problem+json instead of the default { success:, error: } envelope.
+Permittable.error_format     = :problem
+Permittable.problem_base_uri = "https://api.example.com/problems"
+
+# The drift guard always checks that a field's column exists. This also checks the column's type.
+Permittable.check_column_types = true
+
+# Endpoints that permittable:audit and permittable:generate leave alone.
+Permittable.audit_ignore              = %w[active_storage/direct_uploads application#not_found]
+Permittable.audit_ignore_outside_root = true   # the default: controllers from gems and engines are skipped
+
+# One event per rejected request, and per would-be rejection in monitor mode.
+ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
+  Rails.logger.info("params #{payload[:mode]}: #{payload[:controller]}##{payload[:action]} #{payload[:details]}")
+end
+```
+
+```yaml
+# config/locales/en.yml: app-wide copy for any violation code a field gives no message: for
+en:
+  permittable:
+    errors:
+      missing: "is required"
+      invalid_type: "is the wrong type"
+      unknown: "is not a recognized parameter"
+```
+
+**2. Reusable field groups.** See [reusing fields](#reusing-fields-permittablefields-and-use).
+
+```ruby
+# app/contracts/address_fields.rb
+AddressFields = Permittable.fields do
+  required :line1,     :string, length: 1..100, normalize: :squish    # collapses runs of whitespace
+  optional :line2,     :string, length: 0..100, normalize: :strip
+  required :city,      :string, length: 1..80
+  required :country,   :string, length: 2, normalize: :upcase         # an Integer length is exact
+  optional :postcode,  :string, format: /\A[A-Z0-9 -]{3,10}\z/, normalize: :upcase   # any Regexp
+  optional :latitude,  :float,  in: -90.0..90.0
+  optional :longitude, :float,  in: -180.0..180.0
+end
+```
+
+```ruby
+# app/contracts/event_fields.rb: shared by the create and update contracts below
+EventFields = Permittable.fields do
+  # Scalars. Checks run in a fixed order: normalize → cast → length → in → format → validate.
+  required :title,            :string,   length: 1..120, normalize: :squish,
+                                         desc: "Shown as the page heading",   # documentation only (OpenAPI)
+                                         example: "RubyConf 2026"             # checked against the field at boot
+  required :slug,             :string,   length: 3..60, format: :slug, normalize: :downcase
+  optional :subtitle,         :string,   length: 1..140, nullable: true       # null or "" clears the column
+  required :organizer_email,  :string,   format: :email, normalize: :email,   # :email strips and downcases
+                                         message: { missing: "is required", format: "must be a valid email address" }
+  optional :website,          :string,   format: :url
+  optional :custom_domain,    :string,   format: :hostname, normalize: :downcase
+  optional :venue_id,         :string,   format: :uuid
+  required :capacity,         :integer,  in: 1..10_000, message: "must be between 1 and 10,000"
+  optional :ticket_price,     :decimal,  in: BigDecimal("0")..BigDecimal("9999.99"),
+                                         transform: ->(price) { price.round(2) }   # runs after cast and checks
+  optional :waitlist_enabled, :boolean
+  required :starts_at,        :datetime                                       # converted to UTC
+  optional :ends_at,          :datetime
+  optional :registration_closes_on, :date
+  optional :metadata,         :json, length: 0..32, max_depth: 3              # any hash: ≤ 32 keys, ≤ 3 levels
+
+  # Arrays. length: bounds the element count, and is checked before any element is.
+  array :tags,        of: :string,  length: 0..10, transform: ->(tags) { tags.map(&:downcase).uniq }
+  array :co_host_ids, of: :integer, length: 0..5
+  array :ticket_tiers, required: true, length: 1..5,                          # arrays are optional by default
+        validate: ->(tiers) { tiers.map { |t| t[:name] }.uniq.size == tiers.size || :duplicate_names },
+        message:  { duplicate_names: "must have unique names" } do            # a Symbol from validate: is the code
+    required :name,     :string,  length: 1..40
+    required :price,    :decimal, in: BigDecimal("0")..BigDecimal("9999.99")
+    optional :quantity, :integer, in: 1..10_000
+  end
+
+  # A nested hash. Violation paths are dotted: event.venue_address.city
+  optional :venue_address do
+    use AddressFields                                                         # groups compose
+  end
+end
+```
+
+**3. The controller.** See [declaring a contract](#declaring-a-contract) and [field options](#field-options).
+
+```ruby
+# app/controllers/events_controller.rb
+class EventsController < ApplicationController
+  include Permittable   # or once, in ApplicationController
+
+  # No actions listed: a catch-all for every action without its own rule (index, show, destroy, ...).
+  # The last matching rule wins, so the catch-all goes first.
+  permit_params(unknown: :log) do                # undeclared keys are dropped, and logged
+    optional :page,     :integer, in: 1..1000, default: 1
+    optional :per_page, :integer, in: 1..100,  default: 25
+    optional :q,        :string,  length: 0..100, normalize: :squish
+    optional :status,   :string,  in: Event.statuses.keys
+    optional :from,     :date
+  end
+
+  permit_params :create,
+                root:    :event,                 # unwrap params[:event]; missing or not a hash → 400
+                model:   Event,                  # drift guard: each non-virtual scalar must be a column
+                unknown: :error,                 # an undeclared key is a violation, at every level
+                enforce: true,                   # validate in a before_action, not on first read
+                desc:    "Create an event" do    # documentation only (OpenAPI)
+    use EventFields
+
+    # Create-only fields. On an update rule, a default would overwrite the column on every PATCH that omits it.
+    optional :status,   :string, in: Event.statuses.keys, default: "draft"   # a Rails enum, sent by name
+    optional :currency, :string, in: %w[USD EUR GBP], default: "USD",
+                                 normalize: ->(code) { code.strip.upcase }    # a Proc works too
+    required :terms_accepted, :boolean,
+             virtual:  true,                                                  # not a column: no drift check
+             validate: ->(accepted) { accepted || :not_accepted },
+             message:  { not_accepted: "must be accepted" }
+
+    optional :payout, sensitive: true do          # cascades: every sub-field is redacted from logs...
+      required :iban, :string, length: 15..34
+      required :account_holder                    # the type defaults to :string
+      optional :scheme, :string, in: %w[sepa swift], sensitive: false        # ...except an explicit opt-out
+    end
+
+    # Runs once every field is valid: cross-field rules, and reshaping the result.
+    finalize do |event|
+      if event[:ends_at] && event[:ends_at] <= event[:starts_at]
+        violate!("event.ends_at", :before_start, message: "must be after starts_at")   # halts the block
+      end
+      event.except(:terms_accepted)               # must return the final Hash
+    end
+  end
+
+  # PATCH: the same fields with nothing mandatory, and the slug fixed once created.
+  permit_params :update, root: :event, model: Event, unknown: :error, desc: "Edit an event" do
+    use EventFields, optional: true, except: %i[slug]
+  end
+
+  # A legacy action mid-rollout: violations are reported, nothing is rejected.
+  permit_params :reschedule, root: :event, model: Event, mode: :monitor do
+    use EventFields, only: %i[starts_at ends_at], optional: true
+  end
+
+  def index
+    render json: Events::Search.call(permitted_params)   # page: 1, per_page: 25 when nothing is sent
+  end
+
+  def create
+    render json: Events::Create.call(permitted_params), status: :created
+  end
+
+  def update
+    Events::Update.call(params[:id], permitted_params)   # holds only the keys the client sent
+    head :no_content
+  end
+
+  def reschedule
+    # The before_action has already validated. permittable_violations is [] for a clean request.
+    Rails.logger.info("reschedule would reject: #{permittable_violations}") if permittable_violations.any?
+    Event.find(params[:id]).update!(params.require(:event).permit(:starts_at, :ends_at))   # legacy code, unchanged
+    head :no_content
+  end
+end
+```
+
+Because of `model: Event` and `check_column_types`, a migration that drops the `capacity` column, or changes it to a string, fails at boot, not on a request. See [the schema-drift guard](#the-schema-drift-guard).
+
+**4. What the action receives.** This request to `POST /events`:
+
+```json
+{ "event": {
+    "title": "  RubyConf   2026 ", "slug": "RubyConf-2026", "organizer_email": " Ana@Example.COM ",
+    "capacity": "800", "ticket_price": "249.999", "waitlist_enabled": "true",
+    "starts_at": "2026-11-12T09:00:00-05:00", "ends_at": "2026-11-14T18:00:00-05:00",
+    "tags": ["Ruby", "rails", "ruby"], "co_host_ids": ["12", "31"],
+    "ticket_tiers": [{ "name": "Early bird", "price": "199", "quantity": "100" }],
+    "venue_address": { "line1": " 1 Main   St ", "city": "Chicago", "country": "us" },
+    "currency": " eur ", "terms_accepted": "1",
+    "payout": { "iban": "DE89370400440532013000", "account_holder": "Ruby Central" } } }
+```
+
+gives `#create` this `permitted_params`:
+
+```ruby
+{
+  "title"            => "RubyConf 2026",           # squished
+  "slug"             => "rubyconf-2026",           # downcased, then format-checked
+  "organizer_email"  => "ana@example.com",
+  "capacity"         => 800,                       # cast from "800"
+  "ticket_price"     => 0.25e3,                    # BigDecimal, rounded by transform:
+  "waitlist_enabled" => true,
+  "starts_at"        => 2026-11-12 14:00:00 UTC,   # a Time, converted to UTC
+  "ends_at"          => 2026-11-14 23:00:00 UTC,
+  "tags"             => ["ruby", "rails"],         # transform: downcased, duplicates removed
+  "co_host_ids"      => [12, 31],
+  "ticket_tiers"     => [{ "name" => "Early bird", "price" => 0.199e3, "quantity" => 100 }],
+  "venue_address"    => { "line1" => "1 Main St", "city" => "Chicago", "country" => "US" },
+  "status"           => "draft",                   # the default
+  "currency"         => "EUR",                     # the normalize: Proc
+  "payout"           => { "iban" => "DE89370400440532013000", "account_holder" => "Ruby Central" }
+}                                                  # terms_accepted was checked, then removed by finalize
+```
+
+A request with a bad email, a `capacity` of `"0"`, two tiers with the same name, no `terms_accepted` and an extra `admin` key never reaches the action:
+
+```http
+HTTP/1.1 422 Unprocessable Entity
+Content-Type: application/problem+json
+```
+
+```json
+{
+  "type": "https://api.example.com/problems/invalid-parameters",
+  "title": "Invalid parameters",
+  "status": 422,
+  "detail": "Invalid parameters: event.organizer_email must be a valid email address, event.capacity must be between 1 and 10,000, event.ticket_tiers must have unique names, event.terms_accepted is required, event.admin is not a recognized parameter",
+  "instance": "/events",
+  "errors": [
+    { "param": "event.organizer_email", "code": "format",          "message": "must be a valid email address" },
+    { "param": "event.capacity",        "code": "inclusion",       "message": "must be between 1 and 10,000" },
+    { "param": "event.ticket_tiers",    "code": "duplicate_names", "message": "must have unique names" },
+    { "param": "event.terms_accepted",  "code": "missing",         "message": "is required" },
+    { "param": "event.admin",           "code": "unknown",         "message": "is not a recognized parameter" }
+  ]
+}
+```
+
+The first three messages come from the fields' own `message:`, the last two from the locale file. `finalize` did not run, because it runs only when every field is valid.
+
+**5. The same fields outside a controller.** See [standalone contracts](#standalone-contracts-no-controller).
+
+```ruby
+# app/contracts/event_webhook.rb: webhooks, jobs, CSV rows, any Hash
+EventWebhook = Permittable::Contract.define(root: :event, unknown: :error, desc: "Partner event feed") do
+  required :external_id, :string, format: :uuid
+  use EventFields, only: %i[title starts_at ends_at capacity]
+end
+
+result = EventWebhook.call(payload)   # bad client data is a violation, never an exception
+result.valid?                         # => false
+result.violations                     # => [{ param: "event.capacity", code: "inclusion", message: "must be between 1 and 10,000" }]
+result.params                         # the validated HashWithIndifferentAccess; nil when invalid
+
+EventWebhook.call!(payload)           # the params, or raises Permittable::InvalidParameters
+EventWebhook.json_schema              # JSON Schema (draft 2020-12)
+```
+
+**6. Tests.** See [testing contracts](#testing-contracts-rspec-matchers).
+
+```ruby
+# spec/controllers/events_contract_spec.rb
+require "permittable/rspec"
+
+RSpec.describe EventsController do
+  it "declares the contract" do
+    expect(described_class).to permit_param(:title).for_action(:create).as(:string).with_length(1..120).required
+    expect(described_class).to permit_param(:organizer_email).for_action(:create).matching(:email)
+    expect(described_class).to permit_param(:capacity).for_action(:create).as(:integer).within(1..10_000)
+    expect(described_class).to permit_param(:status).for_action(:create).with_default("draft")
+    expect(described_class).to permit_param(:tags).for_action(:create).as_array(of: :string)
+    expect(described_class).to permit_param("ticket_tiers.price").for_action(:create).as(:decimal)
+    expect(described_class).to permit_param(:terms_accepted).for_action(:create).virtual
+    expect(described_class).to permit_param("payout.iban").for_action(:create).sensitive
+    expect(described_class).to permit_param(:subtitle).for_action(:update).nullable.optional
+    expect(described_class).not_to permit_param(:slug).for_action(:update)
+  end
+
+  it "casts what it accepts and names what it rejects" do
+    expect(described_class).to accept_params(event: { title: "Ruby Night", capacity: "40" })
+      .for_action(:update).returning("title" => "Ruby Night", "capacity" => 40)
+
+    expect(described_class).to reject_params(event: { title: "Ruby Night", capacity: "0" })
+      .for_action(:create)
+      .with_violation("event.capacity", :inclusion)
+      .with_violation("event.terms_accepted", :missing)
+  end
+end
+```
+
+**7. Tooling.** See [adopting on a live API](#adopting-on-a-live-api) and [exporting OpenAPI](#exporting-openapi-docs-that-cannot-drift).
+
+```sh
+bin/rails permittable:generate                      # draft contracts for controllers that have none
+bin/rails "permittable:generate[EventsController]"  # draft one controller, even a covered one
+bin/rails permittable:audit                         # every routed action: its contract and its mode
+bin/rails "permittable:audit[strict]"               # CI gate: exit 1 on any unguarded write action
+bin/rails "permittable:openapi[openapi/api.json]"   # OpenAPI 3.1, from the contracts above
+```
+
+```ruby
+EventsController.permittable_contracts                            # every rule: frozen, introspectable data
+EventsController.permit_rule_for(:destroy)                        # the rule a request would use (the catch-all)
+Permittable::OpenAPI.request_body_for(EventsController, :create)  # one requestBody object
+Permittable::OpenAPI.operations_for(EventsController)             # { "create" => ..., "update" => ..., ... }
+```
+
+Not shown above: a controller's own [`render_error`](#violations-and-error-responses) (used when `error_format` is the default `:envelope`), overriding `render_invalid_parameters`, swapping in your own `Permittable.filter_parameter_registry`, and the plain-Ruby `Permittable::Generator` and `Permittable::Audit` APIs. The [Reference](#reference) lists them all.
 
 ---
 
