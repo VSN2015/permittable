@@ -216,7 +216,9 @@ module Permittable
     end
 
     # action => missing?, answered once per action: a `via: :all` route is
-    # five entries for one action, and each resolver call builds a controller.
+    # up to five entries for one action (fewer when an earlier, unconstrained
+    # route already answers some of its verbs on that path, see
+    # OpenAPI.drop_shadowed), and each resolver call builds a controller.
     # The action list is read once per controller, not once per route.
     def missing_lookup(controller)
       listed = listed_actions(controller)

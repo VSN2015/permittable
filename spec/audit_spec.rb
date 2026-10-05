@@ -103,6 +103,76 @@ RSpec.describe Permittable::Audit do
       expect(described_class.summary(found)[:uncovered_with_body]).to eq(3)
     end
 
+    # Rails dispatches a request to the first route matching its path and
+    # verb. The audit reads the same descriptors as the export, so it lists
+    # each verb on a path under the action Rails sends it to, and keeps every
+    # route a constraint could still pass a request on to.
+    context "when routes share a path and verb" do
+      def descriptors(&draw)
+        route_set = ActionDispatch::Routing::RouteSet.new
+        route_set.draw(&draw)
+        Permittable::OpenAPI.rails_routes(Struct.new(:routes).new(route_set))
+      end
+
+      it "lists GET under the explicit route drawn first, with no phantom via: :all row" do
+        routes = descriptors do
+          get "hooks", to: "webhooks#index"
+          match "hooks", to: "webhooks#receive", via: :all
+        end
+        found = described_class.entries(controllers: [bare_class("webhooks")], routes: routes)
+
+        expect(found.map { |e| [e.verb, e.action] }).to contain_exactly(
+          %w[get index], %w[post receive], %w[put receive], %w[patch receive], %w[delete receive]
+        )
+        expect(described_class.format(found)).not_to match(%r{GET\s+/hooks\s+receive})
+        expect(described_class.summary(found)).to include(actions: 5, uncovered_with_body: 3)
+      end
+
+      # Rails never reaches the explicit route, so neither does the audit, and
+      # a contract left on its action guards nothing.
+      it "drops an explicit route an earlier via: :all route shadows, and calls its contract stale" do
+        webhooks = controller_class("webhooks") { permit_params(:index) { optional :page, :integer } }
+        routes = descriptors do
+          match "hooks", to: "webhooks#receive", via: :all
+          get "hooks", to: "webhooks#index"
+        end
+        found = described_class.entries(controllers: [webhooks], routes: routes)
+
+        expect(found.map(&:action).uniq).to eq(["receive"])
+        expect(found.map(&:verb)).to contain_exactly("get", "post", "put", "patch", "delete")
+        expect(described_class.stale(controllers: [webhooks], routes: routes)).to eq("webhooks" => ["index"])
+      end
+
+      # The audit is a gate, so a constrained route must never hide the one
+      # behind it: Rails sends every request the constraint turns away (here,
+      # every non-admin POST) to the uncovered action, and dropping that row
+      # would let `[strict]` pass over unguarded input.
+      it "keeps counting an uncovered route behind a constrained one on the same path" do
+        admin = Class.new { def self.matches?(_request) = true }
+        guarded = controller_class("admin/settings") { permit_params(:update) { optional :theme, :string } }
+        routes = descriptors do
+          constraints(admin) { post "settings", to: "admin/settings#update" }
+          post "settings", to: "settings#update"
+        end
+        found = described_class.entries(controllers: [guarded, bare_class("settings")], routes: routes)
+
+        expect(found.map { |e| [e.controller, e.covered?] }).to eq([["admin/settings", true], ["settings", false]])
+        expect(described_class.summary(found)).to include(actions: 2, uncovered_with_body: 1)
+      end
+
+      it "keeps a route behind a segment-constrained one reachable, so its contract is not stale" do
+        posts = controller_class("posts") { permit_params(:by_slug) { optional :preview, :boolean } }
+        routes = descriptors do
+          get "posts/:id", to: "posts#show", constraints: { id: /\d+/ }
+          get "posts/:id", to: "posts#by_slug"
+        end
+
+        expect(described_class.entries(controllers: [posts], routes: routes).map(&:action))
+          .to contain_exactly("show", "by_slug")
+        expect(described_class.stale(controllers: [posts], routes: routes)).to eq({})
+      end
+    end
+
     context "when a routed action has no action method" do
       # `resources :posts` routes all seven actions whether or not the
       # controller defines them; Rails 404s the ones it does not.
