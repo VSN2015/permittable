@@ -12,8 +12,9 @@ module Permittable
   # actions covered only by a catch-all rule on a host without
   # `action_methods` appear under the "*" key with `x-permittable-catch-all`,
   # and operations with no matching route — or whose path+verb slot another
-  # controller already claimed, which a document cannot represent twice —
-  # land in `x-permittable-controllers` instead of being dropped silently.
+  # controller already claimed, which a document cannot represent twice, or
+  # whose route an earlier route of the same URL shape shadows — land in
+  # `x-permittable-controllers` instead of being dropped silently.
   module OpenAPI
     module_function
 
@@ -213,6 +214,7 @@ module Permittable
       paths = {}
       unrouted = {}
       slots = []
+      routes, shadows = collapse_shapes(routes)
       targets = route_targets(routes)
       # A class listed twice would find every slot its first pass claimed and
       # land under x-permittable-controllers, colliding with itself there.
@@ -222,6 +224,7 @@ module Permittable
 
         slots.concat(place_operations(controller, operations, targets, paths, unrouted))
       end
+      note_shadows(paths, shadows)
       assign_unique_operation_ids(slots)
       doc = {
         "openapi" => "3.1.0",
@@ -239,16 +242,93 @@ module Permittable
     # operationId; `owner` the [controller key, action] it documents.
     OperationSlot = Struct.new(:holder, :field, :verb, :id, :owner, :path)
 
-    # { [controller, action] => [[path, verb], ...] }, in route order. Built
-    # once, with each verb normalised once: matching every operation against
-    # every route made placement quadratic in the size of the route set. A
-    # route declared twice names one slot, so it is kept once — not counted
-    # as an operation colliding with itself.
+    # { [controller, action] => [[path, verb, template], ...] }, in route
+    # order. Built once, with each verb normalised once: matching every
+    # operation against every route made placement quadratic in the size of
+    # the route set. A route declared twice names one slot, so it is kept
+    # once — not counted as an operation colliding with itself. `template`
+    # is the route's own spelling when collapse_shapes placed it under
+    # another route's, nil otherwise.
     def route_targets(routes)
       return {} if routes.nil?
 
       routes.group_by { |route| [route[:controller].to_s, route[:action].to_s] }
-            .transform_values { |matching| matching.map { |route| [route[:path], verb_of(route)] }.uniq }
+            .transform_values do |matching|
+              matching.map { |route| [route[:path], verb_of(route), route[:template]] }.uniq
+            end
+    end
+
+    # OpenAPI forbids two path templates that differ only in their variable
+    # names: `/{locale}` and `/{slug}` are one path to it. rails_routes keeps
+    # one route's own variants apart, but two routes can still spell one
+    # shape two ways — `scope "(:locale)"` makes it common, its root being
+    # `/{locale}` and its `get ":slug"` `/{slug}` — and so can a hand-built
+    # list. Routes are read in the order given, which for rails_routes is
+    # the order Rails tries them, so the route Rails reaches first wins:
+    #
+    # - The first spelling of a shape names its path. A later route of the
+    #   shape under another verb is placed there too, since Rails picks the
+    #   verb before it fills a segment (`POST /foo` reaches `post ":slug"`
+    #   whatever GET route comes before it). The shared path names its
+    #   variables after the first route, so the later one's own spelling
+    #   rides along as `template:` and is published as `x-permittable-path`.
+    # - Under a verb an earlier route of the shape already answers, a later
+    #   spelling is shadowed: Rails sends the URL to the earlier route, and
+    #   reaches the later one only when that route's constraints reject the
+    #   request (`scope "(:locale)", locale: /en|fr/` passes `/foo` on to
+    #   `:slug`). It is not emitted as a second, forbidden path, nor dropped
+    #   without a trace: it is listed under `x-permittable-shadows` on the
+    #   slot it shares (note_shadows), and an operation left with no slot
+    #   lands in x-permittable-controllers like any whose slot is taken.
+    #   Every shadowed route is listed, reachable or not: request
+    #   constraints and constraint objects can let a request past the
+    #   earlier route, and the descriptors do not carry them.
+    #
+    # A second route with the SAME spelling is not a shape collision; it is
+    # the slot collision place_operations already settles. Returns the
+    # routes to place and { [path, verb] => shadowed routes }.
+    def collapse_shapes(routes)
+      return [routes, {}] if routes.nil?
+
+      spelling = {}
+      first_at = {}
+      shadows = {}
+      kept = routes.filter_map do |route|
+        path = route[:path].to_s
+        verb = verb_of(route)
+        shape = path.gsub(/\{\w+\}/, "{}")
+        shared = (spelling[shape] ||= path)
+        listed = Array(route[:shadows]).map { |alternate| shadow_entry(route, alternate) }
+        if (first_at[[shape, verb]] ||= path) == path
+          (shadows[[shared, verb]] ||= []).concat(listed) unless listed.empty?
+          shared == path ? route : route.merge(path: shared, template: path)
+        else
+          (shadows[[shared, verb]] ||= []).push(shadow_entry(route, path), *listed)
+          nil
+        end
+      end
+      [kept, shadows]
+    end
+
+    def shadow_entry(route, path)
+      { "path" => path, "controller" => route[:controller].to_s, "action" => route[:action].to_s }
+    end
+
+    # Lists, on the operation at each slot, the same-shaped routes it
+    # shadows (collapse_shapes) and, from rails_routes' `shadows:`, the
+    # variants of its own route that a constraint keeps reachable. A slot
+    # with no documented operation has nowhere to say it; the shadowed
+    # operation is not moved in, because the route set still sends that URL
+    # to the slot's own, undocumented route.
+    def note_shadows(paths, shadows)
+      shadows.each do |(path, verb), entries|
+        holder = paths[path]
+        next unless holder&.key?(verb)
+
+        # The same operation object may sit at other slots, so the note goes
+        # on a copy, as an operationId rename does.
+        holder[verb] = holder[verb].merge("x-permittable-shadows" => entries.uniq)
+      end
     end
 
     # Places every operation and returns the slots it filled, for
@@ -272,9 +352,10 @@ module Permittable
           slots << OperationSlot.new(holder, action, nil, operation["operationId"], owner) unless holder.key?(action)
           holder[action] = operation
         else
-          free.each do |path, verb|
+          free.each do |path, verb, template|
             holder = (paths[path] ||= {})
-            holder[verb] = with_path_parameters(operation, path)
+            placed = with_path_parameters(operation, path)
+            holder[verb] = template ? placed.merge("x-permittable-path" => template) : placed
             slots << OperationSlot.new(holder, verb, verb, operation["operationId"], owner, path)
           end
         end
@@ -444,16 +525,18 @@ module Permittable
     # redirect or a Rack endpoint is not described at all, so a controller
     # route behind one on the same path is still listed.
     #
-    # `shadows:` is this method's input only; it is stripped from what it
-    # returns, so callers see the descriptor shape they always have.
+    # `unconditional:` is this method's input only; it is stripped from what
+    # it returns, so callers see the descriptor shape they always have. (It
+    # is not `shadows:`, which names the same-shaped variants a kept path
+    # stands in for and does reach the exporter; see optional_variants.)
     def drop_shadowed(descriptors)
       answered = Set.new
       descriptors.each_with_object([]) do |descriptor, kept|
         slot = descriptor.values_at(:verb, :path)
         next if answered.include?(slot)
 
-        answered << slot if descriptor[:shadows]
-        kept << descriptor.except(:shadows)
+        answered << slot if descriptor[:unconditional]
+        kept << descriptor.except(:unconditional)
       end
     end
 
@@ -497,12 +580,19 @@ module Permittable
     # parentheses are not valid in an OpenAPI path template, so leaving
     # `scope "(:locale)"` as `(/{locale})/posts` made the whole document fail
     # validation. Each variant is its own descriptor, so each path's variables
-    # are required there — which, for that path, they are.
+    # are required there — which, for that path, they are. The variants are
+    # worked out once per route, before the verb split: they are the same
+    # for every verb the route answers.
     #
     # Each descriptor also carries `route:`, the index of the route it came
     # from, so a reader counting routes rather than paths (Audit.summary) can
     # tell one route's expanded variants from a second route that happens to
     # reach the same action. The exporter ignores it.
+    #
+    # A variant that stands in for a same-shaped variant a constraint keeps
+    # reachable (see optional_variants) also carries `shadows:`, those
+    # variants' paths, which the exporter lists on the operation. Most
+    # routes have none, and then the key is left out.
     #
     # A verb on a path that an earlier, unconstrained route already answers
     # is left out: Rails never dispatches it to the later route (see
@@ -518,61 +608,201 @@ module Permittable
         # audit entirely. Expand it into the verbs it actually answers.
         verb = ALL_VERBS if verb.empty?
 
-        path = route.path.spec.to_s.sub("(.:format)", "").gsub(/[:*](\w+)/) { "{#{Regexp.last_match(1)}}" }
+        variants = optional_variants(route.path.spec, requirements)
         # Read once per route; drop_shadowed reads it, then strips it.
-        shadows = unconditional?(route)
+        unconditional = unconditional?(route)
         # One route can answer several verbs (`match via: [:patch, :put]`, and
         # the PATCH|PUT pair resources generates); documenting only the first
-        # dropped the others from the export entirely.
-        verb.split("|").map do |single|
-          { controller: requirements[:controller], action: requirements[:action],
-            verb: single.downcase, path: path, route: index, shadows: shadows }
+        # dropped the others from the export entirely. Verb by verb, then
+        # variant by variant: drop_shadowed takes the first descriptor it
+        # sees for a path and verb as the route Rails dispatches it to.
+        verb.split("|").flat_map do |single|
+          variants.map do |path, shadows|
+            descriptor = { controller: requirements[:controller], action: requirements[:action],
+                           verb: single.downcase, path: path, route: index, unconditional: unconditional }
+            shadows.empty? ? descriptor : descriptor.merge(shadows: shadows)
+          end
         end
       end
-      expanded = descriptors.flat_map do |descriptor|
-        optional_variants(descriptor[:path]).map { |variant| descriptor.merge(path: variant) }
-      end
-      drop_shadowed(expanded)
+      drop_shadowed(descriptors)
     end
 
-    # Every concrete path an optionally-grouped template stands for:
-    # `/archive(/{year}(/{month}))` → `/archive`, `/archive/{year}`,
-    # `/archive/{year}/{month}`. Rails fills groups left to right, so
-    # `/x(/{a})(/{b})` with one segment present is always `/x/{a}` — the
-    # `/x/{b}` variant is the same URL under another name, and OpenAPI forbids
-    # two templates differing only in variable names. Variants are built with
-    # each group present first, so the one Rails would match is the one kept;
-    # the list is then reversed, which puts every group's ABSENT variant
+    # A route parameter as optional_variants reads it: a `:name` segment or a
+    # `*name` wildcard (`star`), with the regexp the route constrains it to,
+    # if any.
+    Param = Struct.new(:name, :constraint, :star) do
+      # Journey's defaults: a segment stops at "/", "." and "?"; a wildcard
+      # takes anything.
+      def pattern
+        constraint || (star ? /.+/m : %r{[^./?]+})
+      end
+    end
+
+    # Journey's separators. A parameter never spans one, so variants are
+    # compared token by token between them.
+    SEPARATORS = %w[/ .].freeze
+
+    # The optional group Rails appends to every route unless told otherwise.
+    FORMAT_GROUP = "(.:format)".freeze
+
+    # Every concrete path a route stands for, each mapped to the paths of the
+    # same-shaped variants it stands in for (usually none):
+    # `archive(/:year(/:month))` → `/archive`, `/archive/{year}`,
+    # `/archive/{year}/{month}`.
+    #
+    # Rails matches a URL against the route's regexp, which tries each group
+    # present before absent, left to right, and binds the URL to the first
+    # variant whose segments accept it. Variants are enumerated in that
+    # order, and one is dropped when an earlier variant accepts every URL it
+    # would (shadowed?). So `x(/:a)(/:b)` drops `/x/{b}` (`/x/foo` is :a),
+    # and `x(/:a)(/new)` drops `/x/new`, which Rails reads as :a = "new".
+    # Constraints count: with `a: /\d+/`, "new" fails :a, so there `/x/new`
+    # is a real URL and stays.
+    #
+    # The same constraint makes `/x/foo` :b in `x(/:a)(/:b)`, so `/x/{b}` is
+    # real beside `/x/{a}`. OpenAPI forbids two templates that differ only in
+    # variable names, so the one Rails tries first is kept and the other is
+    # named in its shadows rather than emitted. Distinct shapes are both
+    # kept; OpenAPI allows `/x/new` beside `/x/{a}`.
+    #
+    # The list is then reversed, which puts every group's ABSENT variant
     # first at every nesting level, the order the document lists them in.
     # The variants of one route share an operation, and it is the operationId
     # dedupe (assign_unique_operation_ids), not this expansion, that makes
     # their ids unique. It ranks the shallowest path first whatever order the
     # variants arrive in, so `/posts` keeps `posts_create` and
     # `/{locale}/posts` takes the suffix.
-    def optional_variants(path)
-      variants, = expand_optional_groups(path, 0)
-      variants.map { |variant| variant.empty? ? "/" : variant }
-              .uniq { |variant| variant.gsub(/\{\w+\}/, "{}") }
-              .reverse
-    end
+    #
+    # The spec is walked as the tree Journey parsed, node by node, not as its
+    # string: `to_s` prints an escaped parenthesis in a literal as a bare
+    # one, which a string scan then read as a group. A Journey-shaped stand-in
+    # may carry a String spec instead (string_variants).
+    def optional_variants(spec, requirements = {})
+      variants = if spec.respond_to?(:type)
+                   tree_variants(spec, requirements)
+                 else
+                   string_variants(spec.to_s.sub(FORMAT_GROUP, ""), requirements).first
+                 end
+      variants = variants.map { |tokens| join_literals(tokens) }
+      # No group, no choice: nothing for one variant to shadow.
+      return { render(variants.first) => [] } if variants.one?
 
-    # Walks the template from `pos` to the matching `)` (or the end),
-    # returning the variants of that stretch and the position after it.
-    def expand_optional_groups(path, pos)
-      variants = [+""]
-      while pos < path.length
-        char = path[pos]
-        if char == "("
-          inner, pos = expand_optional_groups(path, pos + 1)
-          variants = variants.product(inner + [""]).map(&:join)
-        elsif char == ")"
-          return [variants, pos + 1]
+      kept = {}
+      first_of_shape = {}
+      variants.each_with_index do |tokens, index|
+        next if variants.take(index).any? { |earlier| shadowed?(earlier, tokens) }
+
+        path = render(tokens)
+        twin = (first_of_shape[path.gsub(/\{\w+\}/, "{}")] ||= path)
+        if twin == path
+          kept[path] ||= []
         else
-          variants.each { |variant| variant << char }
-          pos += 1
+          kept[twin] << path
         end
       end
+      kept.to_a.reverse.to_h
+    end
+
+    # A Journey tree's variants, each a list of tokens: literal text and
+    # Param. A group yields its contents' variants, then the empty one —
+    # present before absent, as Rails' regexp tries them — except the
+    # `(.:format)` group, which is left out. The node types are the same from
+    # Rails 6.1 to 8.1; OR is not reachable through the routing DSL (which
+    # escapes "|") but is read as its alternatives, in order.
+    def tree_variants(node, requirements)
+      case node.type
+      when :CAT
+        tree_variants(node.left, requirements).product(tree_variants(node.right, requirements))
+                                              .map { |left, right| left + right }
+      when :GROUP
+        node.to_s == FORMAT_GROUP ? [[]] : tree_variants(node.left, requirements) + [[]]
+      when :OR then node.children.flat_map { |child| tree_variants(child, requirements) }
+      when :SYMBOL then [[param(node.name, false, requirements)]]
+      when :STAR then [[param(node.name, true, requirements)]]
+      else [[node.left.to_s]] # LITERAL, SLASH, DOT
+      end
+    end
+
+    # tree_variants for a String spec, from `pos` to the `)` closing the
+    # group at `depth` (or the end); returns the variants and the position
+    # after them. Journey's escapes hold: `\(`, `\)` and `\:` are literal
+    # text. A parenthesis with no partner raises: the old scan stopped at an
+    # unmatched `)` and returned what it had read, so `/un)matched` was
+    # documented as `/un` without a word.
+    def string_variants(spec, requirements, pos = 0, depth = 0)
+      variants = [[]]
+      while pos < spec.length
+        case (char = spec[pos])
+        when "("
+          inner, pos = string_variants(spec, requirements, pos + 1, depth + 1)
+          variants = variants.product(inner + [[]]).map { |left, right| left + right }
+          next
+        when ")"
+          raise ArgumentError, "unbalanced \")\" in route path #{spec.inspect}" if depth.zero?
+
+          return [variants, pos + 1]
+        when "\\"
+          pos += 1
+          token = spec[pos].to_s
+        when ":", "*"
+          name = spec[(pos + 1)..][/\A\w+/]
+          token = name ? param(name, char == "*", requirements) : char
+          pos += name.length if name
+        else
+          token = char
+        end
+        variants.each { |variant| variant << token }
+        pos += 1
+      end
+      raise ArgumentError, "unbalanced \"(\" in route path #{spec.inspect}" unless depth.zero?
+
       [variants, pos]
+    end
+
+    def param(name, star, requirements)
+      constraint = requirements[name.to_sym]
+      Param.new(name, constraint.is_a?(Regexp) ? constraint : nil, star)
+    end
+
+    # Adjacent literal text joined into one token per run between
+    # separators, so two variants line up token by token whichever nodes or
+    # characters their text came from.
+    def join_literals(tokens)
+      tokens.each_with_object([]) do |token, joined|
+        next if token == ""
+
+        if [token, joined.last].all? { |text| text.is_a?(String) && !SEPARATORS.include?(text) }
+          joined[-1] = joined.last + token
+        else
+          joined << token
+        end
+      end
+    end
+
+    def render(tokens)
+      path = tokens.map { |token| token.is_a?(Param) ? "{#{token.name}}" : token }.join
+      path.empty? ? "/" : path
+    end
+
+    # Whether Rails, trying `earlier` first, leaves `later` no URL: wherever
+    # `later` has a token, `earlier` accepts everything it does. Text must be
+    # equal; a parameter accepts text its pattern matches whole, and another
+    # parameter when it is itself unconstrained (a segment never takes a
+    # wildcard's slashes) or constrained by the same regexp. Two different
+    # constraints are taken to leave `later` reachable, which keeps a
+    # variant rather than dropping a real one.
+    def shadowed?(earlier, later)
+      earlier.length == later.length && earlier.zip(later).all? { |mine, theirs| accepts?(mine, theirs) }
+    end
+
+    def accepts?(mine, theirs)
+      return mine == theirs unless mine.is_a?(Param)
+
+      pattern = mine.pattern
+      return Regexp.new("\\A(?:#{pattern.source})\\z", pattern.options).match?(theirs) if theirs.is_a?(String)
+      return mine.constraint == theirs.constraint if mine.constraint
+
+      mine.star || !theirs.star
     end
 
     def controller_key(controller)
