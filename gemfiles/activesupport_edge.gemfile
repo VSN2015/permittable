@@ -1,0 +1,22 @@
+# Compatibility gemfile: activesupport from Rails main — see gemfiles/README.md.
+# Unlike the other gemfiles this is an early warning, not a support claim: it
+# tracks the unreleased next line, so CI runs it without letting it fail the
+# build.
+source "https://rubygems.org"
+
+gemspec path: ".."
+
+git "https://github.com/rails/rails.git", branch: "main" do
+  gem "activesupport"
+
+  # Dev/test only, from the same commit: actionpack drives the
+  # real-ActionController integration specs, activerecord + sqlite3 the
+  # schema-drift specs, railties the booted-app Railtie specs.
+  gem "actionpack"
+  gem "activerecord"
+  gem "railties"
+end
+gem "rake"
+gem "rspec", "~> 3.12"
+gem "simplecov", "~> 1.1"
+gem "sqlite3", ">= 2.1"

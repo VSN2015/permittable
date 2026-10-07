@@ -19,6 +19,10 @@ CI runs every gemfile against every supported Ruby (see `.github/workflows/ci.ym
 The root `Gemfile` stays unpinned — it resolves to the newest release, which is
 what local development and the lint job use.
 
+`activesupport_edge.gemfile` is the exception: it tracks Rails `main`, the
+unreleased next line, and is not part of the supported range. CI runs it, and
+Ruby `head`, as an early warning that is reported but does not fail the build.
+
 Lockfiles here are deliberately **not** committed: the point is to resolve the
 newest patch of each line on every run, so a regression in a supported version
 shows up as a CI failure rather than being frozen out by a stale lock.
