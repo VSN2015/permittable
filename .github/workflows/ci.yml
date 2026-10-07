@@ -23,33 +23,45 @@ jobs:
       run: bundle exec rubocop --format github
 
   # The gemspec advertises a range of Ruby and ActiveSupport versions; this
-  # matrix is how that claim is tested rather than assumed. It is an explicit
-  # include list, not a cross product, because it doubles as the answer to
-  # "which combinations does this gem actually support?" — every entry is one
-  # a real app could be running (see gemfiles/README.md).
+  # matrix is how that claim is tested rather than assumed. It is the full
+  # cross product, every supported Ruby against every ActiveSupport line, so
+  # no combination inside the range is supported on assumption (see
+  # gemfiles/README.md). The two `experimental` entries at the end are the
+  # exception: they sit outside the range.
   test:
     name: RSpec (${{ matrix.name }}, ruby ${{ matrix.ruby }})
     runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental == true }}
 
     strategy:
       fail-fast: false
       matrix:
+        ruby: ['3.2', '3.3', '3.4', '4.0']
+        gemfile:
+        - Gemfile
+        - gemfiles/activesupport_6.1.gemfile
+        - gemfiles/activesupport_7.0.gemfile
+        - gemfiles/activesupport_7.1.gemfile
+        - gemfiles/activesupport_7.2.gemfile
+        - gemfiles/activesupport_8.0.gemfile
+        - gemfiles/activesupport_8.1.gemfile
         include:
-        # Newest of everything — the root Gemfile, what local development uses.
-        - { ruby: '3.4', gemfile: 'Gemfile', name: 'newest' }
-        - { ruby: '3.3', gemfile: 'Gemfile', name: 'newest' }
-        - { ruby: '3.2', gemfile: 'Gemfile', name: 'newest' }
-        # The floor. activesupport 6.1 predates official Ruby 3.2 support, so
-        # it is tested on the oldest Ruby this gem allows and no further.
-        - { ruby: '3.2', gemfile: 'gemfiles/activesupport_6.1.gemfile', name: 'activesupport 6.1' }
-        - { ruby: '3.2', gemfile: 'gemfiles/activesupport_7.0.gemfile', name: 'activesupport 7.0' }
-        - { ruby: '3.2', gemfile: 'gemfiles/activesupport_7.1.gemfile', name: 'activesupport 7.1' }
-        - { ruby: '3.3', gemfile: 'gemfiles/activesupport_7.1.gemfile', name: 'activesupport 7.1' }
-        - { ruby: '3.2', gemfile: 'gemfiles/activesupport_7.2.gemfile', name: 'activesupport 7.2' }
-        - { ruby: '3.4', gemfile: 'gemfiles/activesupport_7.2.gemfile', name: 'activesupport 7.2' }
-        - { ruby: '3.2', gemfile: 'gemfiles/activesupport_8.0.gemfile', name: 'activesupport 8.0' }
-        - { ruby: '3.4', gemfile: 'gemfiles/activesupport_8.0.gemfile', name: 'activesupport 8.0' }
-        - { ruby: '3.4', gemfile: 'gemfiles/activesupport_8.1.gemfile', name: 'activesupport 8.1' }
+        # The job-name label for each gemfile, attached on every Ruby above.
+        # Gemfile is the newest of everything, what local development uses.
+        - { gemfile: 'Gemfile', name: 'newest' }
+        - { gemfile: 'gemfiles/activesupport_6.1.gemfile', name: 'activesupport 6.1' }
+        - { gemfile: 'gemfiles/activesupport_7.0.gemfile', name: 'activesupport 7.0' }
+        - { gemfile: 'gemfiles/activesupport_7.1.gemfile', name: 'activesupport 7.1' }
+        - { gemfile: 'gemfiles/activesupport_7.2.gemfile', name: 'activesupport 7.2' }
+        - { gemfile: 'gemfiles/activesupport_8.0.gemfile', name: 'activesupport 8.0' }
+        - { gemfile: 'gemfiles/activesupport_8.1.gemfile', name: 'activesupport 8.1' }
+        # Early warning, not a support claim: the next Ruby and the next Rails,
+        # both unreleased. A failure here is reported on the run but does not
+        # fail it, or block a release; it is what to fix before they ship.
+        # Ruby head takes a lockless gemfile because the root Gemfile.lock pins
+        # precompiled native gems that refuse an unreleased Ruby ABI.
+        - { ruby: 'head', gemfile: 'gemfiles/activesupport_8.1.gemfile', name: 'activesupport 8.1', experimental: true }
+        - { ruby: '4.0', gemfile: 'gemfiles/activesupport_edge.gemfile', name: 'rails main', experimental: true }
 
     env:
       BUNDLE_GEMFILE: ${{ matrix.gemfile }}

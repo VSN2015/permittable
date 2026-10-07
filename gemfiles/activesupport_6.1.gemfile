@@ -5,6 +5,17 @@ gemspec path: ".."
 
 gem "activesupport", "~> 6.1.0"
 
+# Ruby 3.4 and 4.0 moved these out of the default gems, and Rails 6.1 predates
+# that, so it requires them without declaring them. A 6.1 app on those Rubies
+# lists them in its own Gemfile; so does this one. (activesupport 7.0.10 is the
+# same list, declared as dependencies.)
+gem "base64"
+gem "benchmark"
+gem "bigdecimal"
+gem "drb"
+gem "logger"
+gem "mutex_m"
+
 # Dev/test only, matched to the pinned line: actionpack drives the
 # real-ActionController integration specs, activerecord + sqlite3 the
 # schema-drift specs, railties the booted-app Railtie specs.
