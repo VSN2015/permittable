@@ -584,6 +584,50 @@ RSpec.describe "Permittable RSpec matchers" do
       expect(contract).not_to accept_params(a: "1", controller: "x")
     end
 
+    describe "the negated form" do
+      it "fails, rather than passing silently, when the action resolves to no rule" do
+        message = failure_of { expect(users).not_to accept_params(valid).for_action(:craete) }
+        expect(message).to include("expected UsersController not to accept those params for #craete")
+        expect(message).to include("no contract covering #craete")
+
+        message = failure_of { expect(users).not_to reject_params({ user: {} }).for_action(:craete) }
+        expect(message).to include("not to reject those params for #craete")
+        expect(message).to include("no contract covering #craete")
+      end
+
+      it "fails, rather than passing silently, when the subject declares no contracts" do
+        empty = Class.new(FakeController) { include Permittable }
+        message = failure_of { expect(empty).not_to accept_params(a: 1) }
+        expect(message).to include("declares no contracts")
+      end
+
+      it "passes only on the opposite outcome" do
+        expect(users).not_to accept_params({ user: {} }).for_action(:create)
+        expect(users).not_to reject_params(valid).for_action(:create)
+
+        message = failure_of { expect(users).not_to accept_params(valid).for_action(:create) }
+        expect(message).to include("not to accept those params for #create, but it did")
+        message = failure_of { expect(users).not_to reject_params({ user: {} }).for_action(:create) }
+        expect(message).to include("not to reject those params for #create, but it did")
+      end
+
+      it "refuses a negated qualifier instead of passing on the wrong outcome" do
+        expect { expect(users).not_to accept_params(valid).for_action(:create).returning("name" => "zzz") }
+          .to raise_error(ArgumentError, /`not_to accept_params\(\.\.\.\)`.*returning.*ambiguous/m)
+        expect { expect(users).not_to reject_params({ user: {} }).for_action(:create).with_violation("user.age", :inclusion) }
+          .to raise_error(ArgumentError, /`not_to reject_params\(\.\.\.\)`.*with_violation.*ambiguous/m)
+      end
+    end
+
+    it "resets per-run state, so a reused matcher reports the current run" do
+      matcher = accept_params(valid).for_action(:craete)
+      expect(failure_of { expect(users).to matcher }).to include("no contract covering #craete")
+
+      message = failure_of { expect(users).to matcher.for_action(:create).returning("name" => "zzz") }
+      expect(message).not_to include("no contract covering")
+      expect(message).to include("accepted them but returned")
+    end
+
     it "describes itself readably" do
       expect(accept_params({}).for_action(:create).description).to eq("accept those params for #create")
       expect(reject_params({}).with_violation("a", :missing).description)
