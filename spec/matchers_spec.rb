@@ -570,6 +570,24 @@ RSpec.describe "Permittable RSpec matchers" do
       expect(single).to reject_params({})
     end
 
+    it "labels the violation notification with the subject and action, never nil" do
+      events = []
+      subscriber = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
+        events << payload.slice(:controller, :action, :mode)
+      end
+      begin
+        expect(users).to reject_params({ user: {} }).for_action(:create)
+        contract = Permittable::Contract.define { required :a, :string }
+        expect(contract).to reject_params({})
+      ensure
+        ActiveSupport::Notifications.unsubscribe(subscriber)
+      end
+      expect(events).to eq([
+                             { controller: "UsersController", action: "create", mode: :enforce },
+                             { controller: "Permittable::Contract", action: "call", mode: :enforce }
+                           ])
+    end
+
     it "works on a standalone Contract too" do
       contract = Permittable::Contract.define { required :a, :integer }
       expect(contract).to accept_params({ a: "1" }).returning("a" => 1)
