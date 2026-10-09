@@ -520,14 +520,28 @@ module Permittable
       end
 
       # accept_params only: assert the cast, defaulted, transformed output.
+      # Refused on reject_params rather than ignored: rejected_ok? never
+      # reads it, so the chain would pass while its description claims an
+      # assertion that was never made.
       def returning(hash)
+        unless @expect_accepted
+          raise ArgumentError, "#{LABEL}: `returning` belongs to accept_params, not reject_params — " \
+                               "a rejected payload returns nothing to compare"
+        end
+
         @returning = hash
         self
       end
 
       # reject_params only: assert a particular violation is among those
-      # recorded. Repeatable; the code is optional.
+      # recorded. Repeatable; the code is optional. Refused on accept_params
+      # for the same reason returning is on reject_params.
       def with_violation(param, code = nil)
+        if @expect_accepted
+          raise ArgumentError, "#{LABEL}: `with_violation` belongs to reject_params, not accept_params — " \
+                               "an accepted payload has no violations"
+        end
+
         @expected_violations << { param: param.to_s, code: code&.to_s }
         self
       end
