@@ -535,12 +535,28 @@ module Permittable
       # -- RSpec protocol -----------------------------------------------------
 
       def matches?(subject)
-        @subject = resolve_subject(subject)
-        rule = resolve_rule
+        rule = locate(subject)
         return false unless rule
 
         @violations, @result = run(rule)
         @expect_accepted ? accepted_ok? : rejected_ok?
+      end
+
+      # Defined explicitly rather than left to RSpec's `!matches?`: an
+      # unresolved rule makes matches? false, which a negation would read
+      # as a pass — `not_to accept_params(...).for_action(:craete)` passing
+      # on a typo, or on a controller that declares nothing at all. A
+      # qualifier is refused for the same reason permit_param refuses one:
+      # `not_to ...returning(x)` would pass both on a rejection and on an
+      # acceptance returning anything else.
+      def does_not_match?(subject) # rubocop:disable Naming/PredicatePrefix -- the RSpec protocol name
+        raise ArgumentError, negated_qualifier_message if @returning || !@expected_violations.empty?
+
+        rule = locate(subject)
+        return false unless rule
+
+        @violations, @result = run(rule)
+        @expect_accepted ? !accepted_ok? : !rejected_ok?
       end
 
       def failure_message
@@ -559,6 +575,8 @@ module Permittable
 
       def failure_message_when_negated
         verb = @expect_accepted ? "accept" : "reject"
+        return "expected #{subject_name} not to #{verb} those params#{action_label}, but it #{@problem}" if @problem
+
         "expected #{subject_name} not to #{verb} those params#{action_label}, but it did"
       end
 
@@ -575,6 +593,28 @@ module Permittable
       end
 
       private
+
+      # Resolves the subject and its rule, resetting every per-run ivar
+      # first so a matcher object reused across examples (or re-chained
+      # with another for_action) never reports a previous run's problem.
+      def locate(subject)
+        @problem = @violations = @result = nil
+        @subject = resolve_subject(subject)
+        resolve_rule
+      end
+
+      def negated_qualifier_message
+        call = @expect_accepted ? "accept_params" : "reject_params"
+        qualifiers = []
+        qualifiers << "returning #{@returning.inspect}" if @returning
+        qualifiers << "with_violation #{summary(@expected_violations)}" unless @expected_violations.empty?
+        "#{LABEL}: `not_to #{call}(...)` cannot take qualifiers (here: #{qualifiers.join(', ')}) — " \
+          "negating one is ambiguous, since it would pass both when the params are " \
+          "#{@expect_accepted ? 'rejected' : 'accepted'} and when they are #{@expect_accepted ? 'accepted' : 'rejected'} " \
+          "differently. Assert the outcome with the positive form " \
+          "(#{@expect_accepted ? 'reject_params' : 'accept_params'}(...), or #{call}(...) with the qualifier), " \
+          "or drop the qualifier to assert only that the params are not #{@expect_accepted ? 'accepted' : 'rejected'}."
+      end
 
       def accepted_ok?
         return false unless @violations.empty?

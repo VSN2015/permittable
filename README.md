@@ -1361,6 +1361,8 @@ expected UsersController to reject those params with user.age (inclusion), but t
 
 Both work on a controller class, a controller instance, or a [standalone `Contract`](#standalone-contracts-no-controller), and both read the **contract** rather than the rollout mode — a [monitor-mode](#monitor-mode-roll-out-without-rejecting) rule still `reject_params`, because the question is what the contract says, not what the deploy currently does with it.
 
+The negated forms follow the same rules as `not_to permit_param`: `not_to accept_params(...)` passes only when the contract rejects the payload, and `not_to reject_params(...)` only when it accepts it. Neither takes a qualifier — `not_to accept_params(...).returning(x)` would pass both on a rejection and on an acceptance returning anything else, so it raises and names the positive form — and both fail, rather than passing, when no rule covers the action or the subject declares no contracts.
+
 ### Standalone contracts (no controller)
 
 The same DSL, callable on any Hash — webhook payloads, job arguments, service-object inputs, CSV rows:
