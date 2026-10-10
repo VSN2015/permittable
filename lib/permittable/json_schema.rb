@@ -333,14 +333,22 @@ module Permittable
     # length: reasons about characters on strings and element count on
     # arrays; either way it is an exact Integer or a Range (possibly endless
     # / beginless, possibly exclusive).
+    # An infinite end (`1..Float::INFINITY`) is no bound, as for numeric
+    # `in:` — and JSON has no Infinity, so exporting it raised.
     def length_bounds(spec)
       case spec
       when Integer then [spec, spec]
       when Range
-        max = spec.end && spec.exclude_end? ? spec.end - 1 : spec.end
-        [spec.begin, max]
+        min = finite_length(spec.begin)
+        max = finite_length(spec.end)
+        max -= 1 if max && spec.exclude_end?
+        [min, max]
       else [nil, nil]
       end
+    end
+
+    def finite_length(value)
+      value.is_a?(Float) && value.infinite? ? nil : value
     end
 
     # Documentation keys shared by every field kind. `default:`/`example:`

@@ -1541,7 +1541,7 @@ A bad contract is a programmer error, so it fails when the class loads — never
 - An unknown `normalize:` or `format:` preset, listing the presets
 - A `format:` that is neither a `Regexp` nor a preset name
 - `format:`, `length:`, or `normalize:` on a non-`:string` field
-- `length:` that isn't a non-negative `Integer` or a `Range`; an `in:` that is a `String` (`String#include?` would match any substring — `in: "free pro"` accepted `"e"`), or that is neither a `Range` nor answers `include?`
+- `length:` that isn't a non-negative `Integer` or a `Range`, or a `Range` with a negative or fractional end (`..-1`, `-2..3`, `1.5..3.5`; leave an end off, or use `Float::INFINITY`, for no bound); an `in:` that is a `String` (`String#include?` would match any substring — `in: "free pro"` accepted `"e"`), or that is neither a `Range` nor answers `include?`
 - An `in:` member the field's own type can't cast (`in: %w[1 two]` on an `:integer`, `nil` on a field that isn't `nullable:`, or a `Time` on a `:date` field that isn't exactly midnight UTC), or an `in:` `Range` whose endpoints a value of the field's type can't be compared with (`in: "1".."5"` on an `:integer`) — either would reject every request as `inclusion`
 - A bound **no value could satisfy**: a reversed or empty `Range` (`in: 65..18`, `length: 5..2`, `length: 3...3`), an empty `in:` set, or a `length:` of 0 on a `required` field (where `""` already violates as `missing`)
 - `validate:` or `transform:` that isn't callable
