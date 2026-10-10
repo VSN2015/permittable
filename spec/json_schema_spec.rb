@@ -86,6 +86,13 @@ RSpec.describe Permittable::JsonSchema do
       expect(property("x") { array :x, of: :float })
         .to eq("type" => "array", "items" => { "type" => "number", "minimum" => -Float::MAX, "maximum" => Float::MAX })
       expect(property("x") { optional :x, :integer }).to eq("type" => "integer")
+      # A bound past a double's range on the open side is no narrower than the
+      # cast itself, so it is clamped to it rather than published as is.
+      huge = 10**400
+      expect(property("x") { optional :x, :float, in: 0..huge }).to eq("type" => "number", "minimum" => 0, "maximum" => Float::MAX)
+      expect(property("x") { optional :x, :float, in: -huge...0 })
+        .to eq("type" => "number", "minimum" => -Float::MAX, "exclusiveMaximum" => 0)
+      expect(property("x") { optional :x, :float, in: 0...huge }).to eq("type" => "number", "minimum" => 0, "maximum" => Float::MAX)
       expect(JSON.generate(property("x") { optional :x, :float })).to include("1.7976931348623157e+308")
     end
   end

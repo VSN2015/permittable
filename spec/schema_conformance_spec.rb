@@ -106,6 +106,13 @@ module SchemaConformance
         [{ "scores" => [1.5, 10**309] }, :agree]
       ]
     },
+    "a :float bounded past a double's range" => {
+      contract: proc { optional :score, :float, in: 0..(10**400) },
+      payloads: [
+        [{ "score" => 1.5 }, :agree],
+        [{ "score" => 10**309 }, :agree]
+      ]
+    },
     "a :float with a one-sided bound" => {
       contract: proc { optional :score, :float, in: 0.. },
       payloads: [

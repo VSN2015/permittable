@@ -176,11 +176,25 @@ module Permittable
     # the exact edge of what the cast keeps finite, and a JSON number, so
     # each side the field does not already bound more narrowly (or list
     # outright with enum) is bounded there, and the two agree.
+    #
+    # A bound the field does set, but past a double's range on the open side
+    # (`in: 0..10**400`, which json_bound publishes exactly), is no narrower
+    # than the cast, so it is clamped too. One past the range on the closed
+    # side (`in: 10**400..`) is left alone: no double satisfies it, and the
+    # server refuses everything as well.
     def apply_float_limits!(schema)
       return if schema.key?("enum")
 
-      schema["minimum"] = -Float::MAX unless schema.key?("minimum") || schema.key?("exclusiveMinimum")
-      schema["maximum"] = Float::MAX unless schema.key?("maximum") || schema.key?("exclusiveMaximum")
+      clamp_float_bound!(schema, %w[maximum exclusiveMaximum], "maximum", Float::MAX) { |bound| bound > Float::MAX }
+      clamp_float_bound!(schema, %w[minimum exclusiveMinimum], "minimum", -Float::MAX) { |bound| bound < -Float::MAX }
+    end
+
+    def clamp_float_bound!(schema, keywords, keyword, limit)
+      present = keywords.select { |key| schema.key?(key) }
+      return if present.any? { |key| !yield(schema[key]) }
+
+      present.each { |key| schema.delete(key) }
+      schema[keyword] = limit
     end
 
     # A list is stored cast by the field's type, so its enum is what the
