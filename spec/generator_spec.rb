@@ -340,6 +340,59 @@ RSpec.describe Permittable::Generator do
     end
   end
 
+  describe ".draft from a model with array columns" do
+    # sqlite has no array columns, so the model is a duck shaped like a
+    # PostgreSQL model: Rails reports `t.string :tags, array: true` as
+    # type :string with array? true.
+    let(:column_class) do
+      Struct.new(:name, :type, :null, :default, :default_function, :array, :sql_type, keyword_init: true) do
+        def array? = array
+      end
+    end
+
+    let(:columns) do
+      [column_class.new(name: "id", type: :integer, null: false, array: false),
+       column_class.new(name: "title", type: :string, null: true, array: false),
+       column_class.new(name: "tags", type: :string, null: true, default: "{}", array: true, sql_type: "character varying[]"),
+       column_class.new(name: "scores", type: :integer, null: false, array: true, sql_type: "integer[]"),
+       column_class.new(name: "labels", type: :jsonb, null: true, array: true, sql_type: "jsonb[]")]
+    end
+
+    let(:model) do
+      cols = columns
+      Class.new do
+        define_singleton_method(:name) { "Post" }
+        define_singleton_method(:columns) { cols }
+        define_singleton_method(:column_names) { cols.map(&:name) }
+        define_singleton_method(:columns_hash) { cols.to_h { |c| [c.name, c] } }
+        define_singleton_method(:table_exists?) { true }
+        define_singleton_method(:table_name) { "posts" }
+        define_singleton_method(:primary_key) { "id" }
+      end
+    end
+
+    let(:draft) { described_class.draft(model: model) }
+
+    it "drafts an array column as an array field of the column's type, never as a scalar" do
+      expect(draft).to match(/optional :title, :string$/)
+      expect(draft).to match(/array :tags, of: :string # database default: "\{\}"/)
+      expect(draft).to match(/array :scores, of: :integer, required: true/)
+      expect(draft).not_to match(/optional :tags, :string/)
+    end
+
+    it "leaves a TODO for an array column whose element type has no scalar contract type" do
+      expect(draft).to match(/# TODO: labels \(jsonb\[\]\) has no contract type/)
+    end
+
+    it "produces a draft that accepts the array the column stores" do
+      stub_const("Post", model)
+      source = draft.gsub("mode: :monitor", "mode: :enforce")
+      klass = permittable_class { class_eval(source) }
+      params = { post: { title: "x", tags: %w[a b], scores: %w[1 2] } }
+      expect(controller(klass, params: params).permitted_params).to eq("title" => "x", "tags" => %w[a b], "scores" => [1, 2])
+    end
+  end
+
   describe ".draft of a contract the model would actually accept" do
     after do
       %i[gen_blog_posts gen_orders gen_shipments gen_vehicles gen_fleet_cars gen_oddities].each do |table|

@@ -3164,6 +3164,24 @@ RSpec.describe Permittable do
           expect(&declaring(typed) { optional :blob, :string }).not_to raise_error
         end
 
+        it "catches a scalar declared over an array column, and says how to declare it" do
+          # sqlite has no array columns; this is the shape a PostgreSQL
+          # `t.string :tags, array: true` column reports.
+          column = Struct.new(:type, :array) { def array? = array }
+          model = Class.new do
+            define_singleton_method(:table_name) { "ducks" }
+            define_singleton_method(:table_exists?) { true }
+            define_singleton_method(:column_names) { %w[tags title] }
+            define_singleton_method(:columns_hash) { { "tags" => column.new(:string, true), "title" => column.new(:string, false) } }
+          end
+          expect(&declaring(model) { optional :tags, :string }).to raise_error(ArgumentError) do |e|
+            expect(e.message).to match(/'tags' is declared :string but the column is an array \(of :string\)/)
+            expect(e.message).to include("array :tags, of: :string")
+            expect(e.message).to include("virtual: true")
+          end
+          expect(&declaring(model) { optional :title, :string }).not_to raise_error
+        end
+
         context "with a Rails enum" do
           # `enum` is spelled positionally from Rails 7.0 and by keyword before
           # it; the keyword form is gone in 8.0, and the matrix covers both.
