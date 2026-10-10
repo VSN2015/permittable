@@ -690,6 +690,19 @@ RSpec.describe Permittable do
       end
     end
 
+    # BigDecimal's exponent is bounded too: it overflows to Infinity (already
+    # refused) and underflows to zero, silently, so :decimal kept a value
+    # :float refuses by the same rule.
+    it "rejects a :decimal that underflowed to zero, like a :float" do
+      ["1e-99999999999999999999", "-5e-99999999999999999999", "0.1e-99999999999999999999"].each do |value|
+        expect(rejected(:d, value, &decl)).to eq([{ param: "d", code: "invalid_type" }]), "for #{value}"
+      end
+      expect(permit({ d: "1e-400" }, &decl)[:d]).to eq(BigDecimal("1e-400"))
+      ["0", "-0.0", "0e-99999999999999999999"].each do |value|
+        expect(permit({ d: value }, &decl)[:d]).to be_zero, "for #{value}"
+      end
+    end
+
     it "rejects non-finite Float objects for both numeric types" do
       [Float::INFINITY, -Float::INFINITY, Float::NAN].each do |value|
         expect(rejected(:f, value, &decl)).to eq([{ param: "f", code: "invalid_type" }]), "for :float #{value}"

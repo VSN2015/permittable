@@ -882,20 +882,27 @@ module Permittable
     def cast_decimal(value)
       case value
       when Numeric then finite_decimal(BigDecimal(value.to_s))
-      when String then value.match?(NUMERIC_FORMAT) ? finite_decimal(BigDecimal(value)) : [:error, "invalid_type"]
+      when String then value.match?(NUMERIC_FORMAT) ? finite_decimal(BigDecimal(value), source: value) : [:error, "invalid_type"]
       else [:error, "invalid_type"]
       end
     rescue ArgumentError
       [:error, "invalid_type"]
     end
 
-    # BigDecimal has no exponent limit, so a :decimal cannot overflow — but
     # BigDecimal("NaN") and BigDecimal("Infinity") SUCCEED where Float()
     # raises, so a client could send the literal string "NaN" for a price and
     # have it stored. Nothing else in the gem disagreed with itself this
     # loudly: :float rejected those strings and :decimal did not.
-    def finite_decimal(result)
-      result.finite? ? [:ok, result] : [:error, "invalid_type"]
+    #
+    # BigDecimal's exponent is far wider than a Float's, but it is bounded:
+    # "1e99999999999999999999" overflows to Infinity, refused above, and
+    # "1e-99999999999999999999" underflows to zero — silently, like a Float,
+    # so the same nonzero-significand rule as finite_float applies.
+    def finite_decimal(result, source: nil)
+      return [:error, "invalid_type"] unless result.finite?
+      return [:error, "invalid_type"] if result.zero? && nonzero_significand?(source)
+
+      [:ok, result]
     end
 
     def cast_boolean(value)
