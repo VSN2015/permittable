@@ -901,8 +901,26 @@ module Permittable
     def finite_decimal(result, source: nil)
       return [:error, "invalid_type"] unless result.finite?
       return [:error, "invalid_type"] if result.zero? && nonzero_significand?(source)
+      return [:error, "invalid_type"] if source && amplified?(result, source)
 
       [:ok, result]
+    end
+
+    # How many digits a :decimal's plain form may run to beyond what the
+    # client actually sent. See amplified?.
+    DECIMAL_DIGIT_ALLOWANCE = 1_000
+
+    # BigDecimal keeps a huge exponent exactly: "1e4000000000000000000" is 22
+    # bytes and a finite value. But a database adapter quoting it, JSON
+    # rendering, BigDecimal#to_s and a log line all build its plain form,
+    # which is NoMemoryError there — and with a smaller exponent
+    # ("1e1000000000"), a gigabyte string from a dozen bytes of request.
+    # So a String whose plain form would run past both a thousand digits and
+    # its own length is refused: "1e400" and "1e-999" still cast, and so
+    # does any number spelled out digit by digit, however long, since the
+    # request already paid for every digit.
+    def amplified?(result, source)
+      result.exponent.abs > [DECIMAL_DIGIT_ALLOWANCE, source.length].max
     end
 
     def cast_boolean(value)
