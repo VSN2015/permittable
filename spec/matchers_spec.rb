@@ -555,6 +555,13 @@ RSpec.describe "Permittable RSpec matchers" do
       expect(monitored).to reject_params({}).for_action(:create).with_violation("a", :missing)
     end
 
+    it "refuses a qualifier that belongs to the other matcher instead of ignoring it" do
+      expect { accept_params(valid).with_violation("user.name", :missing) }
+        .to raise_error(ArgumentError, /with_violation.*reject_params/m)
+      expect { reject_params({ user: {} }).returning("name" => "Jo") }
+        .to raise_error(ArgumentError, /returning.*accept_params/m)
+    end
+
     it "demands for_action when several contracts are declared, like permit_param" do
       expect { expect(users).to accept_params(valid) }
         .to raise_error(ArgumentError, /declares 2 contracts/)
