@@ -344,11 +344,11 @@ module Permittable
       return nil unless columns || scan
       return column_draft(model, columns.values, [], except: except) unless scan
 
-      shared = scanned_lines(scan, listed_columns(columns, :shared))
+      shared = scanned_lines(scan, listed_columns(columns, :shared), model: model)
       return fallback_draft(model, scan, columns, except: except) unless declares_field?(shared)
 
       render(root: scan.root, model: columns && model, except: except) do |rule|
-        scanned_lines(scan, listed_columns(columns, rule))
+        scanned_lines(scan, listed_columns(columns, rule), model: model)
       end
     end
 
@@ -949,13 +949,13 @@ module Permittable
     # Scanned names are emitted with Symbol#inspect, not as `:#{name}`: a
     # string-keyed `permit("2fa")` scans to a name that is not a bare symbol
     # literal, and `:2fa` would make the whole draft a SyntaxError.
-    def scanned_lines(scan, columns)
+    def scanned_lines(scan, columns, model: nil)
       lines = scan.scalars.map { |name| scanned_scalar_line(name, columns) }
       lines += scan.arrays.map do |name|
         "array #{name.to_sym.inspect}, of: :string " \
           "# TODO: confirm the element type, and declare length: — an array without one is unbounded"
       end
-      scan.nested.each { |name, keys| lines += nested_lines(name, keys) }
+      scan.nested.each { |name, keys| lines += nested_lines(name, keys, model: model) }
       scan.nested_arrays.each { |name, keys| lines += nested_array_lines(name, keys) }
       lines + scan_todo_lines(scan)
     end
@@ -994,11 +994,26 @@ module Permittable
       "#{field} # TODO: confirm the type"
     end
 
-    def nested_lines(name, keys)
+    # `permit(addresses_attributes: [...])` cannot say whether it permits one
+    # hash or many; the model can. When the key is a collection's nested
+    # attributes (has_many + accepts_nested_attributes_for), fields_for
+    # sends its records as `{"0" => {...}, "1" => {...}}`, which a nested
+    # block reads as unknown keys and silently drops, and an `array ... do`
+    # field reads as the records it encodes. A has_one's stay a nested block.
+    def nested_lines(name, keys, model: nil)
+      return nested_array_lines(name, keys) if collection_attributes?(model, name)
+
       ["optional #{name.to_sym.inspect} do # TODO: drafted from `#{name}: [...]` — " \
        "if this is an array of hashes, use `array #{name.to_sym.inspect} do`"] +
         sub_field_lines(keys) +
         ["end"]
+    end
+
+    def collection_attributes?(model, name)
+      base = name.to_s.delete_suffix("_attributes")
+      return false if base == name.to_s || !model.respond_to?(:reflect_on_association)
+
+      model.reflect_on_association(base.to_sym)&.collection? || false
     end
 
     # No TODO on the kind here, unlike nested_lines: `params.expect` spells an

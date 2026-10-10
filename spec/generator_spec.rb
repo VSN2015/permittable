@@ -340,6 +340,53 @@ RSpec.describe Permittable::Generator do
     end
   end
 
+  describe ".draft of nested attributes for a has_many" do
+    before do
+      ActiveRecord::Schema.define do
+        create_table(:gen_people) { |t| t.string :name }
+        create_table(:gen_addresses) do |t|
+          t.references :gen_person
+          t.string :city
+        end
+        create_table(:gen_profiles) do |t|
+          t.references :gen_person
+          t.string :bio
+        end
+      end
+      stub_const("GenAddress", Class.new(TestModel) { self.table_name = "gen_addresses" })
+      stub_const("GenProfile", Class.new(TestModel) { self.table_name = "gen_profiles" })
+      stub_const("GenPerson", Class.new(TestModel) do
+        self.table_name = "gen_people"
+        has_many :addresses, class_name: "GenAddress", foreign_key: :gen_person_id
+        has_one :profile, class_name: "GenProfile", foreign_key: :gen_person_id
+        accepts_nested_attributes_for :addresses, :profile
+      end)
+    end
+
+    after { %i[gen_people gen_addresses gen_profiles].each { |t| ActiveRecord::Base.connection.drop_table(t, if_exists: true) } }
+
+    let(:scan) do
+      described_class.scan("params.require(:gen_person).permit(:name, addresses_attributes: [:city], profile_attributes: [:bio])")
+    end
+
+    # fields_for sends a has_many's records as an index-keyed Hash, which a
+    # nested block read as unknown keys and silently dropped.
+    it "drafts a collection's nested attributes as an array, and a has_one's as a nested block" do
+      draft = described_class.draft(model: GenPerson, scan: scan)
+      expect(draft).to match(/^ +array :addresses_attributes do$/)
+      expect(draft).to match(/optional :profile_attributes do # TODO/)
+    end
+
+    it "produces a draft that keeps every record fields_for sends" do
+      source = described_class.draft(model: GenPerson, scan: scan)
+      klass = permittable_class { class_eval(source) }
+      sent = { gen_person: { name: "Jo", addresses_attributes: { "0" => { city: "Paris" }, "1" => { city: "Rome" } } } }
+      expect(controller(klass, params: sent).permittable_violations).to eq([])
+      expect(controller(klass, params: sent).permitted_params[:addresses_attributes])
+        .to eq([{ "city" => "Paris" }, { "city" => "Rome" }])
+    end
+  end
+
   describe ".draft of a contract the model would actually accept" do
     after do
       %i[gen_blog_posts gen_orders gen_shipments gen_vehicles gen_fleet_cars gen_oddities].each do |table|
