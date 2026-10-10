@@ -703,6 +703,27 @@ RSpec.describe Permittable do
       end
     end
 
+    # BigDecimal keeps an exponent of 4e18 exactly, and the cast accepted a
+    # 22-byte string holding one, but anything that formats it — a database
+    # adapter quoting it, JSON rendering, a log line — builds its plain
+    # form: NoMemoryError, or with a smaller exponent, gigabytes from a few
+    # bytes of request.
+    it "rejects a :decimal string whose plain form would dwarf what was sent" do
+      %w[1e4000000000000000000 1e-4000000000000000000 1e1000000000 -2.5e-100000 1e1001].each do |value|
+        expect(rejected(:d, value, &decl)).to eq([{ param: "d", code: "invalid_type" }]), "for #{value}"
+      end
+    end
+
+    it "still accepts a :decimal up to a thousand digits each way, and any digits spelled out in full" do
+      expect(permit({ d: "1e400" }, &decl)[:d]).to eq(BigDecimal("1e400"))
+      expect(permit({ d: "1e999" }, &decl)[:d]).to eq(BigDecimal("1e999"))
+      expect(permit({ d: "-1e-999" }, &decl)[:d]).to eq(BigDecimal("-1e-999"))
+      long = "9" * 1500
+      expect(permit({ d: long }, &decl)[:d]).to eq(BigDecimal(long))
+      tiny = "0.#{'0' * 1500}1"
+      expect(permit({ d: tiny }, &decl)[:d]).to eq(BigDecimal(tiny))
+    end
+
     it "rejects non-finite Float objects for both numeric types" do
       [Float::INFINITY, -Float::INFINITY, Float::NAN].each do |value|
         expect(rejected(:f, value, &decl)).to eq([{ param: "f", code: "invalid_type" }]), "for :float #{value}"
