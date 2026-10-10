@@ -3,7 +3,8 @@ module Permittable
   #
   # `:envelope` (the default) is the gem's original shape: the host's
   # #render_error when the controller defines one (e.g. concerns_on_rails'
-  # Respondable), otherwise the identical inline JSON.
+  # Respondable; see host_render_error for a private one), otherwise the
+  # identical inline JSON.
   #
   # `:problem` renders RFC 9457 Problem Details — `application/problem+json`
   # with type/title/status/detail/instance members and the field violations as
@@ -44,19 +45,70 @@ module Permittable
     end
 
     def render_envelope(controller, message:, status:, code: nil, details: nil)
-      if controller.respond_to?(:render_error)
-        # errors: only when there are details — a host may document its
-        # render_error contract as `(message:, status:, code:)`, and an
-        # unconditional errors: kwarg would break those implementations.
+      host = host_render_error(controller)
+      if host
         kwargs = { message: message, code: code, status: status }
-        kwargs[:errors] = details if details
-        controller.render_error(**kwargs)
+        kwargs[:errors] = details if details && takes_errors?(host)
+        host.call(**kwargs)
       else
         error = { message: message }
         error[:code] = code if code
         error[:details] = details if details
         controller.render(json: { success: false, error: error }, status: status)
       end
+    end
+
+    # The host's render_error, or nil to render the inline shape. A public
+    # one is always used, as documented. A private one is the usual spelling
+    # on an ApplicationController (a public method there is routable as an
+    # action in every subclass), so it is used too — but only when it is
+    # shaped like the documented keyword contract: a private
+    # `render_error(message, status)` helper written for something else was
+    # never consulted, and must not start turning every 422 into a 500.
+    def host_render_error(controller)
+      return controller.method(:render_error) if controller.respond_to?(:render_error)
+      return nil unless controller.respond_to?(:render_error, true)
+
+      method = controller.method(:render_error)
+      method if keyword_contract?(method.parameters)
+    end
+
+    # The keywords render_envelope may pass: message:, code: and status:
+    # always, errors: when the method takes it.
+    DELEGATED_KEYWORDS = %i[message code status errors].freeze
+
+    # Shaped like the documented contract: it takes message:, code: and
+    # status: (by name or through **), and requires nothing the gem does not
+    # pass — no positional argument, no keyword outside DELEGATED_KEYWORDS.
+    # `(message:, status:)` is a common private helper on an
+    # ApplicationController, and calling it with code: would raise.
+    def keyword_contract?(parameters)
+      return false if parameters.any? { |kind, _| kind == :req }
+
+      required = parameters.filter_map { |kind, name| name if kind == :keyreq }
+      return false unless (required - DELEGATED_KEYWORDS).empty?
+      return true if parameters.any? { |kind, _| kind == :keyrest }
+
+      (%i[message code status] - keyword_names(parameters)).empty?
+    end
+
+    # A rejection always carries details, so passing errors: whenever there
+    # are some passed it on every call — and a host documenting its contract
+    # as `(message:, status:, code:)`, which the README promises keeps
+    # working, raised ArgumentError out of the rescue_from handler: a 500 for
+    # every invalid request. errors: now goes only to a method that can take
+    # it: one naming it, taking **kwargs, or declaring no keywords at all
+    # (`*args`, which received it inside its trailing Hash before).
+    def takes_errors?(method)
+      parameters = method.parameters
+      return true if parameters.any? { |kind, _| kind == :keyrest }
+
+      names = keyword_names(parameters)
+      names.empty? || names.include?(:errors)
+    end
+
+    def keyword_names(parameters)
+      parameters.filter_map { |kind, name| name if %i[key keyreq].include?(kind) }
     end
 
     # Members are emitted in the order RFC 9457 documents them, so the wire

@@ -2552,6 +2552,91 @@ RSpec.describe Permittable do
     end
   end
 
+  describe "delegating to the host's render_error" do
+    def rejected(klass)
+      c = controller(klass, params: {})
+      begin
+        c.permitted_params
+      rescue described_class::InvalidParameters => e
+        c.render_invalid_parameters(e)
+      end
+      c
+    end
+
+    def host_with(&render_error)
+      permittable_class do
+        permit_params(:create) { required :name, :string }
+        class_eval(&render_error)
+      end
+    end
+
+    it "passes errors: to a render_error that takes it" do
+      klass = host_with do
+        def render_error(message:, status:, code: nil, errors: nil)
+          render(json: { host: true, message: message, code: code, errors: errors }, status: status)
+        end
+      end
+      expect(rejected(klass).rendered[:json]).to include(host: true, code: "invalid_parameters",
+                                                         errors: [{ param: "name", code: "missing" }])
+    end
+
+    it "keeps a three-keyword render_error working, as documented, instead of raising" do
+      klass = host_with do
+        def render_error(message:, status:, code:)
+          render(json: { host: true, message: message, code: code }, status: status)
+        end
+      end
+      c = rejected(klass)
+      expect(c.rendered[:status]).to eq(:unprocessable_entity)
+      expect(c.rendered[:json]).to include(host: true, code: "invalid_parameters")
+    end
+
+    it "passes errors: to a render_error that takes any keyword" do
+      klass = host_with do
+        def render_error(**kwargs)
+          render(json: kwargs.merge(host: true), status: kwargs[:status])
+        end
+      end
+      expect(rejected(klass).rendered[:json]).to include(host: true, errors: [{ param: "name", code: "missing" }])
+    end
+
+    it "delegates to a private render_error, the usual spelling for a helper that must not be an action" do
+      klass = host_with do
+        private
+
+        def render_error(message:, status:, code: nil, errors: nil)
+          render(json: { host: true, message: message, code: code, errors: errors }, status: status)
+        end
+      end
+      expect(rejected(klass).rendered[:json]).to include(host: true, errors: [{ param: "name", code: "missing" }])
+    end
+
+    # The gem always passes message:, code: and status:, so a private
+    # helper is used only when it takes all three and requires nothing else.
+    # Anything narrower was never consulted, and calling it would raise: a
+    # 500 on every rejection, the bug this delegation exists to avoid.
+    it "leaves a private render_error with some other signature alone, as before" do
+      inline = { success: false, error: { message: "Invalid parameters: name (missing)", code: "invalid_parameters",
+                                          details: [{ param: "name", code: "missing" }] } }
+      signatures = [
+        "message, status",
+        "message:, status:",
+        "message:, status: :bad_request",
+        "message:, status:, code:, details:",
+        "msg = nil, status: 500, message: nil"
+      ]
+      signatures.each do |signature|
+        klass = host_with do
+          class_eval <<~RUBY, __FILE__, __LINE__ + 1
+            # private def render_error(message:, status:) = render(json: { unrelated: true }, status: 500)
+            private def render_error(#{signature}) = render(json: { unrelated: true }, status: 500)
+          RUBY
+        end
+        expect(rejected(klass).rendered[:json]).to eq(inline), "for render_error(#{signature})"
+      end
+    end
+  end
+
   describe "bounded prose: log lines and summaries" do
     def logging_controller(klass, params:, action: "create")
       c = controller(klass, params: params, action: action)
