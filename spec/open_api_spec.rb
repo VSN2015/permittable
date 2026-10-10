@@ -67,6 +67,26 @@ RSpec.describe Permittable::OpenAPI do
       expect(operation["responses"].keys).to eq(%w[400 422])
     end
 
+    # The same class of leak #76, #78 and #79 closed for other authored values.
+    it "hands out desc: strings a caller can edit without rewriting the contract" do
+      rule_desc = +"Register a user"
+      field_desc = +"Display name"
+      klass = controller_class do
+        permit_params(:create, desc: rule_desc) { required :name, :string, desc: field_desc }
+      end
+      operation = described_class.operations_for(klass)["create"]
+      schema = Permittable::JsonSchema.rule(klass.permit_rule_for(:create))
+      begin
+        operation["description"] << " (deprecated)"
+        schema["properties"]["name"]["description"] << " (deprecated)"
+      rescue FrozenError
+        nil # a frozen description is as good: the point is that the contract is unchanged
+      end
+      expect(described_class.operations_for(klass)["create"]["description"]).to eq("Register a user")
+      expect(Permittable::JsonSchema.rule(klass.permit_rule_for(:create))["properties"]["name"]["description"]).to eq("Display name")
+      expect([rule_desc.frozen?, field_desc.frozen?]).to eq([false, false])
+    end
+
     it "omits the 400 response for rootless contracts (only a missing root renders 400)" do
       klass = controller_class { permit_params(:index) { optional :page, :integer } }
       expect(described_class.operations_for(klass)["index"]["responses"].keys).to eq(["422"])

@@ -1199,6 +1199,7 @@ module Permittable
       validate_array_authored_value!(field, :default) if field.key?(:default)
       validate_array_authored_value!(field, :example) if field.key?(:example)
       validate_message!(field)
+      freeze_desc!(field)
       @fields << field
     end
 
@@ -1275,6 +1276,7 @@ module Permittable
                   fields: nested_fields!(name, &block), **opts }
         field[:fields] = cascade_sensitive(field[:fields], field[:sensitive])
         validate_message!(field)
+        freeze_desc!(field)
       elsif type&.to_sym == JSON_TYPE
         assert_opts!(name, opts, JSON_OPTS)
         # `type:` is carried alongside `kind:` so the same `as(:json)` matcher
@@ -1379,6 +1381,7 @@ module Permittable
       validate_authored_value!(field, :default)
       validate_authored_value!(field, :example)
       validate_message!(field)
+      freeze_desc!(field)
     end
 
     # `in:` is a Range (bounds-checked with cover?), a list of values, or an
@@ -1484,6 +1487,7 @@ module Permittable
       validate_json_authored_value!(field, :default)
       validate_json_authored_value!(field, :example)
       validate_message!(field)
+      freeze_desc!(field)
     end
 
     def validate_max_depth!(name, depth)
@@ -1705,6 +1709,16 @@ module Permittable
             "declare nullable: true to make an explicit null part of the contract"
     end
 
+    # `desc:` is exported as the schema's `description`, and was handed out
+    # by reference: a caller appending to a generated document's
+    # description (" (deprecated)", a gsub! for localisation) rewrote the
+    # contract inside the frozen rule, and every later export in the process
+    # carried the edit. Frozen as a copy, like message:, default: and
+    # example:, so the host's own String is left as it passed it.
+    def freeze_desc!(field)
+      field[:desc] = freeze_authored(field[:desc]) unless field[:desc].nil?
+    end
+
     # `message:` customizes what the client reads for a violation on this
     # field: one String covering every code, or a Hash of code => String
     # (codes without an entry keep the default rendering). Keys are
@@ -1804,7 +1818,7 @@ module Permittable
 
       rule = { actions: actions.flatten.map(&:to_s).freeze, root: root && root.to_sym,
                model: model_class, unknown: unknown, enforce: !!enforce, mode: mode, fields: fields,
-               finalize: builder.finalizer, desc: desc }.freeze
+               finalize: builder.finalizer, desc: desc&.deep_dup&.freeze }.freeze
       self.permittable_contracts = permittable_contracts + [rule]
     end
 
