@@ -327,6 +327,26 @@ RSpec.describe Permittable::Generator do
       expect(draft).to include("optional :settings, :json")
     end
 
+    # :json accepts only an object. A json/jsonb column whose default is an
+    # array stores arrays, so drafting it as :json rejected, once enforced,
+    # exactly what every client sends for it.
+    it "leaves a TODO, not a hash-only :json field, for a json column whose default is an array" do
+      ActiveRecord::Schema.define do
+        create_table(:gen_documents) do |t|
+          t.json :labels, null: false, default: []
+          t.json :settings, default: {}
+        end
+      end
+      stub_const("GenDocument", Class.new(TestModel) { self.table_name = "gen_documents" })
+      draft = described_class.draft(model: GenDocument)
+      expect(draft).to match(/# TODO: labels \(json\) defaults to an array, which :json refuses/)
+      expect(draft).to include("array :labels")
+      expect(draft).not_to match(/optional :labels, :json/)
+      expect(draft).to match(/optional :settings, :json # database default: "\{\}"/)
+    ensure
+      ActiveRecord::Base.connection.drop_table(:gen_documents, if_exists: true)
+    end
+
     it "leaves a TODO comment for columns with no contract type at all" do
       expect(draft).to match(/# TODO: thumbnail \(binary\) has no contract type/)
     end
