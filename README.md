@@ -1132,6 +1132,8 @@ On a violating request in monitor mode:
 - `permitted_params` returns the **raw pass-through**: exactly what the client sent, untouched — no casts, no defaults, no transforms. A missing `root:` passes an empty hash; a rootless contract drops only Rails' routing keys.
 - `permittable_violations` returns the recorded details (`[]` when the request was clean), if the action wants to branch on or tag the traffic.
 
+The before-action check that monitors actions which never call `permitted_params` keeps that promise when it cannot check at all. A body Rails cannot parse, or an exception from the contract's own code (`validate:`, `transform:`, `finalize`), is logged as `[monitor] #create could not be checked: <exception class>` and the action runs. An action that then reads `permitted_params` meets the same exception itself, as it would without a contract.
+
 Monitor-mode rules validate **eagerly in the `before_action`, regardless of `enforce:`** — telemetry must not depend on the action calling `permitted_params`, since legacy actions still reading `params` directly are exactly the ones worth monitoring. (On a plain-Ruby host without `before_action`, validation stays lazy.)
 
 [Exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) marks operations whose rule declares `mode: :monitor` with `x-permittable-mode: "monitor"` — the docs shouldn't promise a 422 the server doesn't yet send. Only the per-rule declaration is exported: the global `Permittable.mode` is runtime configuration, not contract data.

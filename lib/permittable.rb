@@ -1929,8 +1929,31 @@ module Permittable
     return nil unless action
 
     rule = self.class.permit_rule_for(action)
-    permitted_params(action) if rule && (rule[:enforce] || permittable_mode(rule) == :monitor)
+    return nil unless rule
+
+    if permittable_mode(rule) == :monitor
+      permittable_monitor_eagerly(action)
+    elsif rule[:enforce]
+      permitted_params(action)
+    end
     nil
+  end
+
+  # Monitor mode's promise is that the action runs, whatever the request
+  # holds — that is what makes it safe to turn on. Checking eagerly reads
+  # `params`, which raises ActionDispatch's ParseError on a body Rails
+  # cannot parse: a webhook action reading request.raw_post itself got a
+  # 400 instead of running. An exception from the contract's own code
+  # (validate:, transform:, finalize) became a 500 the same way. Either is
+  # now logged, by class only (a parse error's message can quote the body),
+  # and the action runs; one that reads permitted_params meets the same
+  # exception itself, as it would with no contract at all.
+  def permittable_monitor_eagerly(action)
+    permitted_params(action)
+  rescue StandardError => e
+    return unless respond_to?(:logger) && logger
+
+    logger.warn("#{LABEL}: [monitor] ##{action} could not be checked: #{e.class} — the action runs unchecked")
   end
 
   # The violation details recorded by validating `action` (default: the
