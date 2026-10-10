@@ -650,6 +650,35 @@ RSpec.describe Permittable do
       expect(violations_for({ at: "Sept" }, &decl).details).to eq([{ param: "at", code: "invalid_type" }])
     end
 
+    # The in-process half: spec_helper has loaded ActiveSupport's DateTime
+    # extensions, as a Rails app does. Without them the day moved — see the
+    # clean-process example in contract_spec.
+    it "reads a :datetime before 1582 in the same calendar as a Date object" do
+      expect(permit({ at: "1500-01-01" }, &decl)[:at]).to eq(Time.utc(1500, 1, 1))
+      expect(permit({ at: "1500-01-01T12:00:00+02:00" }, &decl)[:at]).to eq(Time.utc(1500, 1, 1, 10))
+      expect(permit({ at: Date.new(1500, 1, 1) }, &decl)[:at]).to eq(Time.utc(1500, 1, 1))
+      expect(permit({ on: "1500-01-01" }, &decl)[:on].strftime("%F")).to eq("1500-01-01")
+    end
+
+    # Ruby's parser reports a zone it cannot convert as a zone with no
+    # offset (or one beyond a day), and DateTime.parse then reads the wall
+    # clock as UTC: "+25:00", "-99:00" or an unknown abbreviation named an
+    # instant hours away from the one accepted.
+    it "refuses a :datetime whose stated zone or offset cannot be honoured, instead of reading it as UTC" do
+      ["2026-09-05T10:30:00+24:00", "2026-09-05T10:30:00+25:00", "2026-09-05T10:30:00-99:00",
+       "2026-09-05 10:30 +99", "2026-09-05 10:30 XYZ"].each do |value|
+        expect(violations_for({ at: value }, &decl).details).to eq([{ param: "at", code: "invalid_type" }]), value
+      end
+    end
+
+    it "still honours every offset within a day, and named zones Ruby knows" do
+      expect(permit({ at: "2026-09-05T10:30:00+14:00" }, &decl)[:at]).to eq(Time.utc(2026, 9, 4, 20, 30))
+      expect(permit({ at: "2026-09-05T10:30:00+23:59" }, &decl)[:at]).to eq(Time.utc(2026, 9, 4, 10, 31))
+      expect(permit({ at: "2026-09-05T10:30:00-00:00" }, &decl)[:at]).to eq(Time.utc(2026, 9, 5, 10, 30))
+      expect(permit({ at: "2026-09-05 10:30 EST" }, &decl)[:at]).to eq(Time.utc(2026, 9, 5, 15, 30))
+      expect(permit({ at: "Sat, 05 Sep 2026 10:30:00 +0000" }, &decl)[:at]).to eq(Time.utc(2026, 9, 5, 10, 30))
+    end
+
     it "accepts Time, DateTime and Date objects for :datetime, normalising to UTC" do
       expect(permit({ at: Time.utc(2026, 9, 5, 10, 30) }, &decl)[:at]).to eq(Time.utc(2026, 9, 5, 10, 30))
       expect(permit({ at: DateTime.new(2026, 9, 5, 10, 30, 0, "+07:00") }, &decl)[:at])

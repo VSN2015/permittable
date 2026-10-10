@@ -273,6 +273,25 @@ RSpec.describe Permittable::Contract do
       )
     end
 
+    it "reads a :datetime before 1582 as the day it names, whatever the host has loaded" do
+      # ISO 8601 dates are proleptic Gregorian, like Time. DateTime.parse
+      # defaults to the 1582 Italian reform and reads an earlier date as
+      # Julian; stdlib's DateTime#to_time then converts by day number, so
+      # "1500-01-01" became 1500-01-10. ActiveSupport's DateTime#to_time
+      # converts by component instead, so a Rails app kept the day: the
+      # result depended on what the host had loaded. Only a clean process
+      # can see the stdlib half.
+      script = <<~RUBY
+        require "permittable"
+        contract = Permittable::Contract.define { required :at, :datetime }
+        print contract.call!(at: "1500-01-01T12:00:00+02:00")[:at].strftime("%F %T %Z")
+      RUBY
+      lib = File.expand_path("../lib", __dir__)
+      out, err, status = Open3.capture3(RbConfig.ruby, "-I", lib, "-e", script)
+      expect(status).to be_success, err
+      expect(out).to eq("1500-01-01 10:00:00 UTC")
+    end
+
     it "does not rewrite the caller's own Time while normalising it to UTC" do
       moment = Time.new(2026, 9, 5, 17, 30, 0, "+07:00")
       result = described_class.define { required :at, :datetime }.call!(at: moment)

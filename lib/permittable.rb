@@ -958,11 +958,34 @@ module Permittable
         # Time from components would have to reimplement DateTime.parse's
         # handling of offsets, zone names and sub-second precision, and
         # getting that subtly wrong costs more than the parse.
-        complete_date?(Date._parse(value)) ? [:ok, DateTime.parse(value).to_time.utc] : [:error, "invalid_type"]
+        #
+        # Parsed in the proleptic Gregorian calendar, which is what ISO 8601
+        # and Time use. DateTime.parse defaults to the 1582 Italian reform
+        # and read an earlier date as Julian; stdlib's DateTime#to_time then
+        # converts by day number, so "1500-01-01" became 1500-01-10 — unless
+        # the host had loaded ActiveSupport's DateTime#to_time, which
+        # converts by component. Gregorian, both agree.
+        found = Date._parse(value)
+        return [:error, "invalid_type"] unless complete_date?(found) && honoured_zone?(found)
+
+        [:ok, DateTime.parse(value, true, Date::GREGORIAN).to_time.utc]
       else [:error, "invalid_type"]
       end
     rescue ArgumentError, RangeError
       [:error, "invalid_type"]
+    end
+
+    # A zone the parser could not turn into an offset — an offset of a day
+    # or more ("+24:00", "-99:00", "+99") or an abbreviation it does not
+    # know ("XYZ") — is reported as a zone with no offset, or with one
+    # beyond a day, and DateTime.parse then reads the wall clock as UTC: an
+    # instant hours away from the one the client named. The client stated a
+    # zone, so it is refused rather than guessed at.
+    def honoured_zone?(found)
+      return true unless found.key?(:zone)
+
+      offset = found[:offset]
+      !offset.nil? && offset.abs < 86_400
     end
 
     # Presets only make sense on String input; a non-String value (JSON
