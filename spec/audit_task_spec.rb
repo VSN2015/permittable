@@ -32,6 +32,33 @@ RSpec.describe "permittable:audit and permittable:generate with an ignore list",
         def create = head(:created)
       end
     RUBY
+    # Bare ActionController::Metal, the usual shape of a lean webhook
+    # endpoint: neither Base nor API, and the tasks used to collect only
+    # those two, so this unguarded POST had no row and [strict] passed.
+    "app/controllers/hooks_controller.rb" => <<~RUBY,
+      class HooksController < ActionController::Metal
+        include ActionController::Head
+
+        def receive = head(:accepted)
+      end
+    RUBY
+    # Metal with a contract: enforced at runtime, so it belongs in the export.
+    "app/controllers/pings_controller.rb" => <<~RUBY,
+      class PingsController < ActionController::Metal
+        include AbstractController::Rendering
+        include ActionController::Rendering
+        include ActionController::Renderers::All
+        include ActionController::Head
+        include AbstractController::Callbacks
+        include ActionController::Rescue
+        include ActionController::StrongParameters
+        include Permittable
+
+        permit_params(:create, enforce: true) { required :host, :string }
+
+        def create = head(:created)
+      end
+    RUBY
     # Never routed: the generator drafts from controllers, not routes.
     "app/controllers/notes_controller.rb" => <<~RUBY
       class NotesController < ApplicationController
@@ -80,6 +107,8 @@ RSpec.describe "permittable:audit and permittable:generate with an ignore list",
     Rails.application.routes.draw do
       post "widgets", to: "widgets#create"
       post "uploads", to: "gem_uploads#create"
+      post "hooks", to: "hooks#receive"
+      post "pings", to: "pings#create"
       match "*path", to: "application#not_found", via: :all
     end
     Rails.application.load_tasks
@@ -102,8 +131,12 @@ RSpec.describe "permittable:audit and permittable:generate with an ignore list",
     end
 
     results = {}
-    Permittable.audit_ignore = %w[application#not_found widget]
+    Permittable.audit_ignore = %w[application#not_found widget hooks]
     results["ignored"] = run_task("permittable:audit", "strict")
+
+    Permittable.audit_ignore = %w[application#not_found]
+    results["metal"] = run_task("permittable:audit", "strict")
+    results["openapi"] = run_task("permittable:openapi")
 
     Permittable.audit_ignore = []
     results["unignored"] = run_task("permittable:audit", "strict")
@@ -157,9 +190,25 @@ RSpec.describe "permittable:audit and permittable:generate with an ignore list",
       expect(ignored["out"]).to match(/^Permittable\.audit_ignore entries that match no routed action .*\n  widget$/)
     end
 
+    it "audits a bare ActionController::Metal controller, and fails on its unguarded POST" do
+      metal = results["metal"]
+      expect(metal["out"]).to match(%r{^hooks\n  POST +/hooks +receive +no contract — ACCEPTS A BODY})
+      expect(metal["out"]).to match(%r{^pings\n  POST +/pings +create +enforce})
+      expect(metal["aborted"]).to be(true)
+      expect(metal["err"]).to include("1 routed action accepts a request body with no contract covering it")
+    end
+
     it "still fails on the catch-all once it is not ignored" do
       expect(results["unignored"]["aborted"]).to be(true)
       expect(results["unignored"]["err"]).to include("with no contract covering it")
+    end
+  end
+
+  describe "permittable:openapi" do
+    it "exports a Metal controller's contract alongside Base ones" do
+      paths = JSON.parse(results["openapi"]["out"])["paths"]
+      expect(paths.keys).to include("/widgets", "/pings")
+      expect(paths["/pings"]["post"]["requestBody"]["content"]["application/json"]["schema"]["required"]).to eq(["host"])
     end
   end
 

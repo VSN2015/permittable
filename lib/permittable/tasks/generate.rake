@@ -11,10 +11,7 @@ namespace :permittable do
   task :generate, [:controller] => :environment do |_t, task_args|
     Rails.application.eager_load!
 
-    bases = []
-    bases << ActionController::Base if defined?(ActionController::Base)
-    bases << ActionController::API if defined?(ActionController::API)
-    controllers = bases.flat_map(&:descendants).uniq.select(&:name)
+    controllers = Permittable::Audit.rails_controllers
 
     # { controller => actions to leave out of its draft }. A named controller
     # is drafted whole, even if covered or ignored; the sweep skips both, and
