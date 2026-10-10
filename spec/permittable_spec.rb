@@ -334,10 +334,26 @@ RSpec.describe Permittable do
     it "refuses a length: Range whose ends are not non-negative Integers" do
       [..-1, -5..-1, -2..3, 1.5..3.5, 0.5.., 1..Rational(7, 2)].each do |range|
         expect { permittable_class { permit_params(:create) { optional :s, :string, length: range } } }
-          .to raise_error(ArgumentError, /:length for :s must have non-negative Integer ends/), "expected #{range.inspect} to raise"
+          .to raise_error(ArgumentError, /:length for :s must have non-negative whole-number ends/), "expected #{range.inspect} to raise"
         expect { permittable_class { permit_params(:create) { array :a, of: :string, length: range } } }
-          .to raise_error(ArgumentError, /:length for :a must have non-negative Integer ends/), "expected #{range.inspect} to raise"
+          .to raise_error(ArgumentError, /:length for :a must have non-negative whole-number ends/), "expected #{range.inspect} to raise"
       end
+    end
+
+    # Only a fractional or negative end is a mistake: a whole-number Float or
+    # Rational end (`1..10.0`) meant ten and worked before.
+    it "still accepts whole-number Float and Rational ends, and exports them as integers" do
+      klass = permittable_class do
+        permit_params(:create) do
+          optional :s, :string, length: 1..10.0
+          optional :t, :string, length: 0.0...Rational(4)
+        end
+      end
+      expect(controller(klass, params: { s: "a" * 10, t: "abc" }).permitted_params).to eq("s" => "a" * 10, "t" => "abc")
+      fields = Permittable::JsonSchema.rule(klass.permit_rule_for(:create))["properties"]
+      expect(fields["s"]).to include("minLength" => 1, "maxLength" => 10)
+      expect(fields["t"]).to include("maxLength" => 3)
+      expect(fields["s"]["maxLength"]).to be_an(Integer)
     end
 
     it "still reads an infinite end as an open one" do

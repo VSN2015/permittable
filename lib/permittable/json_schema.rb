@@ -347,8 +347,12 @@ module Permittable
       end
     end
 
+    # A whole-number Float/Rational end (`1..10.0`) is published as the
+    # Integer it means: minLength and friends are counts.
     def finite_length(value)
-      value.is_a?(Float) && value.infinite? ? nil : value
+      return nil if value.nil? || (value.is_a?(Float) && value.infinite?)
+
+      value.to_i
     end
 
     # Documentation keys shared by every field kind. `default:`/`example:`
