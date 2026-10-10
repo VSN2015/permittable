@@ -2330,12 +2330,27 @@ module Permittable
         violations << permittable_violation(field, full, "invalid_type")
       end
     when :array
+      value = value.values if permittable_fields_for_records?(field, value)
       if value.is_a?(Array)
         result[key] = permittable_check_array(field, value, path: full, unknown: unknown, violations: violations)
       else
         violations << permittable_violation(field, full, "invalid_type")
       end
     end
+  end
+
+  # Whether `value` is an array of hashes sent the way Rails' fields_for
+  # sends one: `user[addresses_attributes][0][city]` reaches the params as a
+  # Hash keyed "0", "1", ... (or a timestamp, for a record added in the
+  # browser). Strong params permits exactly this shape (its
+  # fields_for_style?: every key an integer, every value a hash) and
+  # accepts_nested_attributes_for reads its values in order, so an
+  # `array ... do` field reads them as its elements. Paths then count the
+  # records in the order sent. An empty Hash, or one of scalars, is not this
+  # shape and stays invalid_type.
+  def permittable_fields_for_records?(field, value)
+    field[:fields] && value.is_a?(Hash) && !value.empty? &&
+      value.all? { |key, record| key.to_s.match?(/\A-?\d+\z/) && record.is_a?(Hash) }
   end
 
   # Coercion.check_json, with the copy the result needs made in the middle.
