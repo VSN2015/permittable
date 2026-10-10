@@ -36,7 +36,9 @@ RSpec.describe Permittable::JsonSchema do
       end["properties"]
       expect(props["s"]).to eq("type" => "string")
       expect(props["i"]).to eq("type" => "integer")
-      expect(props["f"]).to eq("type" => "number")
+      # A double's own range: a JSON number literal past it is Infinity to the
+      # server's cast, and refused.
+      expect(props["f"]).to eq("type" => "number", "minimum" => -Float::MAX, "maximum" => Float::MAX)
       expect(props["d"]).to eq("type" => %w[string number], "format" => "decimal")
       expect(props["b"]).to eq("type" => "boolean")
       expect(props["day"]).to eq("type" => "string", "format" => "date")
@@ -72,6 +74,19 @@ RSpec.describe Permittable::JsonSchema do
       prop = property("name") { required :name, :string, length: 0..10 }
       expect(prop["minLength"]).to eq(1)
       expect(prop["maxLength"]).to eq(10)
+    end
+  end
+
+  describe "the limits of a :float" do
+    it "bounds each side the field leaves open at Float::MAX, and leaves a narrower bound or an enum alone" do
+      expect(property("x") { optional :x, :float, in: 0.. }).to eq("type" => "number", "minimum" => 0, "maximum" => Float::MAX)
+      expect(property("x") { optional :x, :float, in: ...1.5 })
+        .to eq("type" => "number", "exclusiveMaximum" => 1.5, "minimum" => -Float::MAX)
+      expect(property("x") { optional :x, :float, in: [1.5, 2.5] }).to eq("type" => "number", "enum" => [1.5, 2.5])
+      expect(property("x") { array :x, of: :float })
+        .to eq("type" => "array", "items" => { "type" => "number", "minimum" => -Float::MAX, "maximum" => Float::MAX })
+      expect(property("x") { optional :x, :integer }).to eq("type" => "integer")
+      expect(JSON.generate(property("x") { optional :x, :float })).to include("1.7976931348623157e+308")
     end
   end
 
@@ -229,8 +244,9 @@ RSpec.describe Permittable::JsonSchema do
       expect(decimal).to include("minimum" => 0)
       expect(decimal.keys.grep(/maximum/i)).to be_empty
 
+      # A :float is left with the limits of a double, as with no in: at all.
       float = property("x") { optional :x, :float, in: -Float::INFINITY...Float::INFINITY }
-      expect(float.keys.grep(/imum/i)).to be_empty
+      expect(float).to eq("type" => "number", "minimum" => -Float::MAX, "maximum" => Float::MAX)
       expect { JSON.generate(float) }.not_to raise_error
     end
 
@@ -265,7 +281,7 @@ RSpec.describe Permittable::JsonSchema do
       # Ruby refuses a two-sided Range with a NaN end, but an endless one
       # builds — and NaN is no JSON number either.
       prop = property("x") { optional :x, :float, in: Float::NAN.. }
-      expect(prop.keys.grep(/imum/i)).to be_empty
+      expect(prop).to eq("type" => "number", "minimum" => -Float::MAX, "maximum" => Float::MAX)
     end
 
     it "carries a non-numeric Range as an extension instead of guessing" do

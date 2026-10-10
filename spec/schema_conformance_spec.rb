@@ -81,6 +81,11 @@ module SchemaConformance
         [{ "name" => "Jo", "age" => 18 }, :agree],
         [{ "name" => "Jo", "age" => 120 }, :agree],
         [{ "name" => "Jo", "score" => 1.5 }, :agree],
+        # A JSON number literal has no size limit; a Float does. The server
+        # refuses one too large to hold, so the docs must too.
+        [{ "name" => "Jo", "score" => 10**309 }, :agree],
+        [{ "name" => "Jo", "score" => -(10**309) }, :agree],
+        [{ "name" => "Jo", "score" => Float::MAX }, :agree],
         [{ "name" => "Jo", "ok" => true }, :agree],
         [{}, :agree],
         [{ "name" => "" }, :agree],
@@ -92,6 +97,21 @@ module SchemaConformance
         [{ "name" => "Jo", "ok" => "true" }, :coerced_encoding],
         [{ "name" => 42 }, :coerced_encoding],
         [{ "name" => "Jo", "age" => nil }, :null_is_absence]
+      ]
+    },
+    "an array of floats" => {
+      contract: proc { array :scores, of: :float },
+      payloads: [
+        [{ "scores" => [1.5, -2] }, :agree],
+        [{ "scores" => [1.5, 10**309] }, :agree]
+      ]
+    },
+    "a :float with a one-sided bound" => {
+      contract: proc { optional :score, :float, in: 0.. },
+      payloads: [
+        [{ "score" => 0 }, :agree],
+        [{ "score" => -1 }, :agree],
+        [{ "score" => 10**309 }, :agree]
       ]
     },
     "a required string with no length: of its own" => {
