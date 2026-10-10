@@ -37,7 +37,7 @@ module Permittable
     # lists the column. They ride on the column, set by in_rule, so the scan
     # path hands them to column_line without its own methods changing.
     DraftColumn = Struct.new(:name, :type, :null, :default, :default_function, :enum, :enum_integers, :sensitive,
-                             :unread, :rule, :listed, :array, keyword_init: true) do
+                             :unread, :rule, :listed, :array, :array_default, keyword_init: true) do
       def in_rule(rule, listed: false)
         self.class.new(**to_h, rule: rule, listed: listed)
       end
@@ -459,6 +459,7 @@ module Permittable
       DraftColumn.new(name: column.name, type: column.type, null: column.null,
                       default_function: column.respond_to?(:default_function) && column.default_function,
                       array: column.respond_to?(:array?) && column.array? == true,
+                      array_default: array_default?(column.default),
                       sensitive: sensitive_role(model, column.name), **model_facts(model, column))
     end
 
@@ -877,6 +878,7 @@ module Permittable
 
       type = column.enum ? :string : COLUMN_TYPES[column.type]
       return "# TODO: #{column.name} (#{column.type}) has no contract type — declare it as a nested block or an array" unless type
+      return json_array_todo(column) if type == :json && column.array_default
 
       required = column.rule != :update && required_column?(column)
       line = "#{required ? 'required' : 'optional'} #{column.name.to_sym.inspect}, :#{type}"
@@ -901,6 +903,23 @@ module Permittable
       line = "array #{column.name.to_sym.inspect}, of: :#{type}#{', required: true' if required}"
       notes = [column.default, *column_todos(column), "TODO: declare length: — an array without one is unbounded"]
       "#{line} # #{notes.compact.join('; ')}"
+    end
+
+    # :json accepts only an object, but a json/jsonb column can as well hold
+    # an array — and when its default is one, it does: drafted as :json, it
+    # rejected as invalid_type, once enforced, what every client sends for
+    # it. Whether the elements are scalars or objects the column cannot say,
+    # so it is a TODO naming both declarations rather than a guess.
+    def json_array_todo(column)
+      name = column.name.to_sym.inspect
+      "# TODO: #{column.name} (#{column.type}) defaults to an array, which :json refuses — declare it " \
+        "`array #{name}, of: :string` (confirm the element type) or `array #{name} do ... end` for objects"
+    end
+
+    # A database default as the adapter reports it: the SQL literal "[]"
+    # through Rails 8.0, possibly the cast Array after.
+    def array_default?(default)
+      default.is_a?(Array) || (default.is_a?(String) && default.lstrip.start_with?("["))
     end
 
     # Drafting from columns alone, a sensitive column is left out of the
