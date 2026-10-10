@@ -99,7 +99,8 @@ module Permittable
 
     # A trailing `if`/`unless`/`rescue` modifier on a paren-less call, which
     # is not one of its arguments.
-    BARE_MODIFIER = /\s+(?:if|unless|rescue)\s.*\z/m
+    # At the start too: `permit if admin?` has no arguments at all.
+    BARE_MODIFIER = /(?:\A|\s+)(?:if|unless|rescue)\s.*\z/m
 
     # One Rails 8 `params.expect` call — the replacement for
     # `require(...).permit(...)`, and the reason this scanner exists twice: a
@@ -684,8 +685,10 @@ module Permittable
       finish = bare_args_end(masked, match.end(0))
       return nil unless finish
 
-      args = source[match.end(0)...finish].sub(BARE_MODIFIER, "")
-      args.strip.empty? ? nil : [args, finish]
+      # The call ends where its arguments do, so a TODO quoting it never
+      # quotes the modifier.
+      args = source[match.end(0)...finish].sub(BARE_MODIFIER, "").rstrip
+      args.empty? ? nil : [args, match.end(0) + args.length]
     end
 
     # Where a paren-less argument list ends: the first newline (or `;`)

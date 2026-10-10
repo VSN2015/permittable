@@ -141,6 +141,17 @@ RSpec.describe Permittable::Generator do
       expect(scan.scalars).to eq(%i[name])
     end
 
+    it "never reads a trailing modifier as an argument, or quotes it in a TODO" do
+      scan = described_class.scan("params.require(:user).permit if admin?")
+      expect([scan.calls, scan.unparsed]).to eq([0, []])
+      scan = described_class.scan(<<~RUBY)
+        params.require(:user).permit :name
+        params.require(:address).permit :city if admin?
+      RUBY
+      expect(scan.root).to eq(:user)
+      expect(scan.other_envelopes).to eq(address: ["params.require(:address).permit :city"])
+    end
+
     it "reads a paren-less expect" do
       scan = described_class.scan("params.expect user: [:name, :age]")
       expect([scan.root, scan.scalars]).to eq([:user, %i[name age]])
