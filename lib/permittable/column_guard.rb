@@ -28,6 +28,15 @@ module Permittable
       date: :temporal, datetime: :temporal, time: :temporal, timestamp: :temporal, timestamptz: :temporal
     }.freeze
 
+    # The contract type an `array ..., of:` takes for a column element type,
+    # for the array-column hint. Only scalar element types: `of:` takes no
+    # other, so a jsonb[] column gets the hint without an `of:`.
+    ARRAY_ELEMENT_TYPES = {
+      string: :string, text: :string, citext: :string, uuid: :string,
+      integer: :integer, bigint: :integer, float: :float, decimal: :decimal, boolean: :boolean,
+      date: :date, datetime: :datetime, timestamp: :datetime, timestamptz: :datetime
+    }.freeze
+
     module_function
 
     # `types:` teaches the error message: a Symbol/String applies to every
@@ -59,6 +68,8 @@ module Permittable
       column = klass.columns_hash[field.to_s]
       return unless declared && column
 
+      ensure_not_array_column!(label, klass, field, declared, column)
+
       wanted = TYPE_GROUPS[declared.to_sym]
       enum = enum_attribute?(klass, field)
       # Checked before the column's type, which an enum's contract does not
@@ -86,6 +97,24 @@ module Permittable
       raise ArgumentError,
             "#{label}: '#{field}' is declared :#{declared} but the column is :#{column.type} " \
             "(table: #{klass.table_name}). #{fix}"
+    end
+
+    # A PostgreSQL array column reports its ELEMENT type as `type`, so
+    # `optional :tags, :string` over `t.string :tags, array: true` sits in
+    # the same group as the column and the group check passes — yet the
+    # field rejects as invalid_type every array the column stores. Only a
+    # scalar or :json field reaches this guard (an `array` field is
+    # implicitly virtual), and neither accepts an Array, so any declaration
+    # over an array column is the wrong shape.
+    def ensure_not_array_column!(label, klass, field, declared, column)
+      return unless column.respond_to?(:array?) && column.array?
+
+      element = ARRAY_ELEMENT_TYPES[column.type&.to_sym]
+      spelled = element ? "array :#{field}, of: :#{element}" : "array :#{field}"
+      raise ArgumentError,
+            "#{label}: '#{field}' is declared :#{declared} but the column is an array#{" (of :#{column.type})" if column.type} " \
+            "(table: #{klass.table_name}), so every array it stores would be rejected as invalid_type. " \
+            "Declare it `#{spelled}`, or declare the field virtual: true if it is not backed by this column."
     end
 
     # `model:` is only duck-typed on column_names, hence the respond_to?.
