@@ -3180,6 +3180,17 @@ RSpec.describe Permittable do
             expect(e.message).to include("virtual: true")
           end
           expect(&declaring(model) { optional :title, :string }).not_to raise_error
+
+          # An element type the adapter does not recognise reports as nil.
+          unknown = Class.new do
+            define_singleton_method(:table_name) { "ducks" }
+            define_singleton_method(:table_exists?) { true }
+            define_singleton_method(:column_names) { %w[shapes] }
+            define_singleton_method(:columns_hash) { { "shapes" => column.new(nil, true) } }
+          end
+          expect(&declaring(unknown) { optional :shapes, :string }).to raise_error(ArgumentError) do |e|
+            expect(e.message).to include("the column is an array (table: ducks)").and include("`array :shapes`")
+          end
         end
 
         context "with a Rails enum" do

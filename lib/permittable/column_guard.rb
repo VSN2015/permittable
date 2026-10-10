@@ -112,7 +112,7 @@ module Permittable
       element = ARRAY_ELEMENT_TYPES[column.type&.to_sym]
       spelled = element ? "array :#{field}, of: :#{element}" : "array :#{field}"
       raise ArgumentError,
-            "#{label}: '#{field}' is declared :#{declared} but the column is an array (of :#{column.type}) " \
+            "#{label}: '#{field}' is declared :#{declared} but the column is an array#{" (of :#{column.type})" if column.type} " \
             "(table: #{klass.table_name}), so every array it stores would be rejected as invalid_type. " \
             "Declare it `#{spelled}`, or declare the field virtual: true if it is not backed by this column."
     end
