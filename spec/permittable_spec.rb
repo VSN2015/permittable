@@ -257,6 +257,33 @@ RSpec.describe Permittable do
       end
     end
 
+    # A request's fraction is a finite decimal, and the export prints at most
+    # nine digits, so a member finer than a nanosecond (Time.at(1.1) holds
+    # 1.100000000000000088817...) was published as an enum value the server
+    # then refused, and no request could ever match it.
+    it "refuses a :datetime :in member finer than a nanosecond, which no request could equal" do
+      [Time.at(1.1).utc, Time.utc(2026, 1, 1) + 0.1, Time.utc(2026, 1, 1, 0, 0, Rational(1, 3))].each do |member|
+        expect { permittable_class { permit_params(:create) { optional :at, :datetime, in: [member] } } }
+          .to raise_error(ArgumentError, /:in for field :at contains .*, which is not a valid :datetime \(finer than a nanosecond/)
+      end
+    end
+
+    it "still accepts a :datetime :in member to the nanosecond, and matches the request that names it" do
+      member = Time.at(1, 100_000_000, :nsec).utc
+      decl = proc { permit_params(:create) { optional :at, :datetime, in: [member, Time.at(1.1).utc.round(9)] } }
+      expect(permit({ at: "1970-01-01T00:00:01.1Z" }, &decl)[:at]).to eq(member)
+      # Time.now carries nanoseconds at most, so a member read off the clock loads.
+      expect { permittable_class { permit_params(:create) { optional :at, :datetime, in: [Time.now] } } }.not_to raise_error
+    end
+
+    # A String member is cast exactly as a request sending that string is, and
+    # published as written, so any precision it spells is reachable.
+    it "still accepts a String :datetime :in member with more than nine fractional digits" do
+      member = "2026-01-01T00:00:00.1234567891Z"
+      decl = proc { permit_params(:create) { optional :at, :datetime, in: [member] } }
+      expect(permit({ at: member }, &decl)[:at]).to eq(Time.utc(2026, 1, 1, 0, 0, Rational(1_234_567_891, 10**10)))
+    end
+
     # On a nullable field an explicit null is accepted before in: is ever
     # consulted, so a nil member only restates that; elsewhere it is a member
     # no request could equal.

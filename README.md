@@ -1544,6 +1544,7 @@ A bad contract is a programmer error, so it fails when the class loads — never
 - `length:` that isn't a non-negative `Integer` or a `Range`; an `in:` that is a `String` (`String#include?` would match any substring — `in: "free pro"` accepted `"e"`), or that is neither a `Range` nor answers `include?`
 - An `in:` member the field's own type can't cast (`in: %w[1 two]` on an `:integer`, `nil` on a field that isn't `nullable:`, or a `Time` on a `:date` field that isn't exactly midnight UTC), or an `in:` `Range` whose endpoints a value of the field's type can't be compared with (`in: "1".."5"` on an `:integer`) — either would reject every request as `inclusion`
 - A bound **no value could satisfy**: a reversed or empty `Range` (`in: 65..18`, `length: 5..2`, `length: 3...3`), an empty `in:` set, or a `length:` of 0 on a `required` field (where `""` already violates as `missing`)
+- A `Time` `in:` member on a `:datetime` field finer than a nanosecond (`Time.at(1.1)`, a third of a second): a request's fraction is a finite decimal and the export prints nine digits, so no request could equal it
 - `validate:` or `transform:` that isn't callable
 - A `default:` or `example:` that violates its own field's contract, or an array `default:`/`example:` whose elements violate `of:` — or, for an array declared with a **block**, an element that isn't a hash the block would accept
 - A `default: nil` or `example: nil` on a field that isn't `nullable:`
