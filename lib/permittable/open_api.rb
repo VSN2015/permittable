@@ -249,14 +249,25 @@ module Permittable
     # once — not counted as an operation colliding with itself. `template`
     # is the route's own spelling when collapse_shapes placed it under
     # another route's, nil otherwise.
+    #
+    # Only OpenAPI's own verbs name a slot. Rails routes any verb in
+    # ActionDispatch::Request::HTTP_METHODS — `via: :report`, `:mkcalendar`,
+    # `:search` and the rest of WebDAV and CalDAV — but a Path Item has fields
+    # for eight, and any other key makes the whole document invalid. A route
+    # on such a verb places nothing; an operation reached by no other route
+    # lands under x-permittable-controllers, as an unrouted one does.
     def route_targets(routes)
       return {} if routes.nil?
 
-      routes.group_by { |route| [route[:controller].to_s, route[:action].to_s] }
+      routes.select { |route| OPENAPI_VERBS.include?(verb_of(route)) }
+            .group_by { |route| [route[:controller].to_s, route[:action].to_s] }
             .transform_values do |matching|
               matching.map { |route| [route[:path], verb_of(route), route[:template]] }.uniq
             end
     end
+
+    # The fixed fields of an OpenAPI 3.1 Path Item that hold an operation.
+    OPENAPI_VERBS = %w[get put post delete options head patch trace].freeze
 
     # OpenAPI forbids two path templates that differ only in their variable
     # names: `/{locale}` and `/{slug}` are one path to it. rails_routes keeps
