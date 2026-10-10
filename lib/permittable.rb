@@ -1522,8 +1522,31 @@ module Permittable
         raise ArgumentError, "#{LABEL}: :length for :#{name} must be a non-negative Integer or a Range " \
                              "(got #{length.inspect})"
       end
+      validate_length_ends!(name, length) if length.is_a?(Range)
 
       assert_satisfiable!(name, :length, length)
+    end
+
+    # A length is a count, so each end of a Range is a non-negative whole
+    # number — an Integer, or a Float/Rational/BigDecimal with no fraction
+    # (`1..10.0` means ten) — or open: nil, or an infinite Float on its own
+    # side (`1..Float::INFINITY` predates endless Ranges). A negative end matched nothing (`..-1`
+    # rejected every value, forever, as the client's fault) or meant nothing
+    # (`-2..3` is `..3`), and a fractional one exported a minLength/maxLength
+    # the JSON Schema metaschema refuses — Ajv rejects the whole document.
+    def validate_length_ends!(name, length)
+      ok = length_end?(length.begin, -Float::INFINITY) && length_end?(length.end, Float::INFINITY)
+      return if ok
+
+      raise ArgumentError, "#{LABEL}: :length for :#{name} must have non-negative whole-number ends " \
+                           "(got #{length.inspect}); leave an end off for no bound, e.g. 1.. or ..80"
+    end
+
+    def length_end?(value, open)
+      return true if value.nil? || value == open
+      return false unless value.is_a?(Numeric) && value.real? && value.finite?
+
+      !value.negative? && value == value.to_i
     end
 
     # A reversed Range (5..2), an exclusive Range with equal endpoints

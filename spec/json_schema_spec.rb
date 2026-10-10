@@ -81,6 +81,18 @@ RSpec.describe Permittable::JsonSchema do
       expect(property("a") { optional :a, :string, length: 4 }).to include("minLength" => 4, "maxLength" => 4)
       expect(property("a") { optional :a, :string, length: 1...10 }).to include("maxLength" => 9)
     end
+
+    # An infinite end loaded and validated fine, then made the export raise
+    # JSON::GeneratorError ("Infinity not allowed in JSON").
+    it "exports an infinite end as no bound, so the document still serializes" do
+      expect(property("a") { optional :a, :string, length: 2..Float::INFINITY })
+        .to eq("type" => "string", "minLength" => 2)
+      expect(property("a") { optional :a, :string, length: -Float::INFINITY..3 })
+        .to eq("type" => "string", "maxLength" => 3)
+      expect(property("a") { array :a, of: :string, length: 1..Float::INFINITY })
+        .to include("minItems" => 1).and(satisfy { |schema| !schema.key?("maxItems") })
+      expect { JSON.generate(schema_for { optional :a, :string, length: 2..Float::INFINITY }) }.not_to raise_error
+    end
   end
 
   describe "in:" do

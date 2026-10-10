@@ -327,6 +327,46 @@ RSpec.describe Permittable do
         .to raise_error(ArgumentError, /:length for :s must be a non-negative Integer or a Range/)
     end
 
+    # A length is a count: a negative or fractional end either matches
+    # nothing (`..-1` rejected every value, forever) or exports a
+    # minLength/maxLength the JSON Schema metaschema refuses, so Ajv would
+    # reject the whole document.
+    it "refuses a length: Range whose ends are not non-negative Integers" do
+      [..-1, -5..-1, -2..3, 1.5..3.5, 0.5.., 1..Rational(7, 2)].each do |range|
+        expect { permittable_class { permit_params(:create) { optional :s, :string, length: range } } }
+          .to raise_error(ArgumentError, /:length for :s must have non-negative whole-number ends/), "expected #{range.inspect} to raise"
+        expect { permittable_class { permit_params(:create) { array :a, of: :string, length: range } } }
+          .to raise_error(ArgumentError, /:length for :a must have non-negative whole-number ends/), "expected #{range.inspect} to raise"
+      end
+    end
+
+    # Only a fractional or negative end is a mistake: a whole-number Float or
+    # Rational end (`1..10.0`) meant ten and worked before.
+    it "still accepts whole-number Float and Rational ends, and exports them as integers" do
+      klass = permittable_class do
+        permit_params(:create) do
+          optional :s, :string, length: 1..10.0
+          optional :t, :string, length: 0.0...Rational(4)
+        end
+      end
+      expect(controller(klass, params: { s: "a" * 10, t: "abc" }).permitted_params).to eq("s" => "a" * 10, "t" => "abc")
+      fields = Permittable::JsonSchema.rule(klass.permit_rule_for(:create))["properties"]
+      expect(fields["s"]).to include("minLength" => 1, "maxLength" => 10)
+      expect(fields["t"]).to include("maxLength" => 3)
+      expect(fields["s"]["maxLength"]).to be_an(Integer)
+    end
+
+    it "still reads an infinite end as an open one" do
+      klass = permittable_class do
+        permit_params(:create) do
+          optional :s, :string, length: 2..Float::INFINITY
+          optional :t, :string, length: -Float::INFINITY..3
+        end
+      end
+      expect(controller(klass, params: { s: "abc", t: "ab" }).permitted_params).to eq("s" => "abc", "t" => "ab")
+      expect(controller(klass, params: { s: "a" }).permittable_violations).to eq([{ param: "s", code: "length" }])
+    end
+
     it "accepts an endless, beginless, or single-value bound" do
       expect { permittable_class { permit_params(:create) { optional :age, :integer, in: 18.. } } }.not_to raise_error
       expect { permittable_class { permit_params(:create) { optional :s, :string, length: ..80 } } }.not_to raise_error
