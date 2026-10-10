@@ -126,6 +126,7 @@ module Permittable
       schema = SCALAR_SCHEMAS.fetch(field[:type]).deep_dup
       apply_format_name!(schema, field)
       apply_in!(schema, field)
+      apply_float_limits!(schema) if field[:type] == :float
       apply_string_bounds!(schema, field)
       apply_pattern!(schema, field[:format])
       schema
@@ -164,7 +165,36 @@ module Permittable
       # SCALAR_SCHEMAS.
       schema["items"] =
         field[:fields] ? object(field[:fields], unknown: unknown) : SCALAR_SCHEMAS.fetch(field[:of]).deep_dup
+      apply_float_limits!(schema["items"]) if field[:of] == :float && !field[:fields]
       schema
+    end
+
+    # A JSON number literal has no size limit, and `type: number` admits all
+    # of them, but a :float is a double: the server reads 10**309 through
+    # to_f as Infinity and refuses it as invalid_type. That made the schema
+    # looser than the server on every :float field, unlabelled. Float::MAX is
+    # the exact edge of what the cast keeps finite, and a JSON number, so
+    # each side the field does not already bound more narrowly (or list
+    # outright with enum) is bounded there, and the two agree.
+    #
+    # A bound the field does set, but past a double's range on the open side
+    # (`in: 0..10**400`, which json_bound publishes exactly), is no narrower
+    # than the cast, so it is clamped too. One past the range on the closed
+    # side (`in: 10**400..`) is left alone: no double satisfies it, and the
+    # server refuses everything as well.
+    def apply_float_limits!(schema)
+      return if schema.key?("enum")
+
+      clamp_float_bound!(schema, %w[maximum exclusiveMaximum], "maximum", Float::MAX) { |bound| bound > Float::MAX }
+      clamp_float_bound!(schema, %w[minimum exclusiveMinimum], "minimum", -Float::MAX) { |bound| bound < -Float::MAX }
+    end
+
+    def clamp_float_bound!(schema, keywords, keyword, limit)
+      present = keywords.select { |key| schema.key?(key) }
+      return if present.any? { |key| !yield(schema[key]) }
+
+      present.each { |key| schema.delete(key) }
+      schema[keyword] = limit
     end
 
     # A list is stored cast by the field's type, so its enum is what the

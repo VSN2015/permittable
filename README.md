@@ -1466,7 +1466,8 @@ A `format:` regexp that does not translate to ECMA-262 is looser in the same way
 | Contract | Emitted schema |
 |---|---|
 | `required` / `optional` | the object's `required:` array; required strings also get `minLength: 1` (`""` is absent) |
-| `:string` `:integer` `:float` `:boolean` | `string` / `integer` / `number` / `boolean` |
+| `:string` `:integer` `:boolean` | `string` / `integer` / `boolean` |
+| `:float` | `number`, with `minimum`/`maximum` of ±`Float::MAX` on any side `in:` leaves open — a JSON number past a double's range is refused by the cast, so the docs refuse it too |
 | `:date` / `:datetime` | `string` + `format: date` / `date-time` |
 | `:decimal` | `type: ["string", "number"]` + `format: decimal` (string is the precision-safe encoding) |
 | `in:` list / numeric Range | `enum` of the cast members (a `:date`/`:datetime` member written as a String is published as written) / `minimum` + `maximum` (exclusive ends honoured). An `in:` object that only answers `include?` is flagged `x-permittable-custom-validation` |
