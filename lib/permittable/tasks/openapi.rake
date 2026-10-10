@@ -15,10 +15,7 @@ namespace :permittable do
   task :openapi, [:output] => :environment do |_t, task_args|
     Rails.application.eager_load!
 
-    bases = []
-    bases << ActionController::Base if defined?(ActionController::Base)
-    bases << ActionController::API if defined?(ActionController::API)
-    controllers = bases.flat_map(&:descendants).uniq.select do |controller|
+    controllers = Permittable::Audit.rails_controllers.select do |controller|
       controller.respond_to?(:permittable_contracts) && controller.permittable_contracts.any?
     end
 
