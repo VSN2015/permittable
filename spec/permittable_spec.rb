@@ -2611,18 +2611,29 @@ RSpec.describe Permittable do
       expect(rejected(klass).rendered[:json]).to include(host: true, errors: [{ param: "name", code: "missing" }])
     end
 
+    # The gem always passes message:, code: and status:, so a private
+    # helper is used only when it takes all three and requires nothing else.
+    # Anything narrower was never consulted, and calling it would raise: a
+    # 500 on every rejection, the bug this delegation exists to avoid.
     it "leaves a private render_error with some other signature alone, as before" do
-      klass = host_with do
-        private
-
-        def render_error(message, status)
-          render(json: { unrelated: message }, status: status)
+      inline = { success: false, error: { message: "Invalid parameters: name (missing)", code: "invalid_parameters",
+                                          details: [{ param: "name", code: "missing" }] } }
+      signatures = [
+        "message, status",
+        "message:, status:",
+        "message:, status: :bad_request",
+        "message:, status:, code:, details:",
+        "msg = nil, status: 500, message: nil"
+      ]
+      signatures.each do |signature|
+        klass = host_with do
+          class_eval <<~RUBY, __FILE__, __LINE__ + 1
+            # private def render_error(message:, status:) = render(json: { unrelated: true }, status: 500)
+            private def render_error(#{signature}) = render(json: { unrelated: true }, status: 500)
+          RUBY
         end
+        expect(rejected(klass).rendered[:json]).to eq(inline), "for render_error(#{signature})"
       end
-      c = rejected(klass)
-      expect(c.rendered[:json]).to eq(success: false, error: { message: "Invalid parameters: name (missing)",
-                                                               code: "invalid_parameters",
-                                                               details: [{ param: "name", code: "missing" }] })
     end
   end
 

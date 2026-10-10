@@ -73,11 +73,23 @@ module Permittable
       method if keyword_contract?(method.parameters)
     end
 
+    # The keywords render_envelope may pass: message:, code: and status:
+    # always, errors: when the method takes it.
+    DELEGATED_KEYWORDS = %i[message code status errors].freeze
+
+    # Shaped like the documented contract: it takes message:, code: and
+    # status: (by name or through **), and requires nothing the gem does not
+    # pass — no positional argument, no keyword outside DELEGATED_KEYWORDS.
+    # `(message:, status:)` is a common private helper on an
+    # ApplicationController, and calling it with code: would raise.
     def keyword_contract?(parameters)
       return false if parameters.any? { |kind, _| kind == :req }
+
+      required = parameters.filter_map { |kind, name| name if kind == :keyreq }
+      return false unless (required - DELEGATED_KEYWORDS).empty?
       return true if parameters.any? { |kind, _| kind == :keyrest }
 
-      (%i[message status] - keyword_names(parameters)).empty?
+      (%i[message code status] - keyword_names(parameters)).empty?
     end
 
     # A rejection always carries details, so passing errors: whenever there
