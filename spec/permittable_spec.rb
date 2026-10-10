@@ -276,6 +276,14 @@ RSpec.describe Permittable do
       expect { permittable_class { permit_params(:create) { optional :at, :datetime, in: [Time.now] } } }.not_to raise_error
     end
 
+    # A String member is cast exactly as a request sending that string is, and
+    # published as written, so any precision it spells is reachable.
+    it "still accepts a String :datetime :in member with more than nine fractional digits" do
+      member = "2026-01-01T00:00:00.1234567891Z"
+      decl = proc { permit_params(:create) { optional :at, :datetime, in: [member] } }
+      expect(permit({ at: member }, &decl)[:at]).to eq(Time.utc(2026, 1, 1, 0, 0, Rational(1_234_567_891, 10**10)))
+    end
+
     # On a nullable field an explicit null is accepted before in: is ever
     # consulted, so a nil member only restates that; elsewhere it is a member
     # no request could equal.

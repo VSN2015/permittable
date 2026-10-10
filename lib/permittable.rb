@@ -1086,7 +1086,7 @@ module Permittable
       return instant_as_date(member) if type == :date && (member.is_a?(Time) || member.is_a?(DateTime))
 
       status, value = cast(type, member)
-      return [status, value] unless status == :ok && type == :datetime && !whole_nanoseconds?(value)
+      return [status, value] unless status == :ok && type == :datetime && !member.is_a?(String) && !whole_nanoseconds?(value)
 
       [:error, "finer than a nanosecond, so it never equals a request; round it, e.g. with .round(9)"]
     end
@@ -1096,7 +1096,9 @@ module Permittable
     # number of nanoseconds — Time.at(1.1) holds 1.10000000000000008881...,
     # Time.utc(..., Rational(1, 3)) a third — was published as an enum value
     # the server refuses and could never be matched. The :datetime analogue
-    # of instant_as_date.
+    # of instant_as_date. Only for a Time-like member: a String member is
+    # cast exactly as a request sending it is, and published as written, so
+    # whatever precision it spells is reachable.
     def whole_nanoseconds?(time)
       (time.subsec * 1_000_000_000).denominator == 1
     end
