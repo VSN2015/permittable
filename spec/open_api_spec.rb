@@ -128,6 +128,28 @@ RSpec.describe Permittable::OpenAPI do
       expect(doc["components"]["schemas"]).to have_key("PermittableInvalidParameters")
     end
 
+    # Rails routes any verb in ActionDispatch::Request::HTTP_METHODS, WebDAV
+    # and CalDAV ones included, but a Path Item has fields for eight. A
+    # `report` key made the whole document fail validation.
+    it "documents only OpenAPI's own verbs under paths, and keeps an operation reached by no other verb visible" do
+      klass = controller_class(path: "calendars") do
+        permit_params(:query) { optional :q, :string }
+        permit_params(:sync) { optional :token, :string }
+      end
+      doc = described_class.document(
+        controllers: [klass],
+        routes: [
+          { controller: "calendars", action: "query", verb: "REPORT", path: "/calendars" },
+          { controller: "calendars", action: "query", verb: "SEARCH", path: "/calendars" },
+          { controller: "calendars", action: "query", verb: "POST", path: "/calendars" },
+          { controller: "calendars", action: "sync", verb: "MKCALENDAR", path: "/calendars/sync" }
+        ]
+      )
+      expect(doc["paths"].keys).to eq(["/calendars"])
+      expect(doc["paths"]["/calendars"].keys).to eq(["post"])
+      expect(doc["x-permittable-controllers"]["calendars"].keys).to eq(["sync"])
+    end
+
     it "declares a path parameter for every variable the path templates" do
       klass = controller_class { permit_params(:update, root: :user) { required :name, :string } }
       doc = described_class.document(
