@@ -588,6 +588,24 @@ RSpec.describe "Permittable RSpec matchers" do
                            ])
     end
 
+    it "labels an anonymous ActionController subject too, whose controller_path is nil" do
+      anonymous = Class.new(ActionController::Base) do
+        include Permittable
+
+        permit_params(:create) { required :a, :string }
+      end
+      events = []
+      subscriber = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
+        events << payload[:controller]
+      end
+      begin
+        expect(anonymous).to reject_params({})
+      ensure
+        ActiveSupport::Notifications.unsubscribe(subscriber)
+      end
+      expect(events).to eq(["the contract"])
+    end
+
     it "works on a standalone Contract too" do
       contract = Permittable::Contract.define { required :a, :integer }
       expect(contract).to accept_params({ a: "1" }).returning("a" => 1)

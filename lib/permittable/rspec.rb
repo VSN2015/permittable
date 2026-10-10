@@ -631,10 +631,12 @@ module Permittable
       # carried controller: nil, action: nil — a subscriber following the
       # README's shape (`payload[:controller].tr("/", ".")`) raised out of
       # the matcher. Label it the way the subject itself would: a
-      # controller by its path (or name), a Contract as Contract#call does.
+      # controller by its path (or name, or "the contract" when anonymous —
+      # an anonymous controller's controller_path is nil), a Contract as
+      # Contract#call does.
       def label_instrumentation(host, action)
         label = if @subject.is_a?(Permittable::Contract) then "Permittable::Contract"
-                elsif @subject.respond_to?(:controller_path) then @subject.controller_path
+                elsif @subject.respond_to?(:controller_path) then @subject.controller_path || subject_name
                 else subject_name
                 end
         host.define_method(:permittable_controller_name) { label }
