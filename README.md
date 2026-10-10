@@ -1349,7 +1349,7 @@ expect(described_class).to reject_params(user: { name: "Jo", email: "nope" })
   .for_action(:create).with_violation("user.email", :format)
 ```
 
-`returning` asserts the **cast, defaulted, transformed** output — the part `permit_param` can't reach, since it only reads the declaration. `with_violation` is repeatable and its code is optional.
+`returning` asserts the **cast, defaulted, transformed** output — the part `permit_param` can't reach, since it only reads the declaration. `with_violation` is repeatable and its code is optional. Each belongs to one matcher: `returning` to `accept_params` and `with_violation` to `reject_params`, and chaining either onto the other raises `ArgumentError` rather than being silently ignored.
 
 Failure messages name what actually happened:
 
