@@ -2063,6 +2063,35 @@ RSpec.describe Permittable do
     end
   end
 
+  # collection_check_boxes and `select multiple: true` render a hidden
+  # `name="post[tag_ids][]" value=""` so that unchecking every box still
+  # sends the key. Strong params passes it through and ActiveRecord's ids
+  # writer drops it; an `of: :integer` array cast it and failed, so every
+  # submission of such a form was a 422, "nothing checked" included.
+  describe "the blank element a form's hidden field sends" do
+    let(:decl) { proc { permit_params(:create) { array :tag_ids, of: :integer, length: 0..2 } } }
+
+    it "is dropped before casting, as \"\" is absent everywhere else" do
+      expect(permit({ tag_ids: ["", "3"] }, &decl)[:tag_ids]).to eq([3])
+      expect(permit({ tag_ids: [""] }, &decl)[:tag_ids]).to eq([])
+      expect(permit({ tag_ids: ["", "3", "4"] }, &decl)[:tag_ids]).to eq([3, 4])
+    end
+
+    it "keeps the client's own indices in violation paths, and counts length: after dropping" do
+      expect(violations_for({ tag_ids: ["", "3", "x"] }, &decl).details).to eq([{ param: "tag_ids[2]", code: "invalid_type" }])
+      expect(violations_for({ tag_ids: ["", "1", "2", "3"] }, &decl).details).to eq([{ param: "tag_ids", code: "length" }])
+    end
+
+    it "drops it from a :string array too, rather than keeping a blank tag" do
+      tags = proc { permit_params(:create) { array :tags, of: :string } }
+      expect(permit({ tags: ["", "ruby"] }, &tags)[:tags]).to eq(["ruby"])
+    end
+
+    it "still refuses a null element, which no form sends" do
+      expect(violations_for({ tag_ids: [nil] }, &decl).details).to eq([{ param: "tag_ids[0]", code: "invalid_type" }])
+    end
+  end
+
   describe "array length: as a bound, not just a report" do
     it "stops at the length violation instead of checking every element" do
       decl = proc { permit_params(:create) { array :tags, of: :string, length: 0..2 } }

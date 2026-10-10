@@ -724,7 +724,7 @@ In [exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) the field is `{
 
 ### Absence, defaults, and partial updates
 
-`nil` and `""` are **both treated as absent** — the query-parameter convention, where an untouched form field arrives as an empty string. Boolean `false` is present. `normalize:` runs *before* this rule, so a field declared `normalize: :squish` treats `"   "` as absent too: whitespace cannot satisfy a `required` field by becoming `""`.
+`nil` and `""` are **both treated as absent** — the query-parameter convention, where an untouched form field arrives as an empty string. Boolean `false` is present. `normalize:` runs *before* this rule, so a field declared `normalize: :squish` treats `"   "` as absent too: whitespace cannot satisfy a `required` field by becoming `""`. The same goes for a `""` **element** of a scalar `array ..., of:`: it is dropped before casting and before `length:` counts, because `collection_check_boxes` and `select multiple: true` always send a hidden `""` so that unchecking everything still sends the key. A `null` element, which no form sends, is still `invalid_type`.
 
 That single rule produces the behaviour you want from a `PATCH`:
 

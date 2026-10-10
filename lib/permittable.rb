@@ -2365,19 +2365,31 @@ module Permittable
   end
 
   def permittable_check_array(field, value, path:, unknown:, violations:)
+    # A scalar array's "" elements are absent, as "" is for a field: the
+    # hidden `name="post[tag_ids][]" value=""` that collection_check_boxes
+    # and `select multiple: true` render, so that unchecking every box still
+    # sends the key, made every submit a 422 for `of: :integer`. Each kept
+    # element keeps the index the client sent it at, so violation paths
+    # still point into the request. A null element, which no form sends,
+    # is still refused.
+    blank = ->(element) { !field[:fields] && element.is_a?(String) && element.empty? }
+    count = field[:fields] ? value.length : value.length - value.count(&blank)
+
     # `length:` is a BOUND, not a report. An array outside it is rejected
     # whatever its contents, so checking those contents can only add work and
     # noise: a 200k-element payload against `length: 0..10` used to cast every
     # element, collect 200k more violations, and answer with a multi-megabyte
     # 422 — for a request already refused by its first check. Stopping here
-    # keeps the cost of an oversized array proportional to rejecting it.
-    if field[:length] && !Coercion.length_ok?(field[:length], value.length)
+    # keeps the cost of an oversized array proportional to rejecting it (the
+    # blank count above allocates nothing).
+    if field[:length] && !Coercion.length_ok?(field[:length], count)
       violations << permittable_violation(field, path, "length")
       return nil
     end
 
     before = violations.length
-    out = value.each_with_index.map do |element, index|
+    elements = value.each_with_index.reject { |element, _| blank.call(element) }
+    out = elements.map do |element, index|
       permittable_check_element(field, element, "#{path}[#{index}]", unknown: unknown, violations: violations)
     end
     # validate: and transform: see only a fully-valid array. A partially-nil
