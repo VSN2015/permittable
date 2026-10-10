@@ -691,7 +691,7 @@ Coercion is **deliberately strict**, and deliberately *not* `ActiveModel::Type`.
 Two more behaviours worth committing to memory:
 
 - **Type confusion is a violation, not a 500.** A request of `?age[]=1` against a scalar `:integer` field yields `invalid_type`. Arrays, hashes, and nested `ActionController::Parameters` can never satisfy a scalar type, so the classic "`NoMethodError` on `[]`" crash is impossible.
-- **Datetimes are normalised to UTC.** A zoneless string parses as UTC regardless of the host timezone, which keeps behaviour deterministic across machines; explicit offsets are honoured and converted.
+- **Datetimes are normalised to UTC.** A zoneless string parses as UTC regardless of the host timezone, which keeps behaviour deterministic across machines; explicit offsets are honoured and converted. A zone the parser cannot honour — an offset of a day or more (`+25:00`), or an abbreviation it does not know — is `invalid_type` rather than read as UTC, and dates are read in the proleptic Gregorian calendar ISO 8601 uses, so `"1500-01-01"` is that day whatever the host has loaded.
 
 ### Free-form hashes (`:json`)
 
