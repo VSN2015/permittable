@@ -86,11 +86,20 @@ module Permittable
       end
     end
 
-    # One permit call, with an optional leading `.require(:root)`. The args
-    # capture tolerates brackets and newlines but not parentheses — a call
-    # whose arguments contain a method call is skipped entirely rather than
-    # half-read.
-    PERMIT_CALL = /params\s*(?:\.\s*require\(\s*:(\w+)\s*\))?\s*\.\s*permit\(([^()]*)\)/m
+    # One permit call, with an optional leading `.require(:root)` — the root
+    # spelled `:user`, `"user"` or `'user'` (groups 1-3; a String root's
+    # content is masked, so it is read back by offset like any argument).
+    # The args capture (group 4) tolerates brackets and newlines but not
+    # parentheses — a call whose arguments contain a method call is skipped
+    # entirely rather than half-read. Without parentheses (`permit :name,
+    # :email`, common in older controllers) group 4 is empty and the
+    # arguments run to the end of the statement: see call_args.
+    PERMIT_CALL = /params\s*(?:\.\s*require\(\s*(?::(\w+)|"([^"\n]*)"|'([^'\n]*)')\s*\))?\s*\.\s*
+                   permit(?:\(([^()]*)\)|[ \t]+(?=[^\s(]))/mx
+
+    # A trailing `if`/`unless`/`rescue` modifier on a paren-less call, which
+    # is not one of its arguments.
+    BARE_MODIFIER = /\s+(?:if|unless|rescue)\s.*\z/m
 
     # One Rails 8 `params.expect` call — the replacement for
     # `require(...).permit(...)`, and the reason this scanner exists twice: a
@@ -100,7 +109,7 @@ module Permittable
     # PERMIT_CALL: brackets and newlines are fine, a parenthesis means a
     # method call in the arguments and the whole call is skipped rather than
     # half-read.
-    EXPECT_CALL = /params\s*\.\s*expect\(([^()]*)\)/m
+    EXPECT_CALL = /params\s*\.\s*expect(?:\(([^()]*)\)|[ \t]+(?=[^\s(]))/m
 
     # The required root envelope of an expect call: `user: [...]`, where the
     # brackets hold fields — not the empty `tag_names: []` of an
@@ -222,11 +231,19 @@ module Permittable
     # The lexed tokens shared by executable_source and masked_source, with
     # comments already dropped — nil when Ripper could not lex `source` at
     # all, or found nothing.
+    # A comment token carries its line's newline ("# note\n"), so dropping
+    # it whole joined that line to the next. A parenthesised call never
+    # noticed; a paren-less one ends at its line (see bare_args_end), so the
+    # newline is kept.
     def code_tokens(source)
       tokens = Ripper.lex(source)
       return nil if tokens.nil? || tokens.empty?
 
-      tokens.reject { |token| COMMENT_TOKENS.include?(token[1]) }
+      tokens.filter_map do |token|
+        next token unless COMMENT_TOKENS.include?(token[1])
+
+        [token[0], :on_nl, "\n", token[3]] if token[2].end_with?("\n")
+      end
     end
 
     # Merge every `params.permit` and `params.expect` call found in the
@@ -261,8 +278,11 @@ module Permittable
       raw = source.to_s
       source = executable_source(raw)
       masked = masked_source(raw)
-      permits = matches(masked, PERMIT_CALL).map { |match| permit_call(source, match) }
-      expects = matches(masked, EXPECT_CALL).map { |match| expect_calls(match.begin(0), split_args(group(source, match, 1))) }
+      permits = matches(masked, PERMIT_CALL).filter_map { |match| permit_call(source, masked, match) }
+      expects = matches(masked, EXPECT_CALL).filter_map do |match|
+        args, = call_args(source, masked, match, 1)
+        expect_calls(match.begin(0), split_args(args)) if args
+      end
       result.calls = permits.size + expects.size
       calls = (permits + expects).flatten.sort_by.with_index { |call, index| [call.position, index] }
       result.root = choose_root(calls, model&.name && default_root(model), exclude)
@@ -640,13 +660,57 @@ module Permittable
     # own text may hold placeholders rather than a real string argument's
     # characters (see masked_source), so every group is read back out of
     # `source` by position instead of off `match` directly.
-    def permit_call(source, match)
-      args = split_args(group(source, match, 2))
-      root = group(source, match, 1)
-      return Call.new(match.begin(0), nil, args, []) unless root
+    # nil when the call cannot be read: a paren-less one whose arguments
+    # hold a method call, or a String root that is not a plain key.
+    def permit_call(source, masked, match)
+      args, finish = call_args(source, masked, match, 4)
+      return nil unless args
 
-      spelling = unparsed_arg(group(source, match, 0)).gsub(/\(\s+/, "(").gsub(/\s+\)/, ")")
-      Call.new(match.begin(0), root.to_sym, args, [], spelling)
+      root = [1, 2, 3].filter_map { |index| group(source, match, index) }.first
+      return Call.new(match.begin(0), nil, split_args(args), []) unless root
+      return nil unless root.match?(/\A\w+\z/)
+
+      spelling = unparsed_arg(source[match.begin(0)...finish]).gsub(/\(\s+/, "(").gsub(/\s+\)/, ")")
+      Call.new(match.begin(0), root.to_sym, split_args(args), [], spelling)
+    end
+
+    # A call's argument text and where the call ends, or nil when it cannot
+    # be read. Parenthesised, that is the paren group. Without parentheses
+    # it runs from the match to the end of the statement (bare_args_end),
+    # less any trailing modifier.
+    def call_args(source, masked, match, paren_group)
+      return [group(source, match, paren_group), match.end(0)] if match.begin(paren_group)
+
+      finish = bare_args_end(masked, match.end(0))
+      return nil unless finish
+
+      args = source[match.end(0)...finish].sub(BARE_MODIFIER, "")
+      args.strip.empty? ? nil : [args, finish]
+    end
+
+    # Where a paren-less argument list ends: the first newline (or `;`)
+    # outside brackets that does not follow a `,` or a `\` — Ruby's own rule
+    # for continuing a command call onto the next line. A parenthesis means
+    # a method call in the arguments, and the call is skipped as the
+    # parenthesised form skips one; so are unbalanced brackets. Read on the
+    # masked source, where string content cannot open a bracket.
+    def bare_args_end(text, start)
+      depth = 0
+      last = nil
+      index = start
+      while index < text.length
+        char = text[index]
+        return nil if "()".include?(char)
+
+        depth += 1 if "[{".include?(char)
+        depth -= 1 if "]}".include?(char)
+        return nil if depth.negative?
+        break if depth.zero? && (char == ";" || (char == "\n" && !(last && ",\\".include?(last))))
+
+        last = char unless char.match?(/\s/)
+        index += 1
+      end
+      depth.zero? ? index : nil
     end
 
     # A rootless expect call — or, when its one key is a route param

@@ -101,6 +101,67 @@ RSpec.describe Permittable::Generator do
     end
   end
 
+  # Parentheses are optional in Ruby, and older controllers often leave them
+  # off. The scanner required them, so `permit :name, :email` matched
+  # nothing: the call vanished, its virtual keys with it, and the draft fell
+  # back to columns alone without a word.
+  describe ".scan of calls written without parentheses" do
+    it "reads a paren-less permit" do
+      scan = described_class.scan(<<~RUBY)
+        def user_params
+          params.require(:user).permit :name, :email, :password_confirmation
+        end
+      RUBY
+      expect([scan.calls, scan.root, scan.scalars]).to eq([1, :user, %i[name email password_confirmation]])
+
+      scan = described_class.scan("params.require(:user).permit :name if admin?")
+      expect(scan.scalars).to eq(%i[name])
+    end
+
+    it "follows a paren-less call across lines that end in a comma or sit inside brackets" do
+      scan = described_class.scan(<<~RUBY)
+        params.require(:user).permit :name,
+                                     tags: [],
+                                     address: [
+                                       :city,
+                                       :zip
+                                     ]
+        do_something_else(:not_a_field)
+      RUBY
+      expect(scan.scalars).to eq(%i[name])
+      expect(scan.arrays).to eq(%i[tags])
+      expect(scan.nested).to eq(address: %i[city zip])
+    end
+
+    it "ends a paren-less call at its line, even with a comment after it" do
+      scan = described_class.scan(<<~RUBY)
+        params.require(:user).permit :name # the display name
+        audit :not_a_field
+      RUBY
+      expect(scan.scalars).to eq(%i[name])
+    end
+
+    it "reads a paren-less expect" do
+      scan = described_class.scan("params.expect user: [:name, :age]")
+      expect([scan.root, scan.scalars]).to eq([:user, %i[name age]])
+    end
+
+    it "still skips a paren-less call whose arguments hold a method call, rather than half-reading it" do
+      scan = described_class.scan("params.require(:user).permit :name, *policy(record).extra")
+      expect(scan.calls).to eq(0)
+    end
+  end
+
+  describe ".scan of a root spelled as a String" do
+    it "reads require(\"user\") and require('user') like require(:user)" do
+      scan = described_class.scan('params.require("user").permit(:name, :email)')
+      expect([scan.root, scan.scalars]).to eq([:user, %i[name email]])
+      expect(described_class.scan("params.require('user').permit :name").root).to eq(:user)
+      # Not a key a contract root can name: skipped, not guessed.
+      expect(described_class.scan('params.require("user name").permit(:name)').calls).to eq(0)
+    end
+  end
+
   describe ".scan of Rails 8 params.expect calls" do
     it "reads the required root envelope and its scalar keys" do
       scan = described_class.scan("params.expect(user: [:name, :age])")
