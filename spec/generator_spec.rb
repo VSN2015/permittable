@@ -459,6 +459,26 @@ RSpec.describe Permittable::Generator do
         )
       end
 
+      # The TODO is advice to paste, so it has to survive the type guard and
+      # keep names intact: the obvious `key(v.to_i) || v` read "shipped" as
+      # 0 and handed the action "pending".
+      it "spells out a stored-integer recipe that loads under check_column_types and keeps names intact" do
+        expect(draft).to include("transform: ->(v) { GenOrder.statuses.key(Integer(v, exception: false)) || v }")
+        Permittable.check_column_types = true
+        klass = load_draft(<<~RUBY)
+          permit_params :update, root: :gen_order, model: GenOrder do
+            optional :status, :string, in: GenOrder.statuses.keys + GenOrder.statuses.values.map(&:to_s),
+                                       transform: ->(v) { GenOrder.statuses.key(Integer(v, exception: false)) || v }
+          end
+        RUBY
+        %w[1 shipped].each do |sent|
+          expect(controller(klass, params: { gen_order: { status: sent } }, action: "update").permitted_params)
+            .to eq("status" => "shipped"), "for #{sent}"
+        end
+      ensure
+        Permittable.check_column_types = false
+      end
+
       it "leaves no stored-integer TODO on an enum whose stored values are strings" do
         expect(draft.lines.grep(/:kind\b/)).to eq(["  optional :kind, :string, in: GenOrder.kinds.keys\n"])
       end
