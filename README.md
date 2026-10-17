@@ -940,7 +940,7 @@ permit_params :create do
 end
 ```
 
-A group is deliberately **not** a contract: it has no `root:`, `unknown:`, `model:` or `mode:` — those describe the request being validated, not a set of fields — and `finalize` is rejected for the same reason. A [standalone `Contract`](#standalone-contracts-no-controller) does answer `#fields`, though, so `use SomeContract` lets a webhook payload and a controller action share one definition instead of two that drift.
+A group is deliberately **not** a contract: it has no `root:`, `unknown:`, `model:` or `mode:` — those describe the request being validated, not a set of fields — and `finalize` is rejected for the same reason. A [standalone `Contract`](#standalone-contracts-no-controller) does answer `#fields`, though, so `use SomeContract` lets a webhook payload and a controller action share one set of fields instead of two that drift. Only the fields: `use` cannot carry a contract's `finalize`, so using a contract that declares one raises at class load rather than silently dropping its cross-field rule. To share both, declare the fields in a `Permittable.fields` group that the contract and the controller each `use`, and declare `finalize` in each; passing one proc to both as `finalize(&EndsAfterStart)` keeps the rule itself in one place.
 
 ### Output reshaping (`transform:` and `finalize`)
 

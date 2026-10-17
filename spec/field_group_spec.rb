@@ -186,6 +186,24 @@ RSpec.describe Permittable::FieldGroup do
       expect(klass.permit_rule_for("create")[:fields].map { |f| f[:name] }).to eq(%i[city])
     end
 
+    it "refuses a Contract that declares finalize, whose cross-field rule use cannot carry" do
+      booking = Permittable::Contract.define do
+        required :starts_on, :date
+        required :ends_on,   :date
+        finalize do |p|
+          violate!(:ends_on, :before_start) if p[:ends_on] < p[:starts_on]
+          p
+        end
+      end
+      expect(booking.call(starts_on: "2026-10-20", ends_on: "2026-10-01").violations)
+        .to eq([{ param: "ends_on", code: "before_start" }])
+
+      expect { permittable_class { permit_params(:create) { use booking } } }
+        .to raise_error(ArgumentError, /use cannot carry a Permittable::Contract's finalize.*Permittable\.fields/)
+      expect { permittable_class { permit_params(:create) { optional(:stay) { use booking } } } }
+        .to raise_error(ArgumentError, /finalize/)
+    end
+
     it "rejects anything that is not a field group" do
       expect { permittable_class { permit_params(:create) { use %i[city] } } }
         .to raise_error(ArgumentError, /use expects a field group/)

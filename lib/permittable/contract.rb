@@ -80,7 +80,10 @@ module Permittable
     # The contract's fields, which is also what makes a Contract usable as a
     # field group: `use SomeContract` inside a permit_params block splices
     # them in, so a webhook payload and a controller action can share one
-    # definition instead of two that drift.
+    # set of fields instead of two that drift. Only the fields — `use`
+    # refuses a contract that declares a finalize, which no field carries.
+    # To share both, put the fields in a `Permittable.fields` group that
+    # each side uses, and declare finalize in each.
     def fields
       rule[:fields]
     end
