@@ -1630,6 +1630,38 @@ RSpec.describe Permittable do
       expect(controller(klass, params: { items: sent }).permitted_params[:items]).to eq([{ "tags" => %w[a b] }])
     end
 
+    it "runs no sub-field transform: over an example: at class load when no container validate: consumes it" do
+      boom = ->(_) { raise "no database at class load" }
+      sent = [{ "id" => "1", "meta" => { "tag" => "t" }, "rows" => [{ "n" => "2" }] }]
+      klass = permittable_class do
+        permit_params(:create) do
+          array :items, example: sent do
+            optional :id, :string, transform: boom
+            optional(:meta) { optional :tag, :string, transform: boom }
+            array(:rows) { optional :n, :integer, transform: boom }
+          end
+        end
+      end
+      published = Permittable::JsonSchema.rule(klass.permit_rule_for("create"))["properties"]["items"]["examples"]
+      expect(published).to eq([[{ "id" => "1", "meta" => { "tag" => "t" }, "rows" => [{ "n" => 2 }] }]])
+    end
+
+    it "validates an example: with sub-field transforms run when only a nested array's validate: consumes them" do
+      sent = [{ "meta" => { "rows" => [{ "tags" => "a,b" }] } }]
+      klass = permittable_class do
+        permit_params(:create) do
+          array :items, example: sent do
+            optional(:meta) do
+              array :rows, validate: ->(a) { a.all? { |r| r[:tags].is_a?(Array) } } do
+                optional :tags, :string, transform: ->(s) { s.split(",") }
+              end
+            end
+          end
+        end
+      end
+      expect(klass.permittable_contracts.last[:fields].first[:example]).to eq(sent)
+    end
+
     it "stores a block array's example: without the sub-field defaults a request would fill in, at any depth" do
       klass = permittable_class do
         permit_params(:create) do

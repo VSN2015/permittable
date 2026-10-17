@@ -7,12 +7,14 @@ module Permittable
   #     its own `transform:` — see permittable_transform below for exactly
   #     which field that is and why. A SUB-FIELD's own transform: still
   #     runs, so what gets stored is what an equivalent request would
-  #     produce — for a default:. An example: is read twice: once like a
-  #     default, to VALIDATE it as a request would be, and once `as_sent`,
-  #     which is what gets stored: no transform at any depth, no sub-field
-  #     default filled in and no array-level validate:. An example documents
-  #     what a client SENDS, so it must not be read through app code that
-  #     reshapes the value into what the action receives.
+  #     produce — for a default:. An example: is read `as_sent`, which is
+  #     what gets stored: no transform at any depth, no sub-field default
+  #     filled in and no array-level validate:. When an array-level validate:
+  #     exists somewhere in it, it is read once more first, like a default,
+  #     to VALIDATE it as a request would be (see ContractBuilder, which
+  #     decides). An example documents what a client SENDS, so it must not
+  #     be read through app code that reshapes the value into what the
+  #     action receives.
   #   * violations carry no `message:` — they become an ArgumentError for
   #     the contract's author, not a response for a client, and I18n may not
   #     be loaded yet.

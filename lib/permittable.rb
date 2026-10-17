@@ -1673,19 +1673,37 @@ module Permittable
     # array-level `validate:` must see the transformed sub-fields a request
     # hands it (`i[:tags].is_a?(Array)`), so the validating read keeps them,
     # and the stored read, which runs no `validate:`, discards them.
+    #
+    # The transforming read exists only for that `validate:`, so it runs only
+    # when one could consume it. Anywhere else its output is thrown away, yet
+    # it would still call app code at class load: `optional :id, :string,
+    # transform: ->(s) { Account.find(s) }` under an `example:` hit the
+    # database, or raised, at boot. Only an array carries a `validate:` that
+    # sees its transformed children: a scalar's or a :json field's runs on
+    # its own value before its own transform, and a nested hash takes none.
+    # Without one, the as-sent read both validates and is stored.
     def validate_array_authored_value!(field, opt)
       value = field[opt]
       return if authored_nil!(field, opt)
       raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} must be an Array" unless value.is_a?(Array)
 
-      read, violations = AuthoredValues.read_array(field, value)
+      as_sent = opt == :example && !array_validate_in?(field)
+      read, violations = AuthoredValues.read_array(field, value, as_sent: as_sent)
       unless violations.empty?
         raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} violates its own contract: " \
                              "#{AuthoredValues.summary(violations)}"
       end
 
-      read, = AuthoredValues.read_array(field, value, as_sent: true) if opt == :example
+      read, = AuthoredValues.read_array(field, value, as_sent: true) if opt == :example && !as_sent
       field[opt] = freeze_authored(opt == :default && field[:transform] ? value : read)
+    end
+
+    # Whether `field`, or any array or nested hash below it, declares an
+    # array-level `validate:`.
+    def array_validate_in?(field)
+      return true if field[:kind] == :array && field[:validate]
+
+      Array(field[:fields]).any? { |sub| array_validate_in?(sub) }
     end
 
     # A contract is frozen data, but `@fields.map(&:freeze)` freezes only the
