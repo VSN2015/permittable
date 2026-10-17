@@ -582,11 +582,20 @@ RSpec.describe Permittable::Generator do
         # Break reading two columns' defaults — an ordinary one and the
         # locking column — after the schema has loaded, so the error comes
         # from the introspection on top of it.
-        defaults = GenBrokenVehicle._default_attributes
-        allow(defaults).to receive(:[]).and_call_original
-        %w[name lock_version].each do |name|
-          allow(defaults).to receive(:[]).with(name).and_raise(ArgumentError, "misconfigured\nsecond line")
+        #
+        # Rails main freezes the model's attribute set, and rspec-mocks
+        # cannot proxy a frozen object, so the set is frozen here on every
+        # Rails line and the failure comes from a delegating stand-in that
+        # the model hands out in its place.
+        defaults = GenBrokenVehicle._default_attributes.freeze
+        broken = SimpleDelegator.new(defaults)
+        broken_names = %w[name lock_version]
+        broken.define_singleton_method(:[]) do |name|
+          raise ArgumentError, "misconfigured\nsecond line" if broken_names.include?(name)
+
+          defaults[name]
         end
+        allow(GenBrokenVehicle).to receive(:_default_attributes).and_return(broken)
       end
 
       let(:draft) { described_class.draft(model: GenBrokenVehicle) }
