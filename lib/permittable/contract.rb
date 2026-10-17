@@ -62,9 +62,16 @@ module Permittable
           super(fields, hash, path: path, unknown: unknown, top_level: false, violations: violations)
         end
 
-        # Instrumentation payload label (anonymous classes have no name).
+        # Instrumentation payload labels: anonymous classes have no name,
+        # and with no router there is no action_name, so the payload names
+        # the one action #call validates — never nil, which a subscriber
+        # formatting "controller#action" would print as a bare "#".
         def permittable_controller_name
           "Permittable::Contract"
+        end
+
+        def permittable_action_name
+          ACTION
         end
       end
       @host_class.permit_params(root: root, unknown: unknown, model: model, mode: :enforce, desc: desc, &)
