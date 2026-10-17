@@ -140,6 +140,36 @@ RSpec.describe Permittable do
       expect(violations_for({ sku: "abc" }, &decl).details).to eq([{ param: "sku", code: "inclusion" }])
     end
 
+    # The README tells an author to pass an include? object for a live list,
+    # and such a list is typically filled in an initializer or
+    # after_initialize, which runs AFTER eager_load! has run the declaration,
+    # so it is empty then. Nothing can be known about an object used as
+    # given, so emptiness is asked only of what the gem reads itself: a
+    # literal list it casts, and a Range.
+    it "accepts a live :in object that is empty at class load, and reads it on every request" do
+      registry = Concurrent::Set.new
+      decl = proc { permit_params(:create) { optional :event, :string, in: registry } }
+      klass = permittable_class(&decl)
+      expect(klass.permit_rule_for(:create)[:fields].first[:in]).to be(registry)
+      expect(violations_for({ event: "order.paid" }, &decl).details).to eq([{ param: "event", code: "inclusion" }])
+
+      registry << "order.paid"
+      expect(permit({ event: "order.paid" }, &decl)[:event]).to eq("order.paid")
+    end
+
+    it "accepts an empty Set subclass that overrides include?, since that override is used as given" do
+      live = Class.new(Set) { def include?(value) = super || value.to_s.start_with?("sku-") }.new
+      decl = proc { permit_params(:create) { optional :sku, :string, in: live } }
+      expect(permit({ sku: "sku-1" }, &decl)[:sku]).to eq("sku-1")
+    end
+
+    it "still refuses an empty literal list, which the gem reads itself and no request could satisfy" do
+      expect { permittable_class { permit_params(:create) { optional :plan, :string, in: Set.new } } }
+        .to raise_error(ArgumentError, /:in for :plan is empty/)
+      expect { permittable_class { permit_params(:create) { optional :plan, :string, in: {} } } }
+        .to raise_error(ArgumentError, /:in for :plan is empty/)
+    end
+
     # Only Array, Set, Hash and Enumerator are lists. An app's own Enumerable
     # with its own include? — a case-insensitive allowlist, a DB-backed
     # registry — is used as given: never enumerated at class load, never

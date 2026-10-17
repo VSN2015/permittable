@@ -1394,19 +1394,26 @@ module Permittable
     # enum rule all read the members the runtime compares against. A member
     # no request value could ever equal is a contract mistake, and fails here
     # rather than as an `inclusion` on every request.
+    #
+    # An empty list or a reversed Range is refused for the same reason, but
+    # an object used as given is not asked: it is read on every request, so
+    # a live registry that is empty now (filled in an initializer or
+    # `after_initialize`, after `eager_load!` has run this) is the very use
+    # the README recommends it for.
     def resolve_in!(field)
       name = field[:name]
       allowed = field[:in]
       if allowed.is_a?(Range)
         assert_comparable_range!(field, allowed)
+        assert_satisfiable!(name, :in, allowed)
       elsif (members = Coercion.in_list(allowed))
         cast_in_members!(field, members)
+        assert_satisfiable!(name, :in, field[:in])
       elsif allowed.is_a?(String) || !allowed.respond_to?(:include?)
         raise ArgumentError, "#{LABEL}: :in for field :#{name} must be a Range, a list of values (an Array, Set, " \
                              "or a Hash read as its keys), or an object answering include? " \
                              "(got #{allowed.inspect})#{string_in_hint(allowed)}"
       end
-      assert_satisfiable!(name, :in, field[:in])
     end
 
     def string_in_hint(allowed)
