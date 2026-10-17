@@ -132,10 +132,14 @@ require "permittable/filter_parameter_registry"
 # ("   " under :squish) cannot satisfy a required field by becoming "". An
 # authored `default:`/`example:` is stored as the contract reads it —
 # normalized and cast, so `default: "18"` on an :integer is 18, and an
-# array's read by the request walker itself. The one exception is a field
-# declaring `transform:`: its default is stored exactly AS AUTHORED, never
+# array's read by the request walker itself. The exceptions: a field
+# declaring `transform:` stores its default exactly AS AUTHORED, never
 # cast — `transform:` never runs on a default either (see OUTPUT RESHAPING),
-# so author such a default already in the shape the action should receive.
+# so author such a default already in the shape the action should receive —
+# and a `:json` field's is always stored as the walker reads a request's hash
+# (indifferent access, String keys; `transform:` or not), except that a
+# `:json` `example:` is stored as authored (in that same shape), whatever a
+# mutating `validate:` did to the copy it was checked on.
 # Either way it is deep-frozen on a copy, and each request gets its own deep
 # copy, so no request can corrupt it for the next.
 #
@@ -189,8 +193,10 @@ require "permittable/filter_parameter_registry"
 #     into an Array. Runs only on request-supplied values: absent fields stay
 #     absent, and a `default:` is handed out exactly AS AUTHORED — validated
 #     against the field's own contract at class load (as any default is), but
-#     neither cast nor transformed — so a request sending a field's default
-#     gets the transformed value, a request omitting it the untransformed one.
+#     neither cast nor transformed (a `:json` field's is read as a request's
+#     hash is, indifferent with String keys, but no more than that) — so a
+#     request sending a field's default gets the transformed value, a
+#     request omitting it the untransformed one.
 #     Author a default already in the shape the action should receive:
 #     `transform: ->(v) { v.to_i }, default: 25` on a :string field hands both
 #     paths the Integer 25. A field with no `transform:` still gets its
@@ -1494,8 +1500,14 @@ module Permittable
     # same Hash authored as `default:`. And a `validate:` that edits its
     # argument edited the host's own Hash, which a request's deep copy spares.
     #
-    # The walker's copy is what is stored, so the action, the export and the
-    # RSpec matcher all read what a request sending it would have produced.
+    # For a `default:` the walker's copy is what is stored, so the action, the
+    # export and the RSpec matcher all read what a request sending it would
+    # have produced. An `example:` is not: it documents what a client SENDS,
+    # so it is validated on that copy but stored as a fresh copy of the value
+    # AS AUTHORED (request-shaped, indifferent with String keys), which a
+    # `validate:` editing its argument cannot have added a key to or dropped
+    # one from. That matches every other example on a contract, which is never
+    # processed the way the action would see it.
     def validate_json_authored_value!(field, opt)
       return unless field.key?(opt)
       return if authored_nil!(field, opt)
@@ -1504,7 +1516,7 @@ module Permittable
       status, read = AuthoredValues.read_json(field, field[opt])
       raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{read})" unless status == :ok
 
-      field[opt] = freeze_authored(read)
+      field[opt] = freeze_authored(opt == :example ? ActiveSupport::HashWithIndifferentAccess.new(field[opt]) : read)
     end
 
     # format / length / normalize reason about characters; on any other
