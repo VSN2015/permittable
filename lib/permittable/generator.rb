@@ -477,10 +477,13 @@ module Permittable
 
     # Whether the database or Rails fills the column in, so no client has to
     # send it. A timestamp is; a primary key only when the database really
-    # generates it: the auto-increment integer of a single-column key, or a
-    # key with a default or a default function (a uuid). A natural key
-    # (`sku`, a `create_table ..., id: :string`) or a part of a composite
-    # key is the client's to send, and is drafted like any other column.
+    # generates it: an auto-increment column (the adapter says so, wherever
+    # it sits in the key: MySQL allows `PRIMARY KEY (region, id)` with `id
+    # AUTO_INCREMENT`), or a key with a default or a default function (a
+    # uuid). An adapter without that flag falls back to the integer of a
+    # single-column key. A natural key (`sku`, a `create_table ..., id:
+    # :string`) or a part of a composite key with no such flag is the
+    # client's to send, and is drafted like any other column.
     # Array() flattens a composite primary key (an Array in Rails 7.1+) into
     # its column names; a nil primary key becomes [].
     def assigned?(model, column)
@@ -489,7 +492,13 @@ module Permittable
       keys = Array(model.primary_key).map(&:to_s)
       return false unless keys.include?(column.name)
 
-      (keys.one? && column.type == :integer) || !column.default.nil? || default_function?(column)
+      auto_increment?(column, sole_key: keys.one?) || !column.default.nil? || default_function?(column)
+    end
+
+    def auto_increment?(column, sole_key:)
+      return column.auto_increment? if column.respond_to?(:auto_increment?)
+
+      sole_key && column.type == :integer
     end
 
     def default_function?(column)

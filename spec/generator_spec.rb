@@ -308,21 +308,55 @@ RSpec.describe Permittable::Generator do
       expect(draft).not_to include("updated_at")
     end
 
-    # Not assigned: no database fills in the parts of a composite key, so a
-    # client sends them, and they are drafted like any other column.
-    it "drafts every column of a composite primary key like any other (Rails 7.1+ returns an Array)" do
-      composite = Class.new(TestModel) do
-        self.table_name = "gen_articles"
-
-        def self.primary_key
-          %w[id views]
+    # An auto-increment column is assigned wherever it sits in the key: MySQL
+    # allows `PRIMARY KEY (region, id)` with `id AUTO_INCREMENT`, and the
+    # adapter says so through `auto_increment?`. sqlite cannot declare that
+    # table (and older Rails' columns have no such flag), so the key is forced
+    # onto gen_articles and its `id` column answers as MySQL's would; the
+    # other part is the NOT NULL `title`.
+    context "when an auto-increment column is part of a composite primary key (Rails 7.1+ returns an Array)" do
+      before do
+        mysql_like = Class.new(SimpleDelegator) do
+          def auto_increment? = name == "id"
+          def respond_to_missing?(name, include_private = false) = name == :auto_increment? || super
         end
+        composite = Class.new(TestModel) do
+          self.table_name = "gen_articles"
+
+          def self.primary_key
+            %w[id title]
+          end
+        end
+        composite.define_singleton_method(:columns) { super().map { |column| mysql_like.new(column) } }
+        stub_const("GenCompositeArticle", composite)
       end
-      stub_const("GenCompositeArticle", composite)
-      draft = described_class.draft(model: GenCompositeArticle)
-      expect(draft).to include("required :id, :integer")
-      expect(draft).to include("optional :views, :integer")
-      expect(draft).to include("required :title, :string")
+
+      def create_rule(draft) = draft[/permit_params :create.*?^end/m]
+
+      it "leaves the auto-increment part out of the columns-only draft and requires the other part" do
+        draft = described_class.draft(model: GenCompositeArticle)
+        expect(draft).not_to include(":id")
+        expect(create_rule(draft)).to include("required :title, :string")
+      end
+
+      it "drafts the auto-increment part optional, never required, when the permit call lists it" do
+        scan = described_class.scan("params.require(:gen_composite_article).permit(:id, :title)")
+        draft = described_class.draft(model: GenCompositeArticle, scan: scan)
+        expect(create_rule(draft)).to include("optional :id, :integer", "required :title, :string")
+        expect(draft).not_to include("required :id")
+      end
+    end
+
+    # An adapter whose columns do not answer `auto_increment?` falls back to
+    # the integer of a single-column key.
+    it "falls back to the integer of a single-column key when the column has no auto_increment? flag" do
+      flagless = Class.new(SimpleDelegator) do
+        def respond_to_missing?(name, include_private = false) = name != :auto_increment? && super
+      end
+      model = Class.new(TestModel) { self.table_name = "gen_articles" }
+      model.define_singleton_method(:columns) { super().map { |column| flagless.new(column) } }
+      stub_const("GenFlaglessArticle", model)
+      expect(described_class.draft(model: GenFlaglessArticle)).not_to include(":id")
     end
 
     # The skip list is for columns drafted with nothing to say they are
@@ -383,7 +417,7 @@ RSpec.describe Permittable::Generator do
             t.integer :pos, null: false
             t.string :note
           end
-          create_table :gen_tokens, id: :string, default: -> { "lower(hex(randomblob(16)))" } do |t|
+          create_table :gen_tokens, id: :string, default: -> { "(lower(hex(randomblob(16))))" } do |t|
             t.string :label
           end
         end
