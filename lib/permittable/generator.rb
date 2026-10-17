@@ -103,13 +103,13 @@ module Permittable
     EXPECT_CALL = /params\s*\.\s*expect\(([^()]*)\)/m
 
     # The required root envelope of an expect call: `user: [...]`, where the
-    # brackets hold fields — not the empty `tag_names: []` of an
-    # array-of-scalars root, and not the `comments: [[...]]` of an
-    # array-of-hashes root, neither of which a rooted contract can express.
-    # The lookahead skips whitespace itself: `\[\s*(?!...)` let `\s*` match
-    # nothing and waved the spaced `tag_names: [ ]` through as an envelope
-    # with no fields.
-    EXPECT_ENVELOPE = /\A(\w+):\s*\[(?!\s*[\[\]])\s*(.*?)\s*\]\z/m
+    # brackets hold fields. Which brackets hold fields is `envelope`'s call,
+    # not this pattern's: not the empty `tag_names: []` of an array-of-scalars
+    # root, and not the `comments: [[...]]` of an array-of-hashes root,
+    # neither of which a rooted contract can express. Rails reads `[[...]]` as
+    # an array of hashes only when the outer list holds that one element;
+    # `[[:name, :email], :age]` is the flat list `[:name, :email, :age]`.
+    EXPECT_ENVELOPE = /\A(\w+):\s*\[(.*)\]\z/m
 
     # An envelope whose fields cannot be read: they live in a constant
     # (`post: PERMITTED_PARAMS`) or a local (`post: permitted_keys`), or a
@@ -127,7 +127,7 @@ module Permittable
     # punctuation at both ends — not `()`, as a parenthesis already makes the
     # whole call unreadable (see PERMIT_CALL). The words are the text between
     # the delimiters, whichever alternative matched.
-    WORD_LIST = /%[iIwW](?:\[[^\[\]]*\]|\{[^{}]*\}|<[^<>]*>|([^\w\s()\[\]{}<>])(?:(?!\1).)*\1)/m
+    WORD_LIST = /%[iIwW](?:\[[^\[\]]*\]|\{[^{}]*\}|<[^<>]*>|([^\w\s(),\[\]{}<>])(?:(?!\1).)*\1)/m
 
     # A list among the filters, splatted or not: `[:name, :email]`, or a word
     # list once bracket_word_lists has spelled it so. Rails flattens the
@@ -614,19 +614,26 @@ module Permittable
     # [:city, :zip]` stays one argument. A list argument is replaced by its
     # elements (see LIST_ARG).
     def split_args(args)
-      parts = [+""]
-      depth = 0
-      args.each_char do |char|
-        depth += 1 if "[{".include?(char)
-        depth -= 1 if "]}".include?(char)
-        next parts << +"" if char == "," && depth.zero?
-
-        parts.last << char
-      end
-      parts.map(&:strip).reject(&:empty?).flat_map do |part|
+      split_top_level(args).flat_map do |part|
         list = LIST_ARG.match(bracket_word_lists(part))
         list ? split_args(list[1]) : [part]
       end
+    end
+
+    # The top-level, comma-separated parts of `args`, as written. A word list
+    # delimited by commas (`%w,name email,`) is kept whole, so it stays one
+    # unreadable argument rather than the TODOs of its pieces (see WORD_LIST).
+    def split_top_level(args)
+      parts = [+""]
+      depth = 0
+      args.scan(/%[iIwW],[^,]*,|./m) do |token|
+        depth += 1 if token.size == 1 && "[{".include?(token)
+        depth -= 1 if token.size == 1 && "]}".include?(token)
+        next parts << +"" if token == "," && depth.zero?
+
+        parts.last << token
+      end
+      parts.map(&:strip).reject(&:empty?)
     end
 
     # `text` with each word list of plain keys spelled as the list it equals:
@@ -664,14 +671,20 @@ module Permittable
     #
     # The shape is judged with word lists bracketed: `user: %i[name email]`
     # is the envelope `user: [:name, :email]`, and `items: [%i[sku]]` the
-    # array-of-hashes root `items: [[:sku]]`. A bracketed envelope's fields
-    # are still split as the source spells them, so a TODO for one quotes it
-    # as written; a word list among them is read where its field is parsed.
+    # array-of-hashes root `items: [[:sku]]`. It is judged on the elements
+    # the outer list holds, as Rails does, not on the flattened fields: the
+    # list is an array of hashes (or empty) only when it holds nothing but one
+    # list, so `user: [%i[name email], :age]` is still the `user` envelope
+    # with three fields. A bracketed envelope's fields are split as the source
+    # spells them, so a TODO for one quotes it as written.
     def envelope(arg)
       listed = bracket_word_lists(arg)
-      if EXPECT_ENVELOPE.match?(listed)
-        match = EXPECT_ENVELOPE.match(arg) || EXPECT_ENVELOPE.match(listed)
-        [match[1].to_sym, split_args(match[2])]
+      if (match = EXPECT_ENVELOPE.match(listed))
+        elements = split_top_level(match[2])
+        return if elements.empty? || (elements.one? && elements.first.start_with?("["))
+
+        written = EXPECT_ENVELOPE.match(arg) || match
+        [match[1].to_sym, split_args(written[2])]
       elsif (match = EXPECT_OPAQUE_ENVELOPE.match(listed))
         [match[1].to_sym, [arg.sub(/\A\w+:\s*/, "")]]
       end

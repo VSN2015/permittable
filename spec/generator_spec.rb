@@ -1256,6 +1256,31 @@ RSpec.describe Permittable::Generator do
       expect(scan.arrays).to eq(%i[tag_names])
     end
 
+    it "keeps the root when a word list sits beside other fields, and spells it into scalars" do
+      # Rails flattens `[%i[name email], :age]` to `[:name, :email, :age]`: a
+      # list is an array of hashes only when it is the outer list's one element.
+      ["[%i[name email], :age]", "[[:name, :email], :age]", "[:age, %w[name email]]"].each do |fields|
+        scan = described_class.scan("params.expect(user: #{fields})")
+        expect([scan.root, scan.scalars.sort, scan.unparsed]).to eq([:user, %i[age email name], []]), fields
+      end
+
+      scan = described_class.scan("params.expect(user: [%i[name email], :age])")
+      enforced = described_class.draft(scan: scan).gsub("mode: :monitor", "mode: :enforce")
+      request = controller(permittable_class { class_eval(enforced) }, params: { user: { name: "Jo", email: "jo@x.io", age: "3" } })
+      expect(request.permitted_params.to_h).to eq("name" => "Jo", "email" => "jo@x.io", "age" => "3")
+
+      scan = described_class.scan("params.expect(user: [%i[name email]])")
+      expect(scan.root).to be_nil
+      expect(scan.nested_arrays).to eq(user: %i[name email])
+    end
+
+    it "does not take a comma as a word list's delimiter, nor cut `%w,name email,` into pieces" do
+      scan = described_class.scan("params.require(:user).permit(:id, %w,name email,)")
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[id])
+      expect(scan.unparsed).to eq(["%w,name email,"])
+    end
+
     it "keeps the root of an envelope whose value it cannot read, with a TODO for the value" do
       ["%i[first-name]", "%I[name \#{prefix}_email]", "permitted_keys"].each do |value|
         scan = described_class.scan("params.expect(user: #{value})")
