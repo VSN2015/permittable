@@ -1214,10 +1214,13 @@ module Permittable
     #   end
     #
     # `optional: true` relaxes every spliced field, which is how an update
-    # contract reuses a create contract: nothing is mandatory, but `default:`,
-    # types and bounds all still apply. It relaxes the TOP LEVEL only — if a
-    # client sends an address at all, the address's own required sub-fields
-    # still hold.
+    # contract reuses a create contract: nothing is mandatory, and types and
+    # bounds all still apply. It drops each relaxed field's `default:` too. A
+    # default is filled in for every request that omits the field, so on a
+    # PATCH it would overwrite the column the client left alone: `default:
+    # "free"` reset every "pro" user who only renamed themself. It relaxes
+    # the TOP LEVEL only — if a client sends an address at all, the
+    # address's own required sub-fields and defaults still hold.
     #
     # `only:`/`except:` select a subset, in the group's own order. Naming a
     # field the group doesn't declare is a class-load error, so a typo cannot
@@ -1226,7 +1229,7 @@ module Permittable
     # and then declare `:city` yourself.
     def use(group, only: nil, except: nil, optional: false)
       fields = select_group_fields!(group_fields!(group), only: only, except: except)
-      fields = fields.map { |field| field.merge(required: false).freeze } if optional
+      fields = fields.map { |field| field.except(:default).merge(required: false).freeze } if optional
       fields.each do |field|
         field_name!(field[:name])
         @fields << field

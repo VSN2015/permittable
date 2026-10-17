@@ -917,18 +917,20 @@ class UsersController < ApplicationController
     use UserFields
   end
 
-  # PATCH: the same fields, nothing mandatory.
+  # PATCH: the same fields, nothing mandatory, no defaults.
   permit_params :update, root: :user, model: User do
     use UserFields, optional: true
   end
 end
 ```
 
+The defaults go because a default is filled in for every request that omits the field. On a `PATCH` that would overwrite the column the client left alone: with `plan`'s `default: "free"` kept, `PATCH {"user": {"name": "Jo"}}` would hand the action `{"name" => "Jo", "plan" => "free"}` and downgrade every `"pro"` user who renamed themself. The exported schema of the update rule leaves them out too.
+
 `use` splices the group in **at the point of use**, in the group's own order, exactly as if the fields had been typed there — so the request-time behaviour, the [drift guard](#the-schema-drift-guard), `sensitive:` registration and the [exported schema](#exporting-openapi-docs-that-cannot-drift) are all identical to the inline spelling. It works at the top level of a contract, inside a nested or array block, and inside another group.
 
 | Option | Meaning |
 |---|---|
-| `optional: true` | Relax every spliced field. **Top level only** — if a client sends an `address` at all, the address's own required sub-fields still hold. Types, bounds and `default:` are untouched, so `use UserFields, optional: true` is a complete `PATCH` contract |
+| `optional: true` | Relax every spliced field: nothing is mandatory, and no `default:` is filled in. **Top level only** — if a client sends an `address` at all, the address's own required sub-fields and defaults still hold. Types and bounds are untouched, so `use UserFields, optional: true` is a complete `PATCH` contract |
 | `only:` / `except:` | Select a subset, in the group's own order. Mutually exclusive |
 
 Because a group is built by the same builder a contract is, **every declaration is validated when the group is defined** — a typo fails once, at the group, instead of at each contract that uses it. Two more things fail at class load rather than silently: `only:`/`except:` naming a field the group doesn't declare (so a typo can't quietly drop a field), and a field declared twice. That last one makes overriding deliberate:

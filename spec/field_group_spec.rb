@@ -106,9 +106,10 @@ RSpec.describe Permittable::FieldGroup do
       expect(create.select { |f| f[:required] }.map { |f| f[:name] }).to eq(%i[name email])
       expect(update.any? { |f| f[:required] }).to be(false)
 
-      # A partial update of one field is now legal, and defaults still apply.
+      # A partial update of one field is now legal, and holds only what was
+      # sent: the relaxed plan's default is dropped (see below).
       result = controller(klass, params: { user: { name: "Jo" } }, action: "update").permitted_params
-      expect(result.to_h).to eq("name" => "Jo", "plan" => "free")
+      expect(result.to_h).to eq("name" => "Jo")
     end
 
     it "leaves nested sub-fields required under optional: true (send an address, name the city)" do
@@ -123,6 +124,32 @@ RSpec.describe Permittable::FieldGroup do
       expect(fields.first[:fields].first[:required]).to be(true)
       expect { controller(klass, params: { address: {} }).permitted_params }
         .to raise_error(Permittable::InvalidParameters, /address.city/)
+    end
+
+    it "drops the relaxed fields' default: under optional: true, so a PATCH never resets what it omits" do
+      group = Permittable.fields do
+        required :name,  :string
+        optional :plan,  :string, in: %w[free pro], default: "free"
+        optional :prefs, :json, default: { "theme" => "light" }
+        array    :tags,  of: :string, default: []
+        optional :address do
+          optional :country, :string, default: "VN"
+          optional :city,    :string
+        end
+      end
+      create = Permittable::Contract.define(root: :user) { use group }
+      update = Permittable::Contract.define(root: :user) { use group, optional: true }
+
+      # A "pro" user renaming themself is not downgraded to "free".
+      expect(update.call("user" => { "name" => "Jo" }).params.to_h).to eq("name" => "Jo")
+      expect(update.json_schema.dig("properties", "user", "properties", "plan")).not_to have_key("default")
+
+      # Top level only, like required: an address the client does send still
+      # gets its own defaults, and the group itself (so create) keeps all of them.
+      expect(update.call("user" => { "address" => { "city" => "Hue" } }).params.to_h)
+        .to eq("address" => { "country" => "VN", "city" => "Hue" })
+      expect(create.call("user" => { "name" => "Jo" }).params.to_h)
+        .to eq("name" => "Jo", "plan" => "free", "prefs" => { "theme" => "light" }, "tags" => [])
     end
 
     it "selects a subset with only: and except:, in the group's own order" do
