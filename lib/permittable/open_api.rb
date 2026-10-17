@@ -480,9 +480,10 @@ module Permittable
       variables = path.scan(/\{(\w+)\}/).flatten
       return operation if variables.empty?
 
-      fields = path_fields(rule, variables.zip(own.scan(/\{(\w+)\}/).flatten))
+      own_names = own.scan(/\{(\w+)\}/).flatten
+      fields = path_fields(rule, variables.zip(own_names))
       parameters = variables.map do |name|
-        schema = fields[name] ? JsonSchema.field(fields[name], unknown: rule[:unknown]) : { "type" => "string" }
+        schema = fields[name] ? path_schema(fields[name]) : { "type" => "string" }
         { "name" => name, "in" => "path", "required" => true, "schema" => schema }
       end
       # Inserted ahead of requestBody, where a reader of the document expects
@@ -490,7 +491,7 @@ module Permittable
       operation.each_with_object({}) do |(key, value), out|
         if key == "requestBody"
           out["parameters"] = parameters
-          value = body_without(rule, fields.values)
+          value = body_without(rule, fields.values, own_names)
         end
         out[key] = value unless value.nil?
       end
@@ -504,26 +505,52 @@ module Permittable
     # never reaches, so only a rootless one has such fields, and only at its
     # top level. `names` pairs each variable of the placed path with the
     # route's own name for it.
+    #
+    # Only a scalar field moves. A URL segment is one string, so an array or
+    # a hash can never be what it carries (`POST /defs/1,2` against
+    # `array :id` is a 422). Such a field stays in the body, where a client
+    # can at least say what it means.
     def path_fields(rule, names)
       return {} if rule[:root]
 
       names.filter_map do |variable, own|
         field = rule[:fields].find { |f| f[:name].to_s == own }
-        [variable, field] if field
+        [variable, field] if field && field[:kind] == :scalar
       end.to_h
+    end
+
+    # A moved field's schema as the path parameter documents it. The URL
+    # always supplies the segment, so a `default:` never applies and the
+    # value is never null: `nullable:` would only add "null" to the type.
+    def path_schema(field)
+      JsonSchema.field(field.except(:default, :nullable))
     end
 
     # The requestBody for `rule` without the fields a path parameter took
     # over; nil, to leave it out, when that was every field. Such a body
-    # would be an empty object, and `unknown: :error` on it forbids what the
-    # runtime ignores or flags anyway, since a path parameter is exempt from
-    # the unknown-key check. An action declared with no fields at all keeps
-    # the empty body it always had.
-    def body_without(rule, moved)
-      return rule_request_body(rule) if moved.empty?
-
+    # would be an empty object. An action declared with no fields at all
+    # keeps the empty body it always had.
+    #
+    # `unknown: :error` forbids every key the contract does not declare, but
+    # the runtime exempts the route's path parameters from that check and
+    # then overwrites them with the URL's values: `PATCH /widgets/7` with
+    # {"id":7,"name":"x"} is a 200 whether or not the contract declares `id`.
+    # That is the payload a Rails form, or a client sending a record back,
+    # produces, so the schema must not forbid it. Each name the route
+    # templates therefore stays in the body as an unconstrained property,
+    # any value and never required, since the value is read from the URL and
+    # nothing in the body can make the request wrong. A rooted contract
+    # needs none of this: its wrapper object is permissive already.
+    def body_without(rule, moved, templated)
       rest = rule[:fields] - moved
-      rule_request_body(rule.merge(fields: rest)) unless rest.empty?
+      return if rest.empty? && !moved.empty?
+
+      body = rule_request_body(moved.empty? ? rule : rule.merge(fields: rest))
+      return body unless rule[:unknown] == :error && !rule[:root]
+
+      properties = body["content"]["application/json"]["schema"]["properties"]
+      templated.each { |name| properties[name] ||= {} }
+      body
     end
 
     # Drops every descriptor for a verb and concrete path that an earlier,
