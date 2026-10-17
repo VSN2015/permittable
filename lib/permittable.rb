@@ -240,6 +240,18 @@ module Permittable
   # rather than leaving a bare ROUTING_KEYS to read like an oversight.
   UNCHECKED_TOP_LEVEL_KEYS = (ROUTING_KEYS + FORM_KEYS).freeze
   MONITOR_DROPPED_KEYS = ROUTING_KEYS
+  # Rails' date_select, datetime_select and time_select submit ONE value as
+  # several keys, each named for its position: `starts_on(1i)` the year,
+  # `(2i)` the month, `(3i)` the day, `(4i)` the hour, `(5i)` the minute and
+  # `(6i)` the second. Strong parameters passes them through for
+  # `permit(:starts_on)` and ActiveRecord assembles them. A contract read
+  # only `starts_on`, so such a form lost its date (silently, under the
+  # default `unknown: :ignore`) and a required one was always missing. A
+  # :date or :datetime field now reads its parts as its own value (see
+  # permittable_read_date_parts); this is how many parts each type has.
+  DATE_PARTS = { date: 3, datetime: 6 }.freeze
+  # One part, as a select sends it: an unsigned decimal integer.
+  DATE_PART_FORMAT = /\A\d+\z/
   # The field kinds that can hold ParamsWrapper's copy of a body — a hash. A
   # rootless contract declaring the wrapper key as one of these reads the
   # copy deliberately, so it is kept (see permittable_drops_wrapper_copy?).
@@ -2292,6 +2304,7 @@ module Permittable
 
   def permittable_check_hash(fields, hash, path:, unknown:, top_level:, violations:)
     result = ActiveSupport::HashWithIndifferentAccess.new
+    hash = permittable_read_date_parts(fields, hash)
     fields.each do |field|
       key = field[:name].to_s
       full = permittable_path(path, key)
@@ -2312,6 +2325,86 @@ module Permittable
     end
     permittable_check_unknown(fields, hash, path: path, unknown: unknown, top_level: top_level, violations: violations)
     result
+  end
+
+  # See DATE_PARTS. A :date or :datetime field reads the parts sent for it
+  # as its own value. They are replaced, in a COPY of `hash`, by the one
+  # value they make, under the field's own key, so the walk sees exactly
+  # what it would have had the client sent that value: the cast, `in:`,
+  # `validate:`, `transform:`, the absence rule and `nullable:` all apply
+  # unchanged, the action gets the field's own key, and the unknown-keys
+  # check never sees the parts. `hash` itself is left as it is: it may be
+  # the request's own params, which monitor mode hands back as they arrived.
+  #
+  # Only when the field's own key is ABSENT: when both are sent, the key the
+  # contract declares wins and the parts are dropped unread, and still no
+  # unknown keys, for they belong to the field. And not when the contract
+  # declares one of the parts as a field of its own, which is how a contract
+  # could carry them through before this: that field keeps it.
+  def permittable_read_date_parts(fields, hash)
+    read = nil
+    fields.each do |field|
+      count = field[:kind] == :scalar && DATE_PARTS[field[:type]]
+      next unless count
+
+      key = field[:name].to_s
+      names = Array.new(count) { |index| "#{key}(#{index + 1}i)" }
+      next unless names.any? { |name| hash.key?(name) }
+      next if fields.any? { |other| names.include?(other[:name].to_s) }
+
+      read ||= hash.dup
+      parts = {}
+      names.each.with_index(1) { |name, position| parts[position] = read.delete(name) if read.key?(name) }
+      next if hash.key?(key)
+
+      # Parts that make no value are handed to the field as the several
+      # values they are, which a scalar refuses as invalid_type: on the
+      # field's own path, with its own message:, as for `?starts_on[]=x`.
+      read[key] = permittable_date_from_parts(parts, field[:type]) || parts.values
+    end
+    read || hash
+  end
+
+  # The ISO 8601 String that `parts` (keyed by Rails' positions, 1-3 the
+  # date and 4-6 the time) spell for a field of `type`, or nil when they
+  # spell none. A String is what a :date or :datetime field already reads,
+  # so its cast and that cast's rules (a zoneless datetime is UTC) stay in
+  # one place.
+  #
+  # Every part sent blank is a form whose selects were all left on their
+  # prompts (`include_blank:` or `prompt:`), and reads as the field sent
+  # empty. Otherwise a :date needs (1i)-(3i) and a :datetime (1i)-(5i), the
+  # seconds being 00 unless (6i) is sent. A part sent blank among filled
+  # ones is a select left on its prompt, and is no number, so it never
+  # defaults.
+  def permittable_date_from_parts(parts, type)
+    return "" if parts.each_value.all? { |part| Coercion.absent_value?(part) }
+
+    time = type == :datetime
+    digits = (1..(time ? 5 : 3)).map { |position| permittable_date_part(parts[position], year: position == 1) }
+    digits << (parts.key?(6) ? permittable_date_part(parts[6]) : "00") if time
+    return nil if digits.include?(nil)
+
+    year, month, day, hour, minute, second = digits
+    time ? "#{year}-#{month}-#{day}T#{hour}:#{minute}:#{second}" : "#{year}-#{month}-#{day}"
+  end
+
+  # One part's digits, padded once its leading zeros are dropped: "7" and
+  # "007" are both "07". Joined as sent, Date._parse reads "2026-007-5" as
+  # May 7th. The year is padded to four digits, so "99" is the year 99 (as
+  # ActiveRecord reads it) rather than a two-digit year Date._parse places
+  # in 1999, and is otherwise left to the cast, as a year in a String is.
+  # Any other part has at most two digits: a month of "100" is no value a
+  # select offers, and Date._parse would read the string around it some
+  # other way. nil for anything that is not an unsigned decimal integer.
+  def permittable_date_part(part, year: false)
+    text = Coercion.utf8_text(part) if part.is_a?(String)
+    return nil unless text&.match?(DATE_PART_FORMAT)
+
+    digits = text.sub(/\A0+(?=\d)/, "")
+    return digits.rjust(4, "0") if year
+
+    digits.rjust(2, "0") if digits.length <= 2
   end
 
   def permittable_check_field(field, value, full, result, unknown:, violations:)

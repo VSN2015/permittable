@@ -1,4 +1,7 @@
 require "action_controller"
+# Rails' own form helpers, so a spec can post exactly what a rendered
+# date_select or datetime_select submits.
+require "action_view"
 require "rack/mock"
 
 # Dispatches a single action through the REAL ActionController stack —
@@ -18,7 +21,8 @@ module IntegrationHarness
   module_function
 
   # `params:` (a Hash) is form-encoded into the request body — how the specs
-  # exercise real ActionController::Parameters bodies. `json:` sends the Hash
+  # exercise real ActionController::Parameters bodies; a String is sent as an
+  # already-encoded form body, verbatim. `json:` sends the Hash
   # as an application/json body instead (what ParamsWrapper acts on), and
   # `path_params:` stands in for what the router would have matched out of
   # the URL — Rails merges both into `params` exactly as a routed request
