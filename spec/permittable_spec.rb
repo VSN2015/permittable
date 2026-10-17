@@ -714,7 +714,11 @@ RSpec.describe Permittable do
         "the year" => date.merge("on(1i)" => ""),
         "the month" => date.merge("on(2i)" => ""),
         "the day" => date.merge("on(3i)" => nil),
-        "year and month, day filled in" => { "on(1i)" => "", "on(2i)" => "", "on(3i)" => "1" }
+        "year and month, day filled in" => { "on(1i)" => "", "on(2i)" => "", "on(3i)" => "1" },
+        # The blank one need only be among those sent: ActiveModel reads the
+        # Hash {2 => nil, 3 => 1} and {1 => 2026, 2 => nil} as nil too.
+        "a blank month, the year not sent" => { "on(2i)" => "", "on(3i)" => "1" },
+        "a blank month, the day not sent" => { "on(1i)" => "2026", "on(2i)" => "" }
       }.each do |why, parts|
         expect(permit({ event: parts }, &decl).to_h).to eq({}), why
         expect(permit(parts) { permit_params(:create) { optional :on, :date, nullable: true } }.to_h)
@@ -783,11 +787,33 @@ RSpec.describe Permittable do
       expect(e.details).to eq(strays.keys.map { |key| { param: "event.#{key}", code: "unknown" } })
     end
 
-    it "lets the field's own key win when both are sent, the parts being no unknown keys either" do
+    # Strong parameters lets `on(1i)`-`(3i)` through `permit(:on)` and
+    # ActiveRecord assigns them AFTER the plain `on`, so parts the contract
+    # never read would overwrite the value it validated. They are therefore
+    # not consumed when the key is sent: `unknown:` sees them as it sees any
+    # other undeclared key.
+    it "lets the field's own key win for the value when both are sent, the parts staying subject to unknown:" do
       both = date.merge("on" => "2026-01-02")
-      expect(permit({ event: both }, &decl).to_h).to eq("on" => Date.new(2026, 1, 2))
+      e = violations_for({ event: both }, &decl)
+      expect(e.details).to eq(date.keys.map { |key| { param: "event.#{key}", code: "unknown" } })
+
+      ignoring = proc do
+        permit_params(:create, root: :event) { optional :on, :date }
+      end
+      expect(permit({ event: both }, &ignoring).to_h).to eq("on" => Date.new(2026, 1, 2))
       # Even parts that would make no value: the key is read, they are not.
-      expect(permit({ event: both.merge("on(2i)" => "Oct") }, &decl).to_h).to eq("on" => Date.new(2026, 1, 2))
+      expect(permit({ event: both.merge("on(2i)" => "Oct") }, &ignoring).to_h).to eq("on" => Date.new(2026, 1, 2))
+    end
+
+    it "logs the parts sent beside the field's own key under unknown: :log, and still reads the key" do
+      klass = permittable_class { permit_params(:create, root: :event, unknown: :log) { optional :on, :date } }
+      messages = []
+      logger = Object.new
+      logger.define_singleton_method(:warn) { |msg| messages << msg }
+      c = controller(klass, params: { event: date.merge("on" => "2026-01-02") })
+      c.define_singleton_method(:logger) { logger }
+      expect(c.permitted_params.to_h).to eq("on" => Date.new(2026, 1, 2))
+      expect(messages.join).to include("event.on(1i)", "event.on(2i)", "event.on(3i)")
     end
 
     it "leaves a part the contract declares as a field of its own to that field" do
@@ -3923,6 +3949,54 @@ RSpec.describe Permittable do
         result = submit(*controls)
         expect(result.status).to eq(200)
         expect(JSON.parse(result.body)["opens_at"]).to eq(["Time", "0001-01-01 00:00:00 UTC"])
+      end
+    end
+
+    describe "date_select parts sent beside the field's own key, with a real request" do
+      # The documented adoption path: `enforce: true` for the contract, and a
+      # legacy action that still hands the model `permit(:starts_on)`, which
+      # lets the parts through too. ActiveRecord assigns multiparameter
+      # attributes after ordinary ones, so parts nobody validated would win.
+      def build_events_controller(**rule)
+        IntegrationHarness.build_controller do
+          include Permittable
+
+          permit_params :create, root: :event, enforce: true, **rule do
+            required :starts_on, :date, validate: ->(d) { d >= Date.new(2026, 1, 1) || "must be 2026 or later" }
+          end
+
+          def create
+            render json: { contract: permitted_params, legacy: params.require(:event).permit(:starts_on).to_h }
+          end
+        end
+      end
+
+      let(:both) do
+        { "event[starts_on]" => "2026-06-01", "event[starts_on(1i)]" => "1999",
+          "event[starts_on(2i)]" => "1", "event[starts_on(3i)]" => "1" }
+      end
+
+      it "is a 422 naming the parts under unknown: :error, not a stored 1999-01-01 no rule saw" do
+        result = IntegrationHarness.dispatch(build_events_controller(unknown: :error), :create,
+                                             method: "POST", params: both)
+        expect(result.status).to eq(422)
+        expect(JSON.parse(result.body)["error"]["details"]).to eq(
+          %w[1i 2i 3i].map { |part| { "param" => "event.starts_on(#{part})", "code" => "unknown" } }
+        )
+      end
+
+      it "reads the field's own key under the default unknown: :ignore, the parts not in permitted_params" do
+        result = IntegrationHarness.dispatch(build_events_controller, :create, method: "POST", params: both)
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)["contract"]).to eq("starts_on" => "2026-06-01")
+      end
+
+      it "still reads the parts as the field when the key is not sent" do
+        parts_only = both.except("event[starts_on]")
+        result = IntegrationHarness.dispatch(build_events_controller(unknown: :error), :create,
+                                             method: "POST", params: parts_only)
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)["contract"]).to eq("starts_on" => "1999-01-01")
       end
     end
 

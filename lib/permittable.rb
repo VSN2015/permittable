@@ -2333,14 +2333,21 @@ module Permittable
   # what it would have had the client sent that value: the cast, `in:`,
   # `validate:`, `transform:`, the absence rule and `nullable:` all apply
   # unchanged, the action gets the field's own key, and the unknown-keys
-  # check never sees the parts. `hash` itself is left as it is: it may be
-  # the request's own params, which monitor mode hands back as they arrived.
+  # check never sees the parts it read. `hash` itself is left as it is: it
+  # may be the request's own params, which monitor mode hands back as they
+  # arrived.
   #
-  # Only when the field's own key is ABSENT: when both are sent, the key the
-  # contract declares wins and the parts are dropped unread, and still no
-  # unknown keys, for they belong to the field. And not when the contract
-  # declares one of the parts as a field of its own, which is how a contract
-  # could carry them through before this: that field keeps it.
+  # Only when the field's own key is ABSENT. When both are sent, the key the
+  # contract declares wins the VALUE, and the parts are left in the copy,
+  # untouched, for the unknown-keys check to judge as it always has: flagged
+  # under `unknown: :error`, logged under `:log`, dropped under `:ignore`.
+  # They must not be consumed unread: strong parameters passes them through
+  # `permit(:starts_on)` (the legacy action of an `enforce: true` rollout) and
+  # ActiveRecord assigns multiparameter attributes AFTER the plain ones, so
+  # parts hidden from `unknown: :error` would overwrite the value the
+  # contract validated. And not when the contract declares one of the parts
+  # as a field of its own, which is how a contract could carry them through
+  # before this: that field keeps it.
   def permittable_read_date_parts(fields, hash)
     read = nil
     fields.each do |field|
@@ -2349,13 +2356,13 @@ module Permittable
 
       key = field[:name].to_s
       names = Array.new(count) { |index| "#{key}(#{index + 1}i)" }
+      next if hash.key?(key)
       next unless names.any? { |name| hash.key?(name) }
       next if fields.any? { |other| names.include?(other[:name].to_s) }
 
       read ||= hash.dup
       parts = {}
       names.each.with_index(1) { |name, position| parts[position] = read.delete(name) if read.key?(name) }
-      next if hash.key?(key)
 
       # Parts that make no value are handed to the field as the several
       # values they are, which a scalar refuses as invalid_type: on the
@@ -2380,12 +2387,15 @@ module Permittable
   # an untouched picker still sit on their prompts beside it, so the form
   # arrives as {"(1i)" => "", "(2i)" => "", "(3i)" => "1"}. The time parts
   # of a :datetime are the other way round: ActiveModel defaults a blank
-  # (4i), (5i) or (6i) to 00 once the date is there, and so does this. A part
-  # that is not sent at all is no part left blank, and (4i) and (5i) must be
-  # sent (a time_select with `ignore_date:` sends only those, and a :datetime
+  # (4i), (5i) or (6i) to 00 once the date is there, and so does this. The
+  # blank part need only be among those SENT: ActiveModel reads a Hash with
+  # (2i) and (3i) but no (1i), or with (1i) and (2i) but no (3i), as nil when
+  # one of the ones it has is blank, and so does this. A part that is missing
+  # with no blank sibling is nil here, for a scalar to refuse as
+  # invalid_type: (1i)-(3i), and for a :datetime (4i) and (5i) too (a
+  # time_select with `ignore_date:` sends only those two, and a :datetime
   # needs a date); (6i), sent by `include_seconds:` only, may be missing.
-  # Whatever else is not an unsigned decimal integer is nil, for a scalar to
-  # refuse as invalid_type.
+  # Whatever else is not an unsigned decimal integer is nil likewise.
   def permittable_date_from_parts(parts, type)
     return "" if (1..3).any? { |position| parts.key?(position) && Coercion.absent_value?(parts[position]) }
 
