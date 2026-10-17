@@ -32,10 +32,11 @@ module Permittable
     # Building these once in columns_for keeps every drafting path (columns
     # alone, or a scan typed from columns) reading the same answers.
     #
-    # `assigned` marks a column the database or Rails fills in (the primary
-    # key, a timestamp): drafted from the columns alone it is left out, and a
-    # permit call that lists it gets it typed from the schema, but never
-    # `required`, since no client has to send it.
+    # `assigned` marks a column the database or Rails fills in (a generated
+    # primary key, a timestamp): drafted from the columns alone it is left
+    # out, and a permit call that lists it gets it typed from the schema, but
+    # never `required`, since no client has to send it. A primary key the
+    # client must send (a natural key) is not assigned (see assigned?).
     #
     # `rule` and `listed` are how column_line is told what it is drafting
     # for: the rule (see render) and whether the controller's permit call
@@ -470,14 +471,29 @@ module Permittable
     def draft_column(model, column)
       DraftColumn.new(name: column.name, type: column.type, null: column.null,
                       default_function: column.respond_to?(:default_function) && column.default_function,
-                      sensitive: sensitive_role(model, column.name), assigned: assigned?(model, column.name),
+                      sensitive: sensitive_role(model, column.name), assigned: assigned?(model, column),
                       **model_facts(model, column))
     end
 
+    # Whether the database or Rails fills the column in, so no client has to
+    # send it. A timestamp is; a primary key only when the database really
+    # generates it: the auto-increment integer of a single-column key, or a
+    # key with a default or a default function (a uuid). A natural key
+    # (`sku`, a `create_table ..., id: :string`) or a part of a composite
+    # key is the client's to send, and is drafted like any other column.
     # Array() flattens a composite primary key (an Array in Rails 7.1+) into
     # its column names; a nil primary key becomes [].
-    def assigned?(model, name)
-      SKIPPED_COLUMNS.include?(name) || Array(model.primary_key).map(&:to_s).include?(name)
+    def assigned?(model, column)
+      return true if SKIPPED_COLUMNS.include?(column.name)
+
+      keys = Array(model.primary_key).map(&:to_s)
+      return false unless keys.include?(column.name)
+
+      (keys.one? && column.type == :integer) || !column.default.nil? || default_function?(column)
+    end
+
+    def default_function?(column)
+      column.respond_to?(:default_function) && !column.default_function.nil?
     end
 
     # What the model adds to one column. An error reading it degrades THAT

@@ -308,7 +308,9 @@ RSpec.describe Permittable::Generator do
       expect(draft).not_to include("updated_at")
     end
 
-    it "skips every column of a composite primary key (Rails 7.1+ returns an Array)" do
+    # Not assigned: no database fills in the parts of a composite key, so a
+    # client sends them, and they are drafted like any other column.
+    it "drafts every column of a composite primary key like any other (Rails 7.1+ returns an Array)" do
       composite = Class.new(TestModel) do
         self.table_name = "gen_articles"
 
@@ -318,8 +320,8 @@ RSpec.describe Permittable::Generator do
       end
       stub_const("GenCompositeArticle", composite)
       draft = described_class.draft(model: GenCompositeArticle)
-      expect(draft).not_to include(":id")
-      expect(draft).not_to include(":views")
+      expect(draft).to include("required :id, :integer")
+      expect(draft).to include("optional :views, :integer")
       expect(draft).to include("required :title, :string")
     end
 
@@ -365,6 +367,64 @@ RSpec.describe Permittable::Generator do
         draft = described_class.draft(model: GenCompositeArticle, scan: scan)
         expect(draft).to include("optional :views, :integer")
         expect(draft).not_to include("virtual")
+      end
+    end
+
+    # Only a key the database generates is assigned: a client has to send a
+    # natural key, and the column is NOT NULL with no default to say so.
+    context "when a primary key is the client's to send" do
+      before do
+        ActiveRecord::Schema.define do
+          create_table :gen_items, primary_key: :sku, id: :string do |t|
+            t.string :title, null: false
+          end
+          create_table :gen_order_lines, primary_key: %i[order_id pos] do |t|
+            t.integer :order_id, null: false
+            t.integer :pos, null: false
+            t.string :note
+          end
+          create_table :gen_tokens, id: :string, default: -> { "lower(hex(randomblob(16)))" } do |t|
+            t.string :label
+          end
+        end
+        stub_const("GenItem", Class.new(TestModel) { self.table_name = "gen_items" })
+        stub_const("GenOrderLine", Class.new(TestModel) { self.table_name = "gen_order_lines" })
+        stub_const("GenToken", Class.new(TestModel) { self.table_name = "gen_tokens" })
+      end
+
+      after do
+        %i[gen_items gen_order_lines gen_tokens].each { |table| ActiveRecord::Base.connection.drop_table(table, if_exists: true) }
+      end
+
+      def create_rule(draft) = draft[/permit_params :create.*?^end/m]
+
+      it "drafts a natural string key the permit call lists as required on create" do
+        scan = described_class.scan("params.require(:gen_item).permit(:sku, :title)")
+        draft = described_class.draft(model: GenItem, scan: scan)
+        expect(create_rule(draft)).to include("required :sku, :string")
+        expect(draft[/permit_params :update.*?^end/m]).to include("optional :sku, :string")
+      end
+
+      it "drafts a natural string key as required when drafting from the columns alone" do
+        expect(create_rule(described_class.draft(model: GenItem))).to include("required :sku, :string")
+      end
+
+      it "drafts the parts of a composite key as required on create, not left out or optional" do
+        columns_only = described_class.draft(model: GenOrderLine)
+        expect(create_rule(columns_only)).to include("required :order_id, :integer", "required :pos, :integer")
+
+        scan = described_class.scan("params.require(:gen_order_line).permit(:order_id, :pos, :note)")
+        permitted = described_class.draft(model: GenOrderLine, scan: scan)
+        expect(create_rule(permitted)).to include("required :order_id, :integer", "required :pos, :integer")
+      end
+
+      it "still treats a key the database fills in (a default function) as assigned" do
+        expect(described_class.draft(model: GenToken)).not_to include(":id")
+
+        scan = described_class.scan("params.require(:gen_token).permit(:id, :label)")
+        draft = described_class.draft(model: GenToken, scan: scan)
+        expect(draft).to include("optional :id, :string")
+        expect(draft).not_to include("required")
       end
     end
 
