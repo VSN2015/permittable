@@ -663,7 +663,7 @@ optional :host,    :string, format: :hostname
 
 A preset carries something a hand-written Regexp cannot: the JSON Schema **`format` keyword** the wider ecosystem understands, so [exported docs](#exporting-openapi-docs-that-cannot-drift) say `"format": "uuid"` rather than only a wall of `pattern`. The `pattern` is still emitted next to it — in draft 2020-12 `format` is an annotation unless a validator opts into asserting it, so the pattern is what actually enforces.
 
-An unknown preset name fails at class load, listing the presets. Passing a `Regexp` directly works exactly as before, and the RSpec matcher speaks both spellings: `matching(:email)` asserts the preset, `matching(/re/)` the Regexp.
+An unknown preset name fails at class load, listing the presets. Passing a `Regexp` directly works exactly as before, and the RSpec matcher speaks both spellings: `matching(:email)` (or `matching("email")`, as the contract accepts either) asserts the preset, `matching(/re/)` the Regexp.
 
 ### Types and strict coercion
 
