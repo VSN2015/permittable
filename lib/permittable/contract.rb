@@ -71,10 +71,15 @@ module Permittable
         # than nowhere, since a :log that cannot log is :ignore by another
         # name. Defining the contract does not raise for a missing logger:
         # whether one exists is only known when the contract is called.
+        #
+        # The fallback Logger is built on every call, not memoized: #call!
+        # makes a new host per call, so an instance memo never applied, and a
+        # class-level one would capture $stderr once, hiding a later
+        # reassignment (a test's capture, a daemonized process's redirect).
         def logger
-          return Rails.logger if defined?(Rails) && Rails.respond_to?(:logger) && Rails.logger
+          return ::Rails.logger if defined?(::Rails) && ::Rails.respond_to?(:logger) && ::Rails.logger
 
-          @logger ||= ::Logger.new($stderr)
+          ::Logger.new($stderr)
         end
 
         # Instrumentation payload label (anonymous classes have no name).
