@@ -665,6 +665,14 @@ module Permittable
     # named in its shadows rather than emitted. Distinct shapes are both
     # kept; OpenAPI allows `/x/new` beside `/x/{a}`.
     #
+    # Before any of that, a variant that is no request path of its own is
+    # dropped (request_path?). An absent group at the start of a route
+    # leaves them: `/(:locale)(/:theme)` without :locale is `//{theme}`,
+    # but Rails squeezes `GET //dark` to `GET /dark`, which binds :locale
+    # (or, constrained away from it, no route at all); and
+    # `(/:locale(/:region))` with nothing present is empty, so the route
+    # does not answer `GET /`.
+    #
     # The list is then reversed, which puts every group's ABSENT variant
     # first at every nesting level, the order the document lists them in.
     # The variants of one route share an operation, and it is the operationId
@@ -689,6 +697,8 @@ module Permittable
 
       kept = {}
       first_of_shape = {}
+      # Such a variant matches no request, so it shadows nothing either.
+      variants = variants.select { |tokens| request_path?(tokens) }
       variants.each_with_index do |tokens, index|
         next if variants.take(index).any? { |earlier| shadowed?(earlier, tokens) }
 
@@ -782,6 +792,16 @@ module Permittable
     def render(tokens)
       path = tokens.map { |token| token.is_a?(Param) ? "{#{token.name}}" : token }.join
       path.empty? ? "/" : path
+    end
+
+    # Whether a variant could be a request's path. Rails normalizes the
+    # path before it matches any route (Journey::Router::Utils.
+    # normalize_path, from 6.1 to 8.1): it is given a leading "/", and every
+    # run of slashes is squeezed to one. So a variant that does not start
+    # with "/", or that holds two in a row, is matched by no request: the
+    # URL a client would build from it reaches the router as another path.
+    def request_path?(tokens)
+      tokens.first == "/" && tokens.each_cons(2).none? { |pair| pair == %w[/ /] }
     end
 
     # Whether Rails, trying `earlier` first, leaves `later` no URL: wherever
