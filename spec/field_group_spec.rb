@@ -204,6 +204,20 @@ RSpec.describe Permittable::FieldGroup do
         .to raise_error(ArgumentError, /finalize/)
     end
 
+    it "says that only:/except: does not lift the refusal, since the finalize cannot be split" do
+      booking = Permittable::Contract.define do
+        required :starts_on, :date
+        required :ends_on,   :date
+        finalize { |p| p }
+      end
+      message = %r{only:/except: .*does not lift.*finalize cannot be split}m
+
+      expect { permittable_class { permit_params(:create) { use booking, only: %i[starts_on] } } }
+        .to raise_error(ArgumentError, message)
+      expect { permittable_class { permit_params(:create) { use booking, except: %i[ends_on] } } }
+        .to raise_error(ArgumentError, message)
+    end
+
     it "rejects anything that is not a field group" do
       expect { permittable_class { permit_params(:create) { use %i[city] } } }
         .to raise_error(ArgumentError, /use expects a field group/)
