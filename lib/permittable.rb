@@ -1416,6 +1416,14 @@ module Permittable
       end
     end
 
+    # An `in:` that is neither a Range nor a list the gem read and cast
+    # itself, so one resolve_in! kept exactly as given: its contents are the
+    # host's, and unknown at class load.
+    def live_in?(field)
+      allowed = field[:in]
+      !allowed.nil? && !allowed.is_a?(Range) && Coercion.in_list(allowed).nil?
+    end
+
     def string_in_hint(allowed)
       return "" unless allowed.is_a?(String)
 
@@ -1629,6 +1637,12 @@ module Permittable
     # :string field means the app gets the Integer 25 either way, whether the
     # request sent "25" (cast then transformed) or omitted the field
     # (authored as the already-final Integer).
+    #
+    # The one rule not checked is `in:` when it is an object used as given
+    # (see resolve_in!): a live registry is empty at class load, so
+    # `in: LIVE, default: "order.paid"` would be refused for a member it will
+    # hold by the first request. What it will contain is unknown then, so its
+    # `include?` is not asked; every other rule is still checked.
     def validate_authored_value!(field, opt)
       return unless field.key?(opt)
       return if authored_nil!(field, opt)
@@ -1637,7 +1651,7 @@ module Permittable
       # proc cannot rewrite the host's own literal.
       authored = field[opt].is_a?(String) ? field[opt].dup : field[opt]
       value = Coercion.apply_normalize(field[:normalize], authored)
-      status, result = Coercion.check_scalar(field, value)
+      status, result = Coercion.check_scalar(live_in?(field) ? field.except(:in) : field, value)
       raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{result})" unless status == :ok
 
       field[opt] = freeze_authored(field[:transform] ? field[opt] : result)
