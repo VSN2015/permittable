@@ -211,6 +211,22 @@ RSpec.describe Permittable::Contract do
     expect(events.first[:details]).to eq([{ param: "user.email", code: "format" }])
   end
 
+  it "labels the violation event with the Contract and the \"call\" action, never nil" do
+    # README: payload[:action] is a String. A Contract has no action_name, so
+    # without a label here a subscriber doing payload[:action].to_sym or
+    # "#{payload[:controller]}##{payload[:action]}" got nil.
+    events = []
+    subscription = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
+      events << payload.slice(:controller, :action, :mode)
+    end
+    begin
+      contract.call(user: { email: "nope" })
+    ensure
+      ActiveSupport::Notifications.unsubscribe(subscription)
+    end
+    expect(events).to eq([{ controller: "Permittable::Contract", action: "call", mode: :enforce }])
+  end
+
   describe "without Rails loaded" do
     # spec_helper loads ActiveRecord, which pulls in every ActiveSupport core
     # extension and would mask a require the gem itself forgot. A standalone
