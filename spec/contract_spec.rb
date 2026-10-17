@@ -211,6 +211,43 @@ RSpec.describe Permittable::Contract do
     expect(events.first[:details]).to eq([{ param: "user.email", code: "format" }])
   end
 
+  describe "unknown: :log" do
+    let(:logged) do
+      described_class.define(unknown: :log) { required :name, :string }
+    end
+
+    it "warns through Rails.logger, read when the contract is called rather than when it is defined" do
+      lines = []
+      logger = Object.new
+      logger.define_singleton_method(:warn) { |message| lines << message }
+      stub_const("Rails", Module.new)
+      contract = logged
+      # Rails.logger is often assigned after the contracts' constants load.
+      Rails.define_singleton_method(:logger) { logger }
+
+      result = contract.call(name: "x", rogue: 1, "other" => 2)
+
+      expect(result.params.to_h).to eq("name" => "x")
+      expect(lines.length).to eq(1)
+      expect(lines.first).to match(/unknown parameter\(s\) ignored by the .*contract: rogue, other/)
+    end
+
+    it "still warns, on $stderr, when there is no Rails.logger to warn through" do
+      # A webhook payload or a CSV row in a plain Ruby script has no Rails at
+      # all; :log must not quietly behave like :ignore there.
+      hide_const("Rails")
+
+      expect { logged.call(name: "x", rogue: 1) }
+        .to output(/unknown parameter\(s\) ignored by the .*contract: rogue/).to_stderr
+    end
+
+    it "stays quiet when nothing is undeclared" do
+      hide_const("Rails")
+
+      expect { logged.call(name: "x") }.not_to output.to_stderr
+    end
+  end
+
   describe "without Rails loaded" do
     # spec_helper loads ActiveRecord, which pulls in every ActiveSupport core
     # extension and would mask a require the gem itself forgot. A standalone

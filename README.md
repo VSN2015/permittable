@@ -1382,7 +1382,7 @@ CreateUser.json_schema                 # the contract as JSON Schema (draft 2020
 CreateUser.rule                        # the frozen, introspectable rule data
 ```
 
-Everything carries over — strict coercion, `""`/`nil` absence, defaults, `finalize` with `violate!`, `sensitive:` log-redaction registration, `invalid_parameters.permittable` instrumentation, 400-vs-422 status semantics for a missing `root:`.
+Everything carries over — strict coercion, `""`/`nil` absence, defaults, `finalize` with `violate!`, `sensitive:` log-redaction registration, `invalid_parameters.permittable` instrumentation, 400-vs-422 status semantics for a missing `root:`. `unknown: :log` warns too, through `Rails.logger` (read at call time) or, with no Rails or no `Rails.logger`, on `$stderr`, so a plain script still hears about undeclared keys rather than having them dropped silently.
 
 **What `#call` still raises.** Client data never raises out of the gem's own checks. Wrong types, non-finite numbers, Strings in any encoding (valid or not) and undeclared keys in any encoding all come back as violations in the `Result`. Two things do raise, on purpose, because neither is the client's mistake. An input that is not a Hash, `nil` (read as `{}`) or an object answering `to_unsafe_h` (such as `ActionController::Parameters`) raises `ArgumentError`. And an exception raised by your own code (a `validate:`, `transform:` or `normalize:` proc, or `finalize`) reaches the caller unchanged, since swallowing it would hide a bug. The one exception is a `normalize:` proc that raises `ArgumentError` or an encoding error on a String that is neither UTF-8 nor ASCII-only; that value is left as it is, like a preset's.
 
