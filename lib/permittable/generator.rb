@@ -32,12 +32,17 @@ module Permittable
     # Building these once in columns_for keeps every drafting path (columns
     # alone, or a scan typed from columns) reading the same answers.
     #
+    # `assigned` marks a column the database or Rails fills in (the primary
+    # key, a timestamp): drafted from the columns alone it is left out, and a
+    # permit call that lists it gets it typed from the schema, but never
+    # `required`, since no client has to send it.
+    #
     # `rule` and `listed` are how column_line is told what it is drafting
     # for: the rule (see render) and whether the controller's permit call
     # lists the column. They ride on the column, set by in_rule, so the scan
     # path hands them to column_line without its own methods changing.
     DraftColumn = Struct.new(:name, :type, :null, :default, :default_function, :enum, :enum_integers, :sensitive,
-                             :unread, :rule, :listed, keyword_init: true) do
+                             :unread, :rule, :listed, :assigned, keyword_init: true) do
       def in_rule(rule, listed: false)
         self.class.new(**to_h, rule: rule, listed: listed)
       end
@@ -342,7 +347,7 @@ module Permittable
       columns = columns_for(model)
       scan = nil unless scan&.found?
       return nil unless columns || scan
-      return column_draft(model, columns.values, [], except: except) unless scan
+      return column_draft(model, unassigned(columns), [], except: except) unless scan
 
       shared = scanned_lines(scan, listed_columns(columns, :shared))
       return fallback_draft(model, scan, columns, except: except) unless declares_field?(shared)
@@ -350,6 +355,12 @@ module Permittable
       render(root: scan.root, model: columns && model, except: except) do |rule|
         scanned_lines(scan, listed_columns(columns, rule))
       end
+    end
+
+    # The columns worth drafting without a permit call to name them: not the
+    # ones the database or Rails assigns (see DraftColumn).
+    def unassigned(columns)
+      columns.values.reject(&:assigned)
     end
 
     # The columns as one rule drafts them (see DraftColumn#in_rule), each
@@ -387,7 +398,7 @@ module Permittable
 
       root = scan.root || (rootless_body?(scan) ? nil : default_root(model))
       undrafted = (Array(scan.undecided) + Array(scan.route_params).filter_map { |arg| scalar_key(arg) }).map(&:to_s)
-      drafted = columns.except(*undrafted)
+      drafted = columns.reject { |_, column| column.assigned }.except(*undrafted)
       # As in drop_drafted_todos: a rootless key the columns now declare is
       # not also a "not in this contract" TODO.
       scan = scan.dup.tap { |copy| copy.rootless = Array(scan.rootless).reject { |arg| drafted.key?(scalar_key(arg).to_s) } }
@@ -416,9 +427,13 @@ module Permittable
       model.respond_to?(:columns) ? model : nil
     end
 
-    # The columns a contract should cover, keyed by name — or nil when there
-    # is no model or its schema is unreachable (same philosophy as the drift
-    # guard: never let generation crash on a half-migrated database).
+    # Every column, keyed by name — or nil when there is no model or its
+    # schema is unreachable (same philosophy as the drift guard: never let
+    # generation crash on a half-migrated database). All of them, the
+    # primary key and timestamps too: this is also where a permitted key's
+    # type is looked up, and a column left out here read as "not a
+    # database column". What is drafted without a permit call is narrowed
+    # later (see DraftColumn#assigned).
     def columns_for(model)
       columns = schema_columns(model)
       columns&.to_h { |column| [column.name, draft_column(model, column)] }
@@ -441,10 +456,7 @@ module Permittable
       return nil unless model.respond_to?(:columns)
       return nil unless model.table_exists?
 
-      # Array() flattens a composite primary key (an Array in Rails 7.1+)
-      # into its column names; a nil primary key becomes [].
-      skipped = SKIPPED_COLUMNS + Array(model.primary_key).map(&:to_s)
-      model.columns.reject { |c| skipped.include?(c.name) }
+      model.columns
     rescue StandardError => e
       raise unless defined?(ActiveRecord::ActiveRecordError) && e.is_a?(ActiveRecord::ActiveRecordError)
 
@@ -458,7 +470,14 @@ module Permittable
     def draft_column(model, column)
       DraftColumn.new(name: column.name, type: column.type, null: column.null,
                       default_function: column.respond_to?(:default_function) && column.default_function,
-                      sensitive: sensitive_role(model, column.name), **model_facts(model, column))
+                      sensitive: sensitive_role(model, column.name), assigned: assigned?(model, column.name),
+                      **model_facts(model, column))
+    end
+
+    # Array() flattens a composite primary key (an Array in Rails 7.1+) into
+    # its column names; a nil primary key becomes [].
+    def assigned?(model, name)
+      SKIPPED_COLUMNS.include?(name) || Array(model.primary_key).map(&:to_s).include?(name)
     end
 
     # What the model adds to one column. An error reading it degrades THAT
@@ -940,7 +959,7 @@ module Permittable
     # request that omits the field, which would overwrite columns on partial
     # updates; the database already handles creation.
     def required_column?(column)
-      return false if column.null
+      return false if column.null || column.assigned
       return false unless column.default.nil?
 
       !column.default_function

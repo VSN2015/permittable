@@ -323,6 +323,58 @@ RSpec.describe Permittable::Generator do
       expect(draft).to include("required :title, :string")
     end
 
+    # The skip list is for columns drafted with nothing to say they are
+    # client input. A permit call that names one says so, and the column
+    # is as real as any other: typed from the schema, so the drift guard
+    # stays on.
+    context "when the permit call lists a primary key or a timestamp" do
+      let(:scan) { described_class.scan("params.require(:gen_article).permit(:id, :title, :created_at, :updated_at)") }
+      let(:draft) { described_class.draft(model: GenArticle, scan: scan) }
+
+      it "drafts them with their real types, not as virtual string fields" do
+        expect(draft).to include("optional :id, :integer")
+        expect(draft).to include("optional :created_at, :datetime")
+        expect(draft).to include("optional :updated_at, :datetime")
+        expect(draft).not_to include("virtual")
+        expect(draft).not_to include("not a database column")
+      end
+
+      it "drafts them optional although the columns are NOT NULL, since the database or Rails assigns them" do
+        expect(draft).to include("required :title, :string")
+        expect(draft.scan(/^\s*required :\w+/)).to eq(["  required :title"])
+      end
+
+      it "loads, and casts a timestamp a client sends as the column's type" do
+        enforced = draft.gsub("mode: :monitor", "mode: :enforce")
+        klass = permittable_class { class_eval(enforced) }
+        params = { gen_article: { title: "Hi", created_at: "2026-10-17T12:00:00Z" } }
+        permitted = controller(klass, params: params).permitted_params
+        expect(permitted["created_at"]).to respond_to(:year)
+      end
+
+      it "types every column of a composite primary key from the schema" do
+        composite = Class.new(TestModel) do
+          self.table_name = "gen_articles"
+
+          def self.primary_key
+            %w[id views]
+          end
+        end
+        stub_const("GenCompositeArticle", composite)
+        scan = described_class.scan("params.require(:gen_article).permit(:views, :title)")
+        draft = described_class.draft(model: GenCompositeArticle, scan: scan)
+        expect(draft).to include("optional :views, :integer")
+        expect(draft).not_to include("virtual")
+      end
+    end
+
+    it "still leaves the primary key and timestamps out when a scan names no field and the columns are drafted" do
+      scan = described_class.scan("params.require(:gen_article).permit(*PERMITTED)")
+      draft = described_class.draft(model: GenArticle, scan: scan)
+      expect(draft).to include("required :title, :string")
+      expect(draft).not_to match(/:(id|created_at|updated_at)\b/)
+    end
+
     it "maps a json column onto the opaque :json contract type" do
       expect(draft).to include("optional :settings, :json")
     end
