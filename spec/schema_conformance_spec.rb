@@ -253,6 +253,24 @@ module SchemaConformance
         [{ "at" => "not a time" }, :format_annotation]
       ]
     },
+    "required strings that are not :string" => {
+      # "" is absent whatever the type, so each of these is `missing` at
+      # runtime; only minLength lets the schema agree for the string encodings.
+      contract: proc {
+        required :title,     :string
+        required :price,     :decimal
+        required :due_on,    :date
+        required :starts_at, :datetime
+      },
+      payloads: [
+        [{ "title" => "t", "price" => "1.50", "due_on" => "2026-01-01", "starts_at" => "2026-01-01T10:00:00Z" }, :agree],
+        [{ "title" => "t", "price" => 1.5, "due_on" => "2026-01-01", "starts_at" => "2026-01-01T10:00:00Z" }, :agree],
+        [{ "title" => "", "price" => "1.50", "due_on" => "2026-01-01", "starts_at" => "2026-01-01T10:00:00Z" }, :agree],
+        [{ "title" => "t", "price" => "", "due_on" => "2026-01-01", "starts_at" => "2026-01-01T10:00:00Z" }, :agree],
+        [{ "title" => "t", "price" => "1.50", "due_on" => "", "starts_at" => "2026-01-01T10:00:00Z" }, :agree],
+        [{ "title" => "t", "price" => "1.50", "due_on" => "2026-01-01", "starts_at" => "" }, :agree]
+      ]
+    },
     "arrays" => {
       contract: proc { array :tags, of: :string, length: 1..3 },
       payloads: [

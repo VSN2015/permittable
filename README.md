@@ -1465,7 +1465,7 @@ A `format:` regexp that does not translate to ECMA-262 is looser in the same way
 
 | Contract | Emitted schema |
 |---|---|
-| `required` / `optional` | the object's `required:` array; required strings also get `minLength: 1` (`""` is absent) |
+| `required` / `optional` | the object's `required:` array; required strings, and the string encoding of a required `:decimal`/`:date`/`:datetime`, also get `minLength: 1` (`""` is absent; a `nullable:` `:decimal`/`:date`/`:datetime` reads it as a null, so it gets none) |
 | `:string` `:integer` `:float` `:boolean` | `string` / `integer` / `number` / `boolean` |
 | `:date` / `:datetime` | `string` + `format: date` / `date-time` |
 | `:decimal` | `type: ["string", "number"]` + `format: decimal` (string is the precision-safe encoding) |
