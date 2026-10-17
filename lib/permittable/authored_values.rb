@@ -7,15 +7,18 @@ module Permittable
   #     its own `transform:` — see permittable_transform below for exactly
   #     which field that is and why. A SUB-FIELD's own transform: still
   #     runs, so what gets stored is what an equivalent request would
-  #     produce.
+  #     produce — for a default:. An example: reads with `transform: false`,
+  #     which suppresses every transform at every depth: it documents what a
+  #     client SENDS, so it must not be read through app code that reshapes
+  #     the value into what the action receives.
   #   * violations carry no `message:` — they become an ArgumentError for
   #     the contract's author, not a response for a client, and I18n may not
   #     be loaded yet.
   class AuthoredValues
     include Permittable
 
-    def self.read_array(field, value)
-      new.read_array(field, value)
+    def self.read_array(field, value, transform: true)
+      new.read_array(field, value, transform: transform)
     end
 
     def self.summary(violations)
@@ -23,9 +26,10 @@ module Permittable
     end
 
     # [value as a request would get it, violations]
-    def read_array(field, value)
+    def read_array(field, value, transform: true)
       violations = []
       @field = field
+      @transform = transform
       read = permittable_check_array(field, value, path: field[:name].to_s, unknown: :ignore, violations: violations)
       [read, violations]
     end
@@ -50,8 +54,10 @@ module Permittable
     # see its comment), so nothing inside its subtree is worth reading
     # transformed: suppressing every nested call too keeps that walk free of
     # app code, exactly as a scalar default's cast-only check already is.
+    #
+    # With `transform: false` (an example:) none runs, at any depth.
     def permittable_transform(field, value)
-      return value if @field[:transform] || field.equal?(@field)
+      return value if !@transform || @field[:transform] || field.equal?(@field)
 
       super
     end

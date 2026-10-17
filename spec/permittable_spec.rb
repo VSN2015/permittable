@@ -1576,6 +1576,45 @@ RSpec.describe Permittable do
       expect(fields.map { |f| f[:example] }).to eq([21, [3]])
     end
 
+    it "casts an example: under transform: too, which a default: is not, since no example reaches the action" do
+      klass = permittable_class do
+        permit_params(:create) do
+          optional :age,   :integer, example: "18", transform: ->(v) { v * 12 }
+          optional :ok,    :boolean, example: "true", transform: ->(v) { v ? 1 : 0 }
+          array    :ids,   of: :integer, example: %w[3], transform: ->(a) { a.sum }
+          optional :limit, :integer, example: "25", default: "25", transform: ->(v) { v * 2 }
+        end
+      end
+      fields = klass.permittable_contracts.last[:fields]
+      expect(fields.map { |f| f[:example] }).to eq([18, true, [3], 25])
+      expect(fields.last[:default]).to eq("25")
+
+      properties = Permittable::JsonSchema.rule(klass.permit_rule_for("create"))["properties"]
+      expect(properties.transform_values { |schema| schema["examples"] })
+        .to eq("age" => [18], "ok" => [true], "ids" => [[3]], "limit" => [25])
+    end
+
+    it "reads a block array's example: with no transform: at any depth, though its default: runs sub-field ones" do
+      sent = [{ "price" => "9.99", "tags" => "gift,red", "dims" => { "w" => "3" } }]
+      klass = permittable_class do
+        permit_params(:create) do
+          array :line_items, example: sent, default: sent do
+            required :price, :decimal, transform: ->(d) { (d * 100).to_i }
+            optional :tags,  :string,  transform: ->(s) { s.split(",") }
+            optional(:dims) { optional :w, :integer, transform: ->(w) { w * 10 } }
+          end
+        end
+      end
+      received = [{ "price" => 999, "tags" => %w[gift red], "dims" => { "w" => 30 } }]
+
+      published = Permittable::JsonSchema.rule(klass.permit_rule_for("create"))["properties"]["line_items"]["examples"]
+      expect(published).to eq([[{ "price" => 9.99, "tags" => "gift,red", "dims" => { "w" => 3 } }]])
+      # The published example is a request the server accepts, as authored.
+      expect(controller(klass, params: { line_items: published.first }).permitted_params[:line_items]).to eq(received)
+      # The default is what the action receives, so its sub-field transforms still run.
+      expect(controller(klass).permitted_params[:line_items]).to eq(received)
+    end
+
     it "hands out a default: with nothing frozen inside it, however deep" do
       klass = permittable_class do
         permit_params(:create) do
