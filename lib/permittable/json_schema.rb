@@ -311,8 +311,12 @@ module Permittable
     # :date, :datetime and :decimal that is the only thing the schema can say
     # about a blank: `format` is an annotation, and "decimal" is no format a
     # validator knows. (A whitespace-only string needs no floor there: those
-    # types refuse it as invalid_type, which is a cast failure the schema
-    # already leaves to `format`.)
+    # types refuse it as invalid_type, and the schema never claims to catch a
+    # cast failure. For :date and :datetime `format` at least names the
+    # failure to a validator that asserts it; for :decimal nothing does, so
+    # "   " passes the schema and earns a 422. That is a documented looser
+    # case, the same one as "abc" for a :decimal, and deliberately has no
+    # `pattern` to close it.)
     #
     # A nullable field is the exception: it reads "" as an explicit null, a
     # value rather than an absence, so a floor would reject what the server
