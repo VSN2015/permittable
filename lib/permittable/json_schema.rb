@@ -17,8 +17,9 @@ module Permittable
   #     null as a present value of the wrong type — so the schema rejects a
   #     null the server would accept and ignore.
   #   * `validate:`/`transform:`/`finalize` are opaque callables — they never
-  #     change what a client may SEND, so fields carrying them are flagged
-  #     with `x-permittable-*` extensions rather than mistranslated.
+  #     change what a client may SEND, so the field carrying one (or, for
+  #     `finalize`, the rule's own object) is flagged with an `x-permittable-*`
+  #     extension rather than mistranslated.
   #
   # All three leave the schema STRICTER than the server, never looser: a
   # client that validates against the published document is conservative,
@@ -32,6 +33,8 @@ module Permittable
   #   * a `:json` field's `max_depth:` — `x-permittable-max-depth`;
   #   * a Range of non-numbers (`in: "a".."m"`) — `x-permittable-range`;
   #   * a `validate:` proc — `x-permittable-custom-validation`;
+  #   * a `finalize` block, whose `violate!` cross-field checks no field's
+  #     schema can carry — `x-permittable-finalize` on the rule's object;
   #   * a `normalize:` step, which the server runs BEFORE it checks, so
   #     "   " passes a minLength of 3 and is then absent —
   #     `x-permittable-normalize`;
@@ -66,8 +69,16 @@ module Permittable
     # `root:` envelope when the rule declares one. The wrapper itself stays
     # permissive even under `unknown: :error` — the runtime never inspects
     # sibling keys outside the root.
+    #
+    # `finalize` is the one opaque callable that belongs to the rule, not to
+    # a field: it runs once every field has passed and can still refuse the
+    # payload (`ends_on` before `starts_on`), which no per-field keyword can
+    # say. The flag therefore rides on the rule's own object, inside the
+    # `root:` wrapper where the fields are, so a client or generator that
+    # reads the document knows the schema alone is not the whole verdict.
     def rule(permit_rule)
       schema = object(permit_rule[:fields], unknown: permit_rule[:unknown])
+      schema["x-permittable-finalize"] = true if permit_rule[:finalize]
       return schema unless permit_rule[:root]
 
       root = permit_rule[:root].to_s
