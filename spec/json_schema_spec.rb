@@ -170,6 +170,15 @@ RSpec.describe Permittable::JsonSchema do
       end
     end
 
+    # One that keeps its base class's include? is a list, so it has an enum
+    # — what Rails' config_for(:plans) returns is such a Hash subclass.
+    it "exports a Hash subclass that keeps Hash's include? as an enum of its keys" do
+      plans = ActiveSupport::OrderedOptions.new.update(free: { price: 0 }, pro: { price: 10 })
+      prop = property("plan") { optional :plan, :string, in: plans }
+      expect(prop["enum"]).to eq(%w[free pro])
+      expect(prop).not_to have_key("x-permittable-custom-validation")
+    end
+
     it "emits BigDecimal bounds as JSON numbers, which is all minimum/maximum may be" do
       # The natural way to bound a price. Routed through the authored-value
       # re-encoding, the bounds came out as the strings "0.01" / "999.99" —

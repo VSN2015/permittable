@@ -1042,41 +1042,48 @@ module Permittable
     end
 
     # The members of an `in:` that is a LIST, or nil when it is not one.
-    # Only Array, Set, Hash and Enumerator count, and only when the object's
-    # OWN class provides the collection's ordinary include? — not a Hash,
-    # Array or Set SUBCLASS overriding it (a case-insensitive allowlist, a
-    # fuzzy Set, a registry matching some other way entirely). `case allowed;
-    # when Hash ...` matches with ===, which for a Class is is_a?, so a
-    # subclass would otherwise match its ancestor's branch and have its
-    # override silently discarded — read for its raw keys/elements instead,
-    # which can invert which values it actually accepts. It is left opaque
-    # instead, exactly like any other object whose include? is the point
-    # (see resolve_in!) and enumerating it may be expensive (a DB-backed
+    # Only Array, Set, Hash and Enumerator count, and only when the object
+    # answers with the collection's ordinary include? — not one a Hash,
+    # Array or Set SUBCLASS overrides (a case-insensitive allowlist, a fuzzy
+    # Set, a registry matching some other way entirely). `case allowed; when
+    # Hash ...` matches with ===, which for a Class is is_a?, so a subclass
+    # would otherwise match its ancestor's branch and have its override
+    # silently discarded — read for its raw keys/elements instead, which can
+    # invert which values it actually accepts. It is left opaque instead,
+    # exactly like any other object whose include? is the point (see
+    # resolve_in!) and enumerating it may be expensive (a DB-backed
     # registry).
+    #
+    # So the test is which module OWNS include?, not the object's exact
+    # class. A subclass that keeps its base's include? answers exactly what
+    # its keys or elements say, and is a list like its base. Rails'
+    # `config_for(:plans)` returns one, an ActiveSupport::OrderedOptions:
+    # an exact-class test left it opaque, so `include?("pro")` asked about
+    # its Symbol keys and every request was refused.
     #
     # A Hash lists its KEYS, which is what Hash#include? asks about — the
     # Rails enum idiom, `in: Post.statuses` — and, like a Set, is stored as a
     # Set, so membership stays O(1) per request.
-    # ActiveSupport::HashWithIndifferentAccess is the one Hash subclass
-    # accepted anyway: its include? override only canonicalises the argument
-    # (String/Symbol) before the SAME key lookup, so its keys are still
-    # exactly its members — and it is what a Rails enum's own reader
-    # (`Post.statuses`) actually returns.
+    # ActiveSupport::HashWithIndifferentAccess is the one include? override
+    # accepted anyway: it only canonicalises the argument (String/Symbol)
+    # before the SAME key lookup, so its keys are still exactly its members
+    # — and it is what a Rails enum's own reader (`Post.statuses`) actually
+    # returns.
     # Enumerator::Lazy is the same story on the Enumerator side: Lazy
     # overrides chain methods like map and select, but not include?, so it
     # is still read as a list — and forced to an Array here, once, since
     # left lazy it would be cast on every request instead of at class load.
     def in_list(allowed)
       case allowed
-      when Hash then allowed.keys.to_set if plain_hash?(allowed)
-      when Set then allowed if allowed.instance_of?(Set)
-      when Array then allowed.to_a if allowed.instance_of?(Array)
-      when Enumerator then allowed.to_a if allowed.method(:include?).owner == Enumerable
+      when Hash then allowed.keys.to_set if include_from?(allowed, Hash, ActiveSupport::HashWithIndifferentAccess)
+      when Set then allowed if include_from?(allowed, Set)
+      when Array then allowed.to_a if include_from?(allowed, Array)
+      when Enumerator then allowed.to_a if include_from?(allowed, Enumerable)
       end
     end
 
-    def plain_hash?(allowed)
-      allowed.instance_of?(Hash) || allowed.instance_of?(ActiveSupport::HashWithIndifferentAccess)
+    def include_from?(allowed, *owners)
+      owners.include?(allowed.method(:include?).owner)
     end
 
     # A Symbol is read as its String: it is how Ruby spells a constant

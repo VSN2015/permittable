@@ -212,6 +212,30 @@ RSpec.describe Permittable do
       expect(fields.map { |f| f[:in] }).to eq([Set["draft", "published"], Set["free", "pro"]])
     end
 
+    # What makes a list is the collection's own include?, not its exact
+    # class: a subclass that keeps it answers exactly what its keys or
+    # elements say, like its base. Rails' `config_for(:plans)` returns an
+    # ActiveSupport::OrderedOptions, a Hash subclass with Symbol keys, and
+    # it was used as given — `include?("pro")` asked about a Symbol key, so
+    # every request was refused.
+    it "reads a Hash/Array/Set subclass that keeps its base include? as a list" do
+      plans = ActiveSupport::OrderedOptions.new.update(free: { price: 0 }, pro: { price: 10 })
+      tags = Class.new(Array).new(%i[new sale])
+      sizes = Class.new(Set).new(%i[s m])
+      decl = proc do
+        permit_params(:create) do
+          optional :plan, :string, in: plans
+          optional :tag,  :string, in: tags
+          optional :size, :string, in: sizes
+        end
+      end
+      fields = permittable_class(&decl).permit_rule_for(:create)[:fields]
+      expect(fields.map { |f| f[:in] }).to eq([Set["free", "pro"], %w[new sale], Set["s", "m"]])
+      expect(permit({ plan: "pro", tag: "sale", size: "m" }, &decl).to_h).to eq("plan" => "pro", "tag" => "sale", "size" => "m")
+      expect(violations_for({ plan: "gold", tag: "old", size: "xl" }, &decl).details)
+        .to eq([{ param: "plan", code: "inclusion" }, { param: "tag", code: "inclusion" }, { param: "size", code: "inclusion" }])
+    end
+
     # The approved snapshot: a list is cast once, so a later `PLANS << "gold"`
     # is not seen. An app that needs a live list passes its own include?
     # object, which is read on every request.
