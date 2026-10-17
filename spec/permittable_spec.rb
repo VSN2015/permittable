@@ -1615,6 +1615,36 @@ RSpec.describe Permittable do
       expect(controller(klass).permitted_params[:line_items]).to eq(received)
     end
 
+    it "validates a block array's example: as a request would, with sub-field transforms run, yet stores it as sent" do
+      sent = [{ "tags" => "a,b" }]
+      klass = permittable_class do
+        permit_params(:create) do
+          # Both checks need what the action receives: the Array a request's `tags` becomes.
+          array :items, example: sent, validate: ->(a) { a.all? { |i| i[:tags].is_a?(Array) && i[:tags].fetch(0) } } do
+            optional :tags, :string, transform: ->(s) { s.split(",") }
+          end
+        end
+      end
+      published = Permittable::JsonSchema.rule(klass.permit_rule_for("create"))["properties"]["items"]["examples"]
+      expect(published).to eq([sent])
+      expect(controller(klass, params: { items: sent }).permitted_params[:items]).to eq([{ "tags" => %w[a b] }])
+    end
+
+    it "stores a block array's example: without the sub-field defaults a request would fill in, at any depth" do
+      klass = permittable_class do
+        permit_params(:create) do
+          array :items, example: [{ "name" => "x", "dims" => {} }],
+                        validate: ->(a) { a.all? { |i| i[:cents] == 0 && i[:dims][:w] == 1 } } do
+            optional :name,  :string
+            optional :cents, :integer, default: 0, transform: ->(i) { i * 100 }
+            optional(:dims) { optional :w, :integer, default: 1 }
+          end
+        end
+      end
+      published = Permittable::JsonSchema.rule(klass.permit_rule_for("create"))["properties"]["items"]["examples"]
+      expect(published).to eq([[{ "name" => "x", "dims" => {} }]])
+    end
+
     it "hands out a default: with nothing frozen inside it, however deep" do
       klass = permittable_class do
         permit_params(:create) do

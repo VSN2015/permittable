@@ -620,7 +620,7 @@ Which options are legal depends on the field kind — anything else raises at cl
 | `max_depth:` | — | — | — | `:json` fields only — maximum container nesting. See [free-form hashes](#free-form-hashes-json) |
 | `required:` | — | ✅ | — | Arrays are optional unless this is `true` |
 | `desc:` | ✅ | ✅ | ✅ | Documentation only — the field's `description` in [exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) |
-| `example:` | ✅ | ✅ | — | Documentation only, but **validated against the field's own contract at class load**, like `default:`. Published as a client would send it: cast (`example: "18"` on an `:integer` is `18`), and never run through `transform:`, at any depth, even on a field that declares one |
+| `example:` | ✅ | ✅ | — | Documentation only, but **validated against the field's own contract at class load**, like `default:`. Published as a client would send it: cast (`example: "18"` on an `:integer` is `18`), and never run through `transform:`, at any depth, even on a field that declares one. An array example is validated as a request would be, but the sub-field `default:`s a request would fill in are not published |
 | `nullable:` | ✅ | ✅ | ✅ | An explicitly-sent empty value yields `nil` instead of counting as absent — see [explicit nulls](#explicit-nulls-nullable) |
 
 ¹ `format:`, `length:`, and `normalize:` reason about characters and are **only valid on `:string` fields**. On any other type they would silently apply to an already-cast value, so declaring them raises at class load.

@@ -1663,22 +1663,28 @@ module Permittable
     # read" above really is what an equivalent request produces — see
     # AuthoredValues.
     #
-    # An `example:` is the walker's read either way, with NO `transform:` run
-    # at any depth: like a scalar's, it documents what a client sends. Read
-    # through a sub-field's transform, `[{ price: "9.99" }]` under `transform:
-    # ->(d) { (d * 100).to_i }` was published as `[{ "price": 999 }]`: 100
-    # times the price, and a `tags` split into an Array the server refuses.
+    # An `example:` is validated the same way, as a request would be, but what
+    # is STORED is a second read of it exactly as a client SENDS it: cast and
+    # normalized, with no `transform:` run at any depth and no sub-field
+    # `default:` filled in. Read through a sub-field's transform,
+    # `[{ price: "9.99" }]` under `transform: ->(d) { (d * 100).to_i }` was
+    # published as `[{ "price": 999 }]`: 100 times the price, and a `tags`
+    # split into an Array the server refuses. The two reads cannot be one: an
+    # array-level `validate:` must see the transformed sub-fields a request
+    # hands it (`i[:tags].is_a?(Array)`), so the validating read keeps them,
+    # and the stored read, which runs no `validate:`, discards them.
     def validate_array_authored_value!(field, opt)
       value = field[opt]
       return if authored_nil!(field, opt)
       raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} must be an Array" unless value.is_a?(Array)
 
-      read, violations = AuthoredValues.read_array(field, value, transform: opt == :default)
+      read, violations = AuthoredValues.read_array(field, value)
       unless violations.empty?
         raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} violates its own contract: " \
                              "#{AuthoredValues.summary(violations)}"
       end
 
+      read, = AuthoredValues.read_array(field, value, as_sent: true) if opt == :example
       field[opt] = freeze_authored(opt == :default && field[:transform] ? value : read)
     end
 
@@ -2413,8 +2419,9 @@ module Permittable
     # NOTHING violated, validate: included — a transform may rely on what
     # validate: checked (`Math.sqrt` after "all positive").
     elements_valid = violations.drop(before).all? { |v| permittable_unknown_key_violation?(v) }
-    if field[:validate] && elements_valid
-      status, code = Coercion.check_custom(field[:validate], out)
+    validator = permittable_array_validator(field)
+    if validator && elements_valid
+      status, code = Coercion.check_custom(validator, out)
       violations << permittable_violation(field, path, code) unless status == :ok
     end
     # Transform only a fully-valid array — a partially-nil one (element
@@ -2427,6 +2434,11 @@ module Permittable
   # without running app code over it at class load.
   def permittable_transform(field, value)
     field[:transform] ? field[:transform].call(value) : value
+  end
+
+  # A second seam, for the same reader: the array-level `validate:` to run.
+  def permittable_array_validator(field)
+    field[:validate]
   end
 
   def permittable_check_element(field, element, path, unknown:, violations:)
