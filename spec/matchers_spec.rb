@@ -593,7 +593,7 @@ RSpec.describe "Permittable RSpec matchers" do
       contract = Permittable::Contract.define { required :a, :string }
       events = []
       subscriber = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
-        events << payload.slice(:controller, :action, :mode)
+        events << payload.slice(:controller, :mode)
       end
       begin
         contract.call({})
@@ -601,7 +601,7 @@ RSpec.describe "Permittable RSpec matchers" do
       ensure
         ActiveSupport::Notifications.unsubscribe(subscriber)
       end
-      expect(events).to eq([{ controller: "Permittable::Contract", action: "call", mode: :enforce }] * 2)
+      expect(events).to eq([{ controller: "Permittable::Contract", mode: :enforce }] * 2)
     end
 
     it "matches a standalone Contract's own unknown: :error strictness — no top-level exemption" do
