@@ -1584,6 +1584,17 @@ RSpec.describe Permittable::Generator do
         expect(described_class.targets([catch_all], ignore: [], root: nil)).to eq(catch_all => [])
       end
 
+      it "takes both actions as defined when building the controller raises a ScriptError" do
+        # Audit.dispatchable? builds the controller and rescues only a
+        # StandardError, so this would otherwise end the whole sweep.
+        abstract = real_controller("SweepAbstractController") do
+          def initialize = raise(NotImplementedError, "subclass responsibility")
+          def create = head(:created)
+        end
+        expect(described_class.targets([abstract, sessions], ignore: [], root: nil)).to eq(abstract => [], sessions => [:update])
+        expect(described_class.undefined_actions(abstract)).to eq([])
+      end
+
       it "adds an ignored action to the undefined ones" do
         targets = described_class.targets([sessions], ignore: ["sweep_sessions#create"], root: nil)
         expect(targets).to eq({})

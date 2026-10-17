@@ -355,9 +355,17 @@ module Permittable
     # method, and a controller that cannot list its actions is assumed to
     # define them all. A second definition here would drift from what
     # permittable:audit then calls stale.
+    #
+    # Reading it can build the controller (see Audit.dispatchable?), which
+    # rescues only a StandardError. A controller whose `initialize` raises a
+    # ScriptError, such as NotImplementedError, would abort the whole sweep,
+    # which never built a controller before. It is inconclusive, so it is
+    # assumed to define both, the same answer as one that cannot list them.
     def undefined_actions(controller)
       missing = Audit.missing_lookup(controller)
       DEFAULT_ACTIONS.select { |action| missing[action.to_s] }
+    rescue StandardError, ScriptError
+      []
     end
 
     # The core: knowledge in (columns and/or a scan), snippet out. Returns a
