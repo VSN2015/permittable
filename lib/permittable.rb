@@ -226,14 +226,16 @@ module Permittable
   # unknown-keys check must not flag them.
   ROUTING_KEYS = %w[controller action format].freeze
   # Nor the keys an ordinary form POST carries — the CSRF token, the verb
-  # override, the encoding probe, and the submit button's name. Without this
-  # `unknown: :error` was unusable outside a JSON API: every browser form
-  # failed on the framework's own keys rather than on anything the client got
-  # wrong. Exempt from the CHECK only: unlike the routing keys these are NOT
-  # stripped from monitor mode's raw pass-through, where handing back an
-  # untouched params hash is the whole promise and a legacy action may well
-  # read `_method` itself.
-  FORM_KEYS = %w[authenticity_token _method utf8 commit].freeze
+  # override, the encoding probe, and the submit button's name: `commit` from
+  # f.submit/submit_tag, `button` from f.button/button_tag (which render
+  # <button name="button">, so a browser sends `button=` even with no
+  # value). Without this `unknown: :error` was unusable outside a JSON API:
+  # every browser form failed on the framework's own keys rather than on
+  # anything the client got wrong. Exempt from the CHECK only: unlike the
+  # routing keys these are NOT stripped from monitor mode's raw
+  # pass-through, where handing back an untouched params hash is the whole
+  # promise and a legacy action may well read `_method` itself.
+  FORM_KEYS = %w[authenticity_token _method utf8 commit button].freeze
   # ROUTING_KEYS/FORM_KEYS name where the keys come FROM; these two name what
   # is DECIDED with them, which is what the call sites care about — and the
   # asymmetry between them is the deliberate point, so spell it once here

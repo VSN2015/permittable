@@ -1819,6 +1819,17 @@ RSpec.describe Permittable do
       expect(e.details).to eq([{ param: "extra", code: "unknown" }])
     end
 
+    it "skips `button`, the name f.button and button_tag give the submitter, as it skips f.submit's `commit`" do
+      # <button name="button" type="submit"> with no value attribute submits
+      # `button=`, an empty String.
+      ["", "Search"].each do |value|
+        result = permit({ q: "shoes", button: value }) do
+          permit_params(:create, unknown: :error) { optional :q, :string }
+        end
+        expect(result.to_h).to eq("q" => "shoes"), "for button: #{value.inspect}"
+      end
+    end
+
     it "still flags a form key smuggled inside a root (the exemption is top-level only)" do
       e = violations_for({ user: { name: "a", authenticity_token: "smuggled" } }) do
         permit_params(:create, root: :user, unknown: :error) { required :name, :string }
