@@ -641,6 +641,40 @@ RSpec.describe Permittable do
       expect(permit({ on: Date.new(2026, 9, 5) }, &decl)[:on]).to eq(Date.new(2026, 9, 5))
     end
 
+    # A DateTime IS a Date (it subclasses it), so :date handed one back
+    # whole, time of day included — while a Time was refused, and an in:
+    # member was read as an instant. Every instant is now read the way an
+    # in: member is, and the way :datetime reads a Date the other way
+    # round: midnight UTC is that date, any other instant is not a date.
+    it "reads a Time or DateTime as a plain Date only at midnight UTC, and refuses any other instant" do
+      [DateTime.new(2026, 9, 5), DateTime.new(2026, 9, 5, 5, 0, 0, "+05:00"), Time.utc(2026, 9, 5),
+       Time.utc(2026, 9, 5).in_time_zone("Tokyo")].each do |value|
+        expect(permit({ on: value }, &decl)[:on])
+          .to be_an_instance_of(Date).and(eq(Date.new(2026, 9, 5))), "for #{value.inspect}"
+      end
+      [DateTime.new(2026, 9, 5, 12), Time.utc(2026, 9, 5, 12), DateTime.new(2026, 9, 5, 0, 0, 0, "+05:00"),
+       DateTime.new(2026, 9, 5, 0, 0, Rational(1, 2))].each do |value|
+        expect(violations_for({ on: value }, &decl).details)
+          .to eq([{ param: "on", code: "invalid_type" }]), "for #{value.inspect}"
+      end
+    end
+
+    # The disagreements that reading caused: a noon DateTime default: was
+    # stored as noon (and exported under `format: date` as a date-time), and
+    # a noon DateTime was accepted on its own but refused as `inclusion` by
+    # an in: naming its own date.
+    it "reads a DateTime default: and a DateTime checked against in: the same way" do
+      expect(permit({}) { permit_params(:create) { optional :on, :date, default: DateTime.new(2026, 1, 5) } }[:on])
+        .to be_an_instance_of(Date).and(eq(Date.new(2026, 1, 5)))
+      expect { permittable_class { permit_params(:create) { optional :on, :date, default: DateTime.new(2026, 1, 5, 12) } } }
+        .to raise_error(ArgumentError, /:default for field :on violates its own contract \(invalid_type\)/)
+
+      listed = proc { permit_params(:create) { optional :on, :date, in: [Date.new(2026, 1, 5)] } }
+      expect(permit({ on: DateTime.new(2026, 1, 5) }, &listed)[:on]).to be_an_instance_of(Date)
+      expect(violations_for({ on: DateTime.new(2026, 1, 5, 12) }, &listed).details)
+        .to eq([{ param: "on", code: "invalid_type" }])
+    end
+
     it "applies the same rule to :datetime, where the time part may be absent" do
       expect(permit({ at: "2026-09-05T10:30:00Z" }, &decl)[:at]).to eq(Time.utc(2026, 9, 5, 10, 30))
       # A date with no time is midnight UTC, as documented.

@@ -914,6 +914,15 @@ module Permittable
     # ("2026-09-05", "2026/09/05", "Sep 5, 2026") still works.
     def cast_date(value)
       case value
+      # Ahead of Date, which DateTime subclasses: `when Date` handed a
+      # DateTime back whole, time of day included, so `default:
+      # DateTime.new(2026, 1, 5, 12)` was stored as noon and exported as a
+      # date-time under `format: date` — while a Time was refused outright,
+      # and an in: member was read as an instant. Every instant is now read
+      # the way that member is (see date_of_instant).
+      when Time, DateTime
+        date = date_of_instant(value)
+        date ? [:ok, date] : [:error, "invalid_type"]
       when Date then [:ok, value]
       when String
         found = Date._parse(value)
@@ -934,6 +943,19 @@ module Permittable
     # it actually FOUND rather than the filled-in result.
     def complete_date?(found)
       found.key?(:year) && found.key?(:mon) && found.key?(:mday)
+    end
+
+    # The date a Time or DateTime IS, or nil: its UTC date when it is
+    # exactly midnight UTC. That is the instant ActiveSupport compares a
+    # Date as, and the one :datetime reads a Date as, so the two types map
+    # onto each other and back. Any other instant has a time of day, which
+    # a Date cannot hold, so it is not a date at all — the answer a Time
+    # with a time of day always got. Shared by cast_date and
+    # instant_as_date, so a value and an in: member cannot be read
+    # differently; and always a plain Date, never the DateTime it came as.
+    def date_of_instant(instant)
+      utc = instant.to_time.getutc
+      utc.to_date if utc == utc.beginning_of_day
     end
 
     # A zoneless String parses as UTC regardless of the host timezone
@@ -1092,13 +1114,12 @@ module Permittable
     # with a Date as INSTANTS, the Date standing for its midnight UTC, so
     # that instant is the only one that ever equalled a request's date. It
     # is read as that UTC date; any other instant never matched anything,
-    # and is refused like any member no request could equal. (cast_date
-    # would keep a DateTime whole — it IS a Date — and refuse a Time.)
+    # and is refused like any member no request could equal. cast_date
+    # reads it the same way (date_of_instant); this only gives the
+    # class-load error a reason where a request gets `invalid_type`.
     def instant_as_date(member)
-      utc = member.to_time.getutc
-      return [:error, "not midnight UTC, so it never equals a date"] unless utc == utc.beginning_of_day
-
-      [:ok, utc.to_date]
+      date = date_of_instant(member)
+      date ? [:ok, date] : [:error, "not midnight UTC, so it never equals a date"]
     end
 
     # What an exported enum lists for one member: the cast value, re-encoded

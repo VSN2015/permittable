@@ -676,7 +676,7 @@ Coercion is **deliberately strict**, and deliberately *not* `ActiveModel::Type`.
 | `:float` | `Numeric`; a canonical numeric string (`"1.5"`, `".5"`, `"-2e3"`) | `"abc"`, `"1_8.5"`, `" 1.5 "` |
 | `:decimal` | `Numeric`, or a canonical numeric string → `BigDecimal` | Unparseable strings, `"1_000"`, `" 1.5 "` |
 | `:boolean` | `true`/`false`, `"true"`/`"false"`, `"1"`/`"0"`, `1`/`0` | `"yes"`, `"on"`, `2` |
-| `:date` | `Date`; a string naming a **complete** date, in any format `Date.parse` understands (`"2026-09-05"`, `"2026/09/05"`, `"Sep 5, 2026"`) | Unparseable strings, and **incomplete** ones (`"09/2026"`, `"5th"`, `"Sept"`) |
+| `:date` | `Date`; a `Time`, `DateTime` or `ActiveSupport::TimeWithZone` that is exactly midnight UTC, as that `Date`; a string naming a **complete** date, in any format `Date.parse` understands (`"2026-09-05"`, `"2026/09/05"`, `"Sep 5, 2026"`) | Unparseable strings, **incomplete** ones (`"09/2026"`, `"5th"`, `"Sept"`), and any other instant — one with a time of day, or a midnight in another zone |
 | `:datetime` | `Time`, `DateTime`, `ActiveSupport::TimeWithZone`, `Date`; a string naming a complete date, with or without a time | Unparseable strings, and any string without a complete date (`"10:30"`) |
 | `:json` | Any `Hash` — passed through uncast, see [free-form hashes](#free-form-hashes-json) | Arrays, scalars |
 
