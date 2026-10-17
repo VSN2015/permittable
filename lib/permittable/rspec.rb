@@ -374,7 +374,21 @@ module Permittable
       end
 
       def default_mismatch(field, expected)
-        option_mismatch(field, :default, expected) unless field.key?(:default) && field[:default] == cast_default(field, expected)
+        option_mismatch(field, :default, expected) unless field.key?(:default) && same_default?(field, expected)
+      end
+
+      # A :json default is stored as authored, but the action reads it as
+      # a HashWithIndifferentAccess, String-keyed all the way down. The
+      # declaration's spelling, `with_default(theme: "dark")`, and the
+      # action's, `with_default("theme" => "dark")`, name the same default,
+      # so both sides are read that way before comparing.
+      def same_default?(field, expected)
+        declared = field[:default]
+        if field[:kind] == :json && declared.is_a?(Hash) && expected.is_a?(Hash)
+          ActiveSupport::HashWithIndifferentAccess.new(declared) == ActiveSupport::HashWithIndifferentAccess.new(expected)
+        else
+          declared == cast_default(field, expected)
+        end
       end
 
       # A contract stores its `default:` as the field reads it — cast,
