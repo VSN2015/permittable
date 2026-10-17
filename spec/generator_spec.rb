@@ -132,6 +132,15 @@ RSpec.describe Permittable::Generator do
       expect(scan.calls).to eq(0)
     end
 
+    it "reads @_params, the ivar Rails keeps the controller's params in, but not a lookalike" do
+      scan = described_class.scan("@_params.require(:user).permit(:name)\n@_params.expect(user: [:email])")
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[name email])
+      expect(scan.calls).to eq(2)
+
+      expect(described_class.scan("@@_params.permit(:a)\nx@_params.permit(:b)\n@my_params.permit(:c)").calls).to eq(0)
+    end
+
     it "still reads params behind an explicit receiver or at the start of a line" do
       scan = described_class.scan("self.params.require(:user).permit(:name)\n  params.expect(user: [:email])")
       expect(scan.root).to eq(:user)

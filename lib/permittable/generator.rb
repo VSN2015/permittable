@@ -89,9 +89,10 @@ module Permittable
     # `params` itself, not the tail of another name: `user_params.permit(...)`
     # is called on a helper's result (`params.require(:user)`, say), whose
     # root a rootless read of it would drop. `@params` and `$params` are
-    # variables. A `.` before it is fine: `self.params.permit(...)` is the
+    # variables, except `@_params`, the one Rails itself keeps the controller's
+    # params in. A `.` before it is fine: `self.params.permit(...)` is the
     # real thing.
-    PARAMS = /(?<![\w@$])params/
+    PARAMS = /(?<![\w@$])(?:@_)?params/
 
     # One permit call, with an optional leading `.require(:root)`. The args
     # capture tolerates brackets and newlines but not parentheses — a call
