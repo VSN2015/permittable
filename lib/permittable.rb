@@ -1078,12 +1078,22 @@ module Permittable
       when Hash then allowed.keys.to_set if include_from?(allowed, Hash, ActiveSupport::HashWithIndifferentAccess)
       when Set then allowed if include_from?(allowed, Set)
       when Array then allowed.to_a if include_from?(allowed, Array)
-      when Enumerator then allowed.to_a if include_from?(allowed, Enumerable)
+      when Enumerator then allowed.to_a if include_from?(allowed, Enumerator)
       end
     end
 
-    def include_from?(allowed, *owners)
-      owners.include?(allowed.method(:include?).owner)
+    # Whether `allowed` answers include? as one of `bases` itself does. What
+    # is compared is the owner the BASE class reports, not a literal class:
+    # a gem that prepends a module defining include? into Array, Hash or Set
+    # (an instrumenting one) makes that module the owner for every instance,
+    # and a test against the literal class then read every plain
+    # `in: %i[draft published]` as an object with an include? of its own,
+    # used it as given, and refused "draft". A prepended module is the
+    # base's own include?; a subclass, a singleton method or an `extend`
+    # still has a different owner.
+    def include_from?(allowed, *bases)
+      owner = allowed.method(:include?).owner
+      bases.any? { |base| base.instance_method(:include?).owner == owner }
     end
 
     # A Symbol is read as its String: it is how Ruby spells a constant

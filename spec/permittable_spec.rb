@@ -1,3 +1,5 @@
+require "open3"
+
 RSpec.describe Permittable do
   # FakeController responds to neither before_action nor rescue_from, so the
   # concern's guarded included-block installs nothing — specs drive
@@ -234,6 +236,45 @@ RSpec.describe Permittable do
       expect(permit({ plan: "pro", tag: "sale", size: "m" }, &decl).to_h).to eq("plan" => "pro", "tag" => "sale", "size" => "m")
       expect(violations_for({ plan: "gold", tag: "old", size: "xl" }, &decl).details)
         .to eq([{ param: "plan", code: "inclusion" }, { param: "tag", code: "inclusion" }, { param: "size", code: "inclusion" }])
+    end
+
+    # A gem (an instrumenting or tracing one) can PREPEND a module defining
+    # include? into Array, Hash or Set, and then no object's include? is owned
+    # by the class itself any more: the owner is that module. A subprocess,
+    # because a prepend cannot be undone and would stay in this process for
+    # every other example.
+    it "still reads a plain list as a list when a gem prepends an include? into Array, Hash and Set" do
+      script = <<~RUBY
+        require "json"
+        require "set"
+        require "permittable"
+        tracer = Module.new { def include?(*) = super }
+        [Array, Hash, Set].each { |core| core.prepend(tracer) }
+        override = Module.new { def include?(value) = super(value.to_s.downcase) }
+        Shouting = Class.new(Array) { def include?(value) = super(value.to_s.downcase) }
+        contract = Permittable::Contract.define do
+          optional :status, :string, in: %i[draft published]
+          optional :plan,   :string, in: { "free" => 1, "pro" => 2 }
+          optional :size,   :string, in: Set["s", "m"]
+          optional :tag,    :string, in: Shouting.new(%w[new sale])
+          optional :kind,   :string, in: %w[a b].extend(override)
+        end
+        stored = contract.fields.to_h { |field| [field[:name].to_s, field[:in].class.name] }
+        accepted = contract.call("status" => "draft", "plan" => "pro", "size" => "m", "tag" => "SALE", "kind" => "A")
+        refused = contract.call("status" => "gone", "plan" => "gold", "size" => "xl")
+        print JSON.generate(stored: stored, accepted: accepted.violations.map { |v| v[:param] }, refused: refused.violations.map { |v| v[:param] })
+      RUBY
+      lib = File.expand_path("../lib", __dir__)
+      out, err, status = Open3.capture3(RbConfig.ruby, "-I", lib, "-e", script)
+      expect(status).to be_success, err
+      report = JSON.parse(out)
+      # Every plain collection is still read as a list, so each member is
+      # accepted (a list of Symbols would refuse "draft" if it were used as
+      # given); a subclass and an extend that override include? are still
+      # used as given, which is why "SALE" and "A" pass.
+      expect(report["accepted"]).to eq([])
+      expect(report["refused"]).to eq(%w[status plan size])
+      expect(report["stored"]).to eq("status" => "Array", "plan" => "Set", "size" => "Set", "tag" => "Shouting", "kind" => "Array")
     end
 
     # The approved snapshot: a list is cast once, so a later `PLANS << "gold"`
