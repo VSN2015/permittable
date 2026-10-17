@@ -2366,23 +2366,39 @@ module Permittable
   end
 
   # The ISO 8601 String that `parts` (keyed by Rails' positions, 1-3 the
-  # date and 4-6 the time) spell for a field of `type`, or nil when they
-  # spell none. A String is what a :date or :datetime field already reads,
-  # so its cast and that cast's rules (a zoneless datetime is UTC) stay in
-  # one place.
+  # date and 4-6 the time) spell for a field of `type`, "" when they spell
+  # the field sent empty, or nil when they spell nothing at all. A String is
+  # what a :date or :datetime field already reads, so its cast and that
+  # cast's rules (a zoneless datetime is UTC) stay in one place.
   #
-  # Every part sent blank is a form whose selects were all left on their
-  # prompts (`include_blank:` or `prompt:`), and reads as the field sent
-  # empty. Otherwise a :date needs (1i)-(3i) and a :datetime (1i)-(5i), the
-  # seconds being 00 unless (6i) is sent. A part sent blank among filled
-  # ones is a select left on its prompt, and is no number, so it never
-  # defaults.
+  # This follows ActiveRecord's own reading of the same parts
+  # (ActiveModel::Type::Date and DateTime cast them as a Hash): a value
+  # needs all of (1i)-(3i), and when any one of them is blank the attribute
+  # is nil, so the field reads as sent empty. That has to be ANY and not all
+  # of them: Rails fills a part it discards (discard_day, or the date of a
+  # time_select) through a hidden input, and the year and month selects of
+  # an untouched picker still sit on their prompts beside it, so the form
+  # arrives as {"(1i)" => "", "(2i)" => "", "(3i)" => "1"}. The time parts
+  # of a :datetime are the other way round: ActiveModel defaults a blank
+  # (4i), (5i) or (6i) to 00 once the date is there, and so does this. A part
+  # that is not sent at all is no part left blank, and (4i) and (5i) must be
+  # sent (a time_select with `ignore_date:` sends only those, and a :datetime
+  # needs a date); (6i), sent by `include_seconds:` only, may be missing.
+  # Whatever else is not an unsigned decimal integer is nil, for a scalar to
+  # refuse as invalid_type.
   def permittable_date_from_parts(parts, type)
-    return "" if parts.each_value.all? { |part| Coercion.absent_value?(part) }
+    return "" if (1..3).any? { |position| parts.key?(position) && Coercion.absent_value?(parts[position]) }
 
     time = type == :datetime
-    digits = (1..(time ? 5 : 3)).map { |position| permittable_date_part(parts[position], year: position == 1) }
-    digits << (parts.key?(6) ? permittable_date_part(parts[6]) : "00") if time
+    digits = (1..3).map { |position| permittable_date_part(parts[position], year: position == 1) }
+    if time
+      # 4 and 5 are required, 6 optional; the blank ones are 00 either way.
+      digits += (4..6).map do |position|
+        next "00" if position == 6 && !parts.key?(6)
+
+        parts.key?(position) && Coercion.absent_value?(parts[position]) ? "00" : permittable_date_part(parts[position])
+      end
+    end
     return nil if digits.include?(nil)
 
     year, month, day, hour, minute, second = digits
@@ -2396,8 +2412,12 @@ module Permittable
   # in 1999, and is otherwise left to the cast, as a year in a String is.
   # Any other part has at most two digits: a month of "100" is no value a
   # select offers, and Date._parse would read the string around it some
-  # other way. nil for anything that is not an unsigned decimal integer.
+  # other way. A non-negative Integer is the digits it prints: a JSON body or
+  # an `as: :json` request cannot send the String a form does, and
+  # ActiveRecord reads either. nil for anything that is not an unsigned
+  # decimal integer.
   def permittable_date_part(part, year: false)
+    part = part.to_s if part.is_a?(Integer) && !part.negative?
     text = Coercion.utf8_text(part) if part.is_a?(String)
     return nil unless text&.match?(DATE_PART_FORMAT)
 

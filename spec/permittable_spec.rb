@@ -694,7 +694,7 @@ RSpec.describe Permittable do
       expect(violations_for(date.merge("on(1i)" => "2025"), &ruled).details).to eq([{ param: "on", code: "inclusion" }])
     end
 
-    it "reads parts all sent blank (selects left on their prompts) exactly as the field sent empty" do
+    it "reads a date part sent blank (a select left on its prompt) exactly as the field sent empty" do
       blank = { "on(1i)" => "", "on(2i)" => "", "on(3i)" => nil }
       expect(permit({ event: blank }, &decl).to_h).to eq({})
       expect(violations_for(blank) { permit_params(:create) { required :on, :date } }.details)
@@ -704,10 +704,53 @@ RSpec.describe Permittable do
         .to eq("on" => Date.new(2026, 1, 1))
     end
 
+    # ActiveRecord reads the same parts as nil when ANY of (1i)-(3i) is blank:
+    # ActiveModel::Type::Date.new.cast({1 => nil, 2 => nil, 3 => 1}) is nil.
+    # Rails fills a discarded part through a hidden input even when the visible
+    # selects sit on their prompts (discard_day: true sends (3i)=1), so a form
+    # nobody touched reaches the contract with some parts filled.
+    it "reads the field as sent empty when any one of (1i)-(3i) is blank, whatever the others hold" do
+      {
+        "the year" => date.merge("on(1i)" => ""),
+        "the month" => date.merge("on(2i)" => ""),
+        "the day" => date.merge("on(3i)" => nil),
+        "year and month, day filled in" => { "on(1i)" => "", "on(2i)" => "", "on(3i)" => "1" }
+      }.each do |why, parts|
+        expect(permit({ event: parts }, &decl).to_h).to eq({}), why
+        expect(permit(parts) { permit_params(:create) { optional :on, :date, nullable: true } }.to_h)
+          .to eq("on" => nil), why
+        expect(violations_for(parts) { permit_params(:create) { required :on, :date } }.details)
+          .to eq([{ param: "on", code: "missing" }]), why
+      end
+      # A :datetime too, even when its time parts are filled.
+      expect(permit({ event: time.merge("at(2i)" => "") }, &decl).to_h).to eq({})
+    end
+
+    it "reads a :datetime's time parts sent blank as 00 once the date parts are there, as ActiveModel does" do
+      midnight = Time.utc(2026, 10, 17)
+      expect(permit({ event: time.merge("at(4i)" => "", "at(5i)" => "") }, &decl)[:at]).to eq(midnight)
+      expect(permit({ event: time.merge("at(4i)" => "", "at(6i)" => "") }, &decl)[:at]).to eq(Time.utc(2026, 10, 17, 0, 30))
+      expect(permit({ event: time.merge("at(5i)" => nil, "at(6i)" => "") }, &decl)[:at]).to eq(Time.utc(2026, 10, 17, 9))
+      expect(permit({ event: time.merge("at(6i)" => "") }, &decl)[:at]).to eq(Time.utc(2026, 10, 17, 9, 30))
+    end
+
+    it "reads a non-negative Integer part as ActiveRecord does, and still refuses the other non-String parts" do
+      expect(permit({ event: { "on(1i)" => 2026, "on(2i)" => 10, "on(3i)" => 17 } }, &decl)[:on])
+        .to eq(Date.new(2026, 10, 17))
+      {
+        "a negative Integer" => date.merge("on(2i)" => -1),
+        "a Float" => date.merge("on(2i)" => 10.0),
+        "true" => date.merge("on(2i)" => true),
+        "a Symbol" => date.merge("on(2i)" => :'10'),
+        "a month no select offers" => date.merge("on(2i)" => 100)
+      }.each do |why, parts|
+        expect(violations_for({ event: parts }, &decl).details).to eq([{ param: "event.on", code: "invalid_type" }]), why
+      end
+    end
+
     it "is invalid_type on the field's own path when the parts do not make a value, and never raises" do
       {
         "a part missing" => date.except("on(3i)"),
-        "a part left blank" => date.merge("on(2i)" => ""),
         "a signed part" => date.merge("on(2i)" => "+7"),
         "a part that is not a number" => date.merge("on(2i)" => "Oct"),
         "a fraction" => date.merge("on(3i)" => "1.5"),
@@ -719,8 +762,6 @@ RSpec.describe Permittable do
         "a :datetime sent no time parts" => time.first(3).to_h,
         "an hour without a minute" => time.except("at(5i)"),
         "seconds without an hour or minute" => time.except("at(4i)", "at(5i)").merge("at(6i)" => "15"),
-        "an hour left blank" => time.merge("at(4i)" => ""),
-        "seconds left blank" => time.merge("at(6i)" => ""),
         "a minute past the hour" => time.merge("at(5i)" => "60")
       }.each do |why, parts|
         field = parts.keys.first[/\A\w+/]
@@ -3806,11 +3847,13 @@ RSpec.describe Permittable do
 
       # Posts what a browser submits for these form controls: each select's
       # chosen option (the first, its prompt, when none is selected) and each
-      # hidden input, form-encoded under the names the helpers gave them.
+      # hidden input, form-encoded under the names the helpers gave them. A
+      # hidden input rendered without a value attribute (the part a helper
+      # discards without a default) is submitted as an empty string.
       def submit(*controls)
-        fields = controls.join.scan(%r{<select[^>]*name="([^"]+)"[^>]*>(.*?)</select>|<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"}m)
-        pairs = fields.map do |select, options, input, value|
-          next [input, value] if input
+        fields = controls.join.scan(%r{<select[^>]*name="([^"]+)"[^>]*>(.*?)</select>|<input([^>]*)>}m)
+        pairs = fields.map do |select, options, input|
+          next [input[/name="([^"]+)"/, 1], input[/value="([^"]*)"/, 1].to_s] if input
 
           option = options[/<option[^>]*selected[^>]*>/] || options[/<option[^>]*>/]
           [select, option[/value="([^"]*)"/, 1]]
@@ -3840,6 +3883,46 @@ RSpec.describe Permittable do
         result = submit(view.date_select(:event, :starts_on, prompt: true))
         expect(result.status).to eq(422)
         expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "event.starts_on", "code" => "missing" }])
+      end
+
+      # Rails fills a part it discards through a HIDDEN input even while the
+      # visible selects sit on their prompts, so these forms reach the
+      # contract with some parts filled and the rest blank: what
+      # ActiveRecord reads as nil (ActiveModel::Type::Date.new.cast with
+      # {1 => nil, 2 => nil, 3 => 1}).
+      it "reads a month/year picker left on its prompts as the field sent empty, though discard_day sends (3i)=1" do
+        controls = [view.date_select(:event, :starts_on, default: Date.new(2026, 10, 17)),
+                    view.date_select(:event, :ends_on, discard_day: true, prompt: true)]
+        expect(controls.last).to include('name="event[ends_on(3i)]" value="1"')
+        result = submit(*controls)
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)["ends_on"]).to eq(["NilClass", ""])
+
+        # Picked, the same picker reads as the first of the month.
+        picked = view.date_select(:event, :ends_on, discard_day: true, default: Date.new(2026, 11, 20))
+        expect(JSON.parse(submit(controls.first, picked).body)["ends_on"]).to eq(%w[Date 2026-11-01])
+      end
+
+      it "reads a datetime_select with discard_minute left on its prompts as sent empty, the (5i) it submits being blank" do
+        controls = [view.date_select(:event, :starts_on, default: Date.new(2026, 10, 17)),
+                    view.datetime_select(:event, :opens_at, discard_minute: true, prompt: true)]
+        expect(controls.last).to match(/<input[^>]*name="event\[opens_at\(5i\)\]"(?![^>]*value=)/)
+        result = submit(*controls)
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body).keys).to eq(%w[title starts_on])
+
+        # With a value the hidden input carries the minute it had, so nothing is blank.
+        picked = view.datetime_select(:event, :opens_at, discard_minute: true, default: Time.utc(2026, 10, 17, 9, 30))
+        expect(JSON.parse(submit(controls.first, picked).body)["opens_at"]).to eq(["Time", "2026-10-17 09:30:00 UTC"])
+      end
+
+      it "reads a time_select left on its prompts as ActiveRecord does: the date its hidden inputs send, at 00:00" do
+        controls = [view.date_select(:event, :starts_on, default: Date.new(2026, 10, 17)),
+                    view.time_select(:event, :opens_at, prompt: true)]
+        expect(controls.last).to include('name="event[opens_at(1i)]" value="1"')
+        result = submit(*controls)
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)["opens_at"]).to eq(["Time", "0001-01-01 00:00:00 UTC"])
       end
     end
 
