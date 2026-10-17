@@ -1220,6 +1220,53 @@ RSpec.describe Permittable::Generator do
     end
   end
 
+  # RuboCop's default Style/SymbolArray and Style/WordArray rewrite
+  # `[:name, :email]` into `%i[name email]`, and Rails reads the two alike.
+  describe ".scan of %i and %w word lists" do
+    it "reads `user: %i[name email]` as the user envelope, so the enforced draft accepts the form" do
+      scan = described_class.scan("params.expect(user: %i[name email])")
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[name email])
+      expect(scan.unparsed).to eq([])
+
+      enforced = described_class.draft(scan: scan).gsub("mode: :monitor", "mode: :enforce")
+      request = controller(permittable_class { class_eval(enforced) }, params: { user: { name: "Jo", email: "jo@x.io" } })
+      expect(request.permitted_params.to_h).to eq("name" => "Jo", "email" => "jo@x.io")
+    end
+
+    it "reads %I, %w and %W, over several lines, with any delimiter but a parenthesis" do
+      ["%I[name email]", "%w{name email}", "%W<name email>", "%i|name email|", "%i[\n  name\n  email\n]"].each do |list|
+        scan = described_class.scan("params.expect(user: #{list})")
+        expect([scan.root, scan.scalars, scan.unparsed]).to eq([:user, %i[name email], []]), list
+      end
+    end
+
+    it "reads a list given to permit, splatted or not, and as a nested hash's or an array's keys" do
+      scan = described_class.scan("params.require(:user).permit(%i[name], *%w[email], [:age], address: %i[city zip], tags: %i[])")
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[name email age])
+      expect(scan.nested).to eq(address: %i[city zip])
+      expect(scan.arrays).to eq(%i[tags])
+      expect(scan.unparsed).to eq([])
+    end
+
+    it "reads an empty word list as the array-of-scalars root `[]` is" do
+      scan = described_class.scan("params.expect(tag_names: %i[])")
+      expect(scan.root).to be_nil
+      expect(scan.arrays).to eq(%i[tag_names])
+    end
+
+    it "keeps the root of an envelope whose value it cannot read, with a TODO for the value" do
+      ["%i[first-name]", "%I[name \#{prefix}_email]", "permitted_keys"].each do |value|
+        scan = described_class.scan("params.expect(user: #{value})")
+        expect([scan.root, scan.unparsed]).to eq([:user, [value]]), value
+      end
+
+      draft = described_class.draft(scan: described_class.scan("params.expect(user: %i[name first-name])\nparams.permit(:page)"))
+      expect(draft).to include("# TODO: belongs to another envelope (user): user: %i[name first-name]")
+    end
+  end
+
   describe ".scan of a body shape beside an expect envelope" do
     it "says it is outside the envelope rather than calling it a route param" do
       draft = described_class.draft(scan: described_class.scan("params.expect(:id, post: [:title], tag_names: [])"))
@@ -1412,7 +1459,9 @@ RSpec.describe Permittable::Generator do
       "Post.find(params.expect(:id))\nparams.permit(:page)\nparams.expect(post: [:title])",
       "params.permit(:page)\nparams.expect(post: [:title], tag_names: [])",
       "params.require(:u).permit(:name, meta: [ , ], opts: [[ ]])",
-      "params.expect(u: [:name, meta: [[ ]]])"
+      "params.expect(u: [:name, meta: [[ ]]])",
+      "params.expect(post: %i[title body], items: [%i[sku]])",
+      "params.require(:u).permit(*%i[name], address: %w[city], tags: %i[], meta: %i[a-b])"
     ].each do |source|
       it "loads the draft of #{source.inspect}" do
         expect { load_draft(described_class.draft(scan: described_class.scan(source))) }.not_to raise_error

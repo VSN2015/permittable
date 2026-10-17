@@ -111,10 +111,29 @@ module Permittable
     # with no fields.
     EXPECT_ENVELOPE = /\A(\w+):\s*\[(?!\s*[\[\]])\s*(.*?)\s*\]\z/m
 
-    # An envelope whose fields live in a constant: `post: PERMITTED_PARAMS`.
-    # The fields cannot be read, but the root can, and read as a rootless
-    # argument it let a `params.permit(:page)` beside it take the root.
-    EXPECT_CONSTANT_ENVELOPE = /\A(\w+):\s*((?:::)?[A-Z]\w*(?:::[A-Z]\w*)*)\z/
+    # An envelope whose fields cannot be read: they live in a constant
+    # (`post: PERMITTED_PARAMS`) or a local (`post: permitted_keys`), or a
+    # word list holds a key that is not a plain one (`post: %i[first-name]`).
+    # Rails requires `post` whatever its value holds, so the root can still
+    # be read; read as a rootless argument it let a `params.permit(:page)`
+    # beside it take the root, and dropped the root when it stood alone. A
+    # value that opens with `[` is an array: EXPECT_ENVELOPE's fields, or a
+    # root a rooted contract cannot express (see there), never this.
+    EXPECT_OPAQUE_ENVELOPE = /\A(\w+):\s*([^\[\s].*)\z/m
+
+    # A %i/%w word list, or %I/%W: RuboCop's default Style/SymbolArray and
+    # Style/WordArray rewrite `[:name, :email]` into `%i[name email]`, and
+    # Rails reads the two alike. Delimited by `[]`, `{}`, `<>`, or the same
+    # punctuation at both ends — not `()`, as a parenthesis already makes the
+    # whole call unreadable (see PERMIT_CALL). The words are the text between
+    # the delimiters, whichever alternative matched.
+    WORD_LIST = /%[iIwW](?:\[[^\[\]]*\]|\{[^{}]*\}|<[^<>]*>|([^\w\s()\[\]{}<>])(?:(?!\1).)*\1)/m
+
+    # A list among the filters, splatted or not: `[:name, :email]`, or a word
+    # list once bracket_word_lists has spelled it so. Rails flattens the
+    # filters it is given, so its elements are filters in their own right.
+    # Only a flat one: a list holding a list is left whole, unparsed.
+    LIST_ARG = /\A(?:\*\s*)?\[([^\[\]]*)\]\z/
 
     # The key of a single-key rootless EXPECT lookup that is a route param,
     # not input: the Rails 8 scaffold's `Post.find(params.expect(:id))`, or a
@@ -592,7 +611,8 @@ module Permittable
     # -- scan parsing -------------------------------------------------------
 
     # Split a permit argument list on top-level commas only, so `address:
-    # [:city, :zip]` stays one argument.
+    # [:city, :zip]` stays one argument. A list argument is replaced by its
+    # elements (see LIST_ARG).
     def split_args(args)
       parts = [+""]
       depth = 0
@@ -603,7 +623,22 @@ module Permittable
 
         parts.last << char
       end
-      parts.map(&:strip).reject(&:empty?)
+      parts.map(&:strip).reject(&:empty?).flat_map do |part|
+        list = LIST_ARG.match(bracket_word_lists(part))
+        list ? split_args(list[1]) : [part]
+      end
+    end
+
+    # `text` with each word list of plain keys spelled as the list it equals:
+    # `%i[name email]` as `[:name, :email]`, `%w[]` as `[]`, so the shapes
+    # above read it. A word list holding any other word — quoted, escaped or
+    # interpolated — is left as written, and stays unparsed. Only for
+    # matching: a TODO quotes the argument as the source spells it.
+    def bracket_word_lists(text)
+      text.gsub(WORD_LIST) do |list|
+        words = list[3...-1].split
+        words.all? { |word| word.match?(/\A\w+\z/) } ? "[#{words.map { |word| ":#{word}" }.join(', ')}]" : list
+      end
     end
 
     # An expect call's arguments, as one Call per envelope. The bracketed
@@ -625,12 +660,20 @@ module Permittable
     end
 
     # An expect argument as `[root, fields]` when it is an envelope, else nil.
-    # A constant envelope's one "field" is the constant, kept as unparsable.
+    # An opaque envelope's one "field" is its value, kept as unparsable.
+    #
+    # The shape is judged with word lists bracketed: `user: %i[name email]`
+    # is the envelope `user: [:name, :email]`, and `items: [%i[sku]]` the
+    # array-of-hashes root `items: [[:sku]]`. A bracketed envelope's fields
+    # are still split as the source spells them, so a TODO for one quotes it
+    # as written; a word list among them is read where its field is parsed.
     def envelope(arg)
-      if (match = EXPECT_ENVELOPE.match(arg))
+      listed = bracket_word_lists(arg)
+      if EXPECT_ENVELOPE.match?(listed)
+        match = EXPECT_ENVELOPE.match(arg) || EXPECT_ENVELOPE.match(listed)
         [match[1].to_sym, split_args(match[2])]
-      elsif (match = EXPECT_CONSTANT_ENVELOPE.match(arg))
-        [match[1].to_sym, [match[2]]]
+      elsif (match = EXPECT_OPAQUE_ENVELOPE.match(listed))
+        [match[1].to_sym, [arg.sub(/\A\w+:\s*/, "")]]
       end
     end
 
@@ -809,8 +852,10 @@ module Permittable
 
     # One permit argument as `[shape, key]`, or `[shape, key, sub_keys]` for
     # the two hash shapes — nil when the conservative parser cannot read it,
-    # including a nested list with any sub-key it cannot read.
+    # including a nested list with any sub-key it cannot read. A word list
+    # reads as the list it equals: `address: %i[city zip]` is a nested hash.
     def parse_arg(arg)
+      arg = bracket_word_lists(arg)
       if (key = scalar_key(arg))
         [:scalars, key]
       elsif (match = ARRAY_ARG.match(arg))
