@@ -388,7 +388,11 @@ module Permittable
       # (see validate_authored_value!/validate_array_authored_value!), so
       # `expected` is compared bare, not cast — the matcher would otherwise
       # compare a cast value against an uncast stored one and never match.
+      # A :json default is the exception: it is always stored as the walker
+      # reads the hash (indifferent, and never cast), so `expected` is read
+      # the same way, and `{ theme: "dark" }` matches `{ "theme" => "dark" }`.
       def cast_default(field, expected)
+        return cast_json_default(field, expected) if field[:kind] == :json
         return expected if field[:transform]
 
         case field[:kind]
@@ -406,6 +410,13 @@ module Permittable
           violations.empty? ? value : expected
         else expected
         end
+      end
+
+      def cast_json_default(field, expected)
+        return expected unless expected.is_a?(Hash)
+
+        status, value = AuthoredValues.read_json(field, expected)
+        status == :ok ? value : expected
       end
 
       # A contract stores an `in:` list cast by the field's type, so

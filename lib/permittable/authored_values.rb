@@ -1,7 +1,8 @@
 module Permittable
-  # The request walker, pointed at an authored array `default:`/`example:`
-  # at class load — the same permittable_check_array a request goes
-  # through, so the two cannot drift apart. Two seams are overridden:
+  # The request walker, pointed at an authored array or `:json`
+  # `default:`/`example:` at class load — the same permittable_check_array
+  # and permittable_check_json a request goes through, so the two cannot
+  # drift apart. Two seams are overridden:
   #
   #   * the field WHOSE default:/example: is being validated does not run
   #     its own `transform:` — see permittable_transform below for exactly
@@ -18,6 +19,10 @@ module Permittable
       new.read_array(field, value)
     end
 
+    def self.read_json(field, value)
+      new.read_json(field, value)
+    end
+
     def self.summary(violations)
       new.summary(violations)
     end
@@ -28,6 +33,15 @@ module Permittable
       @field = field
       read = permittable_check_array(field, value, path: field[:name].to_s, unknown: :ignore, violations: violations)
       [read, violations]
+    end
+
+    # [:ok, value as a request would get it] or [:error, code]. A request's
+    # hash reaches permittable_check_json indifferent, as every Hash inside
+    # the walker's params is, so the authored one is made so first, the way
+    # the walker reads a nested hash. permittable_check_json then hands
+    # `validate:` a deep copy, as it does a request's, and returns that copy.
+    def read_json(field, value)
+      permittable_check_json(field, ActiveSupport::HashWithIndifferentAccess.new(value))
     end
 
     def summary(violations)

@@ -676,17 +676,10 @@ module Permittable
     # Free-form hash. The shape is deliberately undeclared, so the only
     # checks are the bounds the field asked for: breadth (`length:`, the
     # top-level key count, same reading as an array's element count) and
-    # nesting (`max_depth:`). Shared with macro-time `default:`/`example:`
-    # checking, like check_scalar.
-    def check_json(field, value)
-      status, code = check_json_bounds(field, value)
-      return [status, code] unless status == :ok
-
-      check_custom(field[:validate], value)
-    end
-
-    # The structural half of check_json, which the request walker runs on
-    # its own so that it can copy an accepted hash before app code sees it.
+    # nesting (`max_depth:`). The walker (permittable_check_json) runs them
+    # before `validate:`, so that it can copy an accepted hash before app
+    # code sees it, and an authored `default:`/`example:` goes through that
+    # walker too (see AuthoredValues).
     def check_json_bounds(field, value)
       return [:error, "invalid_type"] unless value.is_a?(Hash)
       return [:error, "length"] if field[:length] && !length_ok?(field[:length], value.length)
@@ -1492,17 +1485,26 @@ module Permittable
       raise ArgumentError, "#{LABEL}: :max_depth for :#{name} must be a positive Integer"
     end
 
-    # Same rule as a scalar's authored value, over check_json: a `default:` or
-    # `example:` that its own bounds would reject fails at class load.
+    # Same rule as a scalar's authored value: a `default:` or `example:` that
+    # its own bounds would reject fails at class load. Like an array's, it is
+    # read by the request walker itself (see AuthoredValues), so it is checked
+    # as a request sending the same hash is. The raw Hash used to be checked
+    # instead: `validate: ->(p) { p[:theme] == "dark" }` passed a request's
+    # {"theme":"dark"}, which the walker reads indifferently, and refused the
+    # same Hash authored as `default:`. And a `validate:` that edits its
+    # argument edited the host's own Hash, which a request's deep copy spares.
+    #
+    # The walker's copy is what is stored, so the action, the export and the
+    # RSpec matcher all read what a request sending it would have produced.
     def validate_json_authored_value!(field, opt)
       return unless field.key?(opt)
       return if authored_nil!(field, opt)
       raise ArgumentError, "#{LABEL}: :#{opt} for :#{field[:name]} must be a Hash" unless field[opt].is_a?(Hash)
 
-      status, code = Coercion.check_json(field, field[opt])
-      raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{code})" unless status == :ok
+      status, read = AuthoredValues.read_json(field, field[opt])
+      raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{read})" unless status == :ok
 
-      field[opt] = freeze_authored(field[opt])
+      field[opt] = freeze_authored(read)
     end
 
     # format / length / normalize reason about characters; on any other
@@ -2338,8 +2340,8 @@ module Permittable
     end
   end
 
-  # Coercion.check_json, with the copy the result needs made in the middle.
-  # The opaque hash is handed over whole, and HashWithIndifferentAccess
+  # The bounds, then `validate:`, with the copy the result needs made in the
+  # middle. The opaque hash is handed over whole, and HashWithIndifferentAccess
   # rebuilt its containers but not the Strings inside them, so it is
   # deep-copied for the reason permittable_normalized copies a String — but
   # only once it is within its bounds. Copying first meant a megabyte

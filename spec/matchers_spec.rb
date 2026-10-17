@@ -97,6 +97,23 @@ RSpec.describe "Permittable RSpec matchers" do
     expect(message).to include('expected default: "nope"')
   end
 
+  it "reads a :json with_default as the contract reads its default:, with String or Symbol keys" do
+    opaque = Class.new(FakeController) do
+      include Permittable
+
+      permit_params(:create) do
+        optional :prefs, :json, default: { theme: "dark" }
+        optional :meta,  :json, default: { "k" => "v" }, transform: ->(h) { h.merge("t" => 1) }
+      end
+    end
+
+    expect(opaque).to permit_param(:prefs).with_default(theme: "dark")
+    expect(opaque).to permit_param(:prefs).with_default("theme" => "dark")
+    expect(opaque).to permit_param(:meta).with_default(k: "v")
+    message = failure_of { expect(opaque).to permit_param(:prefs).with_default(theme: "light") }
+    expect(message).to include("expected default: #{{ theme: 'light' }.inspect}")
+  end
+
   it "casts its argument on a copy, so a mutating normalize: cannot rewrite the spec's own literal" do
     squishy = Class.new(FakeController) do
       include Permittable
