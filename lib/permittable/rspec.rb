@@ -483,8 +483,11 @@ module Permittable
         end
       end
 
+      # An anonymous controller class has no name, and a Contract instance
+      # never does, so the fallback names the kind of subject it is.
       def subject_name
-        (@subject.respond_to?(:name) && @subject.name) || "the controller"
+        (@subject.respond_to?(:name) && @subject.name) ||
+          (@subject.is_a?(Permittable::Contract) ? "the contract" : "the controller")
       end
 
       def path_label
@@ -666,8 +669,11 @@ module Permittable
         violations.map { |v| v[:code] ? "#{v[:param]} (#{v[:code]})" : v[:param] }.join(", ")
       end
 
+      # An anonymous controller class has no name, and a Contract instance
+      # never does, so the fallback names the kind of subject it is.
       def subject_name
-        (@subject.respond_to?(:name) && @subject.name) || "the contract"
+        (@subject.respond_to?(:name) && @subject.name) ||
+          (@subject.is_a?(Permittable::Contract) ? "the contract" : "the controller")
       end
 
       def action_label

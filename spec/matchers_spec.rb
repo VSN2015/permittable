@@ -468,6 +468,16 @@ RSpec.describe "Permittable RSpec matchers" do
     expect(contract).not_to permit_param(:admin)
   end
 
+  it "names a standalone Contract, not a controller, in permit_param's failure messages" do
+    contract = Permittable::Contract.define { optional :a, :string }
+    expect(failure_of { expect(contract).to permit_param(:b) })
+      .to start_with("expected the contract to permit :b")
+    expect(failure_of { expect(contract).not_to permit_param(:a) })
+      .to start_with("expected the contract not to permit :a")
+    expect(failure_of { expect(controller).to permit_param(:admin).for_action(:create) })
+      .to start_with("expected the controller to permit :admin")
+  end
+
   it "fails clearly when the action has no contract at all" do
     message = failure_of { expect(single_contract_controller).to permit_param(:name).for_action(:archive) }
     expect(message).to include("no contract")
@@ -574,6 +584,22 @@ RSpec.describe "Permittable RSpec matchers" do
       contract = Permittable::Contract.define { required :a, :integer }
       expect(contract).to accept_params({ a: "1" }).returning("a" => 1)
       expect(contract).to reject_params({ a: "x" }).with_violation("a", :invalid_type)
+    end
+
+    it "names an anonymous controller, not a contract, in its failure messages" do
+      anonymous = Class.new(FakeController) do
+        include Permittable
+
+        permit_params(:create) { required :a, :string }
+      end
+      expect(failure_of { expect(anonymous).to reject_params({ a: "x" }) })
+        .to start_with("expected the controller to reject those params")
+      expect(failure_of { expect(anonymous).not_to reject_params({}) })
+        .to start_with("expected the controller not to reject those params")
+
+      contract = Permittable::Contract.define { required :a, :string }
+      expect(failure_of { expect(contract).to reject_params({ a: "x" }) })
+        .to start_with("expected the contract to reject those params")
     end
 
     it "matches a standalone Contract's own unknown: :error strictness — no top-level exemption" do
