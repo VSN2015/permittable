@@ -321,16 +321,43 @@ module Permittable
     # ActiveStorage's direct uploads controller is the case this exists for —
     # it was drafted, and a contract pasted into a gem's controller is not
     # one the app can keep. A "controller#action" entry takes only that
-    # action out of the draft, and a controller with no drafted action left
-    # is skipped. Naming a controller to the task drafts it regardless, the
-    # way it drafts a covered one.
+    # action out of the draft, and so does an action the controller does not
+    # define (see undefined_actions): a SessionsController with only `create`
+    # and `destroy` gets no `:update` rule, and ApplicationController, which
+    # defines neither, would otherwise hand its rule to every controller
+    # below it. A controller with no drafted action left is skipped. Naming a
+    # controller to the task drafts it regardless (see named_target), the way
+    # it drafts a covered one.
     def targets(controllers, ignore: Permittable.audit_ignore, root: Audit.app_root)
       controllers.each_with_object({}) do |controller, found|
         next if controller.respond_to?(:permittable_contracts) && controller.permittable_contracts.any?
 
-        skipped = DEFAULT_ACTIONS.select { |action| Audit.ignore_reason(controller, action, ignore: ignore, root: root) }
+        undefined = undefined_actions(controller)
+        skipped = DEFAULT_ACTIONS.select do |action|
+          Audit.ignore_reason(controller, action, ignore: ignore, root: root) || undefined.include?(action)
+        end
         found[controller] = skipped unless skipped == DEFAULT_ACTIONS
       end
+    end
+
+    # What to leave out of the draft of a controller named to the task: the
+    # drafted actions it does not define, as in the sweep — unless it defines
+    # none of them. Then the name is all there is to go on, and it is drafted
+    # whole, as it always was.
+    def named_target(controller)
+      undefined = undefined_actions(controller)
+      undefined == DEFAULT_ACTIONS ? [] : undefined
+    end
+
+    # The drafted actions `controller` does not define, by the audit's own
+    # reading of it (Audit.missing_lookup): not just its action_methods, since
+    # an `action_missing` handler or a template answers an action with no
+    # method, and a controller that cannot list its actions is assumed to
+    # define them all. A second definition here would drift from what
+    # permittable:audit then calls stale.
+    def undefined_actions(controller)
+      missing = Audit.missing_lookup(controller)
+      DEFAULT_ACTIONS.select { |action| missing[action.to_s] }
     end
 
     # The core: knowledge in (columns and/or a scan), snippet out. Returns a
