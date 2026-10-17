@@ -101,6 +101,45 @@ RSpec.describe Permittable::Generator do
     end
   end
 
+  describe ".scan of a receiver that only ends in `params`" do
+    it "does not read user_params.permit as a rootless params.permit" do
+      scan = described_class.scan(<<~RUBY)
+        def user_params = params.require(:user)
+        def create_params = user_params.permit(:name, :email)
+      RUBY
+      expect(scan.calls).to eq(0)
+      expect(scan.scalars).to eq([])
+    end
+
+    it "keeps the root of the real call beside a helper that only ends in params" do
+      scan = described_class.scan(<<~RUBY)
+        def create_params = user_params.permit(:name, :email, :password_confirmation)
+        def user_params = params.require(:user).permit(:name, :email)
+      RUBY
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[name email])
+      expect(scan.calls).to eq(1)
+    end
+
+    it "does not read user_params.expect as a rootless params.expect" do
+      scan = described_class.scan("def create_params = user_params.expect(:name, :email)")
+      expect(scan.calls).to eq(0)
+      expect(scan.scalars).to eq([])
+    end
+
+    it "does not read an instance or global variable named like params" do
+      scan = described_class.scan("@params.permit(:name)\n$params.expect(:email)\n@user_params.permit(:age)")
+      expect(scan.calls).to eq(0)
+    end
+
+    it "still reads params behind an explicit receiver or at the start of a line" do
+      scan = described_class.scan("self.params.require(:user).permit(:name)\n  params.expect(user: [:email])")
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[name email])
+      expect(scan.calls).to eq(2)
+    end
+  end
+
   describe ".scan of Rails 8 params.expect calls" do
     it "reads the required root envelope and its scalar keys" do
       scan = described_class.scan("params.expect(user: [:name, :age])")
@@ -1448,6 +1487,16 @@ RSpec.describe Permittable::Generator do
       expect(draft).to include("root: :gen_post, model: GenPost")
       expect(draft).to include("required :title, :string")
       expect(draft).to include("optional :draft_token, :string, virtual: true")
+    end
+
+    it "keeps the model's root when the permit call is on a helper that only ends in params" do
+      controller = Class.new { def self.controller_name = "gen_posts" }
+      source = <<~RUBY
+        def post_params = params.require(:gen_post)
+        def create_params = post_params.permit(:title)
+      RUBY
+      draft = described_class.for_controller(controller, source: source)
+      expect(draft).to include("root: :gen_post, model: GenPost")
     end
 
     it "accepts an explicit model" do

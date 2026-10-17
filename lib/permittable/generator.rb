@@ -86,11 +86,18 @@ module Permittable
       end
     end
 
+    # `params` itself, not the tail of another name: `user_params.permit(...)`
+    # is called on a helper's result (`params.require(:user)`, say), whose
+    # root a rootless read of it would drop. `@params` and `$params` are
+    # variables. A `.` before it is fine: `self.params.permit(...)` is the
+    # real thing.
+    PARAMS = /(?<![\w@$])params/
+
     # One permit call, with an optional leading `.require(:root)`. The args
     # capture tolerates brackets and newlines but not parentheses — a call
     # whose arguments contain a method call is skipped entirely rather than
     # half-read.
-    PERMIT_CALL = /params\s*(?:\.\s*require\(\s*:(\w+)\s*\))?\s*\.\s*permit\(([^()]*)\)/m
+    PERMIT_CALL = /#{PARAMS}\s*(?:\.\s*require\(\s*:(\w+)\s*\))?\s*\.\s*permit\(([^()]*)\)/m
 
     # One Rails 8 `params.expect` call — the replacement for
     # `require(...).permit(...)`, and the reason this scanner exists twice: a
@@ -100,7 +107,7 @@ module Permittable
     # PERMIT_CALL: brackets and newlines are fine, a parenthesis means a
     # method call in the arguments and the whole call is skipped rather than
     # half-read.
-    EXPECT_CALL = /params\s*\.\s*expect\(([^()]*)\)/m
+    EXPECT_CALL = /#{PARAMS}\s*\.\s*expect\(([^()]*)\)/m
 
     # The required root envelope of an expect call: `user: [...]`, where the
     # brackets hold fields — not the empty `tag_names: []` of an
