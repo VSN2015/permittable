@@ -149,6 +149,151 @@ RSpec.describe Permittable::OpenAPI do
       expect(doc["paths"]["/users"]["post"]).not_to have_key("parameters")
     end
 
+    # Rails merges the router's path parameters over the body's keys, so a
+    # rootless field the route fills from the URL is read from the URL and
+    # validated there: `PATCH /widgets/7` with a body of {"name":"x"} is a
+    # 200 whatever the body says of `id`, and `PATCH /widgets/abc` is a 422.
+    context "with a rootless field named like a path variable" do
+      def widgets_document(controller, &draw)
+        route_set = ActionDispatch::Routing::RouteSet.new.tap { |routes| routes.draw(&draw) }
+        described_class.document(controllers: [controller],
+                                 routes: described_class.rails_routes(Struct.new(:routes).new(route_set)))
+      end
+
+      let(:update_widget) do
+        IntegrationHarness.build_controller do
+          include Permittable
+
+          def self.controller_path = "widgets"
+          permit_params :update do
+            required :id, :integer, in: 1..1000
+            optional :name, :string
+          end
+          def update = render(json: permitted_params)
+        end
+      end
+
+      it "documents the field as the path parameter's schema, not as a body property" do
+        patch = widgets_document(update_widget) { resources :widgets, only: :update }["paths"]["/widgets/{id}"]["patch"]
+
+        expect(patch["parameters"]).to eq(
+          [{ "name" => "id", "in" => "path", "required" => true,
+             "schema" => { "type" => "integer", "minimum" => 1, "maximum" => 1000 } }]
+        )
+        expect(patch["requestBody"]["required"]).to be(false)
+        expect(patch["requestBody"]["content"]["application/json"]["schema"])
+          .to eq("type" => "object", "properties" => { "name" => { "type" => "string" } })
+      end
+
+      it "describes what a request does: the path value is validated, the body need not carry it" do
+        ok = IntegrationHarness.dispatch(update_widget, :update, method: "PATCH", path_params: { id: "7" },
+                                                                 json: { name: "x" })
+        expect([ok.status, JSON.parse(ok.body)]).to eq([200, { "id" => 7, "name" => "x" }])
+        %w[abc 2000].each do |id|
+          bad = IntegrationHarness.dispatch(update_widget, :update, method: "PATCH", path_params: { id: id },
+                                                                    json: { name: "x" })
+          expect(bad.status).to eq(422)
+        end
+      end
+
+      it "drops the request body when the path parameters were its only fields" do
+        controller = IntegrationHarness.build_controller do
+          include Permittable
+
+          def self.controller_path = "widgets"
+          permit_params(:update, unknown: :error) { required :id, :integer }
+        end
+        patch = widgets_document(controller) { resources :widgets, only: :update }["paths"]["/widgets/{id}"]["patch"]
+
+        expect(patch["parameters"].first["schema"]).to eq("type" => "integer")
+        expect(patch).not_to have_key("requestBody")
+      end
+
+      it "keeps unknown: :error on what is left of the body" do
+        controller = IntegrationHarness.build_controller do
+          include Permittable
+
+          def self.controller_path = "widgets"
+          permit_params(:update, unknown: :error) do
+            required :id, :integer
+            required :name, :string
+          end
+        end
+        patch = widgets_document(controller) { resources :widgets, only: :update }["paths"]["/widgets/{id}"]["patch"]
+
+        expect(patch["requestBody"]["required"]).to be(true)
+        expect(patch["requestBody"]["content"]["application/json"]["schema"]).to eq(
+          "type" => "object", "properties" => { "name" => { "type" => "string", "minLength" => 1 } },
+          "required" => ["name"], "additionalProperties" => false
+        )
+      end
+
+      it "keeps a rooted contract's field in the body: there it is a body field" do
+        controller = IntegrationHarness.build_controller do
+          include Permittable
+
+          def self.controller_path = "widgets"
+          permit_params(:update, root: :widget) { required :id, :integer }
+        end
+        patch = widgets_document(controller) { resources :widgets, only: :update }["paths"]["/widgets/{id}"]["patch"]
+
+        expect(patch["parameters"].first["schema"]).to eq("type" => "string")
+        expect(patch["requestBody"]["content"]["application/json"]["schema"]["properties"]["widget"]["properties"])
+          .to have_key("id")
+      end
+
+      it "moves the field only on the paths that template it" do
+        controller = IntegrationHarness.build_controller do
+          include Permittable
+
+          def self.controller_path = "widgets"
+          permit_params(:update, :create) do
+            required :locale, :string, in: %w[en fr]
+            optional :name, :string
+          end
+        end
+        paths = widgets_document(controller) do
+          scope("(:locale)") { resources :widgets, only: %i[create update] }
+        end["paths"]
+
+        in_body = ->(path, verb) { paths[path][verb]["requestBody"]["content"]["application/json"]["schema"] }
+        expect(in_body.call("/widgets", "post")["properties"].keys).to eq(%w[locale name])
+        expect(in_body.call("/{locale}/widgets", "post")["properties"].keys).to eq(%w[name])
+        expect(paths["/{locale}/widgets"]["post"]["parameters"].first["schema"])
+          .to eq("type" => "string", "minLength" => 1, "enum" => %w[en fr])
+        expect(paths["/widgets/{id}"]["patch"]["parameters"].map { |p| p["name"] }).to eq(["id"])
+        expect(in_body.call("/widgets/{id}", "patch")["properties"].keys).to eq(%w[locale name])
+      end
+
+      it "follows the route's own spelling when its path is shared with another's" do
+        pages = IntegrationHarness.build_controller do
+          include Permittable
+
+          def self.controller_path = "pages"
+          permit_params(:create) do
+            required :slug, :string
+            optional :title, :string
+          end
+        end
+        route_set = ActionDispatch::Routing::RouteSet.new.tap do |routes|
+          routes.draw do
+            scope("(:locale)") do
+              root to: "home#index"
+              post ":slug", to: "pages#create"
+            end
+          end
+        end
+        doc = described_class.document(
+          controllers: [pages], routes: described_class.rails_routes(Struct.new(:routes).new(route_set))
+        )
+
+        create = doc["paths"]["/{locale}"]["post"]
+        expect(create["x-permittable-path"]).to eq("/{slug}")
+        expect(create["parameters"].first).to include("name" => "locale", "schema" => { "type" => "string", "minLength" => 1 })
+        expect(create["requestBody"]["content"]["application/json"]["schema"]["properties"].keys).to eq(%w[title])
+      end
+    end
+
     it "keeps a colliding operation visible instead of overwriting it" do
       users = controller_class(path: "users") { permit_params(:create) { required :name, :string } }
       clones = controller_class(path: "clones") { permit_params(:create) { required :other, :string } }
