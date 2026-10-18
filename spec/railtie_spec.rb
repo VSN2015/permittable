@@ -232,11 +232,18 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
   # write, so an unfixed run loses a name only now and then. The setter is
   # slowed by a millisecond to make the window the one a GVL-free Ruby, or an
   # unlucky timer tick, would give: the same lost update every time.
+  #
+  # Every registration restores all missing names, so a name lost early comes
+  # back on a later add and only the last writer's loss survives to the end.
+  # The end state alone therefore misses most races; each write is checked
+  # instead, and counted when it drops an entry that is already present.
   CONCURRENT_SCRIPT = BOOT_HEADER + <<~RUBY
     ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
+    $dropped = 0
     ActiveRecord::Base.singleton_class.prepend(Module.new do
       def filter_attributes=(value)
         sleep 0.001
+        $dropped += 1 unless (filter_attributes - Array(value)).empty?
         super
       end
     end)
@@ -254,6 +261,7 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
 
     print JSON.generate(
       names: names,
+      dropped_writes: $dropped,
       filter_attribute_names: ActiveRecord::Base.filter_attributes.grep(String)
     )
   RUBY
@@ -431,6 +439,7 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
       names = concurrent["names"]
       listed = concurrent["filter_attribute_names"]
       expect(names.size).to eq(50)
+      expect(concurrent["dropped_writes"]).to eq(0)
       expect(names - listed).to eq([])
       expect(listed.tally.values.uniq).to eq([1])
     end
