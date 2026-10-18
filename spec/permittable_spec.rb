@@ -684,6 +684,21 @@ RSpec.describe Permittable do
       end
     end
 
+    it "rejects a :float Numeric too small for a Float, as it does the same number sent as a String" do
+      [BigDecimal("1e-400"), BigDecimal("-1e-400"), Rational(1, 10**400), Rational(-1, 10**400)].each do |value|
+        expect(rejected(:f, value, &decl)).to eq([{ param: "f", code: "invalid_type" }]), "for #{value}"
+      end
+    end
+
+    it "still accepts a Numeric that is zero, or that a Float can hold, down to the smallest subnormal" do
+      [0, 0.0, -0.0, BigDecimal("0"), Rational(0)].each do |value|
+        expect(permit({ f: value }, &decl)[:f]).to eq(0.0), "for #{value.inspect}"
+      end
+      [5e-324, BigDecimal("1e-300"), Rational(1, 10**300), 1, 2**70].each do |value|
+        expect(permit({ f: value }, &decl)[:f]).to eq(value.to_f), "for #{value.inspect}"
+      end
+    end
+
     it "still accepts a genuine zero, however it is spelled" do
       ["0", "0.0", "-0.0", "0e10", "0.0000"].each do |value|
         expect(permit({ f: value }, &decl)[:f]).to eq(0.0), "for #{value}"

@@ -849,7 +849,10 @@ module Permittable
 
     def cast_float(value)
       case value
-      when Numeric then finite_float(value.to_f)
+      # A zero Numeric is a genuine zero; one that only BECAME zero in to_f
+      # (BigDecimal("1e-400"), Rational(1, 10**400)) is underflow, exactly as
+      # for the String of it, so a nonzero one passes its text for the check.
+      when Numeric then finite_float(value.to_f, source: (value.to_s unless value.zero?))
       when String then value.match?(NUMERIC_FORMAT) ? finite_float(Float(value), source: value) : [:error, "invalid_type"]
       else [:error, "invalid_type"]
       end
@@ -865,7 +868,8 @@ module Permittable
     # an ordinary 0.0: a zero result is rejected when the string it came from
     # named a nonzero SIGNIFICAND. Only the significand, because "0e10" is a
     # genuine zero whose exponent digits say nothing about the value — as are
-    # "0", "0.0" and "0.0000".
+    # "0", "0.0" and "0.0000". A Numeric is checked the same way, by its to_s
+    # (see cast_float).
     def finite_float(result, source: nil)
       return [:error, "invalid_type"] unless result.finite?
       return [:error, "invalid_type"] if result.zero? && nonzero_significand?(source)
