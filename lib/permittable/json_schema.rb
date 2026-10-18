@@ -307,15 +307,37 @@ module Permittable
       !allowed.nil? && !allowed.is_a?(Range) && Coercion.in_list(allowed).nil?
     end
 
+    # Every field whose schema admits a string gets its bounds here: :string,
+    # and the string encodings of :decimal, :date and :datetime. minLength
+    # and maxLength only ever constrain the string branch, so the number
+    # branch of a :decimal is untouched. `length:` itself is :string-only.
     def apply_string_bounds!(schema, field)
-      return unless field[:type] == :string
+      return unless Array(schema["type"]).include?("string")
 
       min, max = length_bounds(field[:length])
-      # "" is ABSENT and an absent required field violates, so a required
-      # string can never validly be empty — the schema says so.
-      min = 1 if field[:required] && min.to_i < 1
+      min = 1 if blank_floor?(field) && min.to_i < 1
       schema["minLength"] = min if min
       schema["maxLength"] = max if max
+    end
+
+    # "" is ABSENT whatever the type, and an absent required field violates,
+    # so a required field can never validly be "" — the schema says so. For
+    # :date, :datetime and :decimal that is the only thing the schema can say
+    # about a blank: `format` is an annotation, and "decimal" is no format a
+    # validator knows. (A whitespace-only string needs no floor there: those
+    # types refuse it as invalid_type, and the schema never claims to catch a
+    # cast failure. For :date and :datetime `format` at least names the
+    # failure to a validator that asserts it; for :decimal nothing does, so
+    # "   " passes the schema and earns a 422. That is a documented looser
+    # case, the same one as "abc" for a :decimal, and deliberately has no
+    # `pattern` to close it.)
+    #
+    # A nullable field is the exception: it reads "" as an explicit null, a
+    # value rather than an absence, so a floor would reject what the server
+    # takes. A nullable :string keeps the floor it has always had (stricter
+    # than the server, the safe direction); the other types start without.
+    def blank_floor?(field)
+      field[:required] && (field[:type] == :string || !field[:nullable])
     end
 
     def apply_pattern!(schema, regexp)

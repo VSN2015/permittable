@@ -73,6 +73,36 @@ RSpec.describe Permittable::JsonSchema do
       expect(prop["minLength"]).to eq(1)
       expect(prop["maxLength"]).to eq(10)
     end
+
+    # "" is absent for EVERY type, so a required :decimal/:date/:datetime
+    # rejects it as missing. They are strings on the wire, and `format` is
+    # only an annotation (and "decimal" is no format a validator knows), so
+    # minLength is the one keyword that makes the schema say so too.
+    it "gives a required decimal, date or datetime minLength 1, on its string encoding only" do
+      schema = schema_for do
+        required :price, :decimal
+        required :due_on, :date
+        required :starts_at, :datetime
+        optional :note, :decimal
+        optional :day, :date
+        required :n, :integer
+      end
+      props = schema["properties"]
+
+      expect(props["price"]).to include("type" => %w[string number], "minLength" => 1)
+      expect(props["due_on"]).to include("type" => "string", "minLength" => 1)
+      expect(props["starts_at"]).to include("type" => "string", "minLength" => 1)
+      expect(props["note"]).not_to have_key("minLength")
+      expect(props["day"]).not_to have_key("minLength")
+      expect(props["n"]).not_to have_key("minLength")
+    end
+
+    it "leaves a nullable decimal's \"\" alone, since it reads as an explicit null" do
+      prop = property("price") { required :price, :decimal, nullable: true }
+
+      expect(prop["type"]).to eq(%w[string number null])
+      expect(prop).not_to have_key("minLength")
+    end
   end
 
   describe "length:" do

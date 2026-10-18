@@ -281,6 +281,40 @@ module SchemaConformance
         [{ "starts_on" => 5, "ends_on" => 1 }, :finalize]
       ]
     },
+    "required strings that are not :string" => {
+      # "" is absent whatever the type, so each of these is `missing` at
+      # runtime; only minLength lets the schema agree for the string encodings.
+      contract: proc {
+        required :title,     :string
+        required :price,     :decimal
+        required :due_on,    :date
+        required :starts_at, :datetime
+      },
+      payloads: [
+        [{ "title" => "t", "price" => "1.50", "due_on" => "2026-01-01", "starts_at" => "2026-01-01T10:00:00Z" }, :agree],
+        [{ "title" => "t", "price" => 1.5, "due_on" => "2026-01-01", "starts_at" => "2026-01-01T10:00:00Z" }, :agree],
+        [{ "title" => "", "price" => "1.50", "due_on" => "2026-01-01", "starts_at" => "2026-01-01T10:00:00Z" }, :agree],
+        [{ "title" => "t", "price" => "", "due_on" => "2026-01-01", "starts_at" => "2026-01-01T10:00:00Z" }, :agree],
+        [{ "title" => "t", "price" => "1.50", "due_on" => "", "starts_at" => "2026-01-01T10:00:00Z" }, :agree],
+        [{ "title" => "t", "price" => "1.50", "due_on" => "2026-01-01", "starts_at" => "" }, :agree]
+      ]
+    },
+    "required nullable :decimal, :date and :datetime" => {
+      # The counterpart of the case above: a nullable field reads "" as an
+      # explicit null, which IS a value, so the runtime accepts it and the
+      # schema must too. A minLength 1 floor here would reject a value the
+      # server takes, the stricter direction, and fail this :agree.
+      contract: proc {
+        required :price,     :decimal,  nullable: true
+        required :due_on,    :date,     nullable: true
+        required :starts_at, :datetime, nullable: true
+      },
+      payloads: [
+        [{ "price" => "", "due_on" => "", "starts_at" => "" }, :agree],
+        [{ "price" => nil, "due_on" => nil, "starts_at" => nil }, :agree],
+        [{ "price" => "1.50", "due_on" => "2026-01-01", "starts_at" => "2026-01-01T10:00:00Z" }, :agree]
+      ]
+    },
     "arrays" => {
       contract: proc { array :tags, of: :string, length: 1..3 },
       payloads: [
