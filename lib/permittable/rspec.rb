@@ -616,13 +616,31 @@ module Permittable
           attr_accessor :params
         end
         mirror_contract_unknown_check(host) if @subject.is_a?(Permittable::Contract)
+        action = @action || rule[:actions].first || "call"
+        label_instrumentation(host, action)
         host.permittable_contracts = [rule.merge(mode: :enforce).freeze]
         instance = host.new
         instance.params = @params
-        action = @action || rule[:actions].first || "call"
         violations = instance.permittable_violations(action)
         result = violations.empty? ? instance.permitted_params(action) : nil
         [violations, result]
+      end
+
+      # A rejection instruments invalid_parameters.permittable exactly as a
+      # request would. The host is anonymous, so without this the payload
+      # carried controller: nil, action: nil — a subscriber following the
+      # README's shape (`payload[:controller].tr("/", ".")`) raised out of
+      # the matcher. Label it the way the subject itself would: a
+      # controller by its path (or name, or "the contract" when anonymous —
+      # an anonymous controller's controller_path is nil), a Contract as
+      # Contract#call does.
+      def label_instrumentation(host, action)
+        label = if @subject.is_a?(Permittable::Contract) then "Permittable::Contract"
+                elsif @subject.respond_to?(:controller_path) then @subject.controller_path || subject_name
+                else subject_name
+                end
+        host.define_method(:permittable_controller_name) { label }
+        host.define_method(:permittable_action_name) { action }
       end
 
       # Mirrors Permittable::Contract's own host override verbatim (see
