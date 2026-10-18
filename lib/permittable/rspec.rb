@@ -96,7 +96,10 @@ module Permittable
       end
 
       def matching(regexp)
-        @expected[:format] = regexp
+        # `format: "email"` names a preset exactly as `format: :email` does
+        # (see resolve_format!), so the matcher reads a String the same way;
+        # as a Symbol it also reports the preset the same way in a failure.
+        @expected[:format] = regexp.is_a?(String) ? regexp.to_sym : regexp
         self
       end
 
@@ -364,8 +367,9 @@ module Permittable
         "expected the field to be #{expected}, but it is #{actual}" unless actual == expected
       end
 
-      # `matching(:email)` asserts the preset by name, `matching(/re/)` the
-      # Regexp itself.
+      # `matching(:email)` (or `matching("email")`, normalized to a Symbol by
+      # `matching`) asserts the preset by name, `matching(/re/)` the Regexp
+      # itself.
       def format_mismatch(field, expected)
         return option_mismatch(field, :format, expected) unless expected.is_a?(Symbol)
         return if field[:format_name] == expected
