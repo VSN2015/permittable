@@ -35,8 +35,9 @@ module SchemaConformance
   # The rest run the OTHER way — the schema is LOOSER than the server, and a
   # client following it can still be surprised by a 422 — so each is labelled
   # separately rather than waved through, and LOOSER names the keyword the
-  # DIVERGING FIELD'S OWN schema must still carry, so a tool that wants to
-  # close the gap can find the rule:
+  # DIVERGING FIELD'S OWN schema must still carry (the rule's own object, for
+  # the RULE_LEVEL labels), so a tool that wants to close the gap can find the
+  # rule:
   #
   #   :extension_only — the contract enforces a bound JSON Schema has no
   #     keyword for (`max_depth:`). The exporter does not drop the bound — it
@@ -59,14 +60,23 @@ module SchemaConformance
   #     bounded :decimal's string encoding skips them: "5000" sails past a
   #     `maximum` of 999.99 that the server enforces on the parsed value. The
   #     bound is still published, as a number, for a client that parses first.
+  #   :finalize — a `finalize` block's `violate!` cross-field check runs once
+  #     every field has passed, so a payload each field's schema accepts is
+  #     still refused. It belongs to the rule, not to a field, so the flag
+  #     `x-permittable-finalize` sits on the rule's own object (see RULE_LEVEL).
   LOOSER = {
     extension_only: "x-permittable-max-depth",
     range_extension: "x-permittable-range",
     custom_validation: "x-permittable-custom-validation",
     normalized_first: "x-permittable-normalize",
     format_annotation: "format",
-    string_decimal: "maximum"
+    string_decimal: "maximum",
+    finalize: "x-permittable-finalize"
   }.freeze
+
+  # The LOOSER labels carried by the rule's own object rather than by the
+  # diverging field's schema.
+  RULE_LEVEL = %i[finalize].freeze
 
   CASES = {
     "scalars and bounds" => {
@@ -253,6 +263,58 @@ module SchemaConformance
         [{ "at" => "not a time" }, :format_annotation]
       ]
     },
+    "a finalize block" => {
+      # finalize runs after every field has passed, so a payload the fields
+      # accept can still earn a 422. No field's schema can say that, so the
+      # rule's own object is flagged instead (the field schemas stay clean).
+      contract: proc {
+        required :starts_on, :integer
+        required :ends_on, :integer
+        finalize do |p|
+          violate!(:ends_on, :before_start) if p[:ends_on] < p[:starts_on]
+          p
+        end
+      },
+      payloads: [
+        [{ "starts_on" => 1, "ends_on" => 5 }, :agree],
+        [{ "starts_on" => 1 }, :agree],
+        [{ "starts_on" => 5, "ends_on" => 1 }, :finalize]
+      ]
+    },
+    "required strings that are not :string" => {
+      # "" is absent whatever the type, so each of these is `missing` at
+      # runtime; only minLength lets the schema agree for the string encodings.
+      contract: proc {
+        required :title,     :string
+        required :price,     :decimal
+        required :due_on,    :date
+        required :starts_at, :datetime
+      },
+      payloads: [
+        [{ "title" => "t", "price" => "1.50", "due_on" => "2026-01-01", "starts_at" => "2026-01-01T10:00:00Z" }, :agree],
+        [{ "title" => "t", "price" => 1.5, "due_on" => "2026-01-01", "starts_at" => "2026-01-01T10:00:00Z" }, :agree],
+        [{ "title" => "", "price" => "1.50", "due_on" => "2026-01-01", "starts_at" => "2026-01-01T10:00:00Z" }, :agree],
+        [{ "title" => "t", "price" => "", "due_on" => "2026-01-01", "starts_at" => "2026-01-01T10:00:00Z" }, :agree],
+        [{ "title" => "t", "price" => "1.50", "due_on" => "", "starts_at" => "2026-01-01T10:00:00Z" }, :agree],
+        [{ "title" => "t", "price" => "1.50", "due_on" => "2026-01-01", "starts_at" => "" }, :agree]
+      ]
+    },
+    "required nullable :decimal, :date and :datetime" => {
+      # The counterpart of the case above: a nullable field reads "" as an
+      # explicit null, which IS a value, so the runtime accepts it and the
+      # schema must too. A minLength 1 floor here would reject a value the
+      # server takes, the stricter direction, and fail this :agree.
+      contract: proc {
+        required :price,     :decimal,  nullable: true
+        required :due_on,    :date,     nullable: true
+        required :starts_at, :datetime, nullable: true
+      },
+      payloads: [
+        [{ "price" => "", "due_on" => "", "starts_at" => "" }, :agree],
+        [{ "price" => nil, "due_on" => nil, "starts_at" => nil }, :agree],
+        [{ "price" => "1.50", "due_on" => "2026-01-01", "starts_at" => "2026-01-01T10:00:00Z" }, :agree]
+      ]
+    },
     "arrays" => {
       contract: proc { array :tags, of: :string, length: 1..3 },
       payloads: [
@@ -349,7 +411,12 @@ RSpec.describe "the exported schema against what the contract enforces" do
             expect([runtime, documented]).to eq(%i[reject accept]),
                                              "#{expectation} is for a rule the schema cannot carry; " \
                                              "got runtime=#{runtime}, documented=#{documented}"
-            expect(diverging_field_schema(schema, payload)).to include(SchemaConformance::LOOSER.fetch(expectation))
+            carrier = if SchemaConformance::RULE_LEVEL.include?(expectation)
+                        spec[:root] ? schema.dig("properties", spec[:root].to_s) : schema
+                      else
+                        diverging_field_schema(schema, payload)
+                      end
+            expect(carrier).to include(SchemaConformance::LOOSER.fetch(expectation))
           else
             # Only ever in the safe direction: a client following the docs is
             # conservative, never surprised by a 422.
