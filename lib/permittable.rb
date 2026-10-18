@@ -1851,10 +1851,11 @@ module Permittable
 
       types = checked.to_h { |f| [f[:name], f[:type]] }
       allowed = checked.select { |f| f.key?(:in) }.to_h { |f| [f[:name], f[:in]] }
+      transformed = checked.select { |f| f[:transform] }.map { |f| f[:name].to_sym }
       begin
         ColumnGuard.ensure_columns_on!(LABEL, model_class, *checked.map { |f| f[:name] },
                                        types: types, check_types: Permittable.check_column_types,
-                                       allowed: allowed)
+                                       allowed: allowed, transformed: transformed)
       rescue ArgumentError => e
         # The type error carries its own guidance; only the missing-column one
         # needs the virtual: hint appended.

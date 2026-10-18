@@ -924,9 +924,15 @@ module Permittable
     # it back to its key. Left as a TODO rather than drafted: forms, the
     # common client, send the key. Only for an enum that stores Integers — a
     # string-backed one has no second spelling to admit.
+    #
+    # The transform is spelled out because the obvious one is wrong: with
+    # `key(v.to_i) || v`, "shipped".to_i is 0, so a NAME became the first
+    # key. Integer(v, exception: false) is nil for a name, which key() maps
+    # to nil. The type guard accepts this in: only beside a transform:.
     def enum_todo(column)
       "TODO: Rails also assigns the stored integers (#{column.name}: 1) — if API clients send them, add " \
-        "#{column.enum}.values.map(&:to_s) to in: and map them back to keys with transform:"
+        "#{column.enum}.values.map(&:to_s) to in: and map them back to keys with " \
+        "transform: ->(v) { #{column.enum}.key(Integer(v, exception: false)) || v }"
     end
 
     def unread_todo(column)

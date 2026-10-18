@@ -3237,6 +3237,26 @@ RSpec.describe Permittable do
               .to raise_error(ArgumentError, /in: EnumThing.statuses.keys/)
           end
 
+          # permittable:generate's enum TODO says to admit the stored integers
+          # with in: and map them back with transform: (in: runs first). The
+          # guard refused that exact contract, failing the deploy of a draft
+          # its own generator recommended.
+          it "accepts the stored integers in in: when a transform: maps them back to names" do
+            m = enum_model
+            expect(&declaring(m) do
+              optional :status, :string, in: m.statuses.keys + m.statuses.values.map(&:to_s),
+                                         transform: ->(v) { m.statuses.key(v.to_i) || v }
+            end).not_to raise_error
+            # Still only the stored integers: anything else is refused, transform or not.
+            expect(&declaring(m) { optional :status, :string, in: %w[pending 7], transform: ->(v) { v } })
+              .to raise_error(ArgumentError, /"7"/)
+          end
+
+          it "names the transform: route when the stored integers are listed without one" do
+            expect(&declaring(enum_model) { optional :status, :string, in: %w[pending 1] })
+              .to raise_error(ArgumentError, /"1".*transform:/m)
+          end
+
           it "holds a string-backed enum to the same rule, accepting its stored values too" do
             m = enum_model
             # Assignment accepts a mapped value as well as a name, and a

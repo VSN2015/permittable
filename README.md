@@ -1029,7 +1029,7 @@ A value outside the enum would pass the contract and then raise on assignment.
 Declare it with in: Order.statuses.keys.
 ```
 
-The `in:` may list names and, for a string-backed enum, stored values, since assignment accepts both. It must be a list: a Range is refused because it cannot be checked. String-backed enums follow the same rule. Other declarations are still held to the column's own group: `:integer` on an integer-backed enum passes, and `:datetime` fails with a suggestion of the enum contract rather than `virtual: true`.
+The `in:` may list names and, for a string-backed enum, stored values, since assignment accepts both. An integer-backed enum's stored integers (`"1"`) are accepted only beside a `transform:` that maps them back to names, which is the recipe `permittable:generate`'s TODO spells out. It must be a list: a Range is refused because it cannot be checked. String-backed enums follow the same rule. Other declarations are still held to the column's own group: `:integer` on an integer-backed enum passes, and `:datetime` fails with a suggestion of the enum contract rather than `virtual: true`.
 
 The attribute API is **not** treated the same way, by choice. `attribute :starts_at, :datetime` over a string column is still compared against the string column. An enum's mapping says exactly which strings are valid, so the exemption can demand a matching `in:`. An attribute override gives the guard nothing comparable to check the contract against, so exempting it would only switch the check off for that field. Declare such a field to match its column, or leave the check off.
 
@@ -1155,7 +1155,7 @@ For each controller the task infers the model from `controller_name` (columns gi
 permit_params :create, root: :user, model: User, mode: :monitor do
   required :name, :string
   optional :age, :integer
-  optional :status, :string, in: User.statuses.keys # database default: "active"; TODO: Rails also assigns the stored integers (status: 1) — if API clients send them, add User.statuses.values.map(&:to_s) to in: and map them back to keys with transform:
+  optional :status, :string, in: User.statuses.keys # database default: "active"; TODO: Rails also assigns the stored integers (status: 1) — if API clients send them, add User.statuses.values.map(&:to_s) to in: and map them back to keys with transform: ->(v) { User.statuses.key(Integer(v, exception: false)) || v }
   optional :password_confirmation, :string, virtual: true # TODO: not a database column — confirm the type
   array :tag_names, of: :string # TODO: confirm the element type, and declare length: — an array without one is unbounded
 end
@@ -1164,7 +1164,7 @@ end
 permit_params :update, root: :user, model: User, mode: :monitor do
   optional :name, :string
   optional :age, :integer
-  optional :status, :string, in: User.statuses.keys # database default: "active"; TODO: Rails also assigns the stored integers (status: 1) — if API clients send them, add User.statuses.values.map(&:to_s) to in: and map them back to keys with transform:
+  optional :status, :string, in: User.statuses.keys # database default: "active"; TODO: Rails also assigns the stored integers (status: 1) — if API clients send them, add User.statuses.values.map(&:to_s) to in: and map them back to keys with transform: ->(v) { User.statuses.key(Integer(v, exception: false)) || v }
   optional :password_confirmation, :string, virtual: true # TODO: not a database column — confirm the type
   array :tag_names, of: :string # TODO: confirm the element type, and declare length: — an array without one is unbounded
 end
