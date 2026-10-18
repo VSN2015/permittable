@@ -198,6 +198,12 @@ module Permittable
       # Permittable.mode is runtime configuration the export can't see.
       operation["x-permittable-mode"] = "monitor" if rule[:mode] == :monitor
       operation["x-permittable-catch-all"] = true if action == "*"
+      # `finalize` is flagged on the rule's object schema too (see
+      # JsonSchema.rule), but that sits inside the requestBody, and an
+      # operation can end up with no body (every field a path variable) while
+      # finalize still refuses requests. The operation is the one object that
+      # is always there, so the marker rides on it as well.
+      operation["x-permittable-finalize"] = true if rule[:finalize]
       operation
     end
 

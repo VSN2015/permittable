@@ -745,4 +745,39 @@ RSpec.describe Permittable::JsonSchema do
       expect(inner["additionalProperties"]).to be(false)
     end
   end
+
+  describe "finalize" do
+    # A cross-field rule no single field's schema can carry, so a payload
+    # every field accepts can still be refused by violate!.
+    let(:booking) do
+      proc do
+        required :starts_on, :integer
+        required :ends_on, :integer
+        finalize do |p|
+          violate!(:ends_on, :before_start) if p[:ends_on] < p[:starts_on]
+          p
+        end
+      end
+    end
+
+    it "flags the rule's own object with x-permittable-finalize, inside the root: wrapper" do
+      expect(schema_for(&booking)).to include("x-permittable-finalize" => true)
+
+      rooted = schema_for(root: :booking, &booking)
+      expect(rooted).not_to have_key("x-permittable-finalize")
+      expect(rooted["properties"]["booking"]).to include("x-permittable-finalize" => true)
+
+      expect(schema_for { required :name, :string }).not_to have_key("x-permittable-finalize")
+    end
+
+    it "carries the flag into OpenAPI's requestBody and a standalone Contract's schema" do
+      klass = Class.new(FakeController) { include Permittable }
+      klass.permit_params(:create, root: :booking, &booking)
+      body = Permittable::OpenAPI.request_body_for(klass, :create)
+      expect(body.dig("content", "application/json", "schema", "properties", "booking"))
+        .to include("x-permittable-finalize" => true)
+
+      expect(Permittable::Contract.define(&booking).json_schema).to include("x-permittable-finalize" => true)
+    end
+  end
 end

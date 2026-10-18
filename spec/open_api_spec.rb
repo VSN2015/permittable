@@ -132,6 +132,22 @@ RSpec.describe Permittable::OpenAPI do
       expect(described_class.operations_for(enforced)["create"]).not_to have_key("x-permittable-mode")
     end
 
+    # The rule's object schema carries the flag too, but a requestBody can be
+    # absent (an operation whose only fields are path variables), and the
+    # operation is what is always there.
+    it "flags a rule's finalize on the operation itself, so the marker outlives its requestBody" do
+      klass = controller_class do
+        permit_params(:create, root: :user) do
+          required :name, :string
+          finalize { |p| p }
+        end
+        permit_params(:update) { required :name, :string }
+      end
+      operations = described_class.operations_for(klass)
+      expect(operations["create"]["x-permittable-finalize"]).to be(true)
+      expect(operations["update"]).not_to have_key("x-permittable-finalize")
+    end
+
     it "resolves each action through permit_rule_for, so the last matching rule wins" do
       klass = controller_class do
         permit_params { optional :anything, :string }
