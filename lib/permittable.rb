@@ -1398,19 +1398,34 @@ module Permittable
     # enum rule all read the members the runtime compares against. A member
     # no request value could ever equal is a contract mistake, and fails here
     # rather than as an `inclusion` on every request.
+    #
+    # An empty list or a reversed Range is refused for the same reason, but
+    # an object used as given is not asked: it is read on every request, so
+    # a live registry that is empty now (filled in an initializer or
+    # `after_initialize`, after `eager_load!` has run this) is the very use
+    # the README recommends it for.
     def resolve_in!(field)
       name = field[:name]
       allowed = field[:in]
       if allowed.is_a?(Range)
         assert_comparable_range!(field, allowed)
+        assert_satisfiable!(name, :in, allowed)
       elsif (members = Coercion.in_list(allowed))
         cast_in_members!(field, members)
+        assert_satisfiable!(name, :in, field[:in])
       elsif allowed.is_a?(String) || !allowed.respond_to?(:include?)
         raise ArgumentError, "#{LABEL}: :in for field :#{name} must be a Range, a list of values (an Array, Set, " \
                              "or a Hash read as its keys), or an object answering include? " \
                              "(got #{allowed.inspect})#{string_in_hint(allowed)}"
       end
-      assert_satisfiable!(name, :in, field[:in])
+    end
+
+    # An `in:` that is neither a Range nor a list the gem read and cast
+    # itself, so one resolve_in! kept exactly as given: its contents are the
+    # host's, and unknown at class load.
+    def live_in?(field)
+      allowed = field[:in]
+      !allowed.nil? && !allowed.is_a?(Range) && Coercion.in_list(allowed).nil?
     end
 
     def string_in_hint(allowed)
@@ -1632,6 +1647,12 @@ module Permittable
     # never reaches the action, so that reason does not apply to it: under
     # `transform:` it used to be published uncast, `"type": "integer",
     # "examples": ["18"]`, the very lie the cast exists to stop.
+    #
+    # The one rule not checked is `in:` when it is an object used as given
+    # (see resolve_in!): a live registry is empty at class load, so
+    # `in: LIVE, default: "order.paid"` would be refused for a member it will
+    # hold by the first request. What it will contain is unknown then, so its
+    # `include?` is not asked; every other rule is still checked.
     def validate_authored_value!(field, opt)
       return unless field.key?(opt)
       return if authored_nil!(field, opt)
@@ -1640,7 +1661,7 @@ module Permittable
       # proc cannot rewrite the host's own literal.
       authored = field[opt].is_a?(String) ? field[opt].dup : field[opt]
       value = Coercion.apply_normalize(field[:normalize], authored)
-      status, result = Coercion.check_scalar(field, value)
+      status, result = Coercion.check_scalar(live_in?(field) ? field.except(:in) : field, value)
       raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{result})" unless status == :ok
 
       field[opt] = freeze_authored(opt == :default && field[:transform] ? field[opt] : result)

@@ -140,6 +140,71 @@ RSpec.describe Permittable do
       expect(violations_for({ sku: "abc" }, &decl).details).to eq([{ param: "sku", code: "inclusion" }])
     end
 
+    # The README tells an author to pass an include? object for a live list,
+    # and such a list is typically filled in an initializer or
+    # after_initialize, which runs AFTER eager_load! has run the declaration,
+    # so it is empty then. Nothing can be known about an object used as
+    # given, so emptiness is asked only of what the gem reads itself: a
+    # literal list it casts, and a Range.
+    it "accepts a live :in object that is empty at class load, and reads it on every request" do
+      registry = Concurrent::Set.new
+      decl = proc { permit_params(:create) { optional :event, :string, in: registry } }
+      klass = permittable_class(&decl)
+      expect(klass.permit_rule_for(:create)[:fields].first[:in]).to be(registry)
+      expect(violations_for({ event: "order.paid" }, &decl).details).to eq([{ param: "event", code: "inclusion" }])
+
+      registry << "order.paid"
+      expect(permit({ event: "order.paid" }, &decl)[:event]).to eq("order.paid")
+    end
+
+    # The same unknowable contents decide a default:/example: that names a
+    # member: the live object is empty at class load, so `include?` cannot
+    # answer yet, and the declaration the README recommends must still load.
+    it "accepts a default: and an example: naming a member of a live :in object that is empty at class load" do
+      registry = Concurrent::Set.new
+      decl = proc do
+        permit_params(:create) do
+          optional :event, :string, in: registry, default: "order.paid"
+          optional :topic, :string, in: registry, example: "order.paid"
+        end
+      end
+      fields = permittable_class(&decl).permit_rule_for(:create)[:fields]
+      expect(fields.map { |f| [f[:default], f[:example]] }).to eq([["order.paid", nil], [nil, "order.paid"]])
+
+      registry << "order.paid"
+      expect(permit({}, &decl)[:event]).to eq("order.paid")
+    end
+
+    it "still checks every other rule of a default: and an example: when :in is a live object" do
+      registry = Concurrent::Set.new
+      expect { permittable_class { permit_params(:create) { optional :e, :string, in: registry, default: "toolong", length: 1..3 } } }
+        .to raise_error(ArgumentError, /:default for field :e violates its own contract \(length\)/)
+      expect { permittable_class { permit_params(:create) { optional :e, :string, in: registry, example: "x", format: /\d/ } } }
+        .to raise_error(ArgumentError, /:example for field :e violates its own contract \(format\)/)
+    end
+
+    it "still refuses a default: and an example: outside a literal :in list, which the gem reads itself" do
+      expect { permittable_class { permit_params(:create) { optional :e, :string, in: %w[a b], default: "c" } } }
+        .to raise_error(ArgumentError, /:default for field :e violates its own contract \(inclusion\)/)
+      expect { permittable_class { permit_params(:create) { optional :e, :string, in: Set["a"], example: "c" } } }
+        .to raise_error(ArgumentError, /:example for field :e violates its own contract \(inclusion\)/)
+      expect { permittable_class { permit_params(:create) { optional :e, :integer, in: 1..3, default: 9 } } }
+        .to raise_error(ArgumentError, /:default for field :e violates its own contract \(inclusion\)/)
+    end
+
+    it "accepts an empty Set subclass that overrides include?, since that override is used as given" do
+      live = Class.new(Set) { def include?(value) = super || value.to_s.start_with?("sku-") }.new
+      decl = proc { permit_params(:create) { optional :sku, :string, in: live } }
+      expect(permit({ sku: "sku-1" }, &decl)[:sku]).to eq("sku-1")
+    end
+
+    it "still refuses an empty literal list, which the gem reads itself and no request could satisfy" do
+      expect { permittable_class { permit_params(:create) { optional :plan, :string, in: Set.new } } }
+        .to raise_error(ArgumentError, /:in for :plan is empty/)
+      expect { permittable_class { permit_params(:create) { optional :plan, :string, in: {} } } }
+        .to raise_error(ArgumentError, /:in for :plan is empty/)
+    end
+
     # Only Array, Set, Hash and Enumerator are lists. An app's own Enumerable
     # with its own include? — a case-insensitive allowlist, a DB-backed
     # registry — is used as given: never enumerated at class load, never
