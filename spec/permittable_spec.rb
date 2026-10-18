@@ -725,6 +725,32 @@ RSpec.describe Permittable do
       expect(result[:d]).to eq(BigDecimal("2.5"))
       expect(permit({ f: 3, d: 4 }, &decl).to_h).to eq("f" => 3.0, "d" => BigDecimal("4"))
     end
+
+    # Rational#to_s is "1/2", which BigDecimal cannot read, so a :decimal
+    # used to refuse every Rational, a whole one (3r) included.
+    it "accepts a Rational for a :decimal when its decimal expansion is exact" do
+      {
+        Rational(1, 2) => BigDecimal("0.5"), 3r => BigDecimal("3"), Rational(-7, 4) => BigDecimal("-1.75"),
+        Rational(1, 8) => BigDecimal("0.125"), Rational(3, 40) => BigDecimal("0.075"), Rational(0) => BigDecimal("0"),
+        Rational(1, 2**200) => BigDecimal("#{5**200}e-200"), Rational((10**400) + 1, 5) => BigDecimal("2#{"0" * 399}.2")
+      }.each do |value, expected|
+        cast = permit({ d: value }, &decl)[:d]
+        expect(cast).to be_a(BigDecimal), "for #{value}"
+        expect(cast).to eq(expected), "for #{value}"
+      end
+    end
+
+    it "refuses a Rational for a :decimal when no decimal can hold it exactly" do
+      [Rational(1, 3), Rational(-2, 3), Rational(1, 7), Rational(1, 6), Rational(1, (10**400) * 3)].each do |value|
+        expect(rejected(:d, value, &decl)).to eq([{ param: "d", code: "invalid_type" }]), "for #{value}"
+      end
+    end
+
+    it "accepts a Rational as a :decimal default: and reads a :float the same" do
+      klass = permittable_class { permit_params(:create) { optional :d, :decimal, default: 1 / 2r } }
+      expect(controller(klass).permitted_params[:d]).to eq(BigDecimal("0.5"))
+      expect(permit({ f: Rational(1, 2) }, &decl)[:f]).to eq(0.5)
+    end
   end
 
   # Every case here is CLIENT input that used to raise out of the contract —

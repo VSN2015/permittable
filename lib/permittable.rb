@@ -879,14 +879,31 @@ module Permittable
       source.split(/[eE]/, 2).first.match?(/[1-9]/)
     end
 
+    # Rational#to_s is "1/2", which BigDecimal() cannot read, so the generic
+    # Numeric branch refused every Rational, even a whole one (3r).
     def cast_decimal(value)
       case value
+      when Rational then rational_to_decimal(value)
       when Numeric then finite_decimal(BigDecimal(value.to_s))
       when String then value.match?(NUMERIC_FORMAT) ? finite_decimal(BigDecimal(value)) : [:error, "invalid_type"]
       else [:error, "invalid_type"]
       end
     rescue ArgumentError
       [:error, "invalid_type"]
+    end
+
+    # A Rational is exactly a decimal only when its reduced denominator has
+    # no prime factor but 2 and 5 (1/2, 3/40), and then it divides 10**k for
+    # k = its bit length, which is at least the exponent of either factor.
+    # Anything else (1/3) has no finite expansion, so a BigDecimal could hold
+    # it only rounded at a precision this gem would have to pick. That is the
+    # guess every other coercion here refuses, so it is invalid_type.
+    def rational_to_decimal(value)
+      denominator = value.denominator
+      scale = denominator.bit_length
+      return [:error, "invalid_type"] unless ((10**scale) % denominator).zero?
+
+      finite_decimal(BigDecimal("#{value.numerator * (10**scale) / denominator}e-#{scale}"))
     end
 
     # BigDecimal has no exponent limit, so a :decimal cannot overflow — but
