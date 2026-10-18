@@ -29,11 +29,13 @@ module IntegrationHarness
   # `:input` set Rack::MockRequest ignores `:params`, and `json:` would
   # overwrite `raw_json:`, so a pair used to send one body and silently drop
   # the other. Put form-style fields in `query:` alongside a JSON body.
+  # `accept:` sets the request's Accept header, for specs about content
+  # negotiation (respond_to picks a format from it).
   # `instance:` dispatches on that controller object instead of a fresh one
   # per request, to pin down state that must not survive from one request to
   # the next.
   def dispatch(controller_class, action, method: "GET", query: "", params: nil, json: nil, raw_json: nil,
-               path_params: nil, instance: nil)
+               path_params: nil, instance: nil, accept: nil)
     bodies = { params: params, json: json, raw_json: raw_json }.compact
     if bodies.size > 1
       raise ArgumentError, "IntegrationHarness.dispatch sends one request body, " \
@@ -51,6 +53,7 @@ module IntegrationHarness
     # Without a logger, ActionDispatch logs a body it fails to parse to $stderr.
     env["action_dispatch.logger"] = Logger.new(nil) if raw_json
     env["action_dispatch.request.path_parameters"] = path_params if path_params
+    env["HTTP_ACCEPT"] = accept if accept
     status, headers, body =
       if instance
         request = ActionDispatch::Request.new(env)
