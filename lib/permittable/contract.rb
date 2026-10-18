@@ -118,9 +118,30 @@ module Permittable
 
     def normalize_input(input)
       return {} if input.nil?
-      return input if input.is_a?(Hash) || input.respond_to?(:to_unsafe_h)
+      return input if input.respond_to?(:to_unsafe_h)
+      return unwrap_parameters(input) if input.is_a?(Hash)
 
       raise ArgumentError, "#{LABEL}: Contract#call expects a Hash (got #{input.class})"
+    end
+
+    # A controller's params reach the concern as ActionController::Parameters
+    # and are converted deeply by to_unsafe_h. A service object is usually
+    # handed a slice of them inside a plain Hash — `CreateUser.call(user:
+    # params[:user])` — and nothing converted those: a Parameters value is
+    # not a Hash, so a root read it as invalid_type (400), a nested block or
+    # :json field likewise (422). Each one is converted here, the way
+    # to_unsafe_h converts the whole. Only what holds one is copied.
+    def unwrap_parameters(value)
+      case value
+      when Hash
+        unwrapped = value.transform_values { |v| unwrap_parameters(v) }
+        unwrapped.each_value.zip(value.each_value).all? { |new, old| new.equal?(old) } ? value : unwrapped
+      when Array
+        unwrapped = value.map { |v| unwrap_parameters(v) }
+        unwrapped.zip(value).all? { |new, old| new.equal?(old) } ? value : unwrapped
+      else
+        value.respond_to?(:to_unsafe_h) ? value.to_unsafe_h : value
+      end
     end
   end
 end
