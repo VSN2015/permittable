@@ -514,11 +514,13 @@ module Permittable
     #
     # Descriptors arrive in route order (then verb, then optional variant),
     # so the first one seen is the first route. Precedence is a property of
-    # ONE route set, which is why this runs inside each rails_routes call and
-    # not in the readers: a list concatenated from an app's and an engine's
-    # must not let one shadow the other, and an engine followed from its
-    # mount is judged within the engine alone (Rails falls through to the
-    # next route set when one has no match, X-Cascade).
+    # ONE route table, which is why this runs once inside each rails_routes
+    # call and not in the readers: a list concatenated from an app's and an
+    # engine's must not let one shadow the other. An engine followed from its
+    # mount is part of that one table, expanded where the mount is drawn, so
+    # an app route ahead of the mount hides the engine's route for the same
+    # slot and an engine route hides a later app one (see rails_routes). An
+    # engine route is unconditional only when its mount is as well.
     #
     # Two more limits, both towards listing more. Only identical templates
     # are compared, so templates that differ at all, even only in a
@@ -533,11 +535,6 @@ module Permittable
     def drop_shadowed(descriptors)
       answered = Set.new
       descriptors.each_with_object([]) do |descriptor, kept|
-        # `foreign:` marks what an engine mounted in this set contributed
-        # (see rails_routes): already judged within its own set, and neither
-        # hiding nor hidden here.
-        next kept << descriptor.except(:foreign) if descriptor[:foreign]
-
         slot = descriptor.values_at(:verb, :path)
         next if answered.include?(slot)
 
@@ -620,33 +617,59 @@ module Permittable
     # reads the one route set alone, for a caller that concatenates the lists
     # of an app and its engines itself.
     #
+    # Rails tries the routes in order with a mount standing where it is
+    # drawn, so the engine's routes are judged in that one order with the
+    # app's (see drop_shadowed): an app route ahead of the mount answers
+    # before the engine is asked, an engine route that matches answers and
+    # leaves an app route behind the mount unreached, and only a request the
+    # engine has no route for goes on (X-Cascade). A mount's `via:` limits
+    # the verbs it hands over: another verb is passed on, never answered by
+    # the engine.
+    #
     # A parameter the mount and an engine route both name (`/{id}/.../{id}`)
     # is not renamed; the template then has one variable where Rails binds
     # two, and the README says so.
     def rails_routes(app, engines: true)
-      collect_routes(app.routes, engines: engines, prefixes: [[]], parents: [], visiting: [].freeze)
+      drop_shadowed(collect_routes(app.routes, engines: engines, prefixes: [Prefix.new([], [])], parents: [],
+                                               visiting: [].freeze, reachable: true))
     end
 
+    # What a route set mounted at one variant of its mount's path is led by.
+    # `tokens` are the mount's path from the root (see join_paths).
+    # `shadowed_by` are the paths of the variants Rails tries first, which
+    # leave this one nothing that they accept: a mount at "/" under
+    # `scope "(:locale)"` is matched as `/{locale}` before it is matched as
+    # "/", so /posts is the locale "posts" asking for the engine's root, and
+    # the engine's own /posts is not reached through the second variant. The
+    # mount's path is matched as a whole, unanchored and with no way back
+    # into it once the engine has been asked, so a variant that fits the
+    # leading segments of a path takes it whether or not the engine has a
+    # route for the rest.
+    Prefix = Struct.new(:tokens, :shadowed_by)
+
     # The descriptors of one route set (`set`, anything with `routes`), each
-    # path led by every one of `prefixes` (the token lists of the mounts above
-    # it, [[]] at the top) and each `route:` led by `parents`. `visiting` is
-    # the route sets above this one, so an engine that mounts itself, or an
-    # app and engine that mount each other, ends the walk instead of
-    # recursing for good. Rails would loop on such a request too; the audit
-    # must not hang on it.
-    def collect_routes(set, engines:, prefixes:, parents:, visiting:)
+    # path led by every one of `prefixes` (a Prefix for each variant of the
+    # mounts above it, one empty one at the top) and each `route:` led by
+    # `parents`. `reachable` is whether every mount above answers every
+    # request for its path (see unconditional?); a route behind one that
+    # does not may be passed over, so it hides nothing. `visiting` is the
+    # route sets above this one, so an engine that mounts itself, or an app
+    # and engine that mount each other, ends the walk instead of recursing
+    # for good. Rails would loop on such a request too; the audit must not
+    # hang on it.
+    #
+    # The descriptors still carry `unconditional:`; the caller runs
+    # drop_shadowed over the whole list, mounts expanded in place.
+    def collect_routes(set, engines:, prefixes:, parents:, visiting:, reachable:)
       visiting += [set]
-      descriptors = set.routes.each_with_index.flat_map do |route, index|
+      set.routes.each_with_index.flat_map do |route, index|
         id = parents.empty? ? index : parents + [index]
         requirements = route.requirements
         if engines && (mounted = mounted_routes(route)) && visiting.none? { |above| above.equal?(mounted) }
-          mount_prefixes = prefixes.product(variant_tokens(route.path.spec, requirements))
-                                   .map { |above, own| join_paths(above, own) }
-          # Another set's routes cannot shadow or be shadowed by this one's
-          # (Rails falls through between sets on X-Cascade), so they go past
-          # drop_shadowed untouched, marked so it leaves them alone.
-          next collect_routes(mounted, engines: engines, prefixes: mount_prefixes, parents: Array(id),
-                                       visiting: visiting).map { |descriptor| descriptor.merge(foreign: true) }
+          found = collect_routes(mounted, engines: engines, prefixes: mount_prefixes(prefixes, route), parents: Array(id),
+                                          visiting: visiting, reachable: reachable && unconditional?(route))
+          verbs = route.verb.to_s.downcase.split("|")
+          next verbs.empty? ? found : found.select { |descriptor| verbs.include?(descriptor[:verb]) }
         end
         verb = route.verb.to_s
         next [] if requirements[:controller].nil? || requirements[:action].nil?
@@ -658,7 +681,7 @@ module Permittable
 
         variants = optional_variants(route.path.spec, requirements, prefixes)
         # Read once per route; drop_shadowed reads it, then strips it.
-        unconditional = unconditional?(route)
+        unconditional = reachable && unconditional?(route)
         # One route can answer several verbs (`match via: [:patch, :put]`, and
         # the PATCH|PUT pair resources generates); documenting only the first
         # dropped the others from the export entirely. Verb by verb, then
@@ -672,7 +695,22 @@ module Permittable
           end
         end
       end
-      drop_shadowed(descriptors)
+    end
+
+    # The Prefix of each variant of a mount's path under each of `prefixes`,
+    # outermost mount first, and within a mount present before absent, which
+    # is the order Rails' regexp tries them in. A variant is shadowed by every
+    # variant ahead of it: those of the same mount, and (through the
+    # `shadowed_by` it inherits) those of a mount above, judged where each
+    # was matched.
+    def mount_prefixes(prefixes, route)
+      own = variant_tokens(route.path.spec, route.requirements)
+      prefixes.flat_map do |above|
+        own.each_with_index.map do |tokens, index|
+          Prefix.new(join_paths(above.tokens, tokens),
+                     above.shadowed_by + own.take(index).map { |earlier| join_paths(above.tokens, earlier) })
+        end
+      end
     end
 
     # The route set a mount route hands requests to, or nil for any other
@@ -746,12 +784,18 @@ module Permittable
     # one, which a string scan then read as a group. A Journey-shaped stand-in
     # may carry a String spec instead (string_variants).
     #
-    # `prefixes` are the token lists of the mounts the route sits under
-    # ([[]], none, by default). Each is put in front of every variant, the
-    # mount's variants outermost, which is the order Rails' regexp tries them
-    # in; the shadowing above then judges the joined paths.
-    def optional_variants(spec, requirements = {}, prefixes = [[]])
-      variants = prefixes.product(variant_tokens(spec, requirements)).map { |outer, own| join_paths(outer, own) }
+    # `prefixes` are the Prefix of each variant of the mounts the route sits
+    # under (one empty one, none, by default). Each is put in front of every
+    # variant, the mount's variants outermost, which is the order Rails'
+    # regexp tries them in; a path a mount variant ahead of its own takes
+    # first is left out (see Prefix), and the shadowing above then judges the
+    # rest.
+    def optional_variants(spec, requirements = {}, prefixes = [Prefix.new([], [])])
+      own = variant_tokens(spec, requirements)
+      variants = prefixes.flat_map do |prefix|
+        own.map { |tokens| join_paths(prefix.tokens, tokens) }
+           .reject { |joined| prefix.shadowed_by.any? { |earlier| shadowed?(earlier, joined.first(earlier.length)) } }
+      end
       # No group, no choice: nothing for one variant to shadow.
       return { render(variants.first) => [] } if variants.one?
 
