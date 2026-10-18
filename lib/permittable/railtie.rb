@@ -23,9 +23,33 @@ module Permittable
       # this array in place and ActionDispatch reads the same object per
       # request, so a name registered when a controller loads is seen by the
       # next request. It is the array, not a snapshot, that has to be fed.
+      #
+      # ActiveRecord is a second sink, and a snapshot that never sees a name
+      # registered after it loaded. Its `filter_attributes` is copied from
+      # config.filter_parameters exactly once, when ActiveRecord::Base loads,
+      # and in a real app that is BEFORE any controller registers anything: the
+      # first controller's own `model: Person` loads it. So the copy holds only
+      # the proc above, which cannot redact an Integer in the SQL bind log
+      # (`[["pin_code", 4321]]`, where #inspect, handed an already-inspected
+      # String, was fine). Each name is therefore also fed to the model base
+      # class directly. on_load runs the block at once when ActiveRecord is
+      # already loaded, defers it until it loads, and never fires in an app
+      # without it. The setter drops the memoized inspection filter, and the
+      # include? keeps the list at one entry per name however often a reloaded
+      # controller registers it. A name is handed to on_load once: in an app
+      # where ActiveRecord never loads, each hook would otherwise queue
+      # forever, one per registration, across every code reload.
+      hooked = {}
+      hooked_lock = Mutex.new
       ::Permittable.on_sensitive_parameter do |name|
         filters = app.config.filter_parameters
         filters << name unless filters.include?(name)
+
+        next unless hooked_lock.synchronize { hooked.key?(name) ? false : (hooked[name] = true) }
+
+        ::ActiveSupport.on_load(:active_record) do
+          self.filter_attributes += [name] unless filter_attributes.include?(name)
+        end
       end
     end
 

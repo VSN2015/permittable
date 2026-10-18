@@ -19,7 +19,8 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
     skip "railties is not available in this bundle"
   end
 
-  BOOT_SCRIPT = <<~RUBY.freeze
+  # Shared by both boots: requires, the application, and its initialization.
+  BOOT_HEADER = <<~RUBY.freeze
     # Before rails, for the reason lib/permittable.rb gives: activesupport
     # <= 7.0.8.4 raises NameError on load unless logger is already loaded. A
     # real app on those versions needs this same line in config/boot.rb.
@@ -49,7 +50,13 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
     end
 
     ProbeApp.initialize!
+  RUBY
 
+  # Declares LateController before ActiveRecord::Base is ever referenced, which
+  # is the one order in which the copy ActiveRecord takes of
+  # config.filter_parameters already contains the registered names. See
+  # AR_FIRST_SCRIPT for the order a real app has.
+  BOOT_SCRIPT = BOOT_HEADER + <<~RUBY
     # A controller class loading AFTER boot, which is what lazy loading does in
     # development and what the live registry exists for.
     class LateController < ActionController::Base
@@ -111,6 +118,7 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
       redacted: redacted,
       after_swap: after_swap,
       filter_attribute_procs: ActiveRecord::Base.filter_attributes.count { |f| f.is_a?(Proc) },
+      filter_attribute_names: ActiveRecord::Base.filter_attributes.grep(String),
       model_inspect: Person.new(ssn: "111-22-3333", pin_code: 1234, name: "Ada").inspect,
       # Precompilation joins the app's own patterns into one Regexp; without
       # it the array carries no Regexp at all, so this is the signal that the
@@ -121,25 +129,86 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
     )
   RUBY
 
-  # One boot, several expectations — booting Rails per example would dominate
-  # the suite's runtime for no extra coverage.
-  def self.boot
+  # The order a real app has. The first controller's own `model: Person` (or
+  # any model reference, an initializer, `rails console`) loads ActiveRecord
+  # BEFORE the controller body runs, and the on_load hook that copies
+  # config.filter_parameters into filter_attributes runs exactly once, at that
+  # point. So the sensitive names a contract registers afterwards never reach
+  # the copy, unless something feeds them to ActiveRecord::Base directly.
+  AR_FIRST_SCRIPT = BOOT_HEADER + <<~RUBY
+    require "stringio"
+
+    ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
+    ActiveRecord::Schema.verbose = false
+    ActiveRecord::Schema.define do
+      create_table(:people) { |t| t.string :ssn; t.integer :pin_code; t.date :born_on; t.string :name }
+    end
+    class Person < ActiveRecord::Base; end
+
+    # Only the proc is in the copy at this point: nothing sensitive has loaded.
+    names_before = ActiveRecord::Base.filter_attributes.grep(String)
+
+    class PeopleController < ActionController::Base
+      include Permittable
+
+      permit_params(:create) do
+        optional :ssn, :string, sensitive: true
+        optional :pin_code, :integer, sensitive: true
+        optional :born_on, :date, sensitive: true
+        optional :name, :string
+      end
+    end
+
+    # Code reloading re-declares the same contract; the second pass must not
+    # grow the list.
+    Permittable.filter_parameter_registry.names.each { |n| Permittable.register_sensitive_parameter(n) }
+    class PeopleController
+      permit_params(:update) { optional :pin_code, :integer, sensitive: true }
+    end
+
+    log = StringIO.new
+    ActiveRecord::Base.logger = Logger.new(log)
+    Person.create!(ssn: "111-22-3333", pin_code: 4321, born_on: Date.new(1984, 2, 29), name: "Ada")
+
+    print JSON.generate(
+      names_before: names_before,
+      filter_attribute_names: ActiveRecord::Base.filter_attributes.grep(String),
+      filter_attribute_procs: ActiveRecord::Base.filter_attributes.count { |f| f.is_a?(Proc) },
+      filter_parameter_names: Rails.application.config.filter_parameters.grep(String),
+      insert: log.string.lines.grep(/INSERT/).join,
+      model_inspect: Person.first.inspect,
+      rails_version: Rails.gem_version.to_s
+    )
+  RUBY
+
+  # One boot per script, several expectations — booting Rails per example would
+  # dominate the suite's runtime for no extra coverage.
+  def self.run_script(script)
     # The block form removes the directory once the subprocess has exited,
     # including when the boot raises, so repeated runs leave nothing behind.
-    @boot ||= Dir.mktmpdir do |root|
+    Dir.mktmpdir do |root|
       lib = File.expand_path("../lib", __dir__)
       Dir.mkdir(File.join(root, "config"))
       File.write(File.join(root, "config", "database.yml"),
                  "test:\n  adapter: sqlite3\n  database: \":memory:\"\n")
       env = { "PERMITTABLE_PROBE_ROOT" => root, "RAILS_ENV" => "test" }
-      out, err, status = Open3.capture3(env, RbConfig.ruby, "-I", lib, "-e", BOOT_SCRIPT)
+      out, err, status = Open3.capture3(env, RbConfig.ruby, "-I", lib, "-e", script)
       raise "Rails boot failed:\n#{err}" unless status.success?
 
       JSON.parse(out)
     end
   end
 
+  def self.boot
+    @boot ||= run_script(BOOT_SCRIPT)
+  end
+
+  def self.ar_first
+    @ar_first ||= run_script(AR_FIRST_SCRIPT)
+  end
+
   let(:boot) { self.class.boot }
+  let(:ar_first) { self.class.ar_first }
 
   it "appends exactly one filter proc, which survives precompilation" do
     # Precompilation joins patterns by source but partitions procs out and
@@ -190,6 +259,58 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
     expect(boot["after_swap"]["ssn"]).to eq("[FILTERED]")
     expect(boot["after_swap"]["pin"]).to eq("[FILTERED]")
     expect(boot["after_swap"]["note"]).to eq("keep me")
+  end
+
+  it "registers each sensitive name once in filter_attributes" do
+    # LateController loaded before ActiveRecord, so a name can reach the list
+    # twice over: through the copy ActiveRecord takes of filter_parameters (as
+    # a String, or folded into a Regexp when precompilation is on) and through
+    # the sink. Either way each name is there, and only once.
+    expect(boot["filter_attribute_names"]).to match_array(%w[ssn pin_code pin payment card_number])
+  end
+
+  context "when ActiveRecord loads before the controller declares its contract" do
+    # The order a real app has, and the one the examples above do not use: a
+    # controller's `model: Person` loads ActiveRecord before the controller
+    # registers anything, and ActiveRecord copies filter_parameters into
+    # filter_attributes only once, when it loads.
+    it "feeds each sensitive name to filter_attributes after the copy was taken" do
+      expect(ar_first["names_before"]).to eq([])
+      expect(ar_first["filter_attribute_names"]).to match_array(%w[ssn pin_code born_on])
+    end
+
+    it "keeps the single filter proc alongside the names" do
+      expect(ar_first["filter_attribute_procs"]).to eq(1)
+    end
+
+    it "does not grow filter_attributes when a name is registered again" do
+      expect(ar_first["filter_attribute_names"].tally.values.uniq).to eq([1])
+      expect(ar_first["filter_parameter_names"].tally.values.uniq).to eq([1])
+    end
+
+    it "redacts non-String values in the SQL bind log" do
+      # Rails 6.1 logs bound values unfiltered whatever filter_attributes holds;
+      # the filtering arrived in 7.0, so there is nothing for the gem to feed.
+      if Gem::Version.new(ar_first["rails_version"]) < Gem::Version.new("7.0")
+        skip "ActiveRecord #{ar_first['rails_version']} does not filter its SQL bind log"
+      end
+      # The bind log hands ActiveRecord's filter the raw bound value, so the
+      # proc, which can only redact a String in place, never redacts an Integer.
+      # (#inspect hands it the already-inspected String, which is why that was
+      # never affected; sqlite hands a Date to the bind log serialized, as a
+      # String, so the date column was covered by the proc as well.)
+      expect(ar_first["insert"]).to include('["ssn", "[FILTERED]"]')
+      expect(ar_first["insert"]).to include('["pin_code", "[FILTERED]"]')
+      expect(ar_first["insert"]).to include('["born_on", "[FILTERED]"]')
+      expect(ar_first["insert"]).to include('["name", "Ada"]')
+      expect(ar_first["insert"]).not_to include("4321")
+    end
+
+    it "redacts non-String values in #inspect" do
+      expect(ar_first["model_inspect"]).to include("pin_code: [FILTERED]")
+      expect(ar_first["model_inspect"]).to include("born_on: [FILTERED]")
+      expect(ar_first["model_inspect"]).to include('name: "Ada"')
+    end
   end
 
   it "loads its rake tasks" do
