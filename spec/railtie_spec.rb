@@ -181,6 +181,83 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
     )
   RUBY
 
+  # A name registered BEFORE ActiveRecord loads, then the app ASSIGNING
+  # filter_attributes (an initializer, or to_prepare on every reload) instead of
+  # appending to it. The assignment drops every name the gem fed in; each name
+  # reaches ActiveRecord once, so nothing would add it back unless the sink
+  # restores what is missing whenever a name is registered.
+  OVERWRITE_SCRIPT = BOOT_HEADER + <<~RUBY
+    require "stringio"
+
+    # Registered while ActiveRecord is still unloaded: it waits for the load.
+    Permittable.register_sensitive_parameter("early_secret")
+
+    ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
+    ActiveRecord::Schema.verbose = false
+    ActiveRecord::Schema.define do
+      create_table(:people) { |t| t.integer :early_secret; t.integer :late_secret; t.string :name }
+    end
+    class Person < ActiveRecord::Base; end
+
+    # What an app that assigns rather than appends does.
+    ActiveRecord::Base.filter_attributes = [:password]
+    names_after_overwrite = ActiveRecord::Base.filter_attributes.grep(String)
+
+    # A controller loading afterwards, which is any registration at all.
+    class PeopleController < ActionController::Base
+      include Permittable
+
+      permit_params(:create) { optional :late_secret, :integer, sensitive: true }
+    end
+
+    log = StringIO.new
+    ActiveRecord::Base.logger = Logger.new(log)
+    Person.create!(early_secret: 8888, late_secret: 9999, name: "Ada")
+
+    print JSON.generate(
+      names_after_overwrite: names_after_overwrite,
+      filter_attribute_names: ActiveRecord::Base.filter_attributes.grep(String),
+      filter_attribute_symbols: ActiveRecord::Base.filter_attributes.grep(Symbol).map(&:to_s),
+      insert: log.string.lines.grep(/INSERT/).join,
+      model_inspect: Person.first.inspect,
+      rails_version: Rails.gem_version.to_s
+    )
+  RUBY
+
+  # Threads class-loading sensitive contracts at once, with ActiveRecord loaded.
+  # Each registration reads filter_attributes, then writes it back with its own
+  # name added, so two unlocked ones can write over each other's.
+  #
+  # Under MRI's GVL a thread is rarely switched out between that read and that
+  # write, so an unfixed run loses a name only now and then. The setter is
+  # slowed by a millisecond to make the window the one a GVL-free Ruby, or an
+  # unlucky timer tick, would give: the same lost update every time.
+  CONCURRENT_SCRIPT = BOOT_HEADER + <<~RUBY
+    ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
+    ActiveRecord::Base.singleton_class.prepend(Module.new do
+      def filter_attributes=(value)
+        sleep 0.001
+        super
+      end
+    end)
+
+    names = Array.new(50) { |i| format("race_%d", i) }
+    start = Queue.new
+    threads = names.map do |name|
+      Thread.new do
+        start.pop
+        Permittable.register_sensitive_parameter(name)
+      end
+    end
+    names.size.times { start << true }
+    threads.each(&:join)
+
+    print JSON.generate(
+      names: names,
+      filter_attribute_names: ActiveRecord::Base.filter_attributes.grep(String)
+    )
+  RUBY
+
   # One boot per script, several expectations — booting Rails per example would
   # dominate the suite's runtime for no extra coverage.
   def self.run_script(script)
@@ -207,8 +284,18 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
     @ar_first ||= run_script(AR_FIRST_SCRIPT)
   end
 
+  def self.overwrite
+    @overwrite ||= run_script(OVERWRITE_SCRIPT)
+  end
+
+  def self.concurrent
+    @concurrent ||= run_script(CONCURRENT_SCRIPT)
+  end
+
   let(:boot) { self.class.boot }
   let(:ar_first) { self.class.ar_first }
+  let(:overwrite) { self.class.overwrite }
+  let(:concurrent) { self.class.concurrent }
 
   it "appends exactly one filter proc, which survives precompilation" do
     # Precompilation joins patterns by source but partitions procs out and
@@ -310,6 +397,42 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
       expect(ar_first["model_inspect"]).to include("pin_code: [FILTERED]")
       expect(ar_first["model_inspect"]).to include("born_on: [FILTERED]")
       expect(ar_first["model_inspect"]).to include('name: "Ada"')
+    end
+  end
+
+  context "when the app assigns filter_attributes after names were registered" do
+    it "restores a name registered before ActiveRecord loaded" do
+      # The assignment really did drop it, so the next registration is what
+      # has to bring it back.
+      expect(overwrite["names_after_overwrite"]).to eq([])
+      expect(overwrite["filter_attribute_names"]).to match_array(%w[early_secret late_secret])
+      # The app's own entry is its own; restoring ours must not displace it.
+      expect(overwrite["filter_attribute_symbols"]).to eq(["password"])
+    end
+
+    it "redacts the restored name in the SQL bind log" do
+      if Gem::Version.new(overwrite["rails_version"]) < Gem::Version.new("7.0")
+        skip "ActiveRecord #{overwrite['rails_version']} does not filter its SQL bind log"
+      end
+      expect(overwrite["insert"]).to include('["early_secret", "[FILTERED]"]')
+      expect(overwrite["insert"]).to include('["late_secret", "[FILTERED]"]')
+      expect(overwrite["insert"]).to include('["name", "Ada"]')
+      expect(overwrite["insert"]).not_to include("8888")
+    end
+
+    it "redacts the restored name in #inspect" do
+      expect(overwrite["model_inspect"]).to include("early_secret: [FILTERED]")
+      expect(overwrite["model_inspect"]).to include("late_secret: [FILTERED]")
+    end
+  end
+
+  context "when many threads register sensitive names at once" do
+    it "keeps every name in filter_attributes, once" do
+      names = concurrent["names"]
+      listed = concurrent["filter_attribute_names"]
+      expect(names.size).to eq(50)
+      expect(names - listed).to eq([])
+      expect(listed.tally.values.uniq).to eq([1])
     end
   end
 
