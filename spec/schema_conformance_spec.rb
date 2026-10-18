@@ -17,7 +17,7 @@
 module SchemaConformance
   # A payload's expectation: :agree, or the reason the two may differ.
   #
-  # Three run the SAFE way — the server accepts what its docs reject:
+  # Four run the SAFE way — the server accepts what its docs reject:
   #
   #   :coerced_encoding — the runtime accepts a non-canonical encoding of the
   #     declared type ("30" for an integer, 1 for a string) because form and
@@ -31,6 +31,11 @@ module SchemaConformance
   #   :normalized_encoding — the runtime runs `normalize:` BEFORE it checks,
   #     so a padded value whose normalized form fits ("  abcdefghij  " under
   #     squish and maxLength 10) is accepted though its raw form is too long.
+  #   :beyond_a_double — an :integer or :decimal given a whole number of more
+  #     than 308 digits. The server keeps it as an Integer; the schema bounds
+  #     every such number at ±Float::MAX, because a validator reads that
+  #     literal as the Infinity the parser makes of 1e400, which the server
+  #     refuses and the schema must too.
   #
   # The rest run the OTHER way — the schema is LOOSER than the server, and a
   # client following it can still be surprised by a 422 — so each is labelled
@@ -111,6 +116,42 @@ module SchemaConformance
       payloads: [
         [{ "score" => 1.5 }, :agree],
         [{ "score" => 10**309 }, :agree]
+      ]
+    },
+    "an :integer and a :decimal, whose numbers a parser can push past a double" => {
+      # Rails reads the JSON number 1e400 as Float::INFINITY, which the cast
+      # refuses, while `type: integer` and `type: number` alone admit it. (The
+      # instrument reads Infinity as the integer 1e400 is, as a real validator
+      # does.) A 400-digit INTEGER literal parses to an Integer the server
+      # keeps, so the Float::MAX bound refuses a number the server accepts.
+      # The string encoding of a :decimal is no JSON number and is not bounded.
+      contract: proc {
+        optional :qty, :integer
+        optional :amount, :decimal
+      },
+      payloads: [
+        [{ "qty" => 5 }, :agree],
+        [{ "qty" => Float::INFINITY }, :agree],
+        [{ "qty" => -Float::INFINITY }, :agree],
+        [{ "qty" => 10**309 }, :beyond_a_double],
+        [{ "qty" => 10**400 }, :beyond_a_double],
+        [{ "amount" => 12.5 }, :agree],
+        [{ "amount" => Float::INFINITY }, :agree],
+        [{ "amount" => -Float::INFINITY }, :agree],
+        [{ "amount" => 10**400 }, :beyond_a_double],
+        [{ "amount" => "1#{'0' * 400}" }, :agree]
+      ]
+    },
+    "an :integer with a bound of its own and one past a double" => {
+      contract: proc {
+        optional :age, :integer, in: 0..120
+        optional :big, :integer, in: 0..(10**400)
+      },
+      payloads: [
+        [{ "age" => 120 }, :agree],
+        [{ "age" => Float::INFINITY }, :agree],
+        [{ "big" => 10**309 }, :beyond_a_double],
+        [{ "big" => Float::INFINITY }, :agree]
       ]
     },
     "a :float with a one-sided bound" => {

@@ -35,11 +35,13 @@ RSpec.describe Permittable::JsonSchema do
         optional :at,  :datetime
       end["properties"]
       expect(props["s"]).to eq("type" => "string")
-      expect(props["i"]).to eq("type" => "integer")
       # A double's own range: a JSON number literal past it is Infinity to the
-      # server's cast, and refused.
-      expect(props["f"]).to eq("type" => "number", "minimum" => -Float::MAX, "maximum" => Float::MAX)
-      expect(props["d"]).to eq("type" => %w[string number], "format" => "decimal")
+      # server's cast, and refused. That holds for every number a field reads,
+      # so an :integer and the number branch of a :decimal carry it too.
+      limits = { "minimum" => -Float::MAX, "maximum" => Float::MAX }
+      expect(props["i"]).to eq({ "type" => "integer" }.merge(limits))
+      expect(props["f"]).to eq({ "type" => "number" }.merge(limits))
+      expect(props["d"]).to eq({ "type" => %w[string number], "format" => "decimal" }.merge(limits))
       expect(props["b"]).to eq("type" => "boolean")
       expect(props["day"]).to eq("type" => "string", "format" => "date")
       expect(props["at"]).to eq("type" => "string", "format" => "date-time")
@@ -85,7 +87,6 @@ RSpec.describe Permittable::JsonSchema do
       expect(property("x") { optional :x, :float, in: [1.5, 2.5] }).to eq("type" => "number", "enum" => [1.5, 2.5])
       expect(property("x") { array :x, of: :float })
         .to eq("type" => "array", "items" => { "type" => "number", "minimum" => -Float::MAX, "maximum" => Float::MAX })
-      expect(property("x") { optional :x, :integer }).to eq("type" => "integer")
       # A bound past a double's range on the open side is no narrower than the
       # cast itself, so it is clamped to it rather than published as is.
       huge = 10**400
@@ -94,6 +95,31 @@ RSpec.describe Permittable::JsonSchema do
         .to eq("type" => "number", "minimum" => -Float::MAX, "exclusiveMaximum" => 0)
       expect(property("x") { optional :x, :float, in: 0...huge }).to eq("type" => "number", "minimum" => 0, "maximum" => Float::MAX)
       expect(JSON.generate(property("x") { optional :x, :float })).to include("1.7976931348623157e+308")
+    end
+  end
+
+  describe "the limits of an :integer and of a :decimal's number branch" do
+    let(:limits) { { "minimum" => -Float::MAX, "maximum" => Float::MAX } }
+
+    it "bounds an :integer at Float::MAX as a :float is, since a parsed 1e400 is Infinity and refused" do
+      expect(property("x") { optional :x, :integer }).to eq({ "type" => "integer" }.merge(limits))
+      expect(property("x") { optional :x, :integer, in: 0.. }).to eq("type" => "integer", "minimum" => 0, "maximum" => Float::MAX)
+      expect(property("x") { optional :x, :integer, in: 1..5 }).to eq("type" => "integer", "minimum" => 1, "maximum" => 5)
+      expect(property("x") { optional :x, :integer, in: [1, 2] }).to eq("type" => "integer", "enum" => [1, 2])
+      expect(property("x") { array :x, of: :integer })
+        .to eq("type" => "array", "items" => { "type" => "integer" }.merge(limits))
+      expect(property("x") { optional :x, :integer, in: 0..(10**400) })
+        .to eq("type" => "integer", "minimum" => 0, "maximum" => Float::MAX)
+    end
+
+    it "bounds a :decimal the same way, which only ever constrains its number branch, never a string" do
+      expect(property("x") { optional :x, :decimal })
+        .to eq({ "type" => %w[string number], "format" => "decimal" }.merge(limits))
+      expect(property("x") { optional :x, :decimal, in: 0.. }).to include("minimum" => 0, "maximum" => Float::MAX)
+      expect(property("x") { optional :x, :decimal, in: %w[1.5 2.5] }.keys).not_to include("minimum", "maximum")
+      expect(property("x") { array :x, of: :decimal })
+        .to eq("type" => "array", "items" => { "type" => %w[string number], "format" => "decimal" }.merge(limits))
+      expect(JSON.generate(property("x") { optional :x, :decimal })).to include("1.7976931348623157e+308")
     end
   end
 
@@ -205,8 +231,8 @@ RSpec.describe Permittable::JsonSchema do
       expect(exact.values_at("minimum", "exclusiveMaximum")).to all(be_a(Integer))
 
       endless = property("tip") { optional :tip, :decimal, in: BigDecimal("0.5").. }
-      expect(endless).to include("minimum" => 0.5)
-      expect(endless.keys.grep(/maximum/i)).to be_empty
+      # The open end is the limit of a double, not a bound of the field's own.
+      expect(endless).to include("minimum" => 0.5, "maximum" => Float::MAX)
     end
 
     # The server's own verdict on a value a client sends as the JSON number
@@ -248,10 +274,10 @@ RSpec.describe Permittable::JsonSchema do
       # BigDecimal("Infinity") used to crash the whole export (to_i raises
       # FloatDomainError), and Float::INFINITY is not a JSON number.
       decimal = property("x") { optional :x, :decimal, in: BigDecimal("0")..BigDecimal("Infinity") }
-      expect(decimal).to include("minimum" => 0)
-      expect(decimal.keys.grep(/maximum/i)).to be_empty
+      # Left with the limit of a double, as with no in: at all.
+      expect(decimal).to include("minimum" => 0, "maximum" => Float::MAX)
 
-      # A :float is left with the limits of a double, as with no in: at all.
+      # A :float likewise.
       float = property("x") { optional :x, :float, in: -Float::INFINITY...Float::INFINITY }
       expect(float).to eq("type" => "number", "minimum" => -Float::MAX, "maximum" => Float::MAX)
       expect { JSON.generate(float) }.not_to raise_error
@@ -281,7 +307,7 @@ RSpec.describe Permittable::JsonSchema do
       # CHANGELOG) rather than silently.
       fractional = BigDecimal("1e400") + BigDecimal("0.5")
       prop = property("x") { optional :x, :decimal, in: fractional.. }
-      expect(prop.keys.grep(/imum/i)).to be_empty
+      expect(prop).to include("minimum" => -Float::MAX, "maximum" => Float::MAX)
     end
 
     it "omits a NaN bound, which compares to nothing" do
@@ -602,7 +628,7 @@ RSpec.describe Permittable::JsonSchema do
     it "adds null to a nullable array's type without touching its items" do
       schema = property("tags") { array :tags, of: :integer, nullable: true }
       expect(schema["type"]).to eq(%w[array null])
-      expect(schema["items"]).to eq("type" => "integer")
+      expect(schema["items"]).to eq("type" => "integer", "minimum" => -Float::MAX, "maximum" => Float::MAX)
     end
 
     it "lists null in an enum, which is instance-wide rather than type-scoped" do

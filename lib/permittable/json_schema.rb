@@ -126,7 +126,7 @@ module Permittable
       schema = SCALAR_SCHEMAS.fetch(field[:type]).deep_dup
       apply_format_name!(schema, field)
       apply_in!(schema, field)
-      apply_float_limits!(schema) if field[:type] == :float
+      apply_float_limits!(schema) if NUMERIC_TYPES.include?(field[:type])
       apply_string_bounds!(schema, field)
       apply_pattern!(schema, field[:format])
       schema
@@ -165,7 +165,7 @@ module Permittable
       # SCALAR_SCHEMAS.
       schema["items"] =
         field[:fields] ? object(field[:fields], unknown: unknown) : SCALAR_SCHEMAS.fetch(field[:of]).deep_dup
-      apply_float_limits!(schema["items"]) if field[:of] == :float && !field[:fields]
+      apply_float_limits!(schema["items"]) if NUMERIC_TYPES.include?(field[:of]) && !field[:fields]
       schema
     end
 
@@ -182,6 +182,19 @@ module Permittable
     # than the cast, so it is clamped too. One past the range on the closed
     # side (`in: 10**400..`) is left alone: no double satisfies it, and the
     # server refuses everything as well.
+    #
+    # An :integer and the number branch of a :decimal need the same, for the
+    # same reason: Rails parses the JSON number 1e400 to Float::INFINITY,
+    # which their casts refuse as well, while a bare `type: integer` (and
+    # `type: number`) admits it. The string branch of a :decimal is no JSON
+    # number, and minimum/maximum never see a string, so it is untouched.
+    #
+    # The cost is on the safe side. A JSON INTEGER literal of over 308 digits
+    # parses to an Integer the :integer and :decimal casts keep, and the
+    # schema now refuses it: stricter than the server, which is the
+    # direction this module allows. A bound cannot tell the two apart: a
+    # validator on JavaScript numbers (Ajv) reads that literal as Infinity,
+    # the same as 1e400, so refusing 1e400 refuses it too.
     def apply_float_limits!(schema)
       return if schema.key?("enum")
 
