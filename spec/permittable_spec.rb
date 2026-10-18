@@ -738,6 +738,19 @@ RSpec.describe Permittable do
       expect(permit({ event: time.merge("at(6i)" => "") }, &decl)[:at]).to eq(Time.utc(2026, 10, 17, 9, 30))
     end
 
+    # date_select on a datetime column sends (1i)-(3i) only, and so does
+    # datetime_select with discard_hour: ActiveModel::Type::DateTime casts
+    # {1 => 2026, 2 => 10, 3 => 17} to midnight, and so does the field.
+    it "reads a :datetime's time parts missing as 00 once the date parts are there, as ActiveModel does" do
+      date_only = time.slice("at(1i)", "at(2i)", "at(3i)")
+      expect(permit({ event: date_only }, &decl)[:at]).to eq(Time.utc(2026, 10, 17))
+      expect(permit({ event: date_only }, &decl)[:at])
+        .to eq(ActiveModel::Type::DateTime.new.cast({ 1 => 2026, 2 => 10, 3 => 17 }))
+      expect(permit({ event: time.except("at(5i)") }, &decl)[:at]).to eq(Time.utc(2026, 10, 17, 9))
+      expect(permit({ event: time.except("at(4i)") }, &decl)[:at]).to eq(Time.utc(2026, 10, 17, 0, 30))
+      expect(permit({ event: date_only.merge("at(6i)" => "15") }, &decl)[:at]).to eq(Time.utc(2026, 10, 17, 0, 0, 15))
+    end
+
     it "reads a non-negative Integer part as ActiveRecord does, and still refuses the other non-String parts" do
       expect(permit({ event: { "on(1i)" => 2026, "on(2i)" => 10, "on(3i)" => 17 } }, &decl)[:on])
         .to eq(Date.new(2026, 10, 17))
@@ -763,9 +776,8 @@ RSpec.describe Permittable do
         "an array part" => date.merge("on(1i)" => ["2026"]),
         "a hash part" => date.merge("on(1i)" => { "y" => "2026" }),
         "a part that is not valid UTF-8" => date.merge("on(1i)" => "20\xFF6"),
-        "a :datetime sent no time parts" => time.first(3).to_h,
-        "an hour without a minute" => time.except("at(5i)"),
-        "seconds without an hour or minute" => time.except("at(4i)", "at(5i)").merge("at(6i)" => "15"),
+        "a :datetime sent only time parts" => time.slice("at(4i)", "at(5i)"),
+        "a :datetime sent a year and an hour but no month or day" => time.slice("at(1i)", "at(4i)"),
         "a minute past the hour" => time.merge("at(5i)" => "60")
       }.each do |why, parts|
         field = parts.keys.first[/\A\w+/]
@@ -3940,6 +3952,30 @@ RSpec.describe Permittable do
         # With a value the hidden input carries the minute it had, so nothing is blank.
         picked = view.datetime_select(:event, :opens_at, discard_minute: true, default: Time.utc(2026, 10, 17, 9, 30))
         expect(JSON.parse(submit(controls.first, picked).body)["opens_at"]).to eq(["Time", "2026-10-17 09:30:00 UTC"])
+      end
+
+      it "reads a date_select on a :datetime field as midnight, as ActiveRecord does, the time parts it never sends being 00" do
+        control = view.date_select(:event, :opens_at, default: Date.new(2026, 10, 17))
+        expect(control).not_to include("opens_at(4i)")
+        result = submit(view.date_select(:event, :starts_on, default: Date.new(2026, 10, 17)), control)
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)["opens_at"]).to eq(["Time", "2026-10-17 00:00:00 UTC"])
+      end
+
+      it "reads a datetime_select with discard_hour as midnight of the day picked, the hour and minute it never sends being 00" do
+        control = view.datetime_select(:event, :opens_at, discard_hour: true, default: Time.utc(2026, 10, 17, 9, 30))
+        expect(control).not_to include("opens_at(4i)")
+        result = submit(view.date_select(:event, :starts_on, default: Date.new(2026, 10, 17)), control)
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)["opens_at"]).to eq(["Time", "2026-10-17 00:00:00 UTC"])
+      end
+
+      it "still refuses a time_select with ignore_date, which sends no date for the :datetime to be on" do
+        control = view.time_select(:event, :opens_at, ignore_date: true, default: Time.utc(2026, 10, 17, 9, 30))
+        expect(control).not_to include("opens_at(1i)")
+        result = submit(view.date_select(:event, :starts_on, default: Date.new(2026, 10, 17)), control)
+        expect(result.status).to eq(422)
+        expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "event.opens_at", "code" => "invalid_type" }])
       end
 
       it "reads a time_select left on its prompts as ActiveRecord does: the date its hidden inputs send, at 00:00" do

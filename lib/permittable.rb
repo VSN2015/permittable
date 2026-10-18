@@ -2392,9 +2392,12 @@ module Permittable
   # (2i) and (3i) but no (1i), or with (1i) and (2i) but no (3i), as nil when
   # one of the ones it has is blank, and so does this. A part that is missing
   # with no blank sibling is nil here, for a scalar to refuse as
-  # invalid_type: (1i)-(3i), and for a :datetime (4i) and (5i) too (a
-  # time_select with `ignore_date:` sends only those two, and a :datetime
-  # needs a date); (6i), sent by `include_seconds:` only, may be missing.
+  # invalid_type, when it is one of (1i)-(3i): a time_select with
+  # `ignore_date:` sends only (4i) and (5i), and a :datetime needs a date.
+  # A MISSING (4i), (5i) or (6i) is 00 like a blank one, which is what
+  # ActiveModel does with {1 => 2026, 2 => 10, 3 => 17}: a date_select on a
+  # :datetime column, or a datetime_select with `discard_hour:`, sends the
+  # date alone, and (6i) comes with `include_seconds:` only.
   # Whatever else is not an unsigned decimal integer is nil likewise.
   def permittable_date_from_parts(parts, type)
     return "" if (1..3).any? { |position| parts.key?(position) && Coercion.absent_value?(parts[position]) }
@@ -2402,11 +2405,11 @@ module Permittable
     time = type == :datetime
     digits = (1..3).map { |position| permittable_date_part(parts[position], year: position == 1) }
     if time
-      # 4 and 5 are required, 6 optional; the blank ones are 00 either way.
+      # A time part that is blank or missing is 00, as ActiveModel reads it.
       digits += (4..6).map do |position|
-        next "00" if position == 6 && !parts.key?(6)
+        next "00" if !parts.key?(position) || Coercion.absent_value?(parts[position])
 
-        parts.key?(position) && Coercion.absent_value?(parts[position]) ? "00" : permittable_date_part(parts[position])
+        permittable_date_part(parts[position])
       end
     end
     return nil if digits.include?(nil)
