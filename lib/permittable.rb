@@ -1714,7 +1714,9 @@ module Permittable
     # description (" (deprecated)", a gsub! for localisation) rewrote the
     # contract inside the frozen rule, and every later export in the process
     # carried the edit. Frozen as a copy, like message:, default: and
-    # example:, so the host's own String is left as it passed it.
+    # example:, so the host's own String is left as it passed it. The
+    # exporters hand out an unfrozen `dup` of it, so editing a generated
+    # document in place works and still cannot reach the contract.
     def freeze_desc!(field)
       field[:desc] = freeze_authored(field[:desc]) unless field[:desc].nil?
     end

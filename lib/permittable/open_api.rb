@@ -188,7 +188,9 @@ module Permittable
       operation = {}
       key = controller_key(controller)
       operation["operationId"] = "#{key.tr('/', '_')}_#{action}" if key && action != "*"
-      operation["description"] = rule[:desc] if rule[:desc]
+      # dup: the stored desc is frozen, and a caller editing the generated
+      # document in place must neither raise nor reach the contract.
+      operation["description"] = rule[:desc].dup if rule[:desc]
       operation["requestBody"] = rule_request_body(rule)
       operation["responses"] = responses_for(rule)
       # The docs must not promise a 422 the server doesn't yet send. Only

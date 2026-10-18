@@ -67,24 +67,56 @@ RSpec.describe Permittable::OpenAPI do
       expect(operation["responses"].keys).to eq(%w[400 422])
     end
 
-    # The same class of leak #76, #78 and #79 closed for other authored values.
-    it "hands out desc: strings a caller can edit without rewriting the contract" do
-      rule_desc = +"Register a user"
-      field_desc = +"Display name"
-      klass = controller_class do
-        permit_params(:create, desc: rule_desc) { required :name, :string, desc: field_desc }
+    # The same class of leak #76, #78 and #79 closed for other authored values:
+    # the contract keeps a frozen copy, and every export hands out a fresh,
+    # editable String, so post-processing a generated document in place
+    # (" (deprecated)", a gsub! for localisation) works and leaks nowhere.
+    describe "desc:" do
+      let(:rule_desc) { +"Register a user" }
+      let(:field_descs) do
+        { name: +"Display name", address: +"Where they live", tags: +"Labels", meta: +"Free-form" }
       end
-      operation = described_class.operations_for(klass)["create"]
-      schema = Permittable::JsonSchema.rule(klass.permit_rule_for(:create))
-      begin
-        operation["description"] << " (deprecated)"
-        schema["properties"]["name"]["description"] << " (deprecated)"
-      rescue FrozenError
-        nil # a frozen description is as good: the point is that the contract is unchanged
+      let(:klass) do
+        rule_desc = self.rule_desc
+        descs = field_descs
+        controller_class do
+          permit_params(:create, desc: rule_desc) do
+            required :name, :string, desc: descs[:name]
+            optional(:address, desc: descs[:address]) { required :zip, :string, desc: +"Postcode" }
+            array :tags, of: :string, desc: descs[:tags]
+            optional :meta, :json, desc: descs[:meta]
+          end
+        end
       end
-      expect(described_class.operations_for(klass)["create"]["description"]).to eq("Register a user")
-      expect(Permittable::JsonSchema.rule(klass.permit_rule_for(:create))["properties"]["name"]["description"]).to eq("Display name")
-      expect([rule_desc.frozen?, field_desc.frozen?]).to eq([false, false])
+
+      def exported_descriptions
+        operation = described_class.operations_for(klass)["create"]
+        properties = Permittable::JsonSchema.rule(klass.permit_rule_for(:create))["properties"]
+        [operation["description"], *properties.values.map { |schema| schema["description"] },
+         properties.dig("address", "properties", "zip", "description")]
+      end
+
+      it "exports editable descriptions, on the operation and on every field kind" do
+        expect(exported_descriptions.map(&:frozen?)).to all(be(false))
+        expect { exported_descriptions.each { |text| text << " (deprecated)" } }.not_to raise_error
+        expect { exported_descriptions.each { |text| text.gsub!("e", "E") } }.not_to raise_error
+      end
+
+      it "leaves later exports and the stored rule unchanged after an in-place edit" do
+        exported_descriptions.each { |text| text << " (deprecated)" }
+        expect(exported_descriptions).to eq(["Register a user", "Display name", "Where they live", "Labels",
+                                             "Free-form", "Postcode"])
+        rule = klass.permit_rule_for(:create)
+        stored = [rule[:desc], *rule[:fields].map { |f| f[:desc] }]
+        expect(stored).to eq(["Register a user", "Display name", "Where they live", "Labels", "Free-form"])
+        expect(stored.map(&:frozen?)).to all(be(true))
+      end
+
+      it "leaves the host's own Strings as it passed them" do
+        klass
+        expect([rule_desc, *field_descs.values].map(&:frozen?)).to all(be(false))
+        expect(rule_desc).to eq("Register a user")
+      end
     end
 
     it "omits the 400 response for rootless contracts (only a missing root renders 400)" do
