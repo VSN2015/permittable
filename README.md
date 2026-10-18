@@ -1361,7 +1361,7 @@ expected UsersController to reject those params with user.age (inclusion), but t
 
 Both work on a controller class, a controller instance, or a [standalone `Contract`](#standalone-contracts-no-controller), and both read the **contract** rather than the rollout mode — a [monitor-mode](#monitor-mode-roll-out-without-rejecting) rule still `reject_params`, because the question is what the contract says, not what the deploy currently does with it.
 
-The matchers run **without a request**, so they know the controller's settings but not its route. A controller's configured CSRF parameter (`request_forgery_protection_token`) is exempt from `unknown: :error` exactly as at runtime, but a route's **path parameters** are not: a payload `id` on a member action under `unknown: :error` is reported `unknown`, although a real `PATCH /users/1` carries it in the URL and is accepted. Leave path parameters out of the payload you pass to `accept_params` / `reject_params`.
+The matchers run **without a request**, so they know the controller's settings but not its route. The CSRF parameter name set at class level with `request_forgery_protection_token` is exempt from `unknown: :error` as it is at runtime, but a per-instance override is not seen, and neither are a route's **path parameters**: a payload `id` on a member action under `unknown: :error` is reported `unknown`, although a real `PATCH /users/1` carries it in the URL and is accepted. Leave path parameters out of the payload you pass to `accept_params` / `reject_params`.
 
 ### Standalone contracts (no controller)
 
