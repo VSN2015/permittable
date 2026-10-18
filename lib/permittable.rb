@@ -624,6 +624,12 @@ module Permittable
     class_attribute :permittable_contracts, instance_accessor: false, default: []
 
     rescue_from InvalidParameters, with: :render_invalid_parameters if respond_to?(:rescue_from)
+    # Registered here, at the include, and not at the first `permit_params`:
+    # the README documents `skip_before_action :enforce_params_contract`, and
+    # Rails raises when it is asked to skip a callback that is not defined
+    # yet. The cost is the order: this check runs before any callback
+    # declared after the include (see the README's "Per-request locales"),
+    # so a locale switch that must cover it is a `prepend_around_action`.
     before_action :enforce_params_contract if respond_to?(:before_action)
   end
 
