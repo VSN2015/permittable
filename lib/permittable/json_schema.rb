@@ -371,7 +371,8 @@ module Permittable
         schema["default"] = json_value(field[:default], decimal: decimal_mode) if field.key?(:default)
         schema["examples"] = [json_value(field[:example], decimal: decimal_mode)] if field.key?(:example)
       end
-      schema["description"] = field[:desc] if field[:desc]
+      # dup: the stored desc is frozen; the export is editable and detached.
+      schema["description"] = field[:desc].dup if field[:desc]
       if field[:sensitive]
         schema["writeOnly"] = true
         schema["x-permittable-sensitive"] = true
