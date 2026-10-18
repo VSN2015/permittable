@@ -65,3 +65,73 @@ RSpec.describe "A raw application/json request body" do
     end
   end
 end
+
+# Monitor mode promises "Nothing raises and nothing renders — the action
+# runs", and validates monitor rules in a before_action so legacy actions
+# that never call permitted_params are still observed. That before_action
+# read `params`, which raises ParseError on a body Rails cannot parse: a
+# webhook action reading request.raw_post itself answered 400 instead of
+# running, and an exception from the contract's own code became a 500.
+RSpec.describe "Monitor mode's eager check, when it cannot check" do
+  let(:lines) { [] }
+
+  let(:controller) do
+    log = lines
+    IntegrationHarness.build_controller do
+      include Permittable
+
+      permit_params(:create, root: :data, mode: :monitor) { required :id, :string }
+      permit_params(:update, root: :data, mode: :monitor) do
+        required :starts_on, :string, validate: ->(v) { Date.iso8601(v) >= Date.new(2000) }
+      end
+      permit_params(:destroy, root: :data, enforce: true) { required :id, :string }
+
+      define_method(:logger) do
+        Logger.new(nil).tap { |logger| logger.define_singleton_method(:warn) { |message| log << message } }
+      end
+
+      def create
+        payload = JSON.parse(request.raw_post)
+        render json: { ok: payload }
+      rescue JSON::ParserError
+        render json: { ignored: true }
+      end
+
+      def update
+        render json: { ok: true }
+      end
+
+      def destroy
+        render json: { ok: true }
+      end
+    end
+  end
+
+  it "lets the action run on a body Rails cannot parse, and says why nothing was checked" do
+    result = IntegrationHarness.dispatch(controller, :create, method: "POST", raw_json: '{"data":')
+    expect([result.status, JSON.parse(result.body)]).to eq([200, { "ignored" => true }])
+    expect(lines.grep(/\[monitor\] #create could not be checked: ActionDispatch::Http::Parameters::ParseError/).size).to eq(1)
+  end
+
+  it "lets the action run when the contract's own code raises, and names the exception" do
+    result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { data: { starts_on: "next tuesday" } })
+    expect(result.status).to eq(200)
+    expect(lines.grep(/\[monitor\] #update could not be checked: Date::Error/).size).to eq(1)
+  end
+
+  it "never logs the body it could not parse" do
+    IntegrationHarness.dispatch(controller, :create, method: "POST", raw_json: '{"data":{"password":"hunter2"')
+    expect(lines.join).not_to include("hunter2")
+  end
+
+  it "still lets an enforced, unmonitored rule fail on a body Rails cannot parse, as Rails would" do
+    expect { IntegrationHarness.dispatch(controller, :destroy, method: "DELETE", raw_json: '{"data":') }
+      .to raise_error(ActionDispatch::Http::Parameters::ParseError)
+  end
+
+  it "still checks a well-formed body" do
+    result = IntegrationHarness.dispatch(controller, :create, method: "POST", json: { data: {} })
+    expect(result.status).to eq(200)
+    expect(lines.grep(/\[monitor\] #create would have been rejected: data\.id/).size).to eq(1)
+  end
+end
