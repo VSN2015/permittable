@@ -2063,6 +2063,58 @@ RSpec.describe Permittable do
     end
   end
 
+  # f.fields_for :addresses sends `user[addresses_attributes][0][city]`,
+  # which Rack parses as a Hash keyed "0", "1", ... Strong params permits
+  # that shape (its fields_for_style?) and accepts_nested_attributes_for
+  # reads its values in order; an `array ... do` field answered 422.
+  describe "an array of hashes sent the way fields_for sends one" do
+    let(:decl) do
+      proc do
+        permit_params(:create, root: :user, unknown: :error) do
+          required :name, :string
+          array :addresses_attributes, length: 1..3 do
+            optional :id, :integer
+            required :city, :string
+            optional :_destroy, :boolean
+          end
+        end
+      end
+    end
+
+    let(:sent) do
+      { "0" => { "city" => "Paris" }, "1" => { "id" => "7", "city" => "Rome", "_destroy" => "1" } }
+    end
+
+    it "reads an index-keyed Hash as the array of records it encodes, in the order sent" do
+      expect(permit({ user: { name: "Jo", addresses_attributes: sent } }, &decl)[:addresses_attributes])
+        .to eq([{ "city" => "Paris" }, { "id" => 7, "city" => "Rome", "_destroy" => true }])
+      # A dynamically added record's index is often a timestamp.
+      timestamped = { "1712345678901" => { "city" => "Oslo" } }
+      expect(permit({ user: { name: "Jo", addresses_attributes: timestamped } }, &decl)[:addresses_attributes])
+        .to eq([{ "city" => "Oslo" }])
+    end
+
+    it "checks those records as it checks an array's, length: included" do
+      expect(violations_for({ user: { name: "Jo", addresses_attributes: { "0" => {} } } }, &decl).details)
+        .to eq([{ param: "user.addresses_attributes[0].city", code: "missing" }])
+      four = (0..3).to_h { |i| [i.to_s, { "city" => "C#{i}" }] }
+      expect(violations_for({ user: { name: "Jo", addresses_attributes: four } }, &decl).details)
+        .to eq([{ param: "user.addresses_attributes", code: "length" }])
+    end
+
+    it "still refuses any other Hash, as strong params would not read it as records either" do
+      [{ "city" => "Paris" }, { "0" => "Paris" }, { "a" => { "city" => "Paris" } }, {}].each do |value|
+        expect(violations_for({ user: { name: "Jo", addresses_attributes: value } }, &decl).details)
+          .to eq([{ param: "user.addresses_attributes", code: "invalid_type" }]), "for #{value.inspect}"
+      end
+    end
+
+    it "leaves a scalar array alone: an index-keyed Hash of scalars is not fields_for's shape" do
+      ids = proc { permit_params(:create) { array :ids, of: :integer } }
+      expect(violations_for({ ids: { "0" => "1" } }, &ids).details).to eq([{ param: "ids", code: "invalid_type" }])
+    end
+  end
+
   describe "array length: as a bound, not just a report" do
     it "stops at the length violation instead of checking every element" do
       decl = proc { permit_params(:create) { array :tags, of: :string, length: 0..2 } }
