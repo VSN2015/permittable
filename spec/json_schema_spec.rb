@@ -533,6 +533,48 @@ RSpec.describe Permittable::JsonSchema do
       expect(plain).to include("default" => "n/a", "examples" => ["reviewed"])
     end
 
+    it "withholds in:/format: from a sensitive: field — an allowlist of the only accepted secrets is worse than a default" do
+      # A value list, a Range and a hand-written pattern each describe the
+      # secret itself; the field is flagged the way any rule the schema
+      # cannot carry is, and the document is looser than the server there.
+      props = schema_for do
+        optional :pin,   :string,  in: %w[PIN_SECRET1 PIN_SECRET2], sensitive: true
+        optional :code,  :integer, in: 4000..4999, sensitive: true
+        optional :tag,   :string,  in: "a".."m", sensitive: true
+        optional :tok,   :string,  format: /\AFMT_SECRET\z/, sensitive: true
+        optional :flag,  :string,  format: /\A\bPAT_SECRET\b\z/, sensitive: true
+      end["properties"]
+
+      props.each_value do |prop|
+        expect(prop).to include("writeOnly" => true, "x-permittable-custom-validation" => true)
+        expect(prop.keys & %w[enum minimum maximum exclusiveMaximum pattern x-permittable-pattern x-permittable-range]).to be_empty
+      end
+      expect(JSON.generate(props)).not_to match(/SECRET|4000|4999|"m"/i)
+    end
+
+    it "withholds in:/format: from a child that inherited sensitive:, and still publishes an explicit opt-out" do
+      props = schema_for do
+        optional :payment, sensitive: true do
+          optional :pin, :string, in: %w[PIN_SECRET1], format: /\AFMT_SECRET\z/
+          optional :scheme, :string, in: %w[sepa swift], sensitive: false
+        end
+      end["properties"]["payment"]["properties"]
+      expect(props["pin"]).to eq("type" => "string", "writeOnly" => true,
+                                 "x-permittable-custom-validation" => true, "x-permittable-sensitive" => true)
+      expect(props["scheme"]).to eq("type" => "string", "enum" => %w[sepa swift])
+    end
+
+    it "keeps a format: preset's name and pattern on a sensitive: field — a preset is public, not a secret" do
+      prop = property("mail") { optional :mail, :string, format: :email, sensitive: true }
+      expect(prop).to include("format" => "email", "pattern" => a_kind_of(String), "writeOnly" => true)
+      expect(prop).not_to have_key("x-permittable-custom-validation")
+    end
+
+    it "does not flag a sensitive: field that declares neither in: nor format:" do
+      expect(property("ssn") { optional :ssn, :string, sensitive: true })
+        .not_to have_key("x-permittable-custom-validation")
+    end
+
     it "exports normalize: as x-permittable-normalize — the preset's name, or true for a custom proc" do
       # The server checks the NORMALIZED value, so minLength/maxLength/pattern
       # describe a string the client never sends. The step is not a keyword
