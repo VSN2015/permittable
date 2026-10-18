@@ -858,4 +858,71 @@ RSpec.describe Permittable::Audit do
       end
     end
   end
+
+  # An engine mounted in the app: its routes are the app's, so an unguarded
+  # POST there is a gap, and a contract on its controller is not stale.
+  describe "a mounted engine" do
+    before(:all) do
+      require "rails/engine"
+    rescue LoadError
+      skip "railties is not available in this bundle"
+    end
+
+    let(:engine) do
+      klass = Class.new(Rails::Engine) { def self.find_root(_from) = Pathname.new(Dir.tmpdir) }
+      stub_const("AuditBillingEngine", klass)
+      klass.routes.draw do
+        post "invoices", to: "billing/invoices#create"
+        post "refunds", to: "billing/refunds#create"
+      end
+      klass
+    end
+
+    let(:descriptors) do
+      mounted = engine
+      route_set = ActionDispatch::Routing::RouteSet.new
+      route_set.draw do
+        post "widgets", to: "widgets#create"
+        mount mounted => "/billing"
+      end
+      Permittable::OpenAPI.rails_routes(Struct.new(:routes).new(route_set))
+    end
+
+    let(:invoices) { controller_class("billing/invoices") { permit_params(:create) { required :amount, :integer } } }
+    let(:controllers) { [invoices, bare_class("billing/refunds"), bare_class("widgets")] }
+
+    it "counts the engine's unguarded POST as a gap" do
+      found = described_class.entries(controllers: controllers, routes: descriptors)
+      expect(found.map(&:path)).to contain_exactly("/widgets", "/billing/invoices", "/billing/refunds")
+      expect(described_class.summary(found)).to include(actions: 3, enforced: 1, uncovered: 2, uncovered_with_body: 2)
+    end
+
+    it "does not call a covered engine action stale" do
+      expect(described_class.stale(controllers: controllers, routes: descriptors)).to eq({})
+      expect(described_class.stale(controllers: controllers, routes: descriptors.first(1)))
+        .to eq("billing/invoices" => ["create"])
+    end
+
+    it "still ignores an engine controller defined outside the app root" do
+      Dir.mktmpdir do |dir|
+        file = File.join(dir, "gems", "billing", "refunds_controller.rb")
+        FileUtils.mkdir_p(File.dirname(file))
+        File.write(file, <<~RUBY)
+          class AuditGemRefundsController < FakeController
+            def self.controller_path = "billing/refunds"
+
+            def create; end
+          end
+        RUBY
+        load file
+        gem_controller = AuditGemRefundsController
+        found = described_class.entries(controllers: [gem_controller], routes: descriptors, ignore: [],
+                                        root: File.join(dir, "app"))
+        expect(found.map { |e| [e.path, e.ignored] }).to eq([["/billing/refunds", :outside_root]])
+        expect(described_class.summary(found)[:uncovered_with_body]).to eq(0)
+      ensure
+        Object.send(:remove_const, :AuditGemRefundsController) if Object.const_defined?(:AuditGemRefundsController)
+      end
+    end
+  end
 end

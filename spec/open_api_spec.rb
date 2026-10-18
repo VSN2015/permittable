@@ -1026,6 +1026,148 @@ RSpec.describe Permittable::OpenAPI do
         expect { paths_for("/un(matched(.:format)") }.to raise_error(ArgumentError, %r{/un\(matched})
       end
     end
+
+    # An engine mounted in the app answers requests under its mount point, so
+    # its routes are the app's. Real Rails::Engine classes and real route
+    # sets, as `mount` builds them.
+    describe "mounted engines" do
+      # A named engine class (a mount needs a railtie name) whose routes are
+      # drawn from `draw`. The root is pinned so Rails does not go looking.
+      def engine(name, &draw)
+        klass = Class.new(Rails::Engine) { def self.find_root(_from) = Pathname.new(Dir.tmpdir) }
+        stub_const(name, klass)
+        klass.routes.draw(&draw)
+        klass
+      end
+
+      def paths_of(app, **options)
+        described_class.rails_routes(app, **options).map { |r| [r[:controller], r[:action], r[:verb], r[:path]] }
+      end
+
+      before(:all) do
+        require "rails/engine"
+      rescue LoadError
+        skip "railties is not available in this bundle"
+      end
+
+      it "prefixes the engine's paths with the mount's" do
+        billing = engine("BillingEngine") { post "refunds", to: "refunds#create" }
+        app = rails_app { mount billing => "/billing" }
+        expect(paths_of(app)).to eq([["refunds", "create", "post", "/billing/refunds"]])
+      end
+
+      it "tags a route reached through a mount with [mount, route], an app route with its index" do
+        billing = engine("BillingEngine") do
+          get "a", to: "a#index"
+          get "b", to: "b#index"
+        end
+        app = rails_app do
+          get "x", to: "x#index"
+          mount billing => "/billing"
+        end
+        expect(described_class.rails_routes(app).map { |r| r[:route] }).to eq([0, [1, 0], [1, 1]])
+      end
+
+      it "keeps an engine mounted twice apart" do
+        billing = engine("BillingEngine") { post "refunds", to: "refunds#create" }
+        app = rails_app do
+          mount billing => "/billing", as: :one
+          mount billing => "/invoicing", as: :two
+        end
+        found = described_class.rails_routes(app)
+        expect(found.map { |r| r[:path] }).to eq(%w[/billing/refunds /invoicing/refunds])
+        expect(found.map { |r| r[:route] }.uniq.length).to eq(2)
+      end
+
+      it "joins an engine mounted at / without doubling the slash" do
+        billing = engine("BillingEngine") do
+          root to: "home#index"
+          get "refunds", to: "refunds#index"
+        end
+        app = rails_app { mount billing => "/" }
+        expect(paths_of(app).map(&:last)).to eq(%w[/ /refunds])
+      end
+
+      it "gives an engine's root route the mount's own path" do
+        billing = engine("BillingEngine") { root to: "home#index" }
+        app = rails_app { mount billing => "/billing" }
+        expect(paths_of(app).map(&:last)).to eq(["/billing"])
+      end
+
+      it "expands a mount under an optional scope like any route" do
+        billing = engine("BillingEngine") { post "refunds", to: "refunds#create" }
+        app = rails_app { scope("(:locale)") { mount billing => "/billing" } }
+        expect(paths_of(app).map(&:last)).to eq(%w[/billing/refunds /{locale}/billing/refunds])
+      end
+
+      it "templates a dynamic mount point and keeps its constraint" do
+        billing = engine("BillingEngine") { get "refunds", to: "refunds#index" }
+        app = rails_app { mount billing => ":tenant", constraints: { tenant: /\d+/ } }
+        expect(paths_of(app).map(&:last)).to eq(["/{tenant}/refunds"])
+      end
+
+      it "follows an engine mounted in an engine, with a nested route id" do
+        inner = engine("InnerEngine") { get "deep", to: "deep#index" }
+        outer = engine("OuterEngine") do
+          get "shallow", to: "shallow#index"
+          mount inner => "/inner"
+        end
+        app = rails_app do
+          get "x", to: "x#index"
+          mount outer => "/outer"
+        end
+        found = described_class.rails_routes(app)
+        expect(found.map { |r| r[:path] }).to eq(%w[/x /outer/shallow /outer/inner/deep])
+        expect(found.last[:route]).to eq([1, 1, 0])
+      end
+
+      it "stops at an engine that mounts itself" do
+        cyclic = engine("CyclicEngine") { get "ping", to: "ping#index" }
+        cyclic.routes.draw do
+          get "ping", to: "ping#index"
+          mount CyclicEngine => "/again", as: :again
+        end
+        app = rails_app { mount cyclic => "/c" }
+        expect(paths_of(app).map(&:last)).to eq(["/c/ping"])
+      end
+
+      it "judges shadowing within one route set, not across them" do
+        billing = engine("BillingEngine") { post "refunds", to: "refunds#create" }
+        app = rails_app do
+          post "billing/refunds", to: "legacy#create"
+          mount billing => "/billing"
+          post "billing/refunds", to: "late#create"
+        end
+        expect(paths_of(app)).to eq([%w[legacy create post /billing/refunds],
+                                     %w[refunds create post /billing/refunds]])
+      end
+
+      it "skips a Rack mount that is not an engine" do
+        app = rails_app do
+          mount ->(_env) { [200, {}, []] } => "/sidekiq"
+          get "x", to: "x#index"
+        end
+        expect(paths_of(app).map(&:last)).to eq(["/x"])
+      end
+
+      it "restores the single route set with engines: false" do
+        billing = engine("BillingEngine") { post "refunds", to: "refunds#create" }
+        app = rails_app do
+          get "x", to: "x#index"
+          mount billing => "/billing"
+        end
+        expect(paths_of(app, engines: false).map(&:last)).to eq(["/x"])
+      end
+
+      it "places the engine's operations under paths in the export" do
+        billing = engine("BillingEngine") { post "refunds", to: "refunds#create" }
+        klass = controller_class(path: "refunds") { permit_params(:create) { required :amount, :integer } }
+        app = rails_app { mount billing => "/billing" }
+        doc = described_class.document(controllers: [klass], routes: described_class.rails_routes(app))
+        expect(doc["paths"].keys).to eq(["/billing/refunds"])
+        expect(doc).not_to have_key("x-permittable-controllers")
+      end
+    end
   end
 
   describe "the documented error shape" do
