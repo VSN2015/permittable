@@ -227,14 +227,21 @@ module Permittable
   # unknown-keys check must not flag them.
   ROUTING_KEYS = %w[controller action format].freeze
   # Nor the keys an ordinary form POST carries — the CSRF token, the verb
-  # override, the encoding probe, and the submit button's name. Without this
-  # `unknown: :error` was unusable outside a JSON API: every browser form
-  # failed on the framework's own keys rather than on anything the client got
-  # wrong. Exempt from the CHECK only: unlike the routing keys these are NOT
-  # stripped from monitor mode's raw pass-through, where handing back an
-  # untouched params hash is the whole promise and a legacy action may well
-  # read `_method` itself.
-  FORM_KEYS = %w[authenticity_token _method utf8 commit].freeze
+  # override, the encoding probe, and the submit button's name: `commit` from
+  # f.submit/submit_tag, `button` from f.button/button_tag (which render
+  # <button name="button">, so a browser sends `button=` even with no
+  # value). Without this `unknown: :error` was unusable outside a JSON API:
+  # every browser form failed on the framework's own keys rather than on
+  # anything the client got wrong. Exempt from the CHECK only: unlike the
+  # routing keys these are NOT stripped from monitor mode's raw
+  # pass-through, where handing back an untouched params hash is the whole
+  # promise and a legacy action may well read `_method` itself.
+  #
+  # The click point of an image submit (image_submit_tag, which has no name
+  # of its own to exempt) is a form key too, but not a fixed one: `x` and `y`,
+  # or `<name>.x` and `<name>.y`, as a PAIR of digits. See
+  # permittable_image_submit_keys.
+  FORM_KEYS = %w[authenticity_token _method utf8 commit button].freeze
   # ROUTING_KEYS/FORM_KEYS name where the keys come FROM; these two name what
   # is DECIDED with them, which is what the call sites care about — and the
   # asymmetry between them is the deliberate point, so spell it once here
@@ -2614,6 +2621,7 @@ module Permittable
     if top_level
       extra -= UNCHECKED_TOP_LEVEL_KEYS + permittable_request_supplied_keys
       extra -= [permittable_configured_csrf_key].compact
+      extra -= permittable_image_submit_keys(hash, extra)
     end
     return if extra.empty?
 
@@ -2637,6 +2645,33 @@ module Permittable
     return [] unless respond_to?(:request) && request.respond_to?(:path_parameters)
 
     request.path_parameters.keys.map(&:to_s)
+  end
+
+  # The click point of an image submit among `keys` (the undeclared top-level
+  # keys). image_submit_tag renders <input type="image">, and a browser
+  # submitting through it posts where it was clicked: `x=12&y=7`, or
+  # `save.x=12&save.y=7` when the tag is named "save" (Rack keeps a dotted
+  # key as it is). Like the other FORM_KEYS these are the framework's own
+  # keys, so `unknown: :error` must not fail the form for them. Unlike them
+  # `x` and `y` are ordinary names a contract may really be sent, so a
+  # lone `x` is still flagged: a point is exempt only as a PAIR, both of
+  # them in `keys` (a declared `x` or `y` is not, and is checked as a field)
+  # and both digits, which is all a browser sends (coordinates are never
+  # negative or fractional). Read by bytes, since a client's key or value can
+  # be invalid UTF-8, which a regexp refuses to match, or another encoding
+  # altogether (a UTF-16 key makes `end_with?` raise).
+  def permittable_image_submit_keys(hash, keys)
+    by_bytes = keys.to_h { |key| [key.b, key] }
+    by_bytes.each_with_object([]) do |(bytes, key), point|
+      next unless bytes == "x" || bytes.end_with?(".x")
+
+      partner = by_bytes["#{bytes.delete_suffix('x')}y"]
+      point.push(key, partner) if partner && [key, partner].all? { |name| permittable_digits?(hash[name]) }
+    end
+  end
+
+  def permittable_digits?(value)
+    value.is_a?(String) && !value.empty? && value.each_byte.all? { |byte| byte.between?(48, 57) }
   end
 
   # FORM_KEYS bakes in "authenticity_token" — Rails' DEFAULT CSRF parameter
