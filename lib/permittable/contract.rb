@@ -62,6 +62,26 @@ module Permittable
           super(fields, hash, path: path, unknown: unknown, top_level: false, violations: violations)
         end
 
+        # unknown: :log warns through `logger`, and a controller gets one from
+        # ActionController. This host has none, so :log used to drop the keys
+        # without a word, exactly like :ignore. Rails.logger is read on every
+        # call, not at definition: contracts are usually constants, loaded
+        # before an app's initializers may have assigned it. With no Rails
+        # (a script, a job, a CSV import) the warning goes to $stderr rather
+        # than nowhere, since a :log that cannot log is :ignore by another
+        # name. Defining the contract does not raise for a missing logger:
+        # whether one exists is only known when the contract is called.
+        #
+        # The fallback Logger is built on every call, not memoized: #call!
+        # makes a new host per call, so an instance memo never applied, and a
+        # class-level one would capture $stderr once, hiding a later
+        # reassignment (a test's capture, a daemonized process's redirect).
+        def logger
+          return ::Rails.logger if defined?(::Rails) && ::Rails.respond_to?(:logger) && ::Rails.logger
+
+          ::Logger.new($stderr)
+        end
+
         # Instrumentation payload label (anonymous classes have no name).
         def permittable_controller_name
           "Permittable::Contract"

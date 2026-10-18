@@ -1391,6 +1391,8 @@ Everything carries over — strict coercion, `""`/`nil` absence, defaults, `fina
 
 **What `#call` still raises.** Client data never raises out of the gem's own checks. Wrong types, non-finite numbers, Strings in any encoding (valid or not) and undeclared keys in any encoding all come back as violations in the `Result`. Two things do raise, on purpose, because neither is the client's mistake. An input that is not a Hash, `nil` (read as `{}`) or an object answering `to_unsafe_h` (such as `ActionController::Parameters`) raises `ArgumentError`. `ActionController::Parameters` nested inside a Hash, as in `CreateUser.call(user: params[:user])`, are converted the same way. And an exception raised by your own code (a `validate:`, `transform:` or `normalize:` proc, or `finalize`) reaches the caller unchanged, since swallowing it would hide a bug. The one exception is a `normalize:` proc that raises `ArgumentError` or an encoding error on a String that is neither UTF-8 nor ASCII-only; that value is left as it is, like a preset's.
 
+**`unknown: :log` warns here too.** It writes through `Rails.logger` (read on every call, so a logger assigned after the contract's constant loaded is still found) or, with no Rails or no `Rails.logger`, to `$stderr`, so a plain script still hears about undeclared keys rather than having them dropped silently.
+
 Three differences from the controller concern, all deliberate:
 
 - **A `Contract` always enforces.** Monitor mode is a request-rollout switch; standalone callers read the `Result` instead, so the app-wide `Permittable.mode` is ignored here.
