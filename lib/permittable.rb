@@ -136,7 +136,8 @@ require "permittable/filter_parameter_registry"
 # declaring `transform:`: its default is stored exactly AS AUTHORED, never
 # cast — `transform:` never runs on a default either (see OUTPUT RESHAPING),
 # so author such a default already in the shape the action should receive.
-# Either way it is deep-frozen on a copy, and each request gets its own deep
+# An `example:` is cast either way and never transformed: it documents what a
+# client sends. Either way it is deep-frozen on a copy, and each request gets its own deep
 # copy, so no request can corrupt it for the next.
 #
 # `nullable: true` splits that rule in two for one field, which is how a PATCH
@@ -1618,7 +1619,7 @@ module Permittable
     # same value gets, and what used to be thrown away: `default: "18"` used
     # to be handed to every request omitting it as the String "18", and
     # `:boolean, default: "false"` gave the app a truthy String.
-    # With a `transform:`, the value is stored exactly AS AUTHORED instead —
+    # With a `transform:`, a default is stored exactly AS AUTHORED instead —
     # `transform:` never runs on a default (see AuthoredValues), so casting it
     # here would silently change its type out from under an author who, per
     # the README, writes such a default in the shape the action should
@@ -1626,6 +1627,11 @@ module Permittable
     # :string field means the app gets the Integer 25 either way, whether the
     # request sent "25" (cast then transformed) or omitted the field
     # (authored as the already-final Integer).
+    #
+    # An `example:` is cast either way. It documents what a client SENDS and
+    # never reaches the action, so that reason does not apply to it: under
+    # `transform:` it used to be published uncast, `"type": "integer",
+    # "examples": ["18"]`, the very lie the cast exists to stop.
     def validate_authored_value!(field, opt)
       return unless field.key?(opt)
       return if authored_nil!(field, opt)
@@ -1637,7 +1643,7 @@ module Permittable
       status, result = Coercion.check_scalar(field, value)
       raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{result})" unless status == :ok
 
-      field[opt] = freeze_authored(field[:transform] ? field[opt] : result)
+      field[opt] = freeze_authored(opt == :default && field[:transform] ? field[opt] : result)
     end
 
     # An array's authored value is validated by the REQUEST walker itself
@@ -1650,27 +1656,61 @@ module Permittable
     # cast only the top level of each element, and got every one of those
     # wrong.
     #
-    # What is STORED follows the same split as a scalar's: without
-    # `transform:`, the walker's read (exactly what a request sending it
-    # gets); with one, the array exactly AS AUTHORED — the walker still runs,
-    # so a declaration mistake (an element `validate:` refuses, a sub-field
-    # default out of bounds) still fails at class load, but its cast result
-    # is discarded rather than stored. The array's OWN `transform:` is
-    # deliberately never run on a default either way; a SUB-FIELD's
-    # `transform:` still runs during that walk, so "the walker's read" above
-    # really is what an equivalent request produces — see AuthoredValues.
+    # What is STORED for a default follows the same split as a scalar's:
+    # without `transform:`, the walker's read (exactly what a request sending
+    # it gets); with one, the array exactly AS AUTHORED — the walker still
+    # runs, so a declaration mistake (an element `validate:` refuses, a
+    # sub-field default out of bounds) still fails at class load, but its
+    # cast result is discarded rather than stored. The array's OWN
+    # `transform:` is deliberately never run on a default either way. A
+    # SUB-FIELD's `transform:` still runs during that walk, so "the walker's
+    # read" above really is what an equivalent request produces: all of them
+    # when the array has no `transform:` of its own, and, when it has one,
+    # those below an array declaring `validate:`, the only readers of their
+    # output (a request runs sub-field transforms, then that `validate:`,
+    # then the array's own transform) — see AuthoredValues.
+    #
+    # An `example:` is validated the same way, as a request would be, but what
+    # is STORED is a second read of it exactly as a client SENDS it: cast and
+    # normalized, with no `transform:` run at any depth and no sub-field
+    # `default:` filled in. Read through a sub-field's transform,
+    # `[{ price: "9.99" }]` under `transform: ->(d) { (d * 100).to_i }` was
+    # published as `[{ "price": 999 }]`: 100 times the price, and a `tags`
+    # split into an Array the server refuses. The two reads cannot be one: an
+    # array-level `validate:` must see the transformed sub-fields a request
+    # hands it (`i[:tags].is_a?(Array)`), so the validating read keeps them,
+    # and the stored read, which runs no `validate:`, discards them.
+    #
+    # The transforming read exists only for that `validate:`, so it runs only
+    # when one could consume it. Anywhere else its output is thrown away, yet
+    # it would still call app code at class load: `optional :id, :string,
+    # transform: ->(s) { Account.find(s) }` under an `example:` hit the
+    # database, or raised, at boot. Only an array carries a `validate:` that
+    # sees its transformed children: a scalar's or a :json field's runs on
+    # its own value before its own transform, and a nested hash takes none.
+    # Without one, the as-sent read both validates and is stored.
     def validate_array_authored_value!(field, opt)
       value = field[opt]
       return if authored_nil!(field, opt)
       raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} must be an Array" unless value.is_a?(Array)
 
-      read, violations = AuthoredValues.read_array(field, value)
+      as_sent = opt == :example && !array_validate_in?(field)
+      read, violations = AuthoredValues.read_array(field, value, as_sent: as_sent)
       unless violations.empty?
         raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} violates its own contract: " \
                              "#{AuthoredValues.summary(violations)}"
       end
 
-      field[opt] = freeze_authored(field[:transform] ? value : read)
+      read, = AuthoredValues.read_array(field, value, as_sent: true) if opt == :example && !as_sent
+      field[opt] = freeze_authored(opt == :default && field[:transform] ? value : read)
+    end
+
+    # Whether `field`, or any array or nested hash below it, declares an
+    # array-level `validate:`.
+    def array_validate_in?(field)
+      return true if field[:kind] == :array && field[:validate]
+
+      Array(field[:fields]).any? { |sub| array_validate_in?(sub) }
     end
 
     # A contract is frozen data, but `@fields.map(&:freeze)` freezes only the
@@ -2455,8 +2495,9 @@ module Permittable
     # NOTHING violated, validate: included — a transform may rely on what
     # validate: checked (`Math.sqrt` after "all positive").
     elements_valid = violations.drop(before).all? { |v| permittable_unknown_key_violation?(v) }
-    if field[:validate] && elements_valid
-      status, code = Coercion.check_custom(field[:validate], out)
+    validator = permittable_array_validator(field)
+    if validator && elements_valid
+      status, code = Coercion.check_custom(validator, out)
       violations << permittable_violation(field, path, code) unless status == :ok
     end
     # Transform only a fully-valid array — a partially-nil one (element
@@ -2469,6 +2510,11 @@ module Permittable
   # without running app code over it at class load.
   def permittable_transform(field, value)
     field[:transform] ? field[:transform].call(value) : value
+  end
+
+  # A second seam, for the same reader: the array-level `validate:` to run.
+  def permittable_array_validator(field)
+    field[:validate]
   end
 
   def permittable_check_element(field, element, path, unknown:, violations:)

@@ -1550,6 +1550,96 @@ RSpec.describe Permittable do
       expect(calls).to be_empty
     end
 
+    %i[default example].each do |opt|
+      it "lets an array's validate: see its sub-fields' transforms in an #{opt}: although the array has a transform: of its own" do
+        klass = permittable_class do
+          permit_params(:create) do
+            array :items, opt => [{ "tags" => "a,b" }], transform: ->(a) { a.size },
+                          validate: ->(a) { a.all? { |i| i[:tags].is_a?(Array) } } do
+              optional :tags, :string, transform: ->(s) { s.split(",") }
+            end
+          end
+        end
+        field = klass.permittable_contracts.last[:fields].first
+
+        # Stored exactly as authored: the array's own transform: is under it.
+        expect(field[opt]).to eq([{ "tags" => "a,b" }])
+        # The request this validates is accepted, so the contract is not contradictory.
+        expect(controller(klass, params: { items: [{ tags: "a,b" }] }).permitted_params[:items]).to eq(1)
+      end
+
+      it "still refuses a #{opt}: whose sub-field-transformed value the array's validate: rejects, array transform: or not" do
+        expect do
+          permittable_class do
+            permit_params(:create) do
+              array :items, opt => [{ "tags" => "a" }], transform: ->(a) { a.size },
+                            validate: ->(a) { a.all? { |i| i[:tags].size == 2 } } do
+                optional :tags, :string, transform: ->(s) { s.split(",") }
+              end
+            end
+          end
+        end.to raise_error(ArgumentError, /:#{opt} for array :items violates its own contract: items \(invalid\)/)
+      end
+    end
+
+    it "gives a nested array's validate: its own sub-fields' transforms, and the outer validate: the nested array's transformed result" do
+      build = lambda do |rows|
+        permittable_class do
+          permit_params(:create) do
+            array :orders, default: [{ "rows" => rows }], transform: ->(a) { a.size },
+                           validate: ->(a) { a.all? { |o| o[:rows] == 2 } } do
+              array :rows, transform: ->(r) { r.sum { |x| x[:n] } * 2 },
+                           validate: ->(r) { r.all? { |x| x[:n].is_a?(Integer) } } do
+                optional :n, :integer, transform: ->(n) { n }
+              end
+            end
+          end
+        end
+      end
+
+      expect(build.call([{ "n" => "1" }]).permittable_contracts.last[:fields].first[:default])
+        .to eq([{ "rows" => [{ "n" => "1" }] }])
+      expect { build.call([{ "n" => "2" }]) }.to raise_error(ArgumentError, /:default for array :orders violates its own contract/)
+    end
+
+    it "runs a transform: under a transforming array's default: only where an array's validate: above it reads the result" do
+      calls = []
+      klass = permittable_class do
+        permit_params(:create) do
+          # `:a` shares the array with a validate: but sits on a sibling branch of it: nothing reads its output.
+          array :items, default: [{ "a" => "x", "b" => [{ "c" => 1 }] }], transform: ->(a) { a } do
+            optional :a, :string, transform: ->(s) { (calls << :a) && raise("boom at class load: #{s}") }
+            array :b, validate: ->(arr) { arr.all? { |i| i[:c] == 1 } } do
+              optional :c, :integer, transform: ->(c) { (calls << :c) && c }
+            end
+          end
+        end
+      end
+
+      expect(klass.permittable_contracts.last[:fields].first[:default]).to eq([{ "a" => "x", "b" => [{ "c" => 1 }] }])
+      # `:c` is under :b's validate:, so it runs; `:a` and the array's own transform: never do.
+      expect(calls).to eq([:c])
+    end
+
+    it "runs a transform: for a validate: two levels above it, through a nested hash, and still checks what it returns" do
+      build = lambda do |tags|
+        permittable_class do
+          permit_params(:create) do
+            array :items, example: [{ "h" => { "tags" => tags } }], transform: ->(a) { a.size },
+                          validate: ->(a) { a.all? { |i| i[:h][:tags] == %w[a b] } } do
+              optional :h do
+                optional :tags, :string, transform: ->(s) { s.split(",") }
+              end
+            end
+          end
+        end
+      end
+
+      expect(build.call("a,b").permittable_contracts.last[:fields].first[:example]).to eq([{ "h" => { "tags" => "a,b" } }])
+      # The split really happens: "a,c" splits to an Array the validate: refuses.
+      expect { build.call("a,c") }.to raise_error(ArgumentError, /:example for array :items violates its own contract/)
+    end
+
     it "runs a sub-field's own transform: over an array default:, matching an equivalent explicit request" do
       klass = permittable_class do
         permit_params(:create) do
@@ -1574,6 +1664,107 @@ RSpec.describe Permittable do
       end
       fields = klass.permittable_contracts.last[:fields]
       expect(fields.map { |f| f[:example] }).to eq([21, [3]])
+    end
+
+    it "casts an example: under transform: too, which a default: is not, since no example reaches the action" do
+      klass = permittable_class do
+        permit_params(:create) do
+          optional :age,   :integer, example: "18", transform: ->(v) { v * 12 }
+          optional :ok,    :boolean, example: "true", transform: ->(v) { v ? 1 : 0 }
+          array    :ids,   of: :integer, example: %w[3], transform: ->(a) { a.sum }
+          optional :limit, :integer, example: "25", default: "25", transform: ->(v) { v * 2 }
+        end
+      end
+      fields = klass.permittable_contracts.last[:fields]
+      expect(fields.map { |f| f[:example] }).to eq([18, true, [3], 25])
+      expect(fields.last[:default]).to eq("25")
+
+      properties = Permittable::JsonSchema.rule(klass.permit_rule_for("create"))["properties"]
+      expect(properties.transform_values { |schema| schema["examples"] })
+        .to eq("age" => [18], "ok" => [true], "ids" => [[3]], "limit" => [25])
+    end
+
+    it "reads a block array's example: with no transform: at any depth, though its default: runs sub-field ones" do
+      sent = [{ "price" => "9.99", "tags" => "gift,red", "dims" => { "w" => "3" } }]
+      klass = permittable_class do
+        permit_params(:create) do
+          array :line_items, example: sent, default: sent do
+            required :price, :decimal, transform: ->(d) { (d * 100).to_i }
+            optional :tags,  :string,  transform: ->(s) { s.split(",") }
+            optional(:dims) { optional :w, :integer, transform: ->(w) { w * 10 } }
+          end
+        end
+      end
+      received = [{ "price" => 999, "tags" => %w[gift red], "dims" => { "w" => 30 } }]
+
+      published = Permittable::JsonSchema.rule(klass.permit_rule_for("create"))["properties"]["line_items"]["examples"]
+      expect(published).to eq([[{ "price" => 9.99, "tags" => "gift,red", "dims" => { "w" => 3 } }]])
+      # The published example is a request the server accepts, as authored.
+      expect(controller(klass, params: { line_items: published.first }).permitted_params[:line_items]).to eq(received)
+      # The default is what the action receives, so its sub-field transforms still run.
+      expect(controller(klass).permitted_params[:line_items]).to eq(received)
+    end
+
+    it "validates a block array's example: as a request would, with sub-field transforms run, yet stores it as sent" do
+      sent = [{ "tags" => "a,b" }]
+      klass = permittable_class do
+        permit_params(:create) do
+          # Both checks need what the action receives: the Array a request's `tags` becomes.
+          array :items, example: sent, validate: ->(a) { a.all? { |i| i[:tags].is_a?(Array) && i[:tags].fetch(0) } } do
+            optional :tags, :string, transform: ->(s) { s.split(",") }
+          end
+        end
+      end
+      published = Permittable::JsonSchema.rule(klass.permit_rule_for("create"))["properties"]["items"]["examples"]
+      expect(published).to eq([sent])
+      expect(controller(klass, params: { items: sent }).permitted_params[:items]).to eq([{ "tags" => %w[a b] }])
+    end
+
+    it "runs no sub-field transform: over an example: at class load when no container validate: consumes it" do
+      boom = ->(_) { raise "no database at class load" }
+      sent = [{ "id" => "1", "meta" => { "tag" => "t" }, "rows" => [{ "n" => "2" }] }]
+      klass = permittable_class do
+        permit_params(:create) do
+          array :items, example: sent do
+            optional :id, :string, transform: boom
+            optional(:meta) { optional :tag, :string, transform: boom }
+            array(:rows) { optional :n, :integer, transform: boom }
+          end
+        end
+      end
+      published = Permittable::JsonSchema.rule(klass.permit_rule_for("create"))["properties"]["items"]["examples"]
+      expect(published).to eq([[{ "id" => "1", "meta" => { "tag" => "t" }, "rows" => [{ "n" => 2 }] }]])
+    end
+
+    it "validates an example: with sub-field transforms run when only a nested array's validate: consumes them" do
+      sent = [{ "meta" => { "rows" => [{ "tags" => "a,b" }] } }]
+      klass = permittable_class do
+        permit_params(:create) do
+          array :items, example: sent do
+            optional(:meta) do
+              array :rows, validate: ->(a) { a.all? { |r| r[:tags].is_a?(Array) } } do
+                optional :tags, :string, transform: ->(s) { s.split(",") }
+              end
+            end
+          end
+        end
+      end
+      expect(klass.permittable_contracts.last[:fields].first[:example]).to eq(sent)
+    end
+
+    it "stores a block array's example: without the sub-field defaults a request would fill in, at any depth" do
+      klass = permittable_class do
+        permit_params(:create) do
+          array :items, example: [{ "name" => "x", "dims" => {} }],
+                        validate: ->(a) { a.all? { |i| i[:cents] == 0 && i[:dims][:w] == 1 } } do
+            optional :name,  :string
+            optional :cents, :integer, default: 0, transform: ->(i) { i * 100 }
+            optional(:dims) { optional :w, :integer, default: 1 }
+          end
+        end
+      end
+      published = Permittable::JsonSchema.rule(klass.permit_rule_for("create"))["properties"]["items"]["examples"]
+      expect(published).to eq([[{ "name" => "x", "dims" => {} }]])
     end
 
     it "hands out a default: with nothing frozen inside it, however deep" do
