@@ -66,6 +66,14 @@ module Permittable
         def permittable_controller_name
           "Permittable::Contract"
         end
+
+        # ... and its action: the host has no action_name, so the payload's
+        # `action` (documented as a String) and the log lines that name the
+        # action would be nil. A Contract has one entry point, the same
+        # "call" #call! passes to permitted_params.
+        def permittable_action_name
+          ACTION
+        end
       end
       @host_class.permit_params(root: root, unknown: unknown, model: model, mode: :enforce, desc: desc, &)
     end
