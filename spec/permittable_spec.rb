@@ -1859,6 +1859,24 @@ RSpec.describe Permittable do
         end
       end
 
+      # Keys are client-sent bytes, so the pair is matched by bytes: a name
+      # that is invalid UTF-8 must not raise, and one in another encoding is
+      # just an undeclared key.
+      it "reads the keys by bytes: an invalid-UTF-8 name is exempt and a binary pair too, without raising" do
+        [["a\xFF.x", "a\xFF.y"], ["a\xFF.x".b, "a\xFF.y".b], ["x".b, "y".b]].each do |kx, ky|
+          result = permit({ "q" => "shoes", kx => "12", ky => "7" }, &strict)
+          expect(result.to_h).to eq("q" => "shoes"), "for #{kx.inspect}"
+        end
+      end
+
+      it "flags a UTF-16 `x` and `y`, which are not those names, without raising" do
+        kx = "x".encode("UTF-16LE")
+        ky = "y".encode("UTF-16LE")
+        e = violations_for({ "q" => "shoes", kx => "12", ky => "7" }, &strict)
+        expect(e.details.size).to eq(2)
+        expect(e.details.map { |detail| detail[:code] }).to eq(%w[unknown unknown])
+      end
+
       it "still validates a declared `x` or `y` like any other field" do
         declared = proc { permit_params(:create, unknown: :error) { optional :x, :integer } }
         expect(permit({ x: "12" }, &declared)[:x]).to eq(12)
