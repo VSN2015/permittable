@@ -122,6 +122,24 @@ RSpec.describe "Permittable RSpec matchers" do
     expect(message).to include("declares default: 25")
   end
 
+  it "compares a :json with_default by key, so the authored spelling and the one the action reads both pass" do
+    contract = Permittable::Contract.define do
+      optional :prefs, :json, default: { theme: "dark", panes: [{ side: "left" }] }
+      optional :flags, :json, default: { "beta" => true }
+      optional :none,  :json, nullable: true, default: nil
+    end
+    expect(contract.call({}).params[:prefs]).to eq("theme" => "dark", "panes" => [{ "side" => "left" }])
+
+    expect(contract).to permit_param(:prefs).with_default(theme: "dark", panes: [{ side: "left" }])
+    expect(contract).to permit_param(:prefs).with_default("theme" => "dark", "panes" => [{ "side" => "left" }])
+    expect(contract).to permit_param(:flags).with_default("beta" => true)
+    expect(contract).to permit_param(:flags).with_default(beta: true)
+
+    message = failure_of { expect(contract).to permit_param(:prefs).with_default(theme: "light") }
+    expect(message).to include("expected default: #{{ theme: 'light' }.inspect}")
+    expect(failure_of { expect(contract).to permit_param(:none).with_default({}) }).to include("declares default: nil")
+  end
+
   # The contract stores in: members cast by the field's type, so the chain
   # casts its own argument the same way: `within` can repeat the declaration
   # as written, or name the values the runtime actually holds.
