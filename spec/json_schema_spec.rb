@@ -559,6 +559,44 @@ RSpec.describe Permittable::JsonSchema do
       expect(props["card_number"]).to include("writeOnly" => true, "x-permittable-sensitive" => true)
       expect(props["id"]).not_to have_key("writeOnly")
     end
+
+    it "omits default:/example: from a container holding a sensitive: field at any depth, which would carry its value" do
+      klass = Class.new(FakeController) { include Permittable }
+      klass.permit_params(:create) do
+        # The walker fills pan's own default: into the stored [{}].
+        array :cards, default: [{}] do
+          optional :pan, :string, sensitive: true, default: "4111111111111111"
+        end
+        array :tokens, example: [{ "secret" => "sk_live_EXAMPLE" }] do
+          required :secret, :string, sensitive: true
+        end
+        array :payees, default: [{ "bank" => { "iban" => "DE89370400440532013000" } }] do
+          optional :bank do
+            optional :iban, :string, sensitive: true
+          end
+        end
+        array :batches, example: [{ "cards" => [{ "cvv" => "737" }] }] do
+          array :cards do
+            optional :cvv, :string, sensitive: true
+          end
+        end
+        # Nothing sensitive inside, so nothing is withheld.
+        array :items, default: [{ "sku" => "A1" }], example: [{ "sku" => "B2" }] do
+          optional :sku, :string
+          optional :id, :string, sensitive: false
+        end
+      end
+      props = described_class.rule(klass.permit_rule_for(:create))["properties"]
+
+      %w[cards tokens payees batches].each do |name|
+        expect(props[name]).not_to have_key("default")
+        expect(props[name]).not_to have_key("examples")
+      end
+      expect(props["items"]).to include("default" => [{ "sku" => "A1" }], "examples" => [[{ "sku" => "B2" }]])
+
+      body = JSON.generate(Permittable::OpenAPI.request_body_for(klass, :create))
+      %w[4111111111111111 sk_live_EXAMPLE DE89370400440532013000 737].each { |value| expect(body).not_to include(value) }
+    end
   end
 
   describe "nullable:" do

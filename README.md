@@ -1483,7 +1483,7 @@ A `format:` regexp that does not translate to ECMA-262 is looser in the same way
 | nested block / `array` | `object` + `properties` / `array` + `items` |
 | `unknown: :error` | `additionalProperties: false`, at every nesting level |
 | `root:` | the wrapping object, itself required |
-| `sensitive: true` | `writeOnly: true` (never echoed in responses); the field's own `default:`/`example:` are omitted rather than published |
+| `sensitive: true` | `writeOnly: true` (never echoed in responses); the field's own `default:`/`example:` are omitted rather than published, and so are those of an array that holds it at any depth, since they would carry its value |
 
 </details>
 
