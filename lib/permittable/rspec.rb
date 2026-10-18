@@ -609,6 +609,10 @@ module Permittable
       # replicated here for a Contract subject specifically, keeping the
       # controller path (which is presumed to use the plain module default)
       # byte-for-byte unchanged.
+      #
+      # A controller's own CSRF parameter name is mirrored onto the host too
+      # (mirror_csrf_key), since the unknown: check reads it off the live
+      # controller.
       def run(rule)
         host = Class.new do
           include Permittable
@@ -616,6 +620,7 @@ module Permittable
           attr_accessor :params
         end
         mirror_contract_unknown_check(host) if @subject.is_a?(Permittable::Contract)
+        mirror_csrf_key(host)
         host.permittable_contracts = [rule.merge(mode: :enforce).freeze]
         instance = host.new
         instance.params = @params
@@ -633,6 +638,26 @@ module Permittable
         host.define_method(:permittable_check_unknown) do |fields, hash, path:, unknown:, top_level:, violations:| # rubocop:disable Lint/UnusedBlockArgument
           super(fields, hash, path: path, unknown: unknown, top_level: false, violations: violations)
         end
+      end
+
+      # A controller exempts its configured CSRF parameter from unknown:
+      # :error (permittable_configured_csrf_key, which asks the live
+      # controller for `request_forgery_protection_token`). The bare host has
+      # no such method, so without this the matcher reported the app's
+      # renamed token (`self.request_forgery_protection_token = :csrf_token`)
+      # as unknown while the same POST is a 200 at runtime. The setting is
+      # class-level, so it is read off the subject class and answered from
+      # the host. A standalone Contract has no such method and keeps
+      # exempting nothing, like Contract#call.
+      #
+      # Route path parameters cannot be mirrored the same way: the matcher
+      # has no route to read them from (see the README).
+      def mirror_csrf_key(host)
+        return unless @subject.respond_to?(:request_forgery_protection_token)
+
+        token = @subject.request_forgery_protection_token
+        key = token && token.to_s
+        host.define_method(:permittable_configured_csrf_key) { key }
       end
 
       def resolve_rule
