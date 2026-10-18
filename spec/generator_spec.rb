@@ -428,19 +428,165 @@ RSpec.describe Permittable::Generator do
       expect(draft).not_to include("updated_at")
     end
 
-    it "skips every column of a composite primary key (Rails 7.1+ returns an Array)" do
-      composite = Class.new(TestModel) do
-        self.table_name = "gen_articles"
-
-        def self.primary_key
-          %w[id views]
+    # An auto-increment column is assigned wherever it sits in the key: MySQL
+    # allows `PRIMARY KEY (region, id)` with `id AUTO_INCREMENT`, and the
+    # adapter says so through `auto_increment?`. sqlite cannot declare that
+    # table (and older Rails' columns have no such flag), so the key is forced
+    # onto gen_articles and its `id` column answers as MySQL's would; the
+    # other part is the NOT NULL `title`.
+    context "when an auto-increment column is part of a composite primary key (Rails 7.1+ returns an Array)" do
+      before do
+        mysql_like = Class.new(SimpleDelegator) do
+          def auto_increment? = name == "id"
+          def respond_to_missing?(name, include_private = false) = name == :auto_increment? || super
         end
+        composite = Class.new(TestModel) do
+          self.table_name = "gen_articles"
+
+          def self.primary_key
+            %w[id title]
+          end
+        end
+        composite.define_singleton_method(:columns) { super().map { |column| mysql_like.new(column) } }
+        stub_const("GenCompositeArticle", composite)
       end
-      stub_const("GenCompositeArticle", composite)
-      draft = described_class.draft(model: GenCompositeArticle)
-      expect(draft).not_to include(":id")
-      expect(draft).not_to include(":views")
+
+      def create_rule(draft) = draft[/permit_params :create.*?^end/m]
+
+      it "leaves the auto-increment part out of the columns-only draft and requires the other part" do
+        draft = described_class.draft(model: GenCompositeArticle)
+        expect(draft).not_to include(":id")
+        expect(create_rule(draft)).to include("required :title, :string")
+      end
+
+      it "drafts the auto-increment part optional, never required, when the permit call lists it" do
+        scan = described_class.scan("params.require(:gen_composite_article).permit(:id, :title)")
+        draft = described_class.draft(model: GenCompositeArticle, scan: scan)
+        expect(create_rule(draft)).to include("optional :id, :integer", "required :title, :string")
+        expect(draft).not_to include("required :id")
+      end
+    end
+
+    # An adapter whose columns do not answer `auto_increment?` falls back to
+    # the integer of a single-column key.
+    it "falls back to the integer of a single-column key when the column has no auto_increment? flag" do
+      flagless = Class.new(SimpleDelegator) do
+        def respond_to_missing?(name, include_private = false) = name != :auto_increment? && super
+      end
+      model = Class.new(TestModel) { self.table_name = "gen_articles" }
+      model.define_singleton_method(:columns) { super().map { |column| flagless.new(column) } }
+      stub_const("GenFlaglessArticle", model)
+      expect(described_class.draft(model: GenFlaglessArticle)).not_to include(":id")
+    end
+
+    # The skip list is for columns drafted with nothing to say they are
+    # client input. A permit call that names one says so, and the column
+    # is as real as any other: typed from the schema, so the drift guard
+    # stays on.
+    context "when the permit call lists a primary key or a timestamp" do
+      let(:scan) { described_class.scan("params.require(:gen_article).permit(:id, :title, :created_at, :updated_at)") }
+      let(:draft) { described_class.draft(model: GenArticle, scan: scan) }
+
+      it "drafts them with their real types, not as virtual string fields" do
+        expect(draft).to include("optional :id, :integer")
+        expect(draft).to include("optional :created_at, :datetime")
+        expect(draft).to include("optional :updated_at, :datetime")
+        expect(draft).not_to include("virtual")
+        expect(draft).not_to include("not a database column")
+      end
+
+      it "drafts them optional although the columns are NOT NULL, since the database or Rails assigns them" do
+        expect(draft).to include("required :title, :string")
+        expect(draft.scan(/^\s*required :\w+/)).to eq(["  required :title"])
+      end
+
+      it "loads, and casts a timestamp a client sends as the column's type" do
+        enforced = draft.gsub("mode: :monitor", "mode: :enforce")
+        klass = permittable_class { class_eval(enforced) }
+        params = { gen_article: { title: "Hi", created_at: "2026-10-17T12:00:00Z" } }
+        permitted = controller(klass, params: params).permitted_params
+        expect(permitted["created_at"]).to respond_to(:year)
+      end
+
+      it "types every column of a composite primary key from the schema" do
+        composite = Class.new(TestModel) do
+          self.table_name = "gen_articles"
+
+          def self.primary_key
+            %w[id views]
+          end
+        end
+        stub_const("GenCompositeArticle", composite)
+        scan = described_class.scan("params.require(:gen_article).permit(:views, :title)")
+        draft = described_class.draft(model: GenCompositeArticle, scan: scan)
+        expect(draft).to include("optional :views, :integer")
+        expect(draft).not_to include("virtual")
+      end
+    end
+
+    # Only a key the database generates is assigned: a client has to send a
+    # natural key, and the column is NOT NULL with no default to say so.
+    context "when a primary key is the client's to send" do
+      before do
+        ActiveRecord::Schema.define do
+          create_table :gen_items, primary_key: :sku, id: :string do |t|
+            t.string :title, null: false
+          end
+          create_table :gen_order_lines, primary_key: %i[order_id pos] do |t|
+            t.integer :order_id, null: false
+            t.integer :pos, null: false
+            t.string :note
+          end
+          create_table :gen_tokens, id: :string, default: -> { "(lower(hex(randomblob(16))))" } do |t|
+            t.string :label
+          end
+        end
+        stub_const("GenItem", Class.new(TestModel) { self.table_name = "gen_items" })
+        stub_const("GenOrderLine", Class.new(TestModel) { self.table_name = "gen_order_lines" })
+        stub_const("GenToken", Class.new(TestModel) { self.table_name = "gen_tokens" })
+      end
+
+      after do
+        %i[gen_items gen_order_lines gen_tokens].each { |table| ActiveRecord::Base.connection.drop_table(table, if_exists: true) }
+      end
+
+      def create_rule(draft) = draft[/permit_params :create.*?^end/m]
+
+      it "drafts a natural string key the permit call lists as required on create" do
+        scan = described_class.scan("params.require(:gen_item).permit(:sku, :title)")
+        draft = described_class.draft(model: GenItem, scan: scan)
+        expect(create_rule(draft)).to include("required :sku, :string")
+        expect(draft[/permit_params :update.*?^end/m]).to include("optional :sku, :string")
+      end
+
+      it "drafts a natural string key as required when drafting from the columns alone" do
+        expect(create_rule(described_class.draft(model: GenItem))).to include("required :sku, :string")
+      end
+
+      it "drafts the parts of a composite key as required on create, not left out or optional" do
+        columns_only = described_class.draft(model: GenOrderLine)
+        expect(create_rule(columns_only)).to include("required :order_id, :integer", "required :pos, :integer")
+
+        scan = described_class.scan("params.require(:gen_order_line).permit(:order_id, :pos, :note)")
+        permitted = described_class.draft(model: GenOrderLine, scan: scan)
+        expect(create_rule(permitted)).to include("required :order_id, :integer", "required :pos, :integer")
+      end
+
+      it "still treats a key the database fills in (a default function) as assigned" do
+        expect(described_class.draft(model: GenToken)).not_to include(":id")
+
+        scan = described_class.scan("params.require(:gen_token).permit(:id, :label)")
+        draft = described_class.draft(model: GenToken, scan: scan)
+        expect(draft).to include("optional :id, :string")
+        expect(draft).not_to include("required")
+      end
+    end
+
+    it "still leaves the primary key and timestamps out when a scan names no field and the columns are drafted" do
+      scan = described_class.scan("params.require(:gen_article).permit(*PERMITTED)")
+      draft = described_class.draft(model: GenArticle, scan: scan)
       expect(draft).to include("required :title, :string")
+      expect(draft).not_to match(/:(id|created_at|updated_at)\b/)
     end
 
     it "maps a json column onto the opaque :json contract type" do
