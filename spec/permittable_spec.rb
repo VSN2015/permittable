@@ -3585,6 +3585,65 @@ RSpec.describe Permittable do
       expect(body["error"]["details"]).to eq([{ "param" => "user.age", "code" => "inclusion" }])
     end
 
+    describe "the envelope's content type" do
+      # respond_to sets the response's content type to the negotiated format
+      # BEFORE the block runs, and Rails' `render json:` only sets
+      # application/json when none is set yet. So with html listed first, the
+      # JSON envelope used to go out as text/html.
+      def build_negotiating_controller
+        IntegrationHarness.build_controller do
+          include Permittable
+
+          permit_params :create, root: :user do
+            required :name, :string
+          end
+
+          def create
+            respond_to do |format|
+              format.html { render json: { received: permitted_params } }
+              format.json { render json: { received: permitted_params } }
+            end
+          end
+        end
+      end
+
+      let(:browser_accept) { "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" }
+
+      it "is application/json for a browser form post to an action that negotiates with respond_to" do
+        result = IntegrationHarness.dispatch(build_negotiating_controller, :create, method: "POST",
+                                                                                    params: { user: { nme: "x" } },
+                                                                                    accept: browser_accept)
+        expect(result.status).to eq(422)
+        expect(result.header("Content-Type")).to start_with("application/json")
+        expect(JSON.parse(result.body)["success"]).to be(false)
+      end
+
+      it "is application/json for a JSON body sent with curl's Accept: */*" do
+        result = IntegrationHarness.dispatch(build_negotiating_controller, :create, method: "POST",
+                                                                                    json: { user: { nme: "x" } },
+                                                                                    accept: "*/*")
+        expect(result.status).to eq(422)
+        expect(result.header("Content-Type")).to start_with("application/json")
+        expect(JSON.parse(result.body)["error"]["code"]).to eq("invalid_parameters")
+      end
+
+      it "is application/json when the client asks for JSON" do
+        result = IntegrationHarness.dispatch(build_negotiating_controller, :create, method: "POST",
+                                                                                    json: { user: { nme: "x" } },
+                                                                                    accept: "application/json")
+        expect(result.status).to eq(422)
+        expect(result.header("Content-Type")).to start_with("application/json")
+      end
+
+      it "stays application/json for a controller that does not negotiate" do
+        result = IntegrationHarness.dispatch(build_api_controller, :create, method: "POST",
+                                                                            params: { user: { age: "12" } },
+                                                                            accept: browser_accept)
+        expect(result.status).to eq(422)
+        expect(result.header("Content-Type")).to start_with("application/json")
+      end
+    end
+
     it "renders 400 when the root key is missing" do
       result = IntegrationHarness.dispatch(build_api_controller, :create,
                                            method: "POST", params: { name: "rootless" })

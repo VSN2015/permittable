@@ -55,7 +55,12 @@ module Permittable
         error = { message: message }
         error[:code] = code if code
         error[:details] = details if details
-        controller.render(json: { success: false, error: error }, status: status)
+        # content_type: because `render json:` only supplies application/json
+        # when the response has none yet, and `respond_to` has already set the
+        # negotiated one (text/html for a browser form, or for `Accept: */*`
+        # with html listed first). Without it this JSON body goes out as HTML.
+        controller.render(json: { success: false, error: error }, status: status,
+                          content_type: "application/json")
       end
     end
 
