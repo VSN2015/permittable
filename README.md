@@ -1487,8 +1487,7 @@ A `format:` regexp that does not translate to ECMA-262 is looser in the same way
 | nested block / `array` | `object` + `properties` / `array` + `items` |
 | `unknown: :error` | `additionalProperties: false`, at every nesting level |
 | `root:` | the wrapping object, itself required |
-| `finalize` | `x-permittable-finalize: true` on the rule's object (inside the `root:` wrapper) and on the operation; the cross-field checks themselves are opaque |
-| `sensitive: true` | `writeOnly: true` (never echoed in responses); the field's own `default:`/`example:` are omitted rather than published, and so are those of an array that holds it at any depth, since they would carry its value |
+| `sensitive: true` | `writeOnly: true` (never echoed in responses); the field's own `default:`/`example:` are omitted rather than published, and so are those of an array that holds it at any depth, since they would carry its value, and so are its `in:` (list or Range) and a hand-written `format:` regexp, which would publish the secret itself. A field that declares either is flagged `x-permittable-custom-validation`, so the schema is looser than the server there; a `format:` preset such as `:email` is public and is still published |
 
 </details>
 

@@ -45,7 +45,9 @@ module SchemaConformance
   #   :range_extension — a Range of non-numbers (`in: "a".."m"`), which
   #     minimum/maximum cannot express, carried as `x-permittable-range`.
   #   :custom_validation — a `validate:` proc is opaque app code, so the
-  #     schema can only flag it: `x-permittable-custom-validation`.
+  #     schema can only flag it: `x-permittable-custom-validation`. A
+  #     `sensitive:` field's `in:`/`format:` is the same case by choice: the
+  #     rule is real but publishing it would publish the secret.
   #   :normalized_first — the `normalize:` step, the unsafe way round: "   "
   #     passes a minLength of 3 and then squishes to "" (absent), " a  "
   #     passes it and squishes to "a" (too short). JSON Schema has no keyword
@@ -313,6 +315,18 @@ module SchemaConformance
         [{ "price" => "", "due_on" => "", "starts_at" => "" }, :agree],
         [{ "price" => nil, "due_on" => nil, "starts_at" => nil }, :agree],
         [{ "price" => "1.50", "due_on" => "2026-01-01", "starts_at" => "2026-01-01T10:00:00Z" }, :agree]
+      ]
+    },
+    "a sensitive field's in: and format:, which the schema withholds" => {
+      contract: proc {
+        optional :pin, :string, in: %w[PIN_SECRET1 PIN_SECRET2], sensitive: true
+        optional :tok, :string, format: /\AFMT_SECRET\z/, sensitive: true
+      },
+      payloads: [
+        [{ "pin" => "PIN_SECRET1" }, :agree],
+        [{ "pin" => "guess" }, :custom_validation],
+        [{ "tok" => "FMT_SECRET" }, :agree],
+        [{ "tok" => "guess" }, :custom_validation]
       ]
     },
     "arrays" => {

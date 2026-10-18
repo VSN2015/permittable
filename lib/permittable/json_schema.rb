@@ -38,6 +38,9 @@ module Permittable
   #   * a `validate:` proc — `x-permittable-custom-validation`;
   #   * a `finalize` block, whose `violate!` cross-field checks no field's
   #     schema can carry — `x-permittable-finalize` on the rule's object;
+  #   * a `sensitive:` field's `in:` and `format:`, withheld because they
+  #     would publish the secret itself — the same marker (see
+  #     withholds_constraints?);
   #   * a `normalize:` step, which the server runs BEFORE it checks, so
   #     "   " passes a minLength of 3 and is then absent —
   #     `x-permittable-normalize`;
@@ -139,10 +142,29 @@ module Permittable
     def scalar_schema(field)
       schema = SCALAR_SCHEMAS.fetch(field[:type]).deep_dup
       apply_format_name!(schema, field)
-      apply_in!(schema, field)
+      withheld = withholds_constraints?(field)
+      apply_in!(schema, field) unless withheld
       apply_string_bounds!(schema, field)
-      apply_pattern!(schema, field[:format])
+      apply_pattern!(schema, field[:format]) unless withheld
+      schema["x-permittable-custom-validation"] = true if withheld
       schema
+    end
+
+    # A `sensitive:` field's `in:` list/Range and hand-written `format:` ARE
+    # the secret: an enum of the only accepted PINs is an allowlist, and
+    # `pattern: "^FMT_SECRET$"` or a 4000..4999 range names or narrows the
+    # value the same way, so publishing them would defeat the redaction as
+    # surely as publishing a `default:` (see annotate). They are left out,
+    # with `x-permittable-custom-validation` as the only signal, which makes
+    # the exported schema LOOSER than the server for that field. A
+    # `format:` PRESET is the exception: it names a public rule, not a
+    # secret, so it keeps its `format` and `pattern`. `field[:sensitive]` is
+    # already resolved onto a cascaded child, so a child counts. Only a field
+    # that actually declares one of the two is flagged.
+    def withholds_constraints?(field)
+      return false unless field[:sensitive]
+
+      !field[:in].nil? || (!field[:format].nil? && field[:format_name].nil?)
     end
 
     # A `:json` field's shape is deliberately undeclared, so the schema says
