@@ -45,16 +45,27 @@ module Permittable
 
     def render_envelope(controller, message:, status:, code: nil, details: nil)
       if controller.respond_to?(:render_error)
-        host = controller.method(:render_error)
+        host = host_method(controller)
         kwargs = { message: message, code: code, status: status }
-        kwargs[:errors] = details if details && takes_errors?(host)
-        host.call(**kwargs)
+        kwargs[:errors] = details if details && (host.nil? || takes_errors?(host))
+        host ? host.call(**kwargs) : controller.render_error(**kwargs)
       else
         error = { message: message }
         error[:code] = code if code
         error[:details] = details if details
         controller.render(json: { success: false, error: error }, status: status)
       end
+    end
+
+    # The Method for the host's render_error, or nil when the controller claims
+    # to respond (respond_to? is true) yet has no such method to inspect: one
+    # served by method_missing without respond_to_missing?. Master called it
+    # straight through with errors: included, and nil keeps doing exactly that
+    # rather than raising NameError out of the rescue_from handler.
+    def host_method(controller)
+      controller.method(:render_error)
+    rescue NameError
+      nil
     end
 
     # A rejection always carries details, so passing errors: whenever there
