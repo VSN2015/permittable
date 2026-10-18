@@ -162,6 +162,62 @@ RSpec.describe Permittable::Contract do
         Permittable.mode = :enforce
       end
     end
+
+    # A contract is handed a Hash by a job, a service or a CSV row, and a
+    # Numeric there is not always an Integer or a Float. Whatever it is, the
+    # answer is a value or an invalid_type violation: an exception out of
+    # #call is a 500 where a 422 is due. A controller never receives these (a
+    # request body has no Complex), so this is the standalone surface only.
+    describe "an exotic Numeric, for every scalar type" do
+      # Foreign code: a Numeric subclass is free to make any conversion fail.
+      let(:hostile) do
+        Class.new(Numeric) do
+          %i[to_f to_i to_s zero?].each { |name| define_method(name) { |*| raise "no #{name}" } }
+        end.new
+      end
+      # Prints fine, but cannot become a Float.
+      let(:no_float) do
+        Class.new(Numeric) do
+          def to_f = raise("no to_f")
+          def to_s(*) = "7"
+        end.new
+      end
+
+      # Complex(1, 0) is a :float / :integer / :decimal violation for the same
+      # reason as Complex(1, 1): it is not a real number, and "1+0i" is not how
+      # any of the three is spelled. A :boolean takes it as `1 == Complex(1, 0)`
+      # does, like 1.0 and Rational(1), so that cell is not pinned here.
+      {
+        integer: { complex: :invalid, real_complex: :invalid, hostile: :invalid, no_float: :invalid },
+        float: { complex: :invalid, real_complex: :invalid, hostile: :invalid, no_float: :invalid },
+        decimal: { complex: :invalid, real_complex: :invalid, hostile: :invalid, no_float: BigDecimal("7") },
+        boolean: { complex: :invalid, real_complex: :any, hostile: :invalid, no_float: :invalid },
+        date: { complex: :invalid, real_complex: :invalid, hostile: :invalid, no_float: :invalid },
+        datetime: { complex: :invalid, real_complex: :invalid, hostile: :invalid, no_float: :invalid },
+        # A Numeric is stringified, so a Complex is a String; one that cannot
+        # print is not.
+        string: { complex: "1+1i", real_complex: "1+0i", hostile: :invalid, no_float: "7" }
+      }.each do |type, expectations|
+        expectations.each do |name, expected|
+          it "answers a #{name} input to #{type} with a value or a violation, never an exception" do
+            input = { complex: Complex(1, 1), real_complex: Complex(1, 0), hostile: hostile, no_float: no_float }.fetch(name)
+            result = nil
+            expect { result = described_class.define { optional :x, type }.call(x: input) }.not_to raise_error
+
+            case expected
+            when :invalid then expect(result.violations).to eq([{ param: "x", code: "invalid_type" }])
+            when :any then nil
+            else expect(result.params["x"]).to eq(expected)
+            end
+          end
+        end
+      end
+
+      it "rejects a Complex whose imaginary part is a float zero, which Complex#to_f also refuses" do
+        expect(described_class.define { optional :x, :float }.call(x: Complex(1, 0.0)).violations)
+          .to eq([{ param: "x", code: "invalid_type" }])
+      end
+    end
   end
 
   describe "#call!" do

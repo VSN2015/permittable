@@ -673,8 +673,8 @@ Coercion is **deliberately strict**, and deliberately *not* `ActiveModel::Type`.
 |---|---|---|
 | `:string` | `String`, returned in the encoding it arrived in; `Numeric`/`true`/`false` are stringified | Arrays, hashes, a `String` whose bytes are invalid in its own encoding (`"caf\xC3"`) |
 | `:integer` | `Integer`; whole `Float`s (`4.0`); canonical base-10 numeric strings (`"-12"`, `"007"`) | `"4.5"`, `"abc"`, `"1_8"`, `" 99 "`, `4.5`, NaN/Infinity |
-| `:float` | `Numeric`; a canonical numeric string (`"1.5"`, `".5"`, `"-2e3"`) | `"abc"`, `"1_8.5"`, `" 1.5 "`, and any number outside a Float's range, as a `Numeric` or a string alike (`BigDecimal("1e-400")`, `"1e400"`) |
-| `:decimal` | `Numeric`, or a canonical numeric string → `BigDecimal` | Unparseable strings, `"1_000"`, `" 1.5 "` |
+| `:float` | a real `Numeric`; a canonical numeric string (`"1.5"`, `".5"`, `"-2e3"`) | `"abc"`, `"1_8.5"`, `" 1.5 "`, and any number outside a Float's range, as a `Numeric` or a string alike (`BigDecimal("1e-400")`, `"1e400"`), a `Complex` (even `Complex(1, 0)`), a `Numeric` that cannot be converted |
+| `:decimal` | a real `Numeric`, or a canonical numeric string → `BigDecimal` | Unparseable strings, `"1_000"`, `" 1.5 "`, a `Complex`, a `Numeric` that cannot be converted |
 | `:boolean` | `true`/`false`, `"true"`/`"false"`, `"1"`/`"0"`, `1`/`0` | `"yes"`, `"on"`, `2` |
 | `:date` | `Date`; a string naming a **complete** date, in any format `Date.parse` understands (`"2026-09-05"`, `"2026/09/05"`, `"Sep 5, 2026"`) | Unparseable strings, and **incomplete** ones (`"09/2026"`, `"5th"`, `"Sept"`) |
 | `:datetime` | `Time`, `DateTime`, `ActiveSupport::TimeWithZone`, `Date`; a string naming a complete date, with or without a time | Unparseable strings, and any string without a complete date (`"10:30"`) |

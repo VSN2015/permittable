@@ -817,7 +817,8 @@ module Permittable
       # here (a plain :string field, not :decimal itself) must render the same
       # way regardless of whether that patch happens to be loaded.
       when BigDecimal then [:ok, value.to_s("F")]
-      when Numeric, true, false then [:ok, value.to_s]
+      when Numeric then foreign_numeric { [:ok, value.to_s] }
+      when true, false then [:ok, value.to_s]
       else [:error, "invalid_type"]
       end
     end
@@ -849,14 +850,35 @@ module Permittable
 
     def cast_float(value)
       case value
+      # A Complex is not real? (a real number), so never a Float — even Complex(1, 0),
+      # which :integer and :decimal refuse too ("1+0i" is no spelling of either).
+      # Taking the ones whose to_f happens to work would make the rule "the
+      # imaginary part is an exact zero": Complex(1, 0.0).to_f raises RangeError
+      # just as Complex(1, 1) does, and a contract must not raise on input.
+      #
       # A zero Numeric is a genuine zero; one that only BECAME zero in to_f
       # (BigDecimal("1e-400"), Rational(1, 10**400)) is underflow, exactly as
       # for the String of it, so a nonzero one passes its text for the check.
-      when Numeric then finite_float(value.to_f, source: (value.to_s unless value.zero?))
+      when Numeric
+        foreign_numeric do
+          value.real? ? finite_float(value.to_f, source: (value.to_s unless value.zero?)) : [:error, "invalid_type"]
+        end
       when String then value.match?(NUMERIC_FORMAT) ? finite_float(Float(value), source: value) : [:error, "invalid_type"]
       else [:error, "invalid_type"]
       end
     rescue ArgumentError
+      [:error, "invalid_type"]
+    end
+
+    # The Numeric branches call to_f, to_s and zero? on a value whose class
+    # the caller chose: Complex(1, 1).to_f raises RangeError, and a custom
+    # Numeric may raise anything. A value that cannot be converted is not a
+    # value of the type, so it is an invalid_type violation rather than an
+    # exception out of #call (a 500 where a 422 is due). Wrapped around the
+    # Numeric branches only; the other branches call nothing a caller wrote.
+    def foreign_numeric
+      yield
+    rescue StandardError
       [:error, "invalid_type"]
     end
 
@@ -885,7 +907,7 @@ module Permittable
 
     def cast_decimal(value)
       case value
-      when Numeric then finite_decimal(BigDecimal(value.to_s))
+      when Numeric then foreign_numeric { finite_decimal(BigDecimal(value.to_s)) }
       when String then value.match?(NUMERIC_FORMAT) ? finite_decimal(BigDecimal(value)) : [:error, "invalid_type"]
       else [:error, "invalid_type"]
       end
