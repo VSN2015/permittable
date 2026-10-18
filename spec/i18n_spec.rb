@@ -201,6 +201,7 @@ RSpec.describe "I18n violation messages" do
       expect(details).to eq([{ param: "user.name", code: "missing", message: "fehlt" }])
     end
 
+    # pins the documented limitation; delete if the callback order is ever changed
     it "runs the eager check in registration order, so a plain around_action declared after the include is too late" do
       controller = switching_controller({ enforce: true }) { around_action :switch_locale }
       expect(first_message(create_with(controller))).to eq("is required")
