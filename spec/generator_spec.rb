@@ -101,6 +101,78 @@ RSpec.describe Permittable::Generator do
     end
   end
 
+  # Parentheses are optional in Ruby, and older controllers often leave them
+  # off. The scanner required them, so `permit :name, :email` matched
+  # nothing: the call vanished, its virtual keys with it, and the draft fell
+  # back to columns alone without a word.
+  describe ".scan of calls written without parentheses" do
+    it "reads a paren-less permit" do
+      scan = described_class.scan(<<~RUBY)
+        def user_params
+          params.require(:user).permit :name, :email, :password_confirmation
+        end
+      RUBY
+      expect([scan.calls, scan.root, scan.scalars]).to eq([1, :user, %i[name email password_confirmation]])
+
+      scan = described_class.scan("params.require(:user).permit :name if admin?")
+      expect(scan.scalars).to eq(%i[name])
+    end
+
+    it "follows a paren-less call across lines that end in a comma or sit inside brackets" do
+      scan = described_class.scan(<<~RUBY)
+        params.require(:user).permit :name,
+                                     tags: [],
+                                     address: [
+                                       :city,
+                                       :zip
+                                     ]
+        do_something_else(:not_a_field)
+      RUBY
+      expect(scan.scalars).to eq(%i[name])
+      expect(scan.arrays).to eq(%i[tags])
+      expect(scan.nested).to eq(address: %i[city zip])
+    end
+
+    it "ends a paren-less call at its line, even with a comment after it" do
+      scan = described_class.scan(<<~RUBY)
+        params.require(:user).permit :name # the display name
+        audit :not_a_field
+      RUBY
+      expect(scan.scalars).to eq(%i[name])
+    end
+
+    it "never reads a trailing modifier as an argument, or quotes it in a TODO" do
+      scan = described_class.scan("params.require(:user).permit if admin?")
+      expect([scan.calls, scan.unparsed]).to eq([0, []])
+      scan = described_class.scan(<<~RUBY)
+        params.require(:user).permit :name
+        params.require(:address).permit :city if admin?
+      RUBY
+      expect(scan.root).to eq(:user)
+      expect(scan.other_envelopes).to eq(address: ["params.require(:address).permit :city"])
+    end
+
+    it "reads a paren-less expect" do
+      scan = described_class.scan("params.expect user: [:name, :age]")
+      expect([scan.root, scan.scalars]).to eq([:user, %i[name age]])
+    end
+
+    it "still skips a paren-less call whose arguments hold a method call, rather than half-reading it" do
+      scan = described_class.scan("params.require(:user).permit :name, *policy(record).extra")
+      expect(scan.calls).to eq(0)
+    end
+  end
+
+  describe ".scan of a root spelled as a String" do
+    it "reads require(\"user\") and require('user') like require(:user)" do
+      scan = described_class.scan('params.require("user").permit(:name, :email)')
+      expect([scan.root, scan.scalars]).to eq([:user, %i[name email]])
+      expect(described_class.scan("params.require('user').permit :name").root).to eq(:user)
+      # Not a key a contract root can name: skipped, not guessed.
+      expect(described_class.scan('params.require("user name").permit(:name)').calls).to eq(0)
+    end
+  end
+
   describe ".scan of a receiver that only ends in `params`" do
     it "does not read user_params.permit as a rootless params.permit" do
       scan = described_class.scan(<<~RUBY)
@@ -388,6 +460,53 @@ RSpec.describe Permittable::Generator do
     end
   end
 
+  describe ".draft of nested attributes for a has_many" do
+    before do
+      ActiveRecord::Schema.define do
+        create_table(:gen_people) { |t| t.string :name }
+        create_table(:gen_addresses) do |t|
+          t.references :gen_person
+          t.string :city
+        end
+        create_table(:gen_profiles) do |t|
+          t.references :gen_person
+          t.string :bio
+        end
+      end
+      stub_const("GenAddress", Class.new(TestModel) { self.table_name = "gen_addresses" })
+      stub_const("GenProfile", Class.new(TestModel) { self.table_name = "gen_profiles" })
+      stub_const("GenPerson", Class.new(TestModel) do
+        self.table_name = "gen_people"
+        has_many :addresses, class_name: "GenAddress", foreign_key: :gen_person_id
+        has_one :profile, class_name: "GenProfile", foreign_key: :gen_person_id
+        accepts_nested_attributes_for :addresses, :profile
+      end)
+    end
+
+    after { %i[gen_people gen_addresses gen_profiles].each { |t| ActiveRecord::Base.connection.drop_table(t, if_exists: true) } }
+
+    let(:scan) do
+      described_class.scan("params.require(:gen_person).permit(:name, addresses_attributes: [:city], profile_attributes: [:bio])")
+    end
+
+    # fields_for sends a has_many's records as an index-keyed Hash, which a
+    # nested block read as unknown keys and silently dropped.
+    it "drafts a collection's nested attributes as an array, and a has_one's as a nested block" do
+      draft = described_class.draft(model: GenPerson, scan: scan)
+      expect(draft).to match(/^ +array :addresses_attributes do$/)
+      expect(draft).to match(/optional :profile_attributes do # TODO/)
+    end
+
+    it "produces a draft that keeps every record fields_for sends" do
+      source = described_class.draft(model: GenPerson, scan: scan)
+      klass = permittable_class { class_eval(source) }
+      sent = { gen_person: { name: "Jo", addresses_attributes: { "0" => { city: "Paris" }, "1" => { city: "Rome" } } } }
+      expect(controller(klass, params: sent).permittable_violations).to eq([])
+      expect(controller(klass, params: sent).permitted_params[:addresses_attributes])
+        .to eq([{ "city" => "Paris" }, { "city" => "Rome" }])
+    end
+  end
+
   describe ".draft of a contract the model would actually accept" do
     after do
       %i[gen_blog_posts gen_orders gen_shipments gen_vehicles gen_fleet_cars gen_oddities].each do |table|
@@ -505,6 +624,26 @@ RSpec.describe Permittable::Generator do
         expect(draft).to match(
           /optional :status, .*; TODO: Rails also assigns the stored integers \(status: 1\).*GenOrder\.statuses\.values/
         )
+      end
+
+      # The TODO is advice to paste, so it has to survive the type guard and
+      # keep names intact: the obvious `key(v.to_i) || v` read "shipped" as
+      # 0 and handed the action "pending".
+      it "spells out a stored-integer recipe that loads under check_column_types and keeps names intact" do
+        expect(draft).to include("transform: ->(v) { GenOrder.statuses.key(Integer(v, exception: false)) || v }")
+        Permittable.check_column_types = true
+        klass = load_draft(<<~RUBY)
+          permit_params :update, root: :gen_order, model: GenOrder do
+            optional :status, :string, in: GenOrder.statuses.keys + GenOrder.statuses.values.map(&:to_s),
+                                       transform: ->(v) { GenOrder.statuses.key(Integer(v, exception: false)) || v }
+          end
+        RUBY
+        %w[1 shipped].each do |sent|
+          expect(controller(klass, params: { gen_order: { status: sent } }, action: "update").permitted_params)
+            .to eq("status" => "shipped"), "for #{sent}"
+        end
+      ensure
+        Permittable.check_column_types = false
       end
 
       it "leaves no stored-integer TODO on an enum whose stored values are strings" do
@@ -630,11 +769,20 @@ RSpec.describe Permittable::Generator do
         # Break reading two columns' defaults — an ordinary one and the
         # locking column — after the schema has loaded, so the error comes
         # from the introspection on top of it.
-        defaults = GenBrokenVehicle._default_attributes
-        allow(defaults).to receive(:[]).and_call_original
-        %w[name lock_version].each do |name|
-          allow(defaults).to receive(:[]).with(name).and_raise(ArgumentError, "misconfigured\nsecond line")
+        #
+        # Rails main freezes the model's attribute set, and rspec-mocks
+        # cannot proxy a frozen object, so the set is frozen here on every
+        # Rails line and the failure comes from a delegating stand-in that
+        # the model hands out in its place.
+        defaults = GenBrokenVehicle._default_attributes.freeze
+        broken = SimpleDelegator.new(defaults)
+        broken_names = %w[name lock_version]
+        broken.define_singleton_method(:[]) do |name|
+          raise ArgumentError, "misconfigured\nsecond line" if broken_names.include?(name)
+
+          defaults[name]
         end
+        allow(GenBrokenVehicle).to receive(:_default_attributes).and_return(broken)
       end
 
       let(:draft) { described_class.draft(model: GenBrokenVehicle) }
@@ -1268,6 +1416,78 @@ RSpec.describe Permittable::Generator do
     end
   end
 
+  # RuboCop's default Style/SymbolArray and Style/WordArray rewrite
+  # `[:name, :email]` into `%i[name email]`, and Rails reads the two alike.
+  describe ".scan of %i and %w word lists" do
+    it "reads `user: %i[name email]` as the user envelope, so the enforced draft accepts the form" do
+      scan = described_class.scan("params.expect(user: %i[name email])")
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[name email])
+      expect(scan.unparsed).to eq([])
+
+      enforced = described_class.draft(scan: scan).gsub("mode: :monitor", "mode: :enforce")
+      request = controller(permittable_class { class_eval(enforced) }, params: { user: { name: "Jo", email: "jo@x.io" } })
+      expect(request.permitted_params.to_h).to eq("name" => "Jo", "email" => "jo@x.io")
+    end
+
+    it "reads %I, %w and %W, over several lines, with any delimiter but a parenthesis" do
+      ["%I[name email]", "%w{name email}", "%W<name email>", "%i|name email|", "%i[\n  name\n  email\n]"].each do |list|
+        scan = described_class.scan("params.expect(user: #{list})")
+        expect([scan.root, scan.scalars, scan.unparsed]).to eq([:user, %i[name email], []]), list
+      end
+    end
+
+    it "reads a list given to permit, splatted or not, and as a nested hash's or an array's keys" do
+      scan = described_class.scan("params.require(:user).permit(%i[name], *%w[email], [:age], address: %i[city zip], tags: %i[])")
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[name email age])
+      expect(scan.nested).to eq(address: %i[city zip])
+      expect(scan.arrays).to eq(%i[tags])
+      expect(scan.unparsed).to eq([])
+    end
+
+    it "reads an empty word list as the array-of-scalars root `[]` is" do
+      scan = described_class.scan("params.expect(tag_names: %i[])")
+      expect(scan.root).to be_nil
+      expect(scan.arrays).to eq(%i[tag_names])
+    end
+
+    it "keeps the root when a word list sits beside other fields, and spells it into scalars" do
+      # Rails flattens `[%i[name email], :age]` to `[:name, :email, :age]`: a
+      # list is an array of hashes only when it is the outer list's one element.
+      ["[%i[name email], :age]", "[[:name, :email], :age]", "[:age, %w[name email]]"].each do |fields|
+        scan = described_class.scan("params.expect(user: #{fields})")
+        expect([scan.root, scan.scalars.sort, scan.unparsed]).to eq([:user, %i[age email name], []]), fields
+      end
+
+      scan = described_class.scan("params.expect(user: [%i[name email], :age])")
+      enforced = described_class.draft(scan: scan).gsub("mode: :monitor", "mode: :enforce")
+      request = controller(permittable_class { class_eval(enforced) }, params: { user: { name: "Jo", email: "jo@x.io", age: "3" } })
+      expect(request.permitted_params.to_h).to eq("name" => "Jo", "email" => "jo@x.io", "age" => "3")
+
+      scan = described_class.scan("params.expect(user: [%i[name email]])")
+      expect(scan.root).to be_nil
+      expect(scan.nested_arrays).to eq(user: %i[name email])
+    end
+
+    it "does not take a comma as a word list's delimiter, nor cut `%w,name email,` into pieces" do
+      scan = described_class.scan("params.require(:user).permit(:id, %w,name email,)")
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[id])
+      expect(scan.unparsed).to eq(["%w,name email,"])
+    end
+
+    it "keeps the root of an envelope whose value it cannot read, with a TODO for the value" do
+      ["%i[first-name]", "%I[name \#{prefix}_email]", "permitted_keys"].each do |value|
+        scan = described_class.scan("params.expect(user: #{value})")
+        expect([scan.root, scan.unparsed]).to eq([:user, [value]]), value
+      end
+
+      draft = described_class.draft(scan: described_class.scan("params.expect(user: %i[name first-name])\nparams.permit(:page)"))
+      expect(draft).to include("# TODO: belongs to another envelope (user): user: %i[name first-name]")
+    end
+  end
+
   describe ".scan of a body shape beside an expect envelope" do
     it "says it is outside the envelope rather than calling it a route param" do
       draft = described_class.draft(scan: described_class.scan("params.expect(:id, post: [:title], tag_names: [])"))
@@ -1460,7 +1680,9 @@ RSpec.describe Permittable::Generator do
       "Post.find(params.expect(:id))\nparams.permit(:page)\nparams.expect(post: [:title])",
       "params.permit(:page)\nparams.expect(post: [:title], tag_names: [])",
       "params.require(:u).permit(:name, meta: [ , ], opts: [[ ]])",
-      "params.expect(u: [:name, meta: [[ ]]])"
+      "params.expect(u: [:name, meta: [[ ]]])",
+      "params.expect(post: %i[title body], items: [%i[sku]])",
+      "params.require(:u).permit(*%i[name], address: %w[city], tags: %i[], meta: %i[a-b])"
     ].each do |source|
       it "loads the draft of #{source.inspect}" do
         expect { load_draft(described_class.draft(scan: described_class.scan(source))) }.not_to raise_error
