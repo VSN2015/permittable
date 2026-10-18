@@ -62,9 +62,37 @@ module Permittable
           super(fields, hash, path: path, unknown: unknown, top_level: false, violations: violations)
         end
 
+        # unknown: :log warns through `logger`, and a controller gets one from
+        # ActionController. This host has none, so :log used to drop the keys
+        # without a word, exactly like :ignore. Rails.logger is read on every
+        # call, not at definition: contracts are usually constants, loaded
+        # before an app's initializers may have assigned it. With no Rails
+        # (a script, a job, a CSV import) the warning goes to $stderr rather
+        # than nowhere, since a :log that cannot log is :ignore by another
+        # name. Defining the contract does not raise for a missing logger:
+        # whether one exists is only known when the contract is called.
+        #
+        # The fallback Logger is built on every call, not memoized: #call!
+        # makes a new host per call, so an instance memo never applied, and a
+        # class-level one would capture $stderr once, hiding a later
+        # reassignment (a test's capture, a daemonized process's redirect).
+        def logger
+          return ::Rails.logger if defined?(::Rails) && ::Rails.respond_to?(:logger) && ::Rails.logger
+
+          ::Logger.new($stderr)
+        end
+
         # Instrumentation payload label (anonymous classes have no name).
         def permittable_controller_name
           "Permittable::Contract"
+        end
+
+        # ... and its action: the host has no action_name, so the payload's
+        # `action` (documented as a String) and the log lines that name the
+        # action would be nil. A Contract has one entry point, the same
+        # "call" #call! passes to permitted_params.
+        def permittable_action_name
+          ACTION
         end
       end
       @host_class.permit_params(root: root, unknown: unknown, model: model, mode: :enforce, desc: desc, &)
@@ -118,9 +146,30 @@ module Permittable
 
     def normalize_input(input)
       return {} if input.nil?
-      return input if input.is_a?(Hash) || input.respond_to?(:to_unsafe_h)
+      return input if input.respond_to?(:to_unsafe_h)
+      return unwrap_parameters(input) if input.is_a?(Hash)
 
       raise ArgumentError, "#{LABEL}: Contract#call expects a Hash (got #{input.class})"
+    end
+
+    # A controller's params reach the concern as ActionController::Parameters
+    # and are converted deeply by to_unsafe_h. A service object is usually
+    # handed a slice of them inside a plain Hash — `CreateUser.call(user:
+    # params[:user])` — and nothing converted those: a Parameters value is
+    # not a Hash, so a root read it as invalid_type (400), a nested block or
+    # :json field likewise (422). Each one is converted here, the way
+    # to_unsafe_h converts the whole. Only what holds one is copied.
+    def unwrap_parameters(value)
+      case value
+      when Hash
+        unwrapped = value.transform_values { |v| unwrap_parameters(v) }
+        unwrapped.each_value.zip(value.each_value).all? { |new, old| new.equal?(old) } ? value : unwrapped
+      when Array
+        unwrapped = value.map { |v| unwrap_parameters(v) }
+        unwrapped.zip(value).all? { |new, old| new.equal?(old) } ? value : unwrapped
+      else
+        value.respond_to?(:to_unsafe_h) ? value.to_unsafe_h : value
+      end
     end
   end
 end

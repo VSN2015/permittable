@@ -379,13 +379,18 @@ module Permittable
     # untranslatable or opaque fact in this file is handled: left out, with
     # the `x-permittable-*` extension (here, `writeOnly`/`x-permittable-
     # sensitive`) as the only signal that something is missing.
+    #
+    # The same goes for an array whose elements hold a sensitive field at
+    # any depth (see holds_sensitive?): its `default:`/`example:` carries
+    # that field's value, so it is omitted too.
     def annotate(schema, field)
       decimal_mode = field[:kind] == JSON_TYPE ? :string : :number
-      unless field[:sensitive]
+      unless holds_sensitive?(field)
         schema["default"] = json_value(field[:default], decimal: decimal_mode) if field.key?(:default)
         schema["examples"] = [json_value(field[:example], decimal: decimal_mode)] if field.key?(:example)
       end
-      schema["description"] = field[:desc] if field[:desc]
+      # dup: the stored desc is frozen; the export is editable and detached.
+      schema["description"] = field[:desc].dup if field[:desc]
       if field[:sensitive]
         schema["writeOnly"] = true
         schema["x-permittable-sensitive"] = true
@@ -394,6 +399,30 @@ module Permittable
       schema["x-permittable-transformed"] = true if field[:transform]
       apply_normalize!(schema, field)
       schema
+    end
+
+    # Is this field sensitive, or does it contain a sensitive field at any
+    # depth? A container's `default:`/`example:` is a whole value, so a
+    # sensitive sub-field's value is inside it. `array :cards, default:
+    # [{}]` with `optional :pan, sensitive: true, default: "4111..."` even
+    # stores `[{"pan" => "4111..."}]`, because the walker fills in each
+    # element's sub-field defaults (see AuthoredValues). Omitting pan's own
+    # default protected nothing while the array still published the value.
+    #
+    # The whole container value is omitted. Redacting only the sensitive
+    # keys inside it was the alternative, and it would mislead. Without the
+    # key, `[{}]` documents a default the server never hands out, since it
+    # fills pan in. An example without its required secret fails the very
+    # items schema it is attached to. A placeholder can fail the
+    # sub-field's own format or in:. The field's own default is omitted
+    # rather than replaced for the same reasons.
+    #
+    # The answer is read off the declaration, not the value, so even
+    # `default: []` is withheld. A value stored as authored (beside a
+    # `transform:`) can key its hashes by String or Symbol, and a check
+    # that has to find the sensitive key there is one more way to miss it.
+    def holds_sensitive?(field)
+      field[:sensitive] || Array(field[:fields]).any? { |child| holds_sensitive?(child) }
     end
 
     # The server checks the NORMALIZED string, so minLength/maxLength/pattern

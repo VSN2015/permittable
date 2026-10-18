@@ -378,16 +378,22 @@ module Permittable
     # entries; what was ignored follows in sections of its own, then any
     # ignore entry that matched nothing — `unmatched` defaults to checking
     # Permittable.audit_ignore, the list `entries` defaults to.
+    #
+    # With no routed action at all there is no table or summary, but the
+    # stale and unmatched sections still follow: that is when a contract no
+    # route reaches, or an ignore entry naming nothing, most needs saying.
     def format(entries, stale: {}, unmatched: unmatched_ignores(entries))
-      return "Permittable audit: no routed actions to report.\n" if entries.empty?
-
-      ignored, entries = entries.partition(&:ignored?)
-      out = entries.group_by(&:controller).map { |key, group| controller_block(key, group) }
-      out << summary_lines(summary(entries), rows: entries.length)
+      ignored, audited = entries.partition(&:ignored?)
+      out = entries.empty? ? ["Permittable audit: no routed actions to report."] : table_lines(audited)
       out << stale_lines(stale) unless stale.empty?
       out << ignored_lines(ignored) unless ignored.empty?
       out << unmatched_lines(unmatched) unless unmatched.empty?
       "#{out.join("\n")}\n"
+    end
+
+    def table_lines(entries)
+      entries.group_by(&:controller).map { |key, group| controller_block(key, group) } <<
+        summary_lines(summary(entries), rows: entries.length)
     end
 
     def controller_block(key, group)
