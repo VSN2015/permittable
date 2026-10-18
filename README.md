@@ -1149,7 +1149,9 @@ bin/rails permittable:generate                      # every controller without a
 bin/rails "permittable:generate[UsersController]"   # one controller, even if covered
 ```
 
-The sweep skips what the audit [ignores](#ignoring-controllers-and-actions): controllers whose source is outside `Rails.root` (so ActiveStorage's direct uploads controller is not drafted), and anything in `Permittable.audit_ignore`. A `controller#action` entry leaves only that action out of the controller's draft. Naming a controller drafts it regardless, the same way it drafts a covered one.
+The sweep skips what the audit [ignores](#ignoring-controllers-and-actions): controllers whose source is outside `Rails.root` (so ActiveStorage's direct uploads controller is not drafted), and anything in `Permittable.audit_ignore`. A `controller#action` entry leaves only that action out of the controller's draft.
+
+A draft covers `:create` and `:update`, and only the ones the controller defines, read the way `permittable:audit` reads them (an `action_missing` handler or a template answers an action too): a `SessionsController` with `create` and `destroy` gets a `:create` rule and no `:update`, which would guard nothing and which the audit would list as stale. A controller that defines neither, like `ApplicationController`, is not drafted at all — a rule there would be inherited by every controller below it. Naming a controller drafts it regardless, the same way it drafts a covered one, and leaves out an action it does not define in the same way; only a controller that defines neither is drafted with both.
 
 For each controller the task infers the model from `controller_name` (columns give types, NOT NULL gives `required`), scans the controller source for `params.require(...).permit(...)` and `params.expect(...)` calls (permitted keys give the field list and the `root:`), and prints a paste-ready draft:
 

@@ -1817,5 +1817,103 @@ RSpec.describe Permittable::Generator do
       Permittable.audit_ignore = ["users"]
       expect(described_class.targets([users])).to eq({})
     end
+
+    # A draft for an action the controller does not define guards nothing,
+    # and the audit lists it as stale. The audit's own reading of what a
+    # controller defines decides (see Audit.missing_action?), so a real
+    # ActionController is the thing to ask.
+    context "with controllers that do not define every drafted action" do
+      def real_controller(name, parent = ActionController::Base, &body)
+        stub_const(name, Class.new(parent, &body))
+      end
+
+      let(:both) do
+        real_controller("SweepPostsController") do
+          def create = head(:created)
+          def update = head(:ok)
+        end
+      end
+      let(:sessions) do
+        real_controller("SweepSessionsController") do
+          def create = head(:created)
+          def destroy = head(:no_content)
+        end
+      end
+      let(:webhooks) { real_controller("SweepWebhooksController") { def receive = head(:accepted) } }
+
+      it "drafts every action of a controller that defines them all" do
+        expect(described_class.targets([both], ignore: [], root: nil)).to eq(both => [])
+      end
+
+      it "leaves out a drafted action the controller does not define" do
+        expect(described_class.targets([sessions], ignore: [], root: nil)).to eq(sessions => [:update])
+      end
+
+      it "skips a controller that defines none of them" do
+        base = real_controller("SweepApplicationController") { include Permittable }
+        expect(described_class.targets([webhooks, base], ignore: [], root: nil)).to eq({})
+      end
+
+      it "counts an action a parent controller defines" do
+        child = real_controller("SweepChildSessionsController", sessions)
+        expect(described_class.targets([child], ignore: [], root: nil)).to eq(child => [:update])
+      end
+
+      it "takes every action as defined when the controller has an action_missing handler" do
+        catch_all = real_controller("SweepCatchAllController") { def action_missing(_name, *) = head(:ok) }
+        expect(described_class.targets([catch_all], ignore: [], root: nil)).to eq(catch_all => [])
+      end
+
+      it "takes both actions as defined when building the controller raises a ScriptError" do
+        # Audit.dispatchable? builds the controller and rescues only a
+        # StandardError, so this would otherwise end the whole sweep.
+        abstract = real_controller("SweepAbstractController") do
+          def initialize = raise(NotImplementedError, "subclass responsibility")
+          def create = head(:created)
+        end
+        expect(described_class.targets([abstract, sessions], ignore: [], root: nil)).to eq(abstract => [], sessions => [:update])
+        expect(described_class.undefined_actions(abstract)).to eq([])
+      end
+
+      it "adds an ignored action to the undefined ones" do
+        targets = described_class.targets([sessions], ignore: ["sweep_sessions#create"], root: nil)
+        expect(targets).to eq({})
+        targets = described_class.targets([both], ignore: ["sweep_posts#create"], root: nil)
+        expect(targets).to eq(both => [:create])
+      end
+    end
+  end
+
+  # A controller named to the task is drafted whole, even when covered or
+  # ignored — but not for an action it does not define, unless it defines
+  # neither: then the draft is the only thing the name could have asked for.
+  describe ".named_target" do
+    def real_controller(name, &body)
+      stub_const(name, Class.new(ActionController::Base, &body))
+    end
+
+    it "leaves out the one drafted action the controller does not define" do
+      sessions = real_controller("NamedSessionsController") do
+        def create = head(:created)
+      end
+      expect(described_class.named_target(sessions)).to eq([:update])
+    end
+
+    it "leaves nothing out when the controller defines both" do
+      both = real_controller("NamedBothController") do
+        def create = head(:created)
+        def update = head(:ok)
+      end
+      expect(described_class.named_target(both)).to eq([])
+    end
+
+    it "drafts both when the controller defines neither" do
+      webhooks = real_controller("NamedWebhooksController") { def receive = head(:accepted) }
+      expect(described_class.named_target(webhooks)).to eq([])
+    end
+
+    it "leaves nothing out of a controller that cannot list its actions" do
+      expect(described_class.named_target(Class.new(FakeController))).to eq([])
+    end
   end
 end
