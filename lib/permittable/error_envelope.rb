@@ -45,11 +45,12 @@ module Permittable
     end
 
     def render_envelope(controller, message:, status:, code: nil, details: nil)
-      host = host_render_error(controller)
-      if host
+      public_host = controller.respond_to?(:render_error)
+      host = public_host ? host_method(controller) : private_host_method(controller)
+      if public_host || host
         kwargs = { message: message, code: code, status: status }
-        kwargs[:errors] = details if details && takes_errors?(host)
-        host.call(**kwargs)
+        kwargs[:errors] = details if details && (host.nil? || takes_errors?(host))
+        host ? host.call(**kwargs) : controller.render_error(**kwargs)
       else
         error = { message: message }
         error[:code] = code if code
@@ -58,19 +59,29 @@ module Permittable
       end
     end
 
-    # The host's render_error, or nil to render the inline shape. A public
-    # one is always used, as documented. A private one is the usual spelling
-    # on an ApplicationController (a public method there is routable as an
-    # action in every subclass), so it is used too — but only when it is
-    # shaped like the documented keyword contract: a private
-    # `render_error(message, status)` helper written for something else was
-    # never consulted, and must not start turning every 422 into a 500.
-    def host_render_error(controller)
-      return controller.method(:render_error) if controller.respond_to?(:render_error)
+    # The Method for the host's public render_error, or nil when the controller
+    # claims to respond (respond_to? is true) yet has no such method to
+    # inspect: one served by method_missing without respond_to_missing?.
+    # Master called it straight through with errors: included, and nil keeps
+    # doing exactly that rather than raising NameError out of the rescue_from
+    # handler.
+    def host_method(controller)
+      controller.method(:render_error)
+    rescue NameError
+      nil
+    end
+
+    # A private render_error is the usual spelling on an ApplicationController
+    # (a public method there is routable as an action in every subclass), so
+    # it is used too — but only when it is shaped like the documented keyword
+    # contract: a private `render_error(message, status)` helper written for
+    # something else was never consulted, and must not start turning every 422
+    # into a 500. Nil renders the inline shape.
+    def private_host_method(controller)
       return nil unless controller.respond_to?(:render_error, true)
 
-      method = controller.method(:render_error)
-      method if keyword_contract?(method.parameters)
+      method = host_method(controller)
+      method if method && keyword_contract?(method.parameters)
     end
 
     # The keywords render_envelope may pass: message:, code: and status:

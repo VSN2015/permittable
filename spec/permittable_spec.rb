@@ -2635,6 +2635,40 @@ RSpec.describe Permittable do
         expect(rejected(klass).rendered[:json]).to eq(inline), "for render_error(#{signature})"
       end
     end
+
+    it "passes errors: in the trailing Hash of a render_error(*args) host" do
+      klass = host_with do
+        def render_error(*args)
+          options = args.last
+          render(json: options.merge(host: true), status: options[:status])
+        end
+      end
+      expect(rejected(klass).rendered[:json]).to include(host: true, code: "invalid_parameters",
+                                                         errors: [{ param: "name", code: "missing" }])
+    end
+
+    it "still delegates, with errors:, to a render_error served by method_missing without respond_to_missing?" do
+      klass = host_with do
+        # define_method on purpose: this host is exactly the unusual shape
+        # (no respond_to_missing?) the lint cops would steer people away from.
+        define_method(:respond_to?) { |name, *rest| name == :render_error || super(name, *rest) }
+
+        define_method(:method_missing) do |name, *args, **kwargs, &block|
+          next super(name, *args, **kwargs, &block) unless name == :render_error
+
+          render(json: kwargs.merge(host: true), status: kwargs[:status])
+        end
+      end
+      expect(rejected(klass).rendered[:json]).to include(host: true, code: "invalid_parameters",
+                                                         errors: [{ param: "name", code: "missing" }])
+    end
+
+    it "renders the inline shape, not a 500, when only respond_to?(…, true) claims a render_error that has no Method" do
+      klass = host_with do
+        define_method(:respond_to?) { |name, include_all = false| (include_all && name == :render_error) || super(name, include_all) }
+      end
+      expect(rejected(klass).rendered[:json]).to include(success: false)
+    end
   end
 
   describe "bounded prose: log lines and summaries" do
