@@ -1830,6 +1830,59 @@ RSpec.describe Permittable do
       end
     end
 
+    # A browser submitting through <input type="image"> posts the click point
+    # as `x` and `y`, or `<name>.x` and `<name>.y` when the input is named:
+    # Rack keeps those dotted keys literally, at the top level.
+    describe "the click point an image submit sends" do
+      let(:strict) { proc { permit_params(:create, unknown: :error) { optional :q, :string } } }
+
+      it "skips `x` and `y` when both are digits, and `<name>.x` and `<name>.y` likewise" do
+        [{ x: "12", y: "7" }, { x: "0", y: "0" }, { 'save.x': "12", 'save.y': "7" },
+         { 'enregistrer é.x': "12", 'enregistrer é.y': "7" }].each do |point|
+          result = permit({ q: "shoes", **point }, &strict)
+          expect(result.to_h).to eq("q" => "shoes"), "for #{point.inspect}"
+        end
+      end
+
+      it "flags a lone `x` or `y`, which is no click point but a stray key" do
+        [{ x: "12" }, { y: "7" }, { 'save.x': "12" }, { 'save.y': "7" }, { 'save.x': "12", 'other.y': "7" }].each do |point|
+          e = violations_for({ q: "shoes", **point }, &strict)
+          expect(e.details).to eq(point.keys.map { |key| { param: key.to_s, code: "unknown" } }), "for #{point.inspect}"
+        end
+      end
+
+      it "flags a pair that is not two non-negative integer Strings" do
+        [{ x: "abc", y: "7" }, { x: "12", y: "" }, { x: "-1", y: "7" }, { x: "1.5", y: "7" }, { x: "12", y: " 7" },
+         { x: 12, y: 7 }, { x: ["12"], y: "7" }, { x: "12\xFF", y: "7" }].each do |point|
+          e = violations_for({ q: "shoes", **point }, &strict)
+          expect(e.details).to eq(point.keys.map { |key| { param: key.to_s, code: "unknown" } }), "for #{point.inspect}"
+        end
+      end
+
+      it "still validates a declared `x` or `y` like any other field" do
+        declared = proc { permit_params(:create, unknown: :error) { optional :x, :integer } }
+        expect(permit({ x: "12" }, &declared)[:x]).to eq(12)
+        e = violations_for({ x: "abc", y: "7" }, &declared)
+        expect(e.details).to eq([{ param: "x", code: "invalid_type" }, { param: "y", code: "unknown" }])
+
+        both = proc {
+          permit_params(:create, unknown: :error) do
+            optional :x, :integer
+            optional :y, :integer
+          end
+        }
+        expect(permit({ x: "12", y: "7" }, &both).to_h).to eq("x" => 12, "y" => 7)
+        expect(violations_for({ x: "abc", y: "7" }, &both).details).to eq([{ param: "x", code: "invalid_type" }])
+      end
+
+      it "is exempt at the top level only" do
+        e = violations_for({ user: { name: "a", x: "12", y: "7" } }) do
+          permit_params(:create, root: :user, unknown: :error) { required :name, :string }
+        end
+        expect(e.details).to eq([{ param: "user.x", code: "unknown" }, { param: "user.y", code: "unknown" }])
+      end
+    end
+
     it "still flags a form key smuggled inside a root (the exemption is top-level only)" do
       e = violations_for({ user: { name: "a", authenticity_token: "smuggled" } }) do
         permit_params(:create, root: :user, unknown: :error) { required :name, :string }
@@ -3708,6 +3761,26 @@ RSpec.describe Permittable do
                                                                   path_params: { id: "1" })
         expect(result.status).to eq(200)
         expect(JSON.parse(result.body)).to eq("name" => "Jo")
+      end
+
+      # image_submit_tag renders <input type="image"> with no name, which a
+      # browser submits as the click point `x=12&y=7`; named, as `save.x`.
+      it "does not flag the click point of an image_submit_tag, which f.submit and f.button never send" do
+        controller = build_rootless_controller { optional :name, :string }
+        view = ActionView::Base.empty
+        expect(view.image_submit_tag("save.png")).not_to include("name=")
+        expect(view.image_submit_tag("save.png", name: "save")).to include('name="save"')
+
+        ["name=Jo&authenticity_token=t&x=12&y=7", "name=Jo&save.x=12&save.y=7",
+         "name=Jo&commit=Save", "name=Jo&button="].each do |body|
+          result = IntegrationHarness.dispatch(controller, :create, method: "POST", params: body)
+          expect(result.status).to eq(200), "for #{body}: #{result.body}"
+          expect(JSON.parse(result.body)).to eq("name" => "Jo")
+        end
+
+        result = IntegrationHarness.dispatch(controller, :create, method: "POST", params: "name=Jo&x=12")
+        expect(result.status).to eq(422)
+        expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "x", "code" => "unknown" }])
       end
 
       it "does not flag ParamsWrapper's copy of a JSON body under the wrapper key" do
