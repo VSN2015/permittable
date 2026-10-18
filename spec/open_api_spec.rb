@@ -1055,6 +1055,68 @@ RSpec.describe Permittable::OpenAPI do
           expect(app.routes.recognize_path("/x/foo")).to eq(controller: "x", action: "y", a: "foo")
           expect(paths_of(app)).to eq(["/x", "/x/{a}", "/x/new", "/x/new/{a}"])
         end
+
+        # Rails normalizes a request path before it matches one: the path
+        # starts with a slash, and every run of slashes is squeezed to one.
+        # An absent group at the start of a route can leave a variant that
+        # no request is: `/(:locale)(/:theme)` without :locale is
+        # `//{theme}`, and `(/:locale(/:region))` with nothing present is
+        # empty. Each path documented must reach the action with exactly the
+        # parameters it names.
+        {
+          'scope "(:locale)" { scope "(:theme)" { get "" } }' => [
+            proc { scope("(:locale)") { scope("(:theme)") { get "", to: "x#y" } } },
+            ["/", "/{locale}", "/{locale}/{theme}"]
+          ],
+          'scope "(:locale)" { get "(:page)" }' => [
+            proc { scope("(:locale)") { get "(:page)", to: "x#y" } }, ["/", "/{locale}", "/{locale}/{page}"]
+          ],
+          'get "(:a)(/:b)"' => [proc { get "(:a)(/:b)", to: "x#y" }, ["/", "/{a}", "/{a}/{b}"]],
+          'get "(:locale)(/:page)"' => [proc { get "(:locale)(/:page)", to: "x#y" }, ["/", "/{locale}", "/{locale}/{page}"]],
+          'get "(:locale(/:region))"' => [proc { get "(:locale(/:region))", to: "x#y" }, ["/{locale}", "/{locale}/{region}"]],
+          'get "(:a)(.:b)"' => [proc { get "(:a)(.:b)", to: "x#y" }, ["/{a}", "/{a}.{b}"]]
+        }.each do |drawn, (draw, paths)|
+          it "documents only the paths Rails dispatches as documented for #{drawn}" do
+            app = app_with(&draw)
+            expect(paths_of(app)).to eq(paths)
+            paths.each do |path|
+              names = path.scan(/\{(\w+)\}/).flatten
+              url = path.gsub(/\{(\w+)\}/) { "#{Regexp.last_match(1)}-value" }
+              expect(app.routes.recognize_path(url))
+                .to eq(controller: "x", action: "y", **names.to_h { |name| [name.to_sym, "#{name}-value"] })
+            end
+          end
+        end
+
+        # `GET //dark` is `GET /dark` to Rails, which :locale takes first, so
+        # the `//{theme}` variant documented a parameter never bound. With a
+        # constraint turning "dark" away from :locale, the URL reaches no
+        # route at all: it is dropped, not listed as a variant the
+        # constraint keeps reachable.
+        it "drops the variant an absent leading group leaves with two slashes in a row" do
+          app = app_with { scope("(:locale)") { scope("(:theme)") { get "", to: "x#y" } } }
+          expect(app.routes.recognize_path("//dark")).to eq(controller: "x", action: "y", locale: "dark")
+          expect(paths_of(app)).not_to include("//{theme}")
+
+          constrained = app_with { get "(:locale)(/:theme)", to: "x#y", constraints: { locale: /en|fr/ } }
+          expect(constrained.routes.recognize_path("/en")).to eq(controller: "x", action: "y", locale: "en")
+          expect { constrained.routes.recognize_path("//dark") }.to raise_error(ActionController::RoutingError)
+          expect(described_class.rails_routes(constrained).map { |r| [r[:path], r[:shadows]] })
+            .to eq([["/", nil], ["/{locale}", nil], ["/{locale}/{theme}", nil]])
+        end
+
+        # The route's whole path is one optional group, so with it absent
+        # nothing is left, and Rails does not answer `GET /` here. A route
+        # whose absent groups leave a bare slash does answer it.
+        it "documents / only for a route that answers it" do
+          app = app_with { get "(:locale(/:region))", to: "x#y" }
+          expect { app.routes.recognize_path("/") }.to raise_error(ActionController::RoutingError)
+          expect(paths_of(app)).not_to include("/")
+
+          rooted = app_with { get "(:locale)(/:region)", to: "x#y" }
+          expect(rooted.routes.recognize_path("/")).to eq(controller: "x", action: "y")
+          expect(paths_of(rooted)).to include("/")
+        end
       end
 
       # Reading `route.path.spec.to_s` back as a string threw away what
