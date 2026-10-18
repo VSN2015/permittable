@@ -86,6 +86,14 @@ module Permittable
       end
     end
 
+    # `params` itself, not the tail of another name: `user_params.permit(...)`
+    # is called on a helper's result (`params.require(:user)`, say), whose
+    # root a rootless read of it would drop. `@params` and `$params` are
+    # variables, except `@_params`, the one Rails itself keeps the controller's
+    # params in. A `.` before it is fine: `self.params.permit(...)` is the
+    # real thing.
+    PARAMS = /(?<![\w@$])(?:@_)?params/
+
     # One permit call, with an optional leading `.require(:root)` — the root
     # spelled `:user`, `"user"` or `'user'` (groups 1-3; a String root's
     # content is masked, so it is read back by offset like any argument).
@@ -94,7 +102,7 @@ module Permittable
     # entirely rather than half-read. Without parentheses (`permit :name,
     # :email`, common in older controllers) group 4 is empty and the
     # arguments run to the end of the statement: see call_args.
-    PERMIT_CALL = /params\s*(?:\.\s*require\(\s*(?::(\w+)|"([^"\n]*)"|'([^'\n]*)')\s*\))?\s*\.\s*
+    PERMIT_CALL = /#{PARAMS}\s*(?:\.\s*require\(\s*(?::(\w+)|"([^"\n]*)"|'([^'\n]*)')\s*\))?\s*\.\s*
                    permit(?:\(([^()]*)\)|[ \t]+(?=[^\s(]))/mx
 
     # A trailing `if`/`unless`/`rescue` modifier on a paren-less call, which
@@ -110,7 +118,7 @@ module Permittable
     # PERMIT_CALL: brackets and newlines are fine, a parenthesis means a
     # method call in the arguments and the whole call is skipped rather than
     # half-read.
-    EXPECT_CALL = /params\s*\.\s*expect(?:\(([^()]*)\)|[ \t]+(?=[^\s(]))/m
+    EXPECT_CALL = /#{PARAMS}\s*\.\s*expect(?:\(([^()]*)\)|[ \t]+(?=[^\s(]))/m
 
     # The required root envelope of an expect call: `user: [...]`, where the
     # brackets hold fields. Which brackets hold fields is `envelope`'s call,
