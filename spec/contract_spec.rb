@@ -152,6 +152,28 @@ RSpec.describe Permittable::Contract do
       expect { c.call!("caf\xC3" => 1) }.to raise_error(Permittable::InvalidParameters) { |e| expect(e.message).to be_valid_encoding }
     end
 
+    # The controller path converts params deeply through to_unsafe_h. A
+    # service object handed a slice of them — `CreateUser.call(user:
+    # params[:user])` — passed a plain Hash holding Parameters, which no
+    # Hash check recognised: a 400 for a root, 422 for a nested block.
+    it "reads ActionController::Parameters nested inside a plain Hash, as the controller path does" do
+      params = ActionController::Parameters.new(
+        user: { email: "a@b.co", age: "30" },
+        address: { city: "Hanoi" }, meta: { a: 1 }, items: [{ sku: "x" }]
+      )
+      expect(contract.call(user: params[:user]).params.to_h).to eq("email" => "a@b.co", "age" => 30, "plan" => "free")
+
+      rootless = described_class.define do
+        required(:address) { required :city, :string }
+        optional :meta, :json
+        array(:items) { required :sku, :string }
+      end
+      result = rootless.call(address: params[:address], meta: params[:meta], items: params[:items])
+      expect(result.violations).to eq([])
+      expect(result.params.to_h).to eq("address" => { "city" => "Hanoi" }, "meta" => { "a" => 1 }, "items" => [{ "sku" => "x" }])
+      expect(result.params[:meta]).not_to be_a(ActionController::Parameters)
+    end
+
     it "stays enforce-semantics even when the app-wide mode is monitor" do
       Permittable.mode = :monitor
       begin
