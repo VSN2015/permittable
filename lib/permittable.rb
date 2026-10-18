@@ -1658,10 +1658,13 @@ module Permittable
     # runs, so a declaration mistake (an element `validate:` refuses, a
     # sub-field default out of bounds) still fails at class load, but its
     # cast result is discarded rather than stored. The array's OWN
-    # `transform:` is deliberately never run on a default either way; a
+    # `transform:` is deliberately never run on a default either way. A
     # SUB-FIELD's `transform:` still runs during that walk, so "the walker's
-    # read" above really is what an equivalent request produces — see
-    # AuthoredValues.
+    # read" above really is what an equivalent request produces: all of them
+    # when the array has no `transform:` of its own, and, when it has one,
+    # those below an array declaring `validate:`, the only readers of their
+    # output (a request runs sub-field transforms, then that `validate:`,
+    # then the array's own transform) — see AuthoredValues.
     #
     # An `example:` is validated the same way, as a request would be, but what
     # is STORED is a second read of it exactly as a client SENDS it: cast and

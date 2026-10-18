@@ -1550,6 +1550,96 @@ RSpec.describe Permittable do
       expect(calls).to be_empty
     end
 
+    %i[default example].each do |opt|
+      it "lets an array's validate: see its sub-fields' transforms in an #{opt}: although the array has a transform: of its own" do
+        klass = permittable_class do
+          permit_params(:create) do
+            array :items, opt => [{ "tags" => "a,b" }], transform: ->(a) { a.size },
+                          validate: ->(a) { a.all? { |i| i[:tags].is_a?(Array) } } do
+              optional :tags, :string, transform: ->(s) { s.split(",") }
+            end
+          end
+        end
+        field = klass.permittable_contracts.last[:fields].first
+
+        # Stored exactly as authored: the array's own transform: is under it.
+        expect(field[opt]).to eq([{ "tags" => "a,b" }])
+        # The request this validates is accepted, so the contract is not contradictory.
+        expect(controller(klass, params: { items: [{ tags: "a,b" }] }).permitted_params[:items]).to eq(1)
+      end
+
+      it "still refuses a #{opt}: whose sub-field-transformed value the array's validate: rejects, array transform: or not" do
+        expect do
+          permittable_class do
+            permit_params(:create) do
+              array :items, opt => [{ "tags" => "a" }], transform: ->(a) { a.size },
+                            validate: ->(a) { a.all? { |i| i[:tags].size == 2 } } do
+                optional :tags, :string, transform: ->(s) { s.split(",") }
+              end
+            end
+          end
+        end.to raise_error(ArgumentError, /:#{opt} for array :items violates its own contract: items \(invalid\)/)
+      end
+    end
+
+    it "gives a nested array's validate: its own sub-fields' transforms, and the outer validate: the nested array's transformed result" do
+      build = lambda do |rows|
+        permittable_class do
+          permit_params(:create) do
+            array :orders, default: [{ "rows" => rows }], transform: ->(a) { a.size },
+                           validate: ->(a) { a.all? { |o| o[:rows] == 2 } } do
+              array :rows, transform: ->(r) { r.sum { |x| x[:n] } * 2 },
+                           validate: ->(r) { r.all? { |x| x[:n].is_a?(Integer) } } do
+                optional :n, :integer, transform: ->(n) { n }
+              end
+            end
+          end
+        end
+      end
+
+      expect(build.call([{ "n" => "1" }]).permittable_contracts.last[:fields].first[:default])
+        .to eq([{ "rows" => [{ "n" => "1" }] }])
+      expect { build.call([{ "n" => "2" }]) }.to raise_error(ArgumentError, /:default for array :orders violates its own contract/)
+    end
+
+    it "runs a transform: under a transforming array's default: only where an array's validate: above it reads the result" do
+      calls = []
+      klass = permittable_class do
+        permit_params(:create) do
+          # `:a` shares the array with a validate: but sits on a sibling branch of it: nothing reads its output.
+          array :items, default: [{ "a" => "x", "b" => [{ "c" => 1 }] }], transform: ->(a) { a } do
+            optional :a, :string, transform: ->(s) { (calls << :a) && raise("boom at class load: #{s}") }
+            array :b, validate: ->(arr) { arr.all? { |i| i[:c] == 1 } } do
+              optional :c, :integer, transform: ->(c) { (calls << :c) && c }
+            end
+          end
+        end
+      end
+
+      expect(klass.permittable_contracts.last[:fields].first[:default]).to eq([{ "a" => "x", "b" => [{ "c" => 1 }] }])
+      # `:c` is under :b's validate:, so it runs; `:a` and the array's own transform: never do.
+      expect(calls).to eq([:c])
+    end
+
+    it "runs a transform: for a validate: two levels above it, through a nested hash, and still checks what it returns" do
+      build = lambda do |tags|
+        permittable_class do
+          permit_params(:create) do
+            array :items, example: [{ "h" => { "tags" => tags } }], transform: ->(a) { a.size },
+                          validate: ->(a) { a.all? { |i| i[:h][:tags] == %w[a b] } } do
+              optional :h do
+                optional :tags, :string, transform: ->(s) { s.split(",") }
+              end
+            end
+          end
+        end
+      end
+
+      expect(build.call("a,b").permittable_contracts.last[:fields].first[:example]).to eq([{ "h" => { "tags" => "a,b" } }])
+      # The split really happens: "a,c" splits to an Array the validate: refuses.
+      expect { build.call("a,c") }.to raise_error(ArgumentError, /:example for array :items violates its own contract/)
+    end
+
     it "runs a sub-field's own transform: over an array default:, matching an equivalent explicit request" do
       klass = permittable_class do
         permit_params(:create) do
