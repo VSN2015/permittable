@@ -2968,6 +2968,82 @@ RSpec.describe Permittable do
     end
   end
 
+  describe "delegating to the host's render_error" do
+    def rejected(klass)
+      c = controller(klass, params: {})
+      begin
+        c.permitted_params
+      rescue described_class::InvalidParameters => e
+        c.render_invalid_parameters(e)
+      end
+      c
+    end
+
+    def host_with(&render_error)
+      permittable_class do
+        permit_params(:create) { required :name, :string }
+        class_eval(&render_error)
+      end
+    end
+
+    it "passes errors: to a render_error that takes it" do
+      klass = host_with do
+        def render_error(message:, status:, code: nil, errors: nil)
+          render(json: { host: true, message: message, code: code, errors: errors }, status: status)
+        end
+      end
+      expect(rejected(klass).rendered[:json]).to include(host: true, code: "invalid_parameters",
+                                                         errors: [{ param: "name", code: "missing" }])
+    end
+
+    it "keeps a three-keyword render_error working, as documented, instead of raising" do
+      klass = host_with do
+        def render_error(message:, status:, code:)
+          render(json: { host: true, message: message, code: code }, status: status)
+        end
+      end
+      c = rejected(klass)
+      expect(c.rendered[:status]).to eq(:unprocessable_entity)
+      expect(c.rendered[:json]).to include(host: true, code: "invalid_parameters")
+    end
+
+    it "passes errors: to a render_error that takes any keyword" do
+      klass = host_with do
+        def render_error(**kwargs)
+          render(json: kwargs.merge(host: true), status: kwargs[:status])
+        end
+      end
+      expect(rejected(klass).rendered[:json]).to include(host: true, errors: [{ param: "name", code: "missing" }])
+    end
+
+    it "passes errors: in the trailing Hash of a render_error(*args) host" do
+      klass = host_with do
+        def render_error(*args)
+          options = args.last
+          render(json: options.merge(host: true), status: options[:status])
+        end
+      end
+      expect(rejected(klass).rendered[:json]).to include(host: true, code: "invalid_parameters",
+                                                         errors: [{ param: "name", code: "missing" }])
+    end
+
+    it "still delegates, with errors:, to a render_error served by method_missing without respond_to_missing?" do
+      klass = host_with do
+        # define_method on purpose: this host is exactly the unusual shape
+        # (no respond_to_missing?) the lint cops would steer people away from.
+        define_method(:respond_to?) { |name, *rest| name == :render_error || super(name, *rest) }
+
+        define_method(:method_missing) do |name, *args, **kwargs, &block|
+          next super(name, *args, **kwargs, &block) unless name == :render_error
+
+          render(json: kwargs.merge(host: true), status: kwargs[:status])
+        end
+      end
+      expect(rejected(klass).rendered[:json]).to include(host: true, code: "invalid_parameters",
+                                                         errors: [{ param: "name", code: "missing" }])
+    end
+  end
+
   describe "bounded prose: log lines and summaries" do
     def logging_controller(klass, params:, action: "create")
       c = controller(klass, params: params, action: action)

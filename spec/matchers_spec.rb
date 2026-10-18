@@ -648,7 +648,7 @@ RSpec.describe "Permittable RSpec matchers" do
       ensure
         ActiveSupport::Notifications.unsubscribe(subscriber)
       end
-      expect(events).to eq(["the contract"])
+      expect(events).to eq(["the controller"])
     end
 
     it "works on a standalone Contract too" do

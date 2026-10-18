@@ -45,12 +45,10 @@ module Permittable
 
     def render_envelope(controller, message:, status:, code: nil, details: nil)
       if controller.respond_to?(:render_error)
-        # errors: only when there are details — a host may document its
-        # render_error contract as `(message:, status:, code:)`, and an
-        # unconditional errors: kwarg would break those implementations.
+        host = host_method(controller)
         kwargs = { message: message, code: code, status: status }
-        kwargs[:errors] = details if details
-        controller.render_error(**kwargs)
+        kwargs[:errors] = details if details && (host.nil? || takes_errors?(host))
+        host ? host.call(**kwargs) : controller.render_error(**kwargs)
       else
         error = { message: message }
         error[:code] = code if code
@@ -83,6 +81,36 @@ module Permittable
 
     def json_media_type?(type)
       !type.nil? && (type == "application/json" || type.end_with?("+json"))
+    end
+
+    # The Method for the host's render_error, or nil when the controller claims
+    # to respond (respond_to? is true) yet has no such method to inspect: one
+    # served by method_missing without respond_to_missing?. Master called it
+    # straight through with errors: included, and nil keeps doing exactly that
+    # rather than raising NameError out of the rescue_from handler.
+    def host_method(controller)
+      controller.method(:render_error)
+    rescue NameError
+      nil
+    end
+
+    # A rejection always carries details, so passing errors: whenever there
+    # are some passed it on every call — and a host documenting its contract
+    # as `(message:, status:, code:)`, which the README promises keeps
+    # working, raised ArgumentError out of the rescue_from handler: a 500 for
+    # every invalid request. errors: now goes only to a method that can take
+    # it: one naming it, taking **kwargs, or declaring no keywords at all
+    # (`*args`, which received it inside its trailing Hash before).
+    def takes_errors?(method)
+      parameters = method.parameters
+      return true if parameters.any? { |kind, _| kind == :keyrest }
+
+      names = keyword_names(parameters)
+      names.empty? || names.include?(:errors)
+    end
+
+    def keyword_names(parameters)
+      parameters.filter_map { |kind, name| name if %i[key keyreq].include?(kind) }
     end
 
     # Members are emitted in the order RFC 9457 documents them, so the wire
