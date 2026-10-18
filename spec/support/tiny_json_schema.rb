@@ -36,8 +36,10 @@ module TinyJsonSchema
   end
 
   # An integer is an Integer, or the Infinity a parser makes of a literal
-  # such as 1e400: the JSON text denotes an integer, and a real validator
-  # (Ajv) takes `type: integer` to admit it, so only a bound can refuse it.
+  # such as 1e400: the JSON text denotes an integer, and a validator that
+  # does not enforce finite numbers (for example Ajv with
+  # `strictNumbers: false`, which `strict: false` implies) takes
+  # `type: integer` to admit it, so only a bound can refuse it.
   # Read by type alone it would be refused here and the gap with a missing
   # bound would go unseen.
   def type_ok?(type, value)

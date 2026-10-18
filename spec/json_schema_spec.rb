@@ -232,7 +232,7 @@ RSpec.describe Permittable::JsonSchema do
 
       endless = property("tip") { optional :tip, :decimal, in: BigDecimal("0.5").. }
       # The open end is the limit of a double, not a bound of the field's own.
-      expect(endless).to include("minimum" => 0.5, "maximum" => Float::MAX)
+      expect(endless).to eq("type" => %w[string number], "format" => "decimal", "minimum" => 0.5, "maximum" => Float::MAX)
     end
 
     # The server's own verdict on a value a client sends as the JSON number
@@ -275,7 +275,7 @@ RSpec.describe Permittable::JsonSchema do
       # FloatDomainError), and Float::INFINITY is not a JSON number.
       decimal = property("x") { optional :x, :decimal, in: BigDecimal("0")..BigDecimal("Infinity") }
       # Left with the limit of a double, as with no in: at all.
-      expect(decimal).to include("minimum" => 0, "maximum" => Float::MAX)
+      expect(decimal).to eq("type" => %w[string number], "format" => "decimal", "minimum" => 0, "maximum" => Float::MAX)
 
       # A :float likewise.
       float = property("x") { optional :x, :float, in: -Float::INFINITY...Float::INFINITY }

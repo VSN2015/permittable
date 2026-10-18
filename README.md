@@ -1467,7 +1467,7 @@ A `format:` regexp that does not translate to ECMA-262 is looser in the same way
 |---|---|
 | `required` / `optional` | the object's `required:` array; required strings also get `minLength: 1` (`""` is absent) |
 | `:string` `:boolean` | `string` / `boolean` |
-| `:integer` `:float` | `integer` / `number`, with `minimum`/`maximum` of ±`Float::MAX` on any side `in:` leaves open — a JSON number past a double's range (`1e400`, which Rails parses to Infinity) is refused by the cast, so the docs refuse it too. That makes an `:integer` schema stricter than the server for a whole number of over 308 digits, which the server keeps and the docs refuse |
+| `:integer` `:float` | `integer` / `number`, with `minimum`/`maximum` of ±`Float::MAX` on any side `in:` leaves open — a JSON number past a double's range (`1e400`, which Rails parses to Infinity) is refused by the cast, so the docs refuse it too (a validator that does not enforce finite numbers, for example Ajv with `strictNumbers: false`, which `strict: false` implies, would otherwise admit it). That makes an `:integer` schema stricter than the server for a whole number of over 308 digits, which the server keeps and the docs refuse |
 | `:date` / `:datetime` | `string` + `format: date` / `date-time` |
 | `:decimal` | `type: ["string", "number"]` + `format: decimal` (string is the precision-safe encoding); the number branch gets the same ±`Float::MAX` bounds as `:float`, the string is unbounded |
 | `in:` list / numeric Range | `enum` of the cast members (a `:date`/`:datetime` member written as a String is published as written) / `minimum` + `maximum` (exclusive ends honoured). An `in:` object that only answers `include?` is flagged `x-permittable-custom-validation` |
