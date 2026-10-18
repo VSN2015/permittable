@@ -59,9 +59,30 @@ module Permittable
         # when the response has none yet, and `respond_to` has already set the
         # negotiated one (text/html for a browser form, or for `Accept: */*`
         # with html listed first). Without it this JSON body goes out as HTML.
-        controller.render(json: { success: false, error: error }, status: status,
-                          content_type: "application/json")
+        # A JSON type the response already carries (a registered
+        # application/vnd.api+json, say) is the host's choice and is kept.
+        options = { json: { success: false, error: error }, status: status }
+        options[:content_type] = "application/json" unless json_media_type?(response_media_type(controller))
+        controller.render(**options)
       end
+    end
+
+    # The media type (no parameters) the response already carries, or nil when
+    # it has none yet or the host has no response to ask.
+    def response_media_type(controller)
+      return nil unless controller.respond_to?(:response)
+
+      response = controller.response
+      return nil unless response
+
+      type = response.respond_to?(:media_type) ? response.media_type : response.content_type
+      return nil unless type
+
+      type.to_s.split(";").first.to_s.strip.downcase
+    end
+
+    def json_media_type?(type)
+      !type.nil? && (type == "application/json" || type.end_with?("+json"))
     end
 
     # Members are emitted in the order RFC 9457 documents them, so the wire

@@ -3635,6 +3635,40 @@ RSpec.describe Permittable do
         expect(result.header("Content-Type")).to start_with("application/json")
       end
 
+      # A host that registers a vendor JSON type and negotiates it with
+      # respond_to already has a JSON media type on the response; the envelope
+      # must keep it rather than flatten it to application/json.
+      context "when the response already carries a vendor JSON media type" do
+        before { Mime::Type.register("application/vnd.api+json", :jsonapi) }
+        after { Mime::Type.unregister(:jsonapi) }
+
+        def build_jsonapi_controller
+          IntegrationHarness.build_controller do
+            include Permittable
+
+            permit_params :create, root: :user do
+              required :name, :string
+            end
+
+            def create
+              respond_to do |format|
+                format.html { render json: { received: permitted_params } }
+                format.jsonapi { render json: { received: permitted_params } }
+              end
+            end
+          end
+        end
+
+        it "keeps application/vnd.api+json on the envelope" do
+          result = IntegrationHarness.dispatch(build_jsonapi_controller, :create, method: "POST",
+                                                                                  json: { user: { nme: "x" } },
+                                                                                  accept: "application/vnd.api+json")
+          expect(result.status).to eq(422)
+          expect(result.header("Content-Type")).to start_with("application/vnd.api+json")
+          expect(JSON.parse(result.body)["error"]["code"]).to eq("invalid_parameters")
+        end
+      end
+
       it "stays application/json for a controller that does not negotiate" do
         result = IntegrationHarness.dispatch(build_api_controller, :create, method: "POST",
                                                                             params: { user: { age: "12" } },
