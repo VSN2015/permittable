@@ -2424,6 +2424,49 @@ RSpec.describe Permittable do
         expect { permittable_class { permit_params(:create) { optional :m, :json, max_depth: 1, example: { "a" => { "b" => 1 } } } } }
           .to raise_error(ArgumentError, /:example for field :m violates its own contract \(depth\)/)
       end
+
+      it "reads an authored default:/example: as a request's hash is read: indifferent, and a copy" do
+        theme = ->(prefs) { %w[light dark].include?(prefs[:theme]) }
+        expect(permit({ prefs: { "theme" => "dark" } }) { permit_params(:create) { optional :prefs, :json, validate: theme } }[:prefs])
+          .to eq("theme" => "dark")
+
+        # The same hash, authored, passes the same validate:.
+        klass = permittable_class do
+          permit_params(:create) { optional :prefs, :json, validate: theme, default: { "theme" => "dark" }, example: { theme: "light" } }
+        end
+        expect(controller(klass).permitted_params[:prefs]).to eq("theme" => "dark")
+        expect(Permittable::JsonSchema.rule(klass.permit_rule_for("create"))["properties"]["prefs"])
+          .to include("default" => { "theme" => "dark" }, "examples" => [{ "theme" => "light" }])
+
+        # A validate: that edits its argument edits the copy a request would
+        # hand it, never the host's own Hash, and that copy is what is stored.
+        host = { "a" => 1, "b" => 2 }
+        klass = permittable_class { permit_params(:create) { optional :m, :json, default: host, validate: ->(h) { h.delete("a") } } }
+        expect(host).to eq("a" => 1, "b" => 2)
+        expect(controller(klass).permitted_params[:m]).to eq("b" => 2)
+        expect(controller(klass, params: { m: { "a" => 1, "b" => 2 } }).permitted_params[:m]).to eq("b" => 2)
+      end
+
+      it "publishes an example: as authored, however a mutating validate: edits the copy it is handed" do
+        # An example documents what a client SENDS. A validate: that adds or
+        # drops a key on its argument must not change what is published.
+        adds = ->(prefs) { prefs["seen"] = true }
+        drops = ->(prefs) { prefs.delete("theme") || true }
+        klass = permittable_class do
+          permit_params(:create) do
+            optional :prefs, :json, example: { theme: "dark" }, validate: adds
+            optional :meta,  :json, example: { "theme" => "dark" }, validate: drops
+          end
+        end
+        properties = Permittable::JsonSchema.rule(klass.permit_rule_for("create"))["properties"]
+        expect(properties["prefs"]["examples"]).to eq([{ "theme" => "dark" }])
+        expect(properties["meta"]["examples"]).to eq([{ "theme" => "dark" }])
+
+        # What is stored is still the request-shaped, frozen copy.
+        example = klass.permittable_contracts.last[:fields].find { |f| f[:name] == :prefs }[:example]
+        expect(example).to be_a(ActiveSupport::HashWithIndifferentAccess).and be_frozen
+        expect(example[:theme]).to eq("dark")
+      end
     end
   end
 

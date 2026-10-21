@@ -132,10 +132,14 @@ require "permittable/filter_parameter_registry"
 # ("   " under :squish) cannot satisfy a required field by becoming "". An
 # authored `default:`/`example:` is stored as the contract reads it —
 # normalized and cast, so `default: "18"` on an :integer is 18, and an
-# array's read by the request walker itself. The one exception is a field
-# declaring `transform:`: its default is stored exactly AS AUTHORED, never
+# array's read by the request walker itself. The exceptions: a field
+# declaring `transform:` stores its default exactly AS AUTHORED, never
 # cast — `transform:` never runs on a default either (see OUTPUT RESHAPING),
-# so author such a default already in the shape the action should receive.
+# so author such a default already in the shape the action should receive —
+# and a `:json` field's is always stored as the walker reads a request's hash
+# (indifferent access, String keys; `transform:` or not), except that a
+# `:json` `example:` is stored as authored (in that same shape), whatever a
+# mutating `validate:` did to the copy it was checked on.
 # An `example:` is cast either way and never transformed: it documents what a
 # client sends. Either way it is deep-frozen on a copy, and each request gets its own deep
 # copy, so no request can corrupt it for the next.
@@ -190,8 +194,10 @@ require "permittable/filter_parameter_registry"
 #     into an Array. Runs only on request-supplied values: absent fields stay
 #     absent, and a `default:` is handed out exactly AS AUTHORED — validated
 #     against the field's own contract at class load (as any default is), but
-#     neither cast nor transformed — so a request sending a field's default
-#     gets the transformed value, a request omitting it the untransformed one.
+#     neither cast nor transformed (a `:json` field's is read as a request's
+#     hash is, indifferent with String keys, but no more than that) — so a
+#     request sending a field's default gets the transformed value, a
+#     request omitting it the untransformed one.
 #     Author a default already in the shape the action should receive:
 #     `transform: ->(v) { v.to_i }, default: 25` on a :string field hands both
 #     paths the Integer 25. A field with no `transform:` still gets its
@@ -690,17 +696,10 @@ module Permittable
     # Free-form hash. The shape is deliberately undeclared, so the only
     # checks are the bounds the field asked for: breadth (`length:`, the
     # top-level key count, same reading as an array's element count) and
-    # nesting (`max_depth:`). Shared with macro-time `default:`/`example:`
-    # checking, like check_scalar.
-    def check_json(field, value)
-      status, code = check_json_bounds(field, value)
-      return [status, code] unless status == :ok
-
-      check_custom(field[:validate], value)
-    end
-
-    # The structural half of check_json, which the request walker runs on
-    # its own so that it can copy an accepted hash before app code sees it.
+    # nesting (`max_depth:`). The walker (permittable_check_json) runs them
+    # before `validate:`, so that it can copy an accepted hash before app
+    # code sees it, and an authored `default:`/`example:` goes through that
+    # walker too (see AuthoredValues).
     def check_json_bounds(field, value)
       return [:error, "invalid_type"] unless value.is_a?(Hash)
       return [:error, "length"] if field[:length] && !length_ok?(field[:length], value.length)
@@ -1542,17 +1541,32 @@ module Permittable
       raise ArgumentError, "#{LABEL}: :max_depth for :#{name} must be a positive Integer"
     end
 
-    # Same rule as a scalar's authored value, over check_json: a `default:` or
-    # `example:` that its own bounds would reject fails at class load.
+    # Same rule as a scalar's authored value: a `default:` or `example:` that
+    # its own bounds would reject fails at class load. Like an array's, it is
+    # read by the request walker itself (see AuthoredValues), so it is checked
+    # as a request sending the same hash is. The raw Hash used to be checked
+    # instead: `validate: ->(p) { p[:theme] == "dark" }` passed a request's
+    # {"theme":"dark"}, which the walker reads indifferently, and refused the
+    # same Hash authored as `default:`. And a `validate:` that edits its
+    # argument edited the host's own Hash, which a request's deep copy spares.
+    #
+    # For a `default:` the walker's copy is what is stored, so the action, the
+    # export and the RSpec matcher all read what a request sending it would
+    # have produced. An `example:` is not: it documents what a client SENDS,
+    # so it is validated on that copy but stored as a fresh copy of the value
+    # AS AUTHORED (request-shaped, indifferent with String keys), which a
+    # `validate:` editing its argument cannot have added a key to or dropped
+    # one from. That matches every other example on a contract, which is never
+    # processed the way the action would see it.
     def validate_json_authored_value!(field, opt)
       return unless field.key?(opt)
       return if authored_nil!(field, opt)
       raise ArgumentError, "#{LABEL}: :#{opt} for :#{field[:name]} must be a Hash" unless field[opt].is_a?(Hash)
 
-      status, code = Coercion.check_json(field, field[opt])
-      raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{code})" unless status == :ok
+      status, read = AuthoredValues.read_json(field, field[opt])
+      raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{read})" unless status == :ok
 
-      field[opt] = freeze_authored(field[opt])
+      field[opt] = freeze_authored(opt == :example ? ActiveSupport::HashWithIndifferentAccess.new(field[opt]) : read)
     end
 
     # format / length / normalize reason about characters; on any other
@@ -2484,8 +2498,8 @@ module Permittable
       value.all? { |key, record| key.to_s.match?(/\A-?\d+\z/) && record.is_a?(Hash) }
   end
 
-  # Coercion.check_json, with the copy the result needs made in the middle.
-  # The opaque hash is handed over whole, and HashWithIndifferentAccess
+  # The bounds, then `validate:`, with the copy the result needs made in the
+  # middle. The opaque hash is handed over whole, and HashWithIndifferentAccess
   # rebuilt its containers but not the Strings inside them, so it is
   # deep-copied for the reason permittable_normalized copies a String — but
   # only once it is within its bounds. Copying first meant a megabyte
