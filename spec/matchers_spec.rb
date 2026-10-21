@@ -697,6 +697,34 @@ RSpec.describe "Permittable RSpec matchers" do
         .to start_with("expected the contract to reject those params")
     end
 
+    it "runs a standalone Contract through its own #call, so an input #call refuses raises here too" do
+      optional_only = Permittable::Contract.define { optional :id, :string }
+      strict = Permittable::Contract.define { required :id, :string }
+
+      [[{ "id" => "1" }], "garbage"].each do |input|
+        expect { optional_only.call(input) }.to raise_error(ArgumentError, /expects a Hash/)
+        expect { expect(optional_only).to accept_params(input) }.to raise_error(ArgumentError, /expects a Hash/)
+        expect { expect(strict).to reject_params(input).with_violation("id", :missing) }
+          .to raise_error(ArgumentError, /expects a Hash/)
+      end
+      expect(optional_only).to accept_params(nil).returning({})
+    end
+
+    it "instruments a standalone Contract exactly as Contract#call does" do
+      contract = Permittable::Contract.define { required :a, :string }
+      events = []
+      subscriber = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
+        events << payload.slice(:controller, :mode)
+      end
+      begin
+        contract.call({})
+        expect(contract).to reject_params({})
+      ensure
+        ActiveSupport::Notifications.unsubscribe(subscriber)
+      end
+      expect(events).to eq([{ controller: "Permittable::Contract", mode: :enforce }] * 2)
+    end
+
     it "matches a standalone Contract's own unknown: :error strictness — no top-level exemption" do
       contract = Permittable::Contract.define(unknown: :error) { required :a, :integer }
       expect(contract.call({ a: "1", controller: "x" }).invalid?).to be(true)

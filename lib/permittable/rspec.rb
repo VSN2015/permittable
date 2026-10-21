@@ -687,21 +687,25 @@ module Permittable
       # of @subject's own class: @subject may be a real controller, and
       # instantiating one outside the framework's own dispatch (no request,
       # no response, whatever else its own before_actions assume) is not
-      # safe in general. That means it does not automatically inherit any
-      # override @subject's class makes to permittable_check_unknown — which
-      # is exactly what a standalone Permittable::Contract relies on
-      # (Contract#initialize forces top_level: false, since standalone input
-      # has no router to exempt routing keys for). So that one override is
-      # replicated here for a Contract subject specifically, keeping the
-      # controller path (which is presumed to use the plain module default)
-      # byte-for-byte unchanged.
+      # safe in general.
+      #
+      # A standalone Permittable::Contract needs no stand-in: it always
+      # enforces, and #call is what its callers run, so the matcher runs
+      # exactly that — its input handling, its host's overrides (no
+      # router-key exemption from unknown:, its instrumentation label) and
+      # anything #call grows later. A stand-in skipped Contract's
+      # normalize_input: an Array or a String, which #call refuses with
+      # ArgumentError, read as {} here, so accept_params passed on an
+      # all-optional contract and reject_params(...).with_violation(:missing)
+      # on a required one.
       def run(rule)
+        return run_contract if @subject.is_a?(Permittable::Contract)
+
         host = Class.new do
           include Permittable
 
           attr_accessor :params
         end
-        mirror_contract_unknown_check(host) if @subject.is_a?(Permittable::Contract)
         action = @action || rule[:actions].first || "call"
         label_instrumentation(host, action)
         host.permittable_contracts = [rule.merge(mode: :enforce).freeze]
@@ -729,14 +733,9 @@ module Permittable
         host.define_method(:permittable_action_name) { action }
       end
 
-      # Mirrors Permittable::Contract's own host override verbatim (see
-      # lib/permittable/contract.rb): standalone input has no router and no
-      # request, so nothing is exempt from unknown: checking, top level or
-      # not.
-      def mirror_contract_unknown_check(host)
-        host.define_method(:permittable_check_unknown) do |fields, hash, path:, unknown:, top_level:, violations:| # rubocop:disable Lint/UnusedBlockArgument
-          super(fields, hash, path: path, unknown: unknown, top_level: false, violations: violations)
-        end
+      def run_contract
+        result = @subject.call(@params)
+        [result.violations, result.params]
       end
 
       def resolve_rule
