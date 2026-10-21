@@ -45,7 +45,10 @@ RSpec.describe "RFC 9457 problem+json error format" do
                                   error: { message: "Invalid parameters: user.email (format)",
                                            code: "invalid_parameters",
                                            details: [{ param: "user.email", code: "format" }] })
-    expect(rendered.key?(:content_type)).to be(false)
+    # The body is the JSON envelope whatever respond_to negotiated, so the
+    # media type is stated; it is still the same application/json an app
+    # without respond_to has always received.
+    expect(rendered[:content_type]).to eq("application/json")
   end
 
   it "rejects an unknown format at assignment" do

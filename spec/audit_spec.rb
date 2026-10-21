@@ -534,7 +534,17 @@ RSpec.describe Permittable::Audit do
     end
 
     it "says so plainly when there is nothing to report" do
-      expect(described_class.format([], stale: {})).to include("no routed actions")
+      expect(described_class.format([], stale: {}, unmatched: [])).to eq("Permittable audit: no routed actions to report.\n")
+    end
+
+    # No routed action is exactly when a contract nothing reaches, or an
+    # ignore entry naming nothing, most needs saying: every route was renamed,
+    # or the app's surface is somewhere the route set does not show.
+    it "still lists stale contracts and unmatched ignore entries when no action is routed" do
+      report = described_class.format([], stale: { "orders" => ["create"] }, unmatched: ["ordrs"])
+      expect(report).to start_with("Permittable audit: no routed actions to report.\n")
+      expect(report).to include("no route reaches or Rails would 404 (renamed or deleted?):\n  orders#create")
+      expect(report).to include("entries that match no routed action (a typo, or a route since removed?):\n  ordrs")
     end
   end
 
