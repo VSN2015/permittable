@@ -918,6 +918,200 @@ RSpec.describe Permittable do
     end
   end
 
+  describe "the parts Rails' date_select, datetime_select and time_select submit" do
+    # `on(1i)` is the year, `(2i)` the month, `(3i)` the day, `(4i)` the hour,
+    # `(5i)` the minute and `(6i)` the second: what strong parameters passes
+    # through for `permit(:on)`, and ActiveRecord assembles.
+    let(:decl) do
+      proc do
+        permit_params(:create, root: :event, unknown: :error) do
+          optional :on, :date
+          optional :at, :datetime
+        end
+      end
+    end
+    let(:date) { { "on(1i)" => "2026", "on(2i)" => "10", "on(3i)" => "17" } }
+    let(:time) { { "at(1i)" => "2026", "at(2i)" => "10", "at(3i)" => "17", "at(4i)" => "09", "at(5i)" => "30" } }
+
+    it "reads a :date from (1i)-(3i), handing the action the field's own key only" do
+      expect(permit({ event: date }, &decl).to_h).to eq("on" => Date.new(2026, 10, 17))
+      # Each part is read without its leading zeros and then padded. Joined
+      # as sent, Date._parse reads "2026-007-5" as May 7th.
+      expect(permit({ event: { "on(1i)" => "2026", "on(2i)" => "007", "on(3i)" => "5" } }, &decl)[:on])
+        .to eq(Date.new(2026, 7, 5))
+    end
+
+    it "reads a :datetime from (1i)-(5i) as UTC, like any zoneless value, with (6i) seconds or 00" do
+      expect(permit({ event: time }, &decl).to_h).to eq("at" => Time.utc(2026, 10, 17, 9, 30))
+      expect(permit({ event: time.merge("at(6i)" => "15") }, &decl)[:at]).to eq(Time.utc(2026, 10, 17, 9, 30, 15))
+    end
+
+    it "runs the value they make through the field's own cast and rules" do
+      ruled = proc do
+        permit_params(:create) { optional :on, :date, in: Date.new(2026, 1, 1).., transform: ->(d) { d.strftime("%A") } }
+      end
+      expect(permit(date, &ruled)[:on]).to eq("Saturday")
+      expect(violations_for(date.merge("on(1i)" => "2025"), &ruled).details).to eq([{ param: "on", code: "inclusion" }])
+    end
+
+    it "reads a date part sent blank (a select left on its prompt) exactly as the field sent empty" do
+      blank = { "on(1i)" => "", "on(2i)" => "", "on(3i)" => nil }
+      expect(permit({ event: blank }, &decl).to_h).to eq({})
+      expect(violations_for(blank) { permit_params(:create) { required :on, :date } }.details)
+        .to eq([{ param: "on", code: "missing" }])
+      expect(permit(blank) { permit_params(:create) { optional :on, :date, nullable: true } }.to_h).to eq("on" => nil)
+      expect(permit(blank) { permit_params(:create) { optional :on, :date, default: Date.new(2026, 1, 1) } }.to_h)
+        .to eq("on" => Date.new(2026, 1, 1))
+    end
+
+    # ActiveRecord reads the same parts as nil when ANY of (1i)-(3i) is blank:
+    # ActiveModel::Type::Date.new.cast({1 => nil, 2 => nil, 3 => 1}) is nil.
+    # Rails fills a discarded part through a hidden input even when the visible
+    # selects sit on their prompts (discard_day: true sends (3i)=1), so a form
+    # nobody touched reaches the contract with some parts filled.
+    it "reads the field as sent empty when any one of (1i)-(3i) is blank, whatever the others hold" do
+      {
+        "the year" => date.merge("on(1i)" => ""),
+        "the month" => date.merge("on(2i)" => ""),
+        "the day" => date.merge("on(3i)" => nil),
+        "year and month, day filled in" => { "on(1i)" => "", "on(2i)" => "", "on(3i)" => "1" },
+        # The blank one need only be among those sent: ActiveModel reads the
+        # Hash {2 => nil, 3 => 1} and {1 => 2026, 2 => nil} as nil too.
+        "a blank month, the year not sent" => { "on(2i)" => "", "on(3i)" => "1" },
+        "a blank month, the day not sent" => { "on(1i)" => "2026", "on(2i)" => "" }
+      }.each do |why, parts|
+        expect(permit({ event: parts }, &decl).to_h).to eq({}), why
+        expect(permit(parts) { permit_params(:create) { optional :on, :date, nullable: true } }.to_h)
+          .to eq("on" => nil), why
+        expect(violations_for(parts) { permit_params(:create) { required :on, :date } }.details)
+          .to eq([{ param: "on", code: "missing" }]), why
+      end
+      # A :datetime too, even when its time parts are filled.
+      expect(permit({ event: time.merge("at(2i)" => "") }, &decl).to_h).to eq({})
+    end
+
+    it "reads a :datetime's time parts sent blank as 00 once the date parts are there, as ActiveModel does" do
+      midnight = Time.utc(2026, 10, 17)
+      expect(permit({ event: time.merge("at(4i)" => "", "at(5i)" => "") }, &decl)[:at]).to eq(midnight)
+      expect(permit({ event: time.merge("at(4i)" => "", "at(6i)" => "") }, &decl)[:at]).to eq(Time.utc(2026, 10, 17, 0, 30))
+      expect(permit({ event: time.merge("at(5i)" => nil, "at(6i)" => "") }, &decl)[:at]).to eq(Time.utc(2026, 10, 17, 9))
+      expect(permit({ event: time.merge("at(6i)" => "") }, &decl)[:at]).to eq(Time.utc(2026, 10, 17, 9, 30))
+    end
+
+    # date_select on a datetime column sends (1i)-(3i) only, and so does
+    # datetime_select with discard_hour: ActiveModel::Type::DateTime casts
+    # {1 => 2026, 2 => 10, 3 => 17} to midnight, and so does the field.
+    it "reads a :datetime's time parts missing as 00 once the date parts are there, as ActiveModel does" do
+      date_only = time.slice("at(1i)", "at(2i)", "at(3i)")
+      expect(permit({ event: date_only }, &decl)[:at]).to eq(Time.utc(2026, 10, 17))
+      expect(permit({ event: date_only }, &decl)[:at])
+        .to eq(ActiveModel::Type::DateTime.new.cast({ 1 => 2026, 2 => 10, 3 => 17 }))
+      expect(permit({ event: time.except("at(5i)") }, &decl)[:at]).to eq(Time.utc(2026, 10, 17, 9))
+      expect(permit({ event: time.except("at(4i)") }, &decl)[:at]).to eq(Time.utc(2026, 10, 17, 0, 30))
+      expect(permit({ event: date_only.merge("at(6i)" => "15") }, &decl)[:at]).to eq(Time.utc(2026, 10, 17, 0, 0, 15))
+    end
+
+    it "reads a non-negative Integer part as ActiveRecord does, and still refuses the other non-String parts" do
+      expect(permit({ event: { "on(1i)" => 2026, "on(2i)" => 10, "on(3i)" => 17 } }, &decl)[:on])
+        .to eq(Date.new(2026, 10, 17))
+      {
+        "a negative Integer" => date.merge("on(2i)" => -1),
+        "a Float" => date.merge("on(2i)" => 10.0),
+        "true" => date.merge("on(2i)" => true),
+        "a Symbol" => date.merge("on(2i)" => :'10'),
+        "a month no select offers" => date.merge("on(2i)" => 100)
+      }.each do |why, parts|
+        expect(violations_for({ event: parts }, &decl).details).to eq([{ param: "event.on", code: "invalid_type" }]), why
+      end
+    end
+
+    it "is invalid_type on the field's own path when the parts do not make a value, and never raises" do
+      {
+        "a part missing" => date.except("on(3i)"),
+        "a signed part" => date.merge("on(2i)" => "+7"),
+        "a part that is not a number" => date.merge("on(2i)" => "Oct"),
+        "a fraction" => date.merge("on(3i)" => "1.5"),
+        "a month no select offers" => date.merge("on(2i)" => "100"),
+        "a day the month lacks" => date.merge("on(2i)" => "2", "on(3i)" => "30"),
+        "an array part" => date.merge("on(1i)" => ["2026"]),
+        "a hash part" => date.merge("on(1i)" => { "y" => "2026" }),
+        "a part that is not valid UTF-8" => date.merge("on(1i)" => "20\xFF6"),
+        "a :datetime sent only time parts" => time.slice("at(4i)", "at(5i)"),
+        "a :datetime sent a year and an hour but no month or day" => time.slice("at(1i)", "at(4i)"),
+        "a minute past the hour" => time.merge("at(5i)" => "60")
+      }.each do |why, parts|
+        field = parts.keys.first[/\A\w+/]
+        expect(violations_for({ event: parts }, &decl).details)
+          .to eq([{ param: "event.#{field}", code: "invalid_type" }]), why
+      end
+    end
+
+    it "keeps a declared :date or :datetime field's own parts out of the unknown-keys check, and only those" do
+      expect(permit({ event: date.merge(time) }, &decl).keys).to eq(%w[on at])
+      strays = { "off(1i)" => "2026", "on(4i)" => "9", "at(7i)" => "1", "title(1i)" => "x" }
+      e = violations_for({ event: date.merge(strays) }) do
+        permit_params(:create, root: :event, unknown: :error) do
+          optional :on, :date
+          optional :at, :datetime
+          optional :title, :string
+        end
+      end
+      expect(e.details).to eq(strays.keys.map { |key| { param: "event.#{key}", code: "unknown" } })
+    end
+
+    # Strong parameters lets `on(1i)`-`(3i)` through `permit(:on)` and
+    # ActiveRecord assigns them AFTER the plain `on`, so parts the contract
+    # never read would overwrite the value it validated. They are therefore
+    # not consumed when the key is sent: `unknown:` sees them as it sees any
+    # other undeclared key.
+    it "lets the field's own key win for the value when both are sent, the parts staying subject to unknown:" do
+      both = date.merge("on" => "2026-01-02")
+      e = violations_for({ event: both }, &decl)
+      expect(e.details).to eq(date.keys.map { |key| { param: "event.#{key}", code: "unknown" } })
+
+      ignoring = proc do
+        permit_params(:create, root: :event) { optional :on, :date }
+      end
+      expect(permit({ event: both }, &ignoring).to_h).to eq("on" => Date.new(2026, 1, 2))
+      # Even parts that would make no value: the key is read, they are not.
+      expect(permit({ event: both.merge("on(2i)" => "Oct") }, &ignoring).to_h).to eq("on" => Date.new(2026, 1, 2))
+    end
+
+    it "logs the parts sent beside the field's own key under unknown: :log, and still reads the key" do
+      klass = permittable_class { permit_params(:create, root: :event, unknown: :log) { optional :on, :date } }
+      messages = []
+      logger = Object.new
+      logger.define_singleton_method(:warn) { |msg| messages << msg }
+      c = controller(klass, params: { event: date.merge("on" => "2026-01-02") })
+      c.define_singleton_method(:logger) { logger }
+      expect(c.permitted_params.to_h).to eq("on" => Date.new(2026, 1, 2))
+      expect(messages.join).to include("event.on(1i)", "event.on(2i)", "event.on(3i)")
+    end
+
+    it "leaves a part the contract declares as a field of its own to that field" do
+      result = permit(date) do
+        permit_params(:create) do
+          optional :on, :date
+          optional :'on(1i)', :integer
+        end
+      end
+      expect(result.to_h).to eq("on(1i)" => 2026)
+    end
+
+    it "leaves the request's own params as they arrived" do
+      c = controller(permittable_class(&decl), params: { event: date })
+      c.permitted_params
+      expect(c.params[:event]).to eq(date)
+    end
+
+    it "hands monitor mode's action the value it used to drop, and the raw parts when it reports" do
+      klass = permittable_class { permit_params(:create, root: :event, mode: :monitor) { optional :on, :date } }
+      expect(controller(klass, params: { event: date }).permitted_params.to_h).to eq("on" => Date.new(2026, 10, 17))
+      bad = date.merge("on(2i)" => "13")
+      expect(controller(klass, params: { event: bad }).permitted_params.to_h).to eq(bad)
+    end
+  end
+
   describe "numbers the type cannot faithfully hold" do
     let(:decl) do
       proc do
@@ -4646,6 +4840,178 @@ RSpec.describe Permittable do
                                            method: "POST", params: { name: "Jo", csrf_token: "tok" })
       expect(result.status).to eq(200)
       expect(JSON.parse(result.body)).to eq("name" => "Jo")
+    end
+
+    describe "a form built with Rails' date_select, datetime_select and time_select" do
+      let(:view) { ActionView::Base.empty }
+      let(:events_controller) do
+        IntegrationHarness.build_controller do
+          include Permittable
+
+          permit_params :create, root: :event, unknown: :error do
+            required :title,     :string
+            required :starts_on, :date
+            optional :opens_at,  :datetime
+            optional :ends_on,   :date, nullable: true
+          end
+
+          def create
+            render json: permitted_params.to_h.transform_values { |value| [value.class.name, value.to_s] }
+          end
+        end
+      end
+
+      # Posts what a browser submits for these form controls: each select's
+      # chosen option (the first, its prompt, when none is selected) and each
+      # hidden input, form-encoded under the names the helpers gave them. A
+      # hidden input rendered without a value attribute (the part a helper
+      # discards without a default) is submitted as an empty string.
+      def submit(*controls)
+        fields = controls.join.scan(%r{<select[^>]*name="([^"]+)"[^>]*>(.*?)</select>|<input([^>]*)>}m)
+        pairs = fields.map do |select, options, input|
+          next [input[/name="([^"]+)"/, 1], input[/value="([^"]*)"/, 1].to_s] if input
+
+          option = options[/<option[^>]*selected[^>]*>/] || options[/<option[^>]*>/]
+          [select, option[/value="([^"]*)"/, 1]]
+        end
+        body = URI.encode_www_form([["event[title]", "Ruby Night"], *pairs])
+        IntegrationHarness.dispatch(events_controller, :create, method: "POST", params: body)
+      end
+
+      it "reads each helper's parts as the field it names" do
+        result = submit(view.date_select(:event, :starts_on, default: Date.new(2026, 10, 17)),
+                        view.datetime_select(:event, :opens_at, default: Time.utc(2026, 10, 17, 9, 30)))
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)).to eq("title" => ["String", "Ruby Night"], "starts_on" => %w[Date 2026-10-17],
+                                              "opens_at" => ["Time", "2026-10-17 09:30:00 UTC"])
+
+        result = submit(view.date_select(:event, :starts_on, default: Date.new(2026, 10, 17)),
+                        view.time_select(:event, :opens_at, default: Time.utc(2026, 10, 17, 9, 30)))
+        expect(JSON.parse(result.body)["opens_at"]).to eq(["Time", "2026-10-17 09:30:00 UTC"])
+      end
+
+      it "reads a date_select left on its prompts as the field sent empty" do
+        result = submit(view.date_select(:event, :starts_on, default: Date.new(2026, 10, 17)),
+                        view.date_select(:event, :ends_on, prompt: true))
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)["ends_on"]).to eq(["NilClass", ""])
+
+        result = submit(view.date_select(:event, :starts_on, prompt: true))
+        expect(result.status).to eq(422)
+        expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "event.starts_on", "code" => "missing" }])
+      end
+
+      # Rails fills a part it discards through a HIDDEN input even while the
+      # visible selects sit on their prompts, so these forms reach the
+      # contract with some parts filled and the rest blank: what
+      # ActiveRecord reads as nil (ActiveModel::Type::Date.new.cast with
+      # {1 => nil, 2 => nil, 3 => 1}).
+      it "reads a month/year picker left on its prompts as the field sent empty, though discard_day sends (3i)=1" do
+        controls = [view.date_select(:event, :starts_on, default: Date.new(2026, 10, 17)),
+                    view.date_select(:event, :ends_on, discard_day: true, prompt: true)]
+        expect(controls.last).to include('name="event[ends_on(3i)]" value="1"')
+        result = submit(*controls)
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)["ends_on"]).to eq(["NilClass", ""])
+
+        # Picked, the same picker reads as the first of the month.
+        picked = view.date_select(:event, :ends_on, discard_day: true, default: Date.new(2026, 11, 20))
+        expect(JSON.parse(submit(controls.first, picked).body)["ends_on"]).to eq(%w[Date 2026-11-01])
+      end
+
+      it "reads a datetime_select with discard_minute left on its prompts as sent empty, the (5i) it submits being blank" do
+        controls = [view.date_select(:event, :starts_on, default: Date.new(2026, 10, 17)),
+                    view.datetime_select(:event, :opens_at, discard_minute: true, prompt: true)]
+        expect(controls.last).to match(/<input[^>]*name="event\[opens_at\(5i\)\]"(?![^>]*value=)/)
+        result = submit(*controls)
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body).keys).to eq(%w[title starts_on])
+
+        # With a value the hidden input carries the minute it had, so nothing is blank.
+        picked = view.datetime_select(:event, :opens_at, discard_minute: true, default: Time.utc(2026, 10, 17, 9, 30))
+        expect(JSON.parse(submit(controls.first, picked).body)["opens_at"]).to eq(["Time", "2026-10-17 09:30:00 UTC"])
+      end
+
+      it "reads a date_select on a :datetime field as midnight, as ActiveRecord does, the time parts it never sends being 00" do
+        control = view.date_select(:event, :opens_at, default: Date.new(2026, 10, 17))
+        expect(control).not_to include("opens_at(4i)")
+        result = submit(view.date_select(:event, :starts_on, default: Date.new(2026, 10, 17)), control)
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)["opens_at"]).to eq(["Time", "2026-10-17 00:00:00 UTC"])
+      end
+
+      it "reads a datetime_select with discard_hour as midnight of the day picked, the hour and minute it never sends being 00" do
+        control = view.datetime_select(:event, :opens_at, discard_hour: true, default: Time.utc(2026, 10, 17, 9, 30))
+        expect(control).not_to include("opens_at(4i)")
+        result = submit(view.date_select(:event, :starts_on, default: Date.new(2026, 10, 17)), control)
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)["opens_at"]).to eq(["Time", "2026-10-17 00:00:00 UTC"])
+      end
+
+      it "still refuses a time_select with ignore_date, which sends no date for the :datetime to be on" do
+        control = view.time_select(:event, :opens_at, ignore_date: true, default: Time.utc(2026, 10, 17, 9, 30))
+        expect(control).not_to include("opens_at(1i)")
+        result = submit(view.date_select(:event, :starts_on, default: Date.new(2026, 10, 17)), control)
+        expect(result.status).to eq(422)
+        expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "event.opens_at", "code" => "invalid_type" }])
+      end
+
+      it "reads a time_select left on its prompts as ActiveRecord does: the date its hidden inputs send, at 00:00" do
+        controls = [view.date_select(:event, :starts_on, default: Date.new(2026, 10, 17)),
+                    view.time_select(:event, :opens_at, prompt: true)]
+        expect(controls.last).to include('name="event[opens_at(1i)]" value="1"')
+        result = submit(*controls)
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)["opens_at"]).to eq(["Time", "0001-01-01 00:00:00 UTC"])
+      end
+    end
+
+    describe "date_select parts sent beside the field's own key, with a real request" do
+      # The documented adoption path: `enforce: true` for the contract, and a
+      # legacy action that still hands the model `permit(:starts_on)`, which
+      # lets the parts through too. ActiveRecord assigns multiparameter
+      # attributes after ordinary ones, so parts nobody validated would win.
+      def build_events_controller(**rule)
+        IntegrationHarness.build_controller do
+          include Permittable
+
+          permit_params :create, root: :event, enforce: true, **rule do
+            required :starts_on, :date, validate: ->(d) { d >= Date.new(2026, 1, 1) || "must be 2026 or later" }
+          end
+
+          def create
+            render json: { contract: permitted_params, legacy: params.require(:event).permit(:starts_on).to_h }
+          end
+        end
+      end
+
+      let(:both) do
+        { "event[starts_on]" => "2026-06-01", "event[starts_on(1i)]" => "1999",
+          "event[starts_on(2i)]" => "1", "event[starts_on(3i)]" => "1" }
+      end
+
+      it "is a 422 naming the parts under unknown: :error, not a stored 1999-01-01 no rule saw" do
+        result = IntegrationHarness.dispatch(build_events_controller(unknown: :error), :create,
+                                             method: "POST", params: both)
+        expect(result.status).to eq(422)
+        expect(JSON.parse(result.body)["error"]["details"]).to eq(
+          %w[1i 2i 3i].map { |part| { "param" => "event.starts_on(#{part})", "code" => "unknown" } }
+        )
+      end
+
+      it "reads the field's own key under the default unknown: :ignore, the parts not in permitted_params" do
+        result = IntegrationHarness.dispatch(build_events_controller, :create, method: "POST", params: both)
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)["contract"]).to eq("starts_on" => "2026-06-01")
+      end
+
+      it "still reads the parts as the field when the key is not sent" do
+        parts_only = both.except("event[starts_on]")
+        result = IntegrationHarness.dispatch(build_events_controller(unknown: :error), :create,
+                                             method: "POST", params: parts_only)
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)["contract"]).to eq("starts_on" => "1999-01-01")
+      end
     end
 
     describe "unknown: :error on a rootless contract, with a real request" do
