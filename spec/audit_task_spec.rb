@@ -23,6 +23,12 @@ RSpec.describe "permittable:audit and permittable:generate with an ignore list",
         include Permittable
 
         def not_found = head(:not_found)
+
+        private
+
+        # A permit call here is what drafts the base class, whose rule every
+        # controller below it would inherit.
+        def filter_params = params.permit(:q)
       end
     RUBY
     "app/controllers/widgets_controller.rb" => <<~RUBY,
@@ -33,7 +39,7 @@ RSpec.describe "permittable:audit and permittable:generate with an ignore list",
       end
     RUBY
     # Never routed: the generator drafts from controllers, not routes.
-    "app/controllers/notes_controller.rb" => <<~RUBY
+    "app/controllers/notes_controller.rb" => <<~RUBY,
       class NotesController < ApplicationController
         def create = head(:created)
         def update = head(:ok)
@@ -41,6 +47,27 @@ RSpec.describe "permittable:audit and permittable:generate with an ignore list",
         private
 
         def note_params = params.require(:note).permit(:body)
+      end
+    RUBY
+    # Controllers that define only some of the drafted actions: a draft for
+    # the rest would guard nothing, and the audit would list it as stale.
+    "app/controllers/sessions_controller.rb" => <<~RUBY,
+      class SessionsController < ApplicationController
+        def create = head(:created)
+        def destroy = head(:no_content)
+
+        private
+
+        def session_params = params.require(:session).permit(:email)
+      end
+    RUBY
+    "app/controllers/webhooks_controller.rb" => <<~RUBY
+      class WebhooksController < ApplicationController
+        def receive = head(:accepted)
+
+        private
+
+        def event_params = params.require(:event).permit(:kind)
       end
     RUBY
   }.freeze
@@ -114,6 +141,9 @@ RSpec.describe "permittable:audit and permittable:generate with an ignore list",
     Permittable.audit_ignore_outside_root = false
     results["generate_all"] = run_task("permittable:generate")
 
+    results["generate_sessions"] = run_task("permittable:generate", "SessionsController")
+    results["generate_webhooks"] = run_task("permittable:generate", "WebhooksController")
+
     print JSON.generate(results)
   RUBY
 
@@ -164,11 +194,33 @@ RSpec.describe "permittable:audit and permittable:generate with an ignore list",
   end
 
   describe "permittable:generate" do
+    # The drafts of one controller, from its "# ====" header to the next.
+    def drafted(out, controller)
+      out.split(/^# ==== /).find { |chunk| chunk.start_with?(controller) }.to_s
+    end
+
     it "drafts neither ignored controllers nor ignored actions" do
       out = results["generate"]["out"]
       expect(out).to include("NotesController")
-      expect(out.scan(/permit_params :\w+/)).to eq(["permit_params :update"])
+      expect(drafted(out, "NotesController").scan(/permit_params :\w+/)).to eq(["permit_params :update"])
       expect(out).not_to include("GemUploadsController")
+    end
+
+    it "drafts only the actions a controller defines" do
+      out = results["generate"]["out"]
+      expect(drafted(out, "SessionsController")).to include("permit_params :create, root: :session")
+      expect(out).not_to include("WebhooksController")
+      expect(out).not_to include("ApplicationController")
+    end
+
+    it "leaves an undefined action out of a controller named to the task" do
+      out = results["generate_sessions"]["out"]
+      expect(out).to include("permit_params :create, root: :session")
+    end
+
+    it "drafts a named controller that defines neither action, as it always did" do
+      out = results["generate_webhooks"]["out"]
+      expect(out).to include("permit_params :create, :update, root: :event")
     end
 
     it "drafts a controller from outside Rails.root once that default is off" do

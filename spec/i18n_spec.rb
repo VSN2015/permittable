@@ -120,4 +120,91 @@ RSpec.describe "I18n violation messages" do
     details = violations_for({}) { permit_params(:create) { required :name, :string } }
     expect(details).to eq([{ param: "name", code: "missing" }])
   end
+
+  # The Rails i18n guide's per-request locale switch. `enforce: true` and
+  # monitor-mode rules validate in a before_action registered by
+  # `include Permittable`, so that check sits in the callback chain exactly
+  # where the include is, and resolves its messages in whatever locale is
+  # current THEN. A switch has to wrap it to be seen.
+  describe "under a per-request locale switch", :integration do
+    around do |example|
+      available = I18n.available_locales
+      I18n.available_locales = %i[en de]
+      example.run
+    ensure
+      I18n.available_locales = available
+    end
+
+    before do
+      I18n.backend.store_translations(:en, permittable: { errors: { missing: "is required" } })
+      I18n.backend.store_translations(:de, permittable: { errors: { missing: "fehlt" } })
+    end
+
+    # `declare_switch` is a block of callback macros, run on the class either
+    # before or after `include Permittable`.
+    def switching_controller(rule_options, switch: :after_include, &declare_switch)
+      IntegrationHarness.build_controller do
+        class_eval(&declare_switch) if switch == :before_include
+        include Permittable
+
+        class_eval(&declare_switch) if switch == :after_include
+
+        permit_params :create, root: :user, **rule_options do
+          required :name, :string
+        end
+
+        def create
+          render json: { received: permitted_params }
+        end
+
+        def switch_locale(&action)
+          I18n.with_locale(params[:locale] || I18n.default_locale, &action)
+        end
+      end
+    end
+
+    def create_with(controller)
+      IntegrationHarness.dispatch(controller, :create, method: "POST", query: "locale=de",
+                                                       json: { user: { nme: "x" } })
+    end
+
+    def first_message(result)
+      JSON.parse(result.body)["error"]["details"].first["message"]
+    end
+
+    it "translates in the request's locale when the check is lazy" do
+      controller = switching_controller({}) { around_action :switch_locale }
+      expect(first_message(create_with(controller))).to eq("fehlt")
+    end
+
+    it "translates an enforce: true rule in the request's locale when the switch is prepended" do
+      controller = switching_controller({ enforce: true }) { prepend_around_action :switch_locale }
+      result = create_with(controller)
+      expect(result.status).to eq(422)
+      expect(first_message(result)).to eq("fehlt")
+    end
+
+    it "translates an enforce: true rule in the request's locale when the switch is declared before the include" do
+      controller = switching_controller({ enforce: true }, switch: :before_include) { around_action :switch_locale }
+      expect(first_message(create_with(controller))).to eq("fehlt")
+    end
+
+    it "translates a monitor-mode rule's event in the request's locale when the switch is prepended" do
+      controller = switching_controller({ mode: :monitor }) { prepend_around_action :switch_locale }
+      details = nil
+      subscriber = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
+        details = payload[:details]
+      end
+      result = create_with(controller)
+      ActiveSupport::Notifications.unsubscribe(subscriber)
+      expect(result.status).to eq(200)
+      expect(details).to eq([{ param: "user.name", code: "missing", message: "fehlt" }])
+    end
+
+    # pins the documented limitation; delete if the callback order is ever changed
+    it "runs the eager check in registration order, so a plain around_action declared after the include is too late" do
+      controller = switching_controller({ enforce: true }) { around_action :switch_locale }
+      expect(first_message(create_with(controller))).to eq("is required")
+    end
+  end
 end

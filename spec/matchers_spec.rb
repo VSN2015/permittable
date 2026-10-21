@@ -122,6 +122,24 @@ RSpec.describe "Permittable RSpec matchers" do
     expect(message).to include("declares default: 25")
   end
 
+  it "compares a :json with_default by key, so the authored spelling and the one the action reads both pass" do
+    contract = Permittable::Contract.define do
+      optional :prefs, :json, default: { theme: "dark", panes: [{ side: "left" }] }
+      optional :flags, :json, default: { "beta" => true }
+      optional :none,  :json, nullable: true, default: nil
+    end
+    expect(contract.call({}).params[:prefs]).to eq("theme" => "dark", "panes" => [{ "side" => "left" }])
+
+    expect(contract).to permit_param(:prefs).with_default(theme: "dark", panes: [{ side: "left" }])
+    expect(contract).to permit_param(:prefs).with_default("theme" => "dark", "panes" => [{ "side" => "left" }])
+    expect(contract).to permit_param(:flags).with_default("beta" => true)
+    expect(contract).to permit_param(:flags).with_default(beta: true)
+
+    message = failure_of { expect(contract).to permit_param(:prefs).with_default(theme: "light") }
+    expect(message).to include("expected default: #{{ theme: 'light' }.inspect}")
+    expect(failure_of { expect(contract).to permit_param(:none).with_default({}) }).to include("declares default: nil")
+  end
+
   # The contract stores in: members cast by the field's type, so the chain
   # casts its own argument the same way: `within` can repeat the declaration
   # as written, or name the values the runtime actually holds.
@@ -230,6 +248,23 @@ RSpec.describe "Permittable RSpec matchers" do
       .to include("expected format: :uuid, but the contract declares format: :email")
     expect(failure_of { expect(presets).to permit_param(:code).matching(:uuid) })
       .to include("expected format: :uuid, but the contract declares format: /\\A[A-Z]{3}\\z/")
+  end
+
+  it "accepts a format: preset spelled as a String on either side" do
+    presets = Class.new(FakeController) do
+      include Permittable
+
+      permit_params(:create) do
+        required :email, :string, format: "email"
+        required :code,  :string, format: :uuid
+      end
+    end
+    expect(presets).to permit_param(:email).matching("email")
+    expect(presets).to permit_param(:email).matching(:email)
+    expect(presets).to permit_param(:code).matching("uuid")
+    expect(failure_of { expect(presets).to permit_param(:email).matching("uuid") })
+      .to include("expected format: :uuid, but the contract declares format: :email")
+    expect(permit_param(:email).matching("email").description).to eq(permit_param(:email).matching(:email).description)
   end
 
   it "checks arrays with as_array and an element type" do
@@ -468,6 +503,16 @@ RSpec.describe "Permittable RSpec matchers" do
     expect(contract).not_to permit_param(:admin)
   end
 
+  it "names a standalone Contract, not a controller, in permit_param's failure messages" do
+    contract = Permittable::Contract.define { optional :a, :string }
+    expect(failure_of { expect(contract).to permit_param(:b) })
+      .to start_with("expected the contract to permit :b")
+    expect(failure_of { expect(contract).not_to permit_param(:a) })
+      .to start_with("expected the contract not to permit :a")
+    expect(failure_of { expect(controller).to permit_param(:admin).for_action(:create) })
+      .to start_with("expected the controller to permit :admin")
+  end
+
   it "fails clearly when the action has no contract at all" do
     message = failure_of { expect(single_contract_controller).to permit_param(:name).for_action(:archive) }
     expect(message).to include("no contract")
@@ -570,10 +615,62 @@ RSpec.describe "Permittable RSpec matchers" do
       expect(single).to reject_params({})
     end
 
+    it "labels the violation notification with the subject and action, never nil" do
+      events = []
+      subscriber = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
+        events << payload.slice(:controller, :action, :mode)
+      end
+      begin
+        expect(users).to reject_params({ user: {} }).for_action(:create)
+        contract = Permittable::Contract.define { required :a, :string }
+        expect(contract).to reject_params({})
+      ensure
+        ActiveSupport::Notifications.unsubscribe(subscriber)
+      end
+      expect(events).to eq([
+                             { controller: "UsersController", action: "create", mode: :enforce },
+                             { controller: "Permittable::Contract", action: "call", mode: :enforce }
+                           ])
+    end
+
+    it "labels an anonymous ActionController subject too, whose controller_path is nil" do
+      anonymous = Class.new(ActionController::Base) do
+        include Permittable
+
+        permit_params(:create) { required :a, :string }
+      end
+      events = []
+      subscriber = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
+        events << payload[:controller]
+      end
+      begin
+        expect(anonymous).to reject_params({})
+      ensure
+        ActiveSupport::Notifications.unsubscribe(subscriber)
+      end
+      expect(events).to eq(["the controller"])
+    end
+
     it "works on a standalone Contract too" do
       contract = Permittable::Contract.define { required :a, :integer }
       expect(contract).to accept_params({ a: "1" }).returning("a" => 1)
       expect(contract).to reject_params({ a: "x" }).with_violation("a", :invalid_type)
+    end
+
+    it "names an anonymous controller, not a contract, in its failure messages" do
+      anonymous = Class.new(FakeController) do
+        include Permittable
+
+        permit_params(:create) { required :a, :string }
+      end
+      expect(failure_of { expect(anonymous).to reject_params({ a: "x" }) })
+        .to start_with("expected the controller to reject those params")
+      expect(failure_of { expect(anonymous).not_to reject_params({}) })
+        .to start_with("expected the controller not to reject those params")
+
+      contract = Permittable::Contract.define { required :a, :string }
+      expect(failure_of { expect(contract).to reject_params({ a: "x" }) })
+        .to start_with("expected the contract to reject those params")
     end
 
     it "matches a standalone Contract's own unknown: :error strictness — no top-level exemption" do
