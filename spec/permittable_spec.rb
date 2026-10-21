@@ -140,6 +140,71 @@ RSpec.describe Permittable do
       expect(violations_for({ sku: "abc" }, &decl).details).to eq([{ param: "sku", code: "inclusion" }])
     end
 
+    # The README tells an author to pass an include? object for a live list,
+    # and such a list is typically filled in an initializer or
+    # after_initialize, which runs AFTER eager_load! has run the declaration,
+    # so it is empty then. Nothing can be known about an object used as
+    # given, so emptiness is asked only of what the gem reads itself: a
+    # literal list it casts, and a Range.
+    it "accepts a live :in object that is empty at class load, and reads it on every request" do
+      registry = Concurrent::Set.new
+      decl = proc { permit_params(:create) { optional :event, :string, in: registry } }
+      klass = permittable_class(&decl)
+      expect(klass.permit_rule_for(:create)[:fields].first[:in]).to be(registry)
+      expect(violations_for({ event: "order.paid" }, &decl).details).to eq([{ param: "event", code: "inclusion" }])
+
+      registry << "order.paid"
+      expect(permit({ event: "order.paid" }, &decl)[:event]).to eq("order.paid")
+    end
+
+    # The same unknowable contents decide a default:/example: that names a
+    # member: the live object is empty at class load, so `include?` cannot
+    # answer yet, and the declaration the README recommends must still load.
+    it "accepts a default: and an example: naming a member of a live :in object that is empty at class load" do
+      registry = Concurrent::Set.new
+      decl = proc do
+        permit_params(:create) do
+          optional :event, :string, in: registry, default: "order.paid"
+          optional :topic, :string, in: registry, example: "order.paid"
+        end
+      end
+      fields = permittable_class(&decl).permit_rule_for(:create)[:fields]
+      expect(fields.map { |f| [f[:default], f[:example]] }).to eq([["order.paid", nil], [nil, "order.paid"]])
+
+      registry << "order.paid"
+      expect(permit({}, &decl)[:event]).to eq("order.paid")
+    end
+
+    it "still checks every other rule of a default: and an example: when :in is a live object" do
+      registry = Concurrent::Set.new
+      expect { permittable_class { permit_params(:create) { optional :e, :string, in: registry, default: "toolong", length: 1..3 } } }
+        .to raise_error(ArgumentError, /:default for field :e violates its own contract \(length\)/)
+      expect { permittable_class { permit_params(:create) { optional :e, :string, in: registry, example: "x", format: /\d/ } } }
+        .to raise_error(ArgumentError, /:example for field :e violates its own contract \(format\)/)
+    end
+
+    it "still refuses a default: and an example: outside a literal :in list, which the gem reads itself" do
+      expect { permittable_class { permit_params(:create) { optional :e, :string, in: %w[a b], default: "c" } } }
+        .to raise_error(ArgumentError, /:default for field :e violates its own contract \(inclusion\)/)
+      expect { permittable_class { permit_params(:create) { optional :e, :string, in: Set["a"], example: "c" } } }
+        .to raise_error(ArgumentError, /:example for field :e violates its own contract \(inclusion\)/)
+      expect { permittable_class { permit_params(:create) { optional :e, :integer, in: 1..3, default: 9 } } }
+        .to raise_error(ArgumentError, /:default for field :e violates its own contract \(inclusion\)/)
+    end
+
+    it "accepts an empty Set subclass that overrides include?, since that override is used as given" do
+      live = Class.new(Set) { def include?(value) = super || value.to_s.start_with?("sku-") }.new
+      decl = proc { permit_params(:create) { optional :sku, :string, in: live } }
+      expect(permit({ sku: "sku-1" }, &decl)[:sku]).to eq("sku-1")
+    end
+
+    it "still refuses an empty literal list, which the gem reads itself and no request could satisfy" do
+      expect { permittable_class { permit_params(:create) { optional :plan, :string, in: Set.new } } }
+        .to raise_error(ArgumentError, /:in for :plan is empty/)
+      expect { permittable_class { permit_params(:create) { optional :plan, :string, in: {} } } }
+        .to raise_error(ArgumentError, /:in for :plan is empty/)
+    end
+
     # Only Array, Set, Hash and Enumerator are lists. An app's own Enumerable
     # with its own include? — a case-insensitive allowlist, a DB-backed
     # registry — is used as given: never enumerated at class load, never
@@ -325,6 +390,46 @@ RSpec.describe Permittable do
         .to raise_error(ArgumentError, /:in for :plan is empty/)
       expect { permittable_class { permit_params(:create) { optional :s, :string, length: -1 } } }
         .to raise_error(ArgumentError, /:length for :s must be a non-negative Integer or a Range/)
+    end
+
+    # A length is a count: a negative or fractional end either matches
+    # nothing (`..-1` rejected every value, forever) or exports a
+    # minLength/maxLength the JSON Schema metaschema refuses, so Ajv would
+    # reject the whole document.
+    it "refuses a length: Range whose ends are not non-negative Integers" do
+      [..-1, -5..-1, -2..3, 1.5..3.5, 0.5.., 1..Rational(7, 2)].each do |range|
+        expect { permittable_class { permit_params(:create) { optional :s, :string, length: range } } }
+          .to raise_error(ArgumentError, /:length for :s must have non-negative whole-number ends/), "expected #{range.inspect} to raise"
+        expect { permittable_class { permit_params(:create) { array :a, of: :string, length: range } } }
+          .to raise_error(ArgumentError, /:length for :a must have non-negative whole-number ends/), "expected #{range.inspect} to raise"
+      end
+    end
+
+    # Only a fractional or negative end is a mistake: a whole-number Float or
+    # Rational end (`1..10.0`) meant ten and worked before.
+    it "still accepts whole-number Float and Rational ends, and exports them as integers" do
+      klass = permittable_class do
+        permit_params(:create) do
+          optional :s, :string, length: 1..10.0
+          optional :t, :string, length: 0.0...Rational(4)
+        end
+      end
+      expect(controller(klass, params: { s: "a" * 10, t: "abc" }).permitted_params).to eq("s" => "a" * 10, "t" => "abc")
+      fields = Permittable::JsonSchema.rule(klass.permit_rule_for(:create))["properties"]
+      expect(fields["s"]).to include("minLength" => 1, "maxLength" => 10)
+      expect(fields["t"]).to include("maxLength" => 3)
+      expect(fields["s"]["maxLength"]).to be_an(Integer)
+    end
+
+    it "still reads an infinite end as an open one" do
+      klass = permittable_class do
+        permit_params(:create) do
+          optional :s, :string, length: 2..Float::INFINITY
+          optional :t, :string, length: -Float::INFINITY..3
+        end
+      end
+      expect(controller(klass, params: { s: "abc", t: "ab" }).permitted_params).to eq("s" => "abc", "t" => "ab")
+      expect(controller(klass, params: { s: "a" }).permittable_violations).to eq([{ param: "s", code: "length" }])
     end
 
     it "accepts an endless, beginless, or single-value bound" do
@@ -650,6 +755,35 @@ RSpec.describe Permittable do
       expect(violations_for({ at: "Sept" }, &decl).details).to eq([{ param: "at", code: "invalid_type" }])
     end
 
+    # The in-process half: spec_helper has loaded ActiveSupport's DateTime
+    # extensions, as a Rails app does. Without them the day moved — see the
+    # clean-process example in contract_spec.
+    it "reads a :datetime before 1582 in the same calendar as a Date object" do
+      expect(permit({ at: "1500-01-01" }, &decl)[:at]).to eq(Time.utc(1500, 1, 1))
+      expect(permit({ at: "1500-01-01T12:00:00+02:00" }, &decl)[:at]).to eq(Time.utc(1500, 1, 1, 10))
+      expect(permit({ at: Date.new(1500, 1, 1) }, &decl)[:at]).to eq(Time.utc(1500, 1, 1))
+      expect(permit({ on: "1500-01-01" }, &decl)[:on].strftime("%F")).to eq("1500-01-01")
+    end
+
+    # Ruby's parser reports a zone it cannot convert as a zone with no
+    # offset (or one beyond a day), and DateTime.parse then reads the wall
+    # clock as UTC: "+25:00", "-99:00" or an unknown abbreviation named an
+    # instant hours away from the one accepted.
+    it "refuses a :datetime whose stated zone or offset cannot be honoured, instead of reading it as UTC" do
+      ["2026-09-05T10:30:00+24:00", "2026-09-05T10:30:00+25:00", "2026-09-05T10:30:00-99:00",
+       "2026-09-05 10:30 +99", "2026-09-05 10:30 XYZ"].each do |value|
+        expect(violations_for({ at: value }, &decl).details).to eq([{ param: "at", code: "invalid_type" }]), value
+      end
+    end
+
+    it "still honours every offset within a day, and named zones Ruby knows" do
+      expect(permit({ at: "2026-09-05T10:30:00+14:00" }, &decl)[:at]).to eq(Time.utc(2026, 9, 4, 20, 30))
+      expect(permit({ at: "2026-09-05T10:30:00+23:59" }, &decl)[:at]).to eq(Time.utc(2026, 9, 4, 10, 31))
+      expect(permit({ at: "2026-09-05T10:30:00-00:00" }, &decl)[:at]).to eq(Time.utc(2026, 9, 5, 10, 30))
+      expect(permit({ at: "2026-09-05 10:30 EST" }, &decl)[:at]).to eq(Time.utc(2026, 9, 5, 15, 30))
+      expect(permit({ at: "Sat, 05 Sep 2026 10:30:00 +0000" }, &decl)[:at]).to eq(Time.utc(2026, 9, 5, 10, 30))
+    end
+
     it "accepts Time, DateTime and Date objects for :datetime, normalising to UTC" do
       expect(permit({ at: Time.utc(2026, 9, 5, 10, 30) }, &decl)[:at]).to eq(Time.utc(2026, 9, 5, 10, 30))
       expect(permit({ at: DateTime.new(2026, 9, 5, 10, 30, 0, "+07:00") }, &decl)[:at])
@@ -758,6 +892,32 @@ RSpec.describe Permittable do
       expect(result[:f]).to eq(1.5)
       expect(result[:d]).to eq(BigDecimal("2.5"))
       expect(permit({ f: 3, d: 4 }, &decl).to_h).to eq("f" => 3.0, "d" => BigDecimal("4"))
+    end
+
+    # Rational#to_s is "1/2", which BigDecimal cannot read, so a :decimal
+    # used to refuse every Rational, a whole one (3r) included.
+    it "accepts a Rational for a :decimal when its decimal expansion is exact" do
+      {
+        Rational(1, 2) => BigDecimal("0.5"), 3r => BigDecimal("3"), Rational(-7, 4) => BigDecimal("-1.75"),
+        Rational(1, 8) => BigDecimal("0.125"), Rational(3, 40) => BigDecimal("0.075"), Rational(0) => BigDecimal("0"),
+        Rational(1, 2**200) => BigDecimal("#{5**200}e-200"), Rational((10**400) + 1, 5) => BigDecimal("2#{"0" * 399}.2")
+      }.each do |value, expected|
+        cast = permit({ d: value }, &decl)[:d]
+        expect(cast).to be_a(BigDecimal), "for #{value}"
+        expect(cast).to eq(expected), "for #{value}"
+      end
+    end
+
+    it "refuses a Rational for a :decimal when no decimal can hold it exactly" do
+      [Rational(1, 3), Rational(-2, 3), Rational(1, 7), Rational(1, 6), Rational(1, (10**400) * 3)].each do |value|
+        expect(rejected(:d, value, &decl)).to eq([{ param: "d", code: "invalid_type" }]), "for #{value}"
+      end
+    end
+
+    it "accepts a Rational as a :decimal default: and reads a :float the same" do
+      klass = permittable_class { permit_params(:create) { optional :d, :decimal, default: 1 / 2r } }
+      expect(controller(klass).permitted_params[:d]).to eq(BigDecimal("0.5"))
+      expect(permit({ f: Rational(1, 2) }, &decl)[:f]).to eq(0.5)
     end
   end
 
@@ -1584,6 +1744,96 @@ RSpec.describe Permittable do
       expect(calls).to be_empty
     end
 
+    %i[default example].each do |opt|
+      it "lets an array's validate: see its sub-fields' transforms in an #{opt}: although the array has a transform: of its own" do
+        klass = permittable_class do
+          permit_params(:create) do
+            array :items, opt => [{ "tags" => "a,b" }], transform: ->(a) { a.size },
+                          validate: ->(a) { a.all? { |i| i[:tags].is_a?(Array) } } do
+              optional :tags, :string, transform: ->(s) { s.split(",") }
+            end
+          end
+        end
+        field = klass.permittable_contracts.last[:fields].first
+
+        # Stored exactly as authored: the array's own transform: is under it.
+        expect(field[opt]).to eq([{ "tags" => "a,b" }])
+        # The request this validates is accepted, so the contract is not contradictory.
+        expect(controller(klass, params: { items: [{ tags: "a,b" }] }).permitted_params[:items]).to eq(1)
+      end
+
+      it "still refuses a #{opt}: whose sub-field-transformed value the array's validate: rejects, array transform: or not" do
+        expect do
+          permittable_class do
+            permit_params(:create) do
+              array :items, opt => [{ "tags" => "a" }], transform: ->(a) { a.size },
+                            validate: ->(a) { a.all? { |i| i[:tags].size == 2 } } do
+                optional :tags, :string, transform: ->(s) { s.split(",") }
+              end
+            end
+          end
+        end.to raise_error(ArgumentError, /:#{opt} for array :items violates its own contract: items \(invalid\)/)
+      end
+    end
+
+    it "gives a nested array's validate: its own sub-fields' transforms, and the outer validate: the nested array's transformed result" do
+      build = lambda do |rows|
+        permittable_class do
+          permit_params(:create) do
+            array :orders, default: [{ "rows" => rows }], transform: ->(a) { a.size },
+                           validate: ->(a) { a.all? { |o| o[:rows] == 2 } } do
+              array :rows, transform: ->(r) { r.sum { |x| x[:n] } * 2 },
+                           validate: ->(r) { r.all? { |x| x[:n].is_a?(Integer) } } do
+                optional :n, :integer, transform: ->(n) { n }
+              end
+            end
+          end
+        end
+      end
+
+      expect(build.call([{ "n" => "1" }]).permittable_contracts.last[:fields].first[:default])
+        .to eq([{ "rows" => [{ "n" => "1" }] }])
+      expect { build.call([{ "n" => "2" }]) }.to raise_error(ArgumentError, /:default for array :orders violates its own contract/)
+    end
+
+    it "runs a transform: under a transforming array's default: only where an array's validate: above it reads the result" do
+      calls = []
+      klass = permittable_class do
+        permit_params(:create) do
+          # `:a` shares the array with a validate: but sits on a sibling branch of it: nothing reads its output.
+          array :items, default: [{ "a" => "x", "b" => [{ "c" => 1 }] }], transform: ->(a) { a } do
+            optional :a, :string, transform: ->(s) { (calls << :a) && raise("boom at class load: #{s}") }
+            array :b, validate: ->(arr) { arr.all? { |i| i[:c] == 1 } } do
+              optional :c, :integer, transform: ->(c) { (calls << :c) && c }
+            end
+          end
+        end
+      end
+
+      expect(klass.permittable_contracts.last[:fields].first[:default]).to eq([{ "a" => "x", "b" => [{ "c" => 1 }] }])
+      # `:c` is under :b's validate:, so it runs; `:a` and the array's own transform: never do.
+      expect(calls).to eq([:c])
+    end
+
+    it "runs a transform: for a validate: two levels above it, through a nested hash, and still checks what it returns" do
+      build = lambda do |tags|
+        permittable_class do
+          permit_params(:create) do
+            array :items, example: [{ "h" => { "tags" => tags } }], transform: ->(a) { a.size },
+                          validate: ->(a) { a.all? { |i| i[:h][:tags] == %w[a b] } } do
+              optional :h do
+                optional :tags, :string, transform: ->(s) { s.split(",") }
+              end
+            end
+          end
+        end
+      end
+
+      expect(build.call("a,b").permittable_contracts.last[:fields].first[:example]).to eq([{ "h" => { "tags" => "a,b" } }])
+      # The split really happens: "a,c" splits to an Array the validate: refuses.
+      expect { build.call("a,c") }.to raise_error(ArgumentError, /:example for array :items violates its own contract/)
+    end
+
     it "runs a sub-field's own transform: over an array default:, matching an equivalent explicit request" do
       klass = permittable_class do
         permit_params(:create) do
@@ -1608,6 +1858,107 @@ RSpec.describe Permittable do
       end
       fields = klass.permittable_contracts.last[:fields]
       expect(fields.map { |f| f[:example] }).to eq([21, [3]])
+    end
+
+    it "casts an example: under transform: too, which a default: is not, since no example reaches the action" do
+      klass = permittable_class do
+        permit_params(:create) do
+          optional :age,   :integer, example: "18", transform: ->(v) { v * 12 }
+          optional :ok,    :boolean, example: "true", transform: ->(v) { v ? 1 : 0 }
+          array    :ids,   of: :integer, example: %w[3], transform: ->(a) { a.sum }
+          optional :limit, :integer, example: "25", default: "25", transform: ->(v) { v * 2 }
+        end
+      end
+      fields = klass.permittable_contracts.last[:fields]
+      expect(fields.map { |f| f[:example] }).to eq([18, true, [3], 25])
+      expect(fields.last[:default]).to eq("25")
+
+      properties = Permittable::JsonSchema.rule(klass.permit_rule_for("create"))["properties"]
+      expect(properties.transform_values { |schema| schema["examples"] })
+        .to eq("age" => [18], "ok" => [true], "ids" => [[3]], "limit" => [25])
+    end
+
+    it "reads a block array's example: with no transform: at any depth, though its default: runs sub-field ones" do
+      sent = [{ "price" => "9.99", "tags" => "gift,red", "dims" => { "w" => "3" } }]
+      klass = permittable_class do
+        permit_params(:create) do
+          array :line_items, example: sent, default: sent do
+            required :price, :decimal, transform: ->(d) { (d * 100).to_i }
+            optional :tags,  :string,  transform: ->(s) { s.split(",") }
+            optional(:dims) { optional :w, :integer, transform: ->(w) { w * 10 } }
+          end
+        end
+      end
+      received = [{ "price" => 999, "tags" => %w[gift red], "dims" => { "w" => 30 } }]
+
+      published = Permittable::JsonSchema.rule(klass.permit_rule_for("create"))["properties"]["line_items"]["examples"]
+      expect(published).to eq([[{ "price" => 9.99, "tags" => "gift,red", "dims" => { "w" => 3 } }]])
+      # The published example is a request the server accepts, as authored.
+      expect(controller(klass, params: { line_items: published.first }).permitted_params[:line_items]).to eq(received)
+      # The default is what the action receives, so its sub-field transforms still run.
+      expect(controller(klass).permitted_params[:line_items]).to eq(received)
+    end
+
+    it "validates a block array's example: as a request would, with sub-field transforms run, yet stores it as sent" do
+      sent = [{ "tags" => "a,b" }]
+      klass = permittable_class do
+        permit_params(:create) do
+          # Both checks need what the action receives: the Array a request's `tags` becomes.
+          array :items, example: sent, validate: ->(a) { a.all? { |i| i[:tags].is_a?(Array) && i[:tags].fetch(0) } } do
+            optional :tags, :string, transform: ->(s) { s.split(",") }
+          end
+        end
+      end
+      published = Permittable::JsonSchema.rule(klass.permit_rule_for("create"))["properties"]["items"]["examples"]
+      expect(published).to eq([sent])
+      expect(controller(klass, params: { items: sent }).permitted_params[:items]).to eq([{ "tags" => %w[a b] }])
+    end
+
+    it "runs no sub-field transform: over an example: at class load when no container validate: consumes it" do
+      boom = ->(_) { raise "no database at class load" }
+      sent = [{ "id" => "1", "meta" => { "tag" => "t" }, "rows" => [{ "n" => "2" }] }]
+      klass = permittable_class do
+        permit_params(:create) do
+          array :items, example: sent do
+            optional :id, :string, transform: boom
+            optional(:meta) { optional :tag, :string, transform: boom }
+            array(:rows) { optional :n, :integer, transform: boom }
+          end
+        end
+      end
+      published = Permittable::JsonSchema.rule(klass.permit_rule_for("create"))["properties"]["items"]["examples"]
+      expect(published).to eq([[{ "id" => "1", "meta" => { "tag" => "t" }, "rows" => [{ "n" => 2 }] }]])
+    end
+
+    it "validates an example: with sub-field transforms run when only a nested array's validate: consumes them" do
+      sent = [{ "meta" => { "rows" => [{ "tags" => "a,b" }] } }]
+      klass = permittable_class do
+        permit_params(:create) do
+          array :items, example: sent do
+            optional(:meta) do
+              array :rows, validate: ->(a) { a.all? { |r| r[:tags].is_a?(Array) } } do
+                optional :tags, :string, transform: ->(s) { s.split(",") }
+              end
+            end
+          end
+        end
+      end
+      expect(klass.permittable_contracts.last[:fields].first[:example]).to eq(sent)
+    end
+
+    it "stores a block array's example: without the sub-field defaults a request would fill in, at any depth" do
+      klass = permittable_class do
+        permit_params(:create) do
+          array :items, example: [{ "name" => "x", "dims" => {} }],
+                        validate: ->(a) { a.all? { |i| i[:cents] == 0 && i[:dims][:w] == 1 } } do
+            optional :name,  :string
+            optional :cents, :integer, default: 0, transform: ->(i) { i * 100 }
+            optional(:dims) { optional :w, :integer, default: 1 }
+          end
+        end
+      end
+      published = Permittable::JsonSchema.rule(klass.permit_rule_for("create"))["properties"]["items"]["examples"]
+      expect(published).to eq([[{ "name" => "x", "dims" => {} }]])
     end
 
     it "hands out a default: with nothing frozen inside it, however deep" do
@@ -1853,6 +2204,88 @@ RSpec.describe Permittable do
       expect(e.details).to eq([{ param: "extra", code: "unknown" }])
     end
 
+    it "skips `button`, the name f.button and button_tag give the submitter, as it skips f.submit's `commit`" do
+      # <button name="button" type="submit"> with no value attribute submits
+      # `button=`, an empty String.
+      ["", "Search"].each do |value|
+        result = permit({ q: "shoes", button: value }) do
+          permit_params(:create, unknown: :error) { optional :q, :string }
+        end
+        expect(result.to_h).to eq("q" => "shoes"), "for button: #{value.inspect}"
+      end
+    end
+
+    # A browser submitting through <input type="image"> posts the click point
+    # as `x` and `y`, or `<name>.x` and `<name>.y` when the input is named:
+    # Rack keeps those dotted keys literally, at the top level.
+    describe "the click point an image submit sends" do
+      let(:strict) { proc { permit_params(:create, unknown: :error) { optional :q, :string } } }
+
+      it "skips `x` and `y` when both are digits, and `<name>.x` and `<name>.y` likewise" do
+        [{ x: "12", y: "7" }, { x: "0", y: "0" }, { 'save.x': "12", 'save.y': "7" },
+         { 'enregistrer é.x': "12", 'enregistrer é.y': "7" }].each do |point|
+          result = permit({ q: "shoes", **point }, &strict)
+          expect(result.to_h).to eq("q" => "shoes"), "for #{point.inspect}"
+        end
+      end
+
+      it "flags a lone `x` or `y`, which is no click point but a stray key" do
+        [{ x: "12" }, { y: "7" }, { 'save.x': "12" }, { 'save.y': "7" }, { 'save.x': "12", 'other.y': "7" }].each do |point|
+          e = violations_for({ q: "shoes", **point }, &strict)
+          expect(e.details).to eq(point.keys.map { |key| { param: key.to_s, code: "unknown" } }), "for #{point.inspect}"
+        end
+      end
+
+      it "flags a pair that is not two non-negative integer Strings" do
+        [{ x: "abc", y: "7" }, { x: "12", y: "" }, { x: "-1", y: "7" }, { x: "1.5", y: "7" }, { x: "12", y: " 7" },
+         { x: 12, y: 7 }, { x: ["12"], y: "7" }, { x: "12\xFF", y: "7" }].each do |point|
+          e = violations_for({ q: "shoes", **point }, &strict)
+          expect(e.details).to eq(point.keys.map { |key| { param: key.to_s, code: "unknown" } }), "for #{point.inspect}"
+        end
+      end
+
+      # Keys are client-sent bytes, so the pair is matched by bytes: a name
+      # that is invalid UTF-8 must not raise, and one in another encoding is
+      # just an undeclared key.
+      it "reads the keys by bytes: an invalid-UTF-8 name is exempt and a binary pair too, without raising" do
+        [["a\xFF.x", "a\xFF.y"], ["a\xFF.x".b, "a\xFF.y".b], ["x".b, "y".b]].each do |kx, ky|
+          result = permit({ "q" => "shoes", kx => "12", ky => "7" }, &strict)
+          expect(result.to_h).to eq("q" => "shoes"), "for #{kx.inspect}"
+        end
+      end
+
+      it "flags a UTF-16 `x` and `y`, which are not those names, without raising" do
+        kx = "x".encode("UTF-16LE")
+        ky = "y".encode("UTF-16LE")
+        e = violations_for({ "q" => "shoes", kx => "12", ky => "7" }, &strict)
+        expect(e.details.size).to eq(2)
+        expect(e.details.map { |detail| detail[:code] }).to eq(%w[unknown unknown])
+      end
+
+      it "still validates a declared `x` or `y` like any other field" do
+        declared = proc { permit_params(:create, unknown: :error) { optional :x, :integer } }
+        expect(permit({ x: "12" }, &declared)[:x]).to eq(12)
+        e = violations_for({ x: "abc", y: "7" }, &declared)
+        expect(e.details).to eq([{ param: "x", code: "invalid_type" }, { param: "y", code: "unknown" }])
+
+        both = proc {
+          permit_params(:create, unknown: :error) do
+            optional :x, :integer
+            optional :y, :integer
+          end
+        }
+        expect(permit({ x: "12", y: "7" }, &both).to_h).to eq("x" => 12, "y" => 7)
+        expect(violations_for({ x: "abc", y: "7" }, &both).details).to eq([{ param: "x", code: "invalid_type" }])
+      end
+
+      it "is exempt at the top level only" do
+        e = violations_for({ user: { name: "a", x: "12", y: "7" } }) do
+          permit_params(:create, root: :user, unknown: :error) { required :name, :string }
+        end
+        expect(e.details).to eq([{ param: "user.x", code: "unknown" }, { param: "user.y", code: "unknown" }])
+      end
+    end
+
     it "still flags a form key smuggled inside a root (the exemption is top-level only)" do
       e = violations_for({ user: { name: "a", authenticity_token: "smuggled" } }) do
         permit_params(:create, root: :user, unknown: :error) { required :name, :string }
@@ -2094,6 +2527,101 @@ RSpec.describe Permittable do
         expect { permittable_class { permit_params(:create) { optional :m, :json, max_depth: 1, example: { "a" => { "b" => 1 } } } } }
           .to raise_error(ArgumentError, /:example for field :m violates its own contract \(depth\)/)
       end
+
+      it "reads an authored default:/example: as a request's hash is read: indifferent, and a copy" do
+        theme = ->(prefs) { %w[light dark].include?(prefs[:theme]) }
+        expect(permit({ prefs: { "theme" => "dark" } }) { permit_params(:create) { optional :prefs, :json, validate: theme } }[:prefs])
+          .to eq("theme" => "dark")
+
+        # The same hash, authored, passes the same validate:.
+        klass = permittable_class do
+          permit_params(:create) { optional :prefs, :json, validate: theme, default: { "theme" => "dark" }, example: { theme: "light" } }
+        end
+        expect(controller(klass).permitted_params[:prefs]).to eq("theme" => "dark")
+        expect(Permittable::JsonSchema.rule(klass.permit_rule_for("create"))["properties"]["prefs"])
+          .to include("default" => { "theme" => "dark" }, "examples" => [{ "theme" => "light" }])
+
+        # A validate: that edits its argument edits the copy a request would
+        # hand it, never the host's own Hash, and that copy is what is stored.
+        host = { "a" => 1, "b" => 2 }
+        klass = permittable_class { permit_params(:create) { optional :m, :json, default: host, validate: ->(h) { h.delete("a") } } }
+        expect(host).to eq("a" => 1, "b" => 2)
+        expect(controller(klass).permitted_params[:m]).to eq("b" => 2)
+        expect(controller(klass, params: { m: { "a" => 1, "b" => 2 } }).permitted_params[:m]).to eq("b" => 2)
+      end
+
+      it "publishes an example: as authored, however a mutating validate: edits the copy it is handed" do
+        # An example documents what a client SENDS. A validate: that adds or
+        # drops a key on its argument must not change what is published.
+        adds = ->(prefs) { prefs["seen"] = true }
+        drops = ->(prefs) { prefs.delete("theme") || true }
+        klass = permittable_class do
+          permit_params(:create) do
+            optional :prefs, :json, example: { theme: "dark" }, validate: adds
+            optional :meta,  :json, example: { "theme" => "dark" }, validate: drops
+          end
+        end
+        properties = Permittable::JsonSchema.rule(klass.permit_rule_for("create"))["properties"]
+        expect(properties["prefs"]["examples"]).to eq([{ "theme" => "dark" }])
+        expect(properties["meta"]["examples"]).to eq([{ "theme" => "dark" }])
+
+        # What is stored is still the request-shaped, frozen copy.
+        example = klass.permittable_contracts.last[:fields].find { |f| f[:name] == :prefs }[:example]
+        expect(example).to be_a(ActiveSupport::HashWithIndifferentAccess).and be_frozen
+        expect(example[:theme]).to eq("dark")
+      end
+    end
+  end
+
+  # f.fields_for :addresses sends `user[addresses_attributes][0][city]`,
+  # which Rack parses as a Hash keyed "0", "1", ... Strong params permits
+  # that shape (its fields_for_style?) and accepts_nested_attributes_for
+  # reads its values in order; an `array ... do` field answered 422.
+  describe "an array of hashes sent the way fields_for sends one" do
+    let(:decl) do
+      proc do
+        permit_params(:create, root: :user, unknown: :error) do
+          required :name, :string
+          array :addresses_attributes, length: 1..3 do
+            optional :id, :integer
+            required :city, :string
+            optional :_destroy, :boolean
+          end
+        end
+      end
+    end
+
+    let(:sent) do
+      { "0" => { "city" => "Paris" }, "1" => { "id" => "7", "city" => "Rome", "_destroy" => "1" } }
+    end
+
+    it "reads an index-keyed Hash as the array of records it encodes, in the order sent" do
+      expect(permit({ user: { name: "Jo", addresses_attributes: sent } }, &decl)[:addresses_attributes])
+        .to eq([{ "city" => "Paris" }, { "id" => 7, "city" => "Rome", "_destroy" => true }])
+      # A dynamically added record's index is often a timestamp.
+      timestamped = { "1712345678901" => { "city" => "Oslo" } }
+      expect(permit({ user: { name: "Jo", addresses_attributes: timestamped } }, &decl)[:addresses_attributes])
+        .to eq([{ "city" => "Oslo" }])
+    end
+
+    it "checks those records as it checks an array's, length: included" do
+      expect(violations_for({ user: { name: "Jo", addresses_attributes: { "0" => {} } } }, &decl).details)
+        .to eq([{ param: "user.addresses_attributes[0].city", code: "missing" }])
+      four = (0..3).to_h { |i| [i.to_s, { "city" => "C#{i}" }] }
+      expect(violations_for({ user: { name: "Jo", addresses_attributes: four } }, &decl).details)
+        .to eq([{ param: "user.addresses_attributes", code: "length" }])
+    end
+
+    it "still refuses any other Hash, as strong params would not read it as records either" do
+      [{ "city" => "Paris" }, { "0" => "Paris" }, { "a" => { "city" => "Paris" } }, {}].each do |value|
+        expect(violations_for({ user: { name: "Jo", addresses_attributes: value } }, &decl).details)
+          .to eq([{ param: "user.addresses_attributes", code: "invalid_type" }]), "for #{value.inspect}"
+      end
+    end
+
+    it "leaves a scalar array alone: an index-keyed Hash of scalars is not fields_for's shape" do
+      ids = proc { permit_params(:create) { array :ids, of: :integer } }
+      expect(violations_for({ ids: { "0" => "1" } }, &ids).details).to eq([{ param: "ids", code: "invalid_type" }])
     end
   end
 
@@ -2583,6 +3111,125 @@ RSpec.describe Permittable do
       expect(c.rendered[:status]).to eq(:unprocessable_entity)
       expect(c.rendered[:json][:error][:code]).to eq("invalid_parameters")
       expect(c.rendered[:json][:error][:details]).to eq([{ param: "name", code: "missing" }])
+    end
+  end
+
+  describe "delegating to the host's render_error" do
+    def rejected(klass)
+      c = controller(klass, params: {})
+      begin
+        c.permitted_params
+      rescue described_class::InvalidParameters => e
+        c.render_invalid_parameters(e)
+      end
+      c
+    end
+
+    def host_with(&render_error)
+      permittable_class do
+        permit_params(:create) { required :name, :string }
+        class_eval(&render_error)
+      end
+    end
+
+    it "passes errors: to a render_error that takes it" do
+      klass = host_with do
+        def render_error(message:, status:, code: nil, errors: nil)
+          render(json: { host: true, message: message, code: code, errors: errors }, status: status)
+        end
+      end
+      expect(rejected(klass).rendered[:json]).to include(host: true, code: "invalid_parameters",
+                                                         errors: [{ param: "name", code: "missing" }])
+    end
+
+    it "keeps a three-keyword render_error working, as documented, instead of raising" do
+      klass = host_with do
+        def render_error(message:, status:, code:)
+          render(json: { host: true, message: message, code: code }, status: status)
+        end
+      end
+      c = rejected(klass)
+      expect(c.rendered[:status]).to eq(:unprocessable_entity)
+      expect(c.rendered[:json]).to include(host: true, code: "invalid_parameters")
+    end
+
+    it "passes errors: to a render_error that takes any keyword" do
+      klass = host_with do
+        def render_error(**kwargs)
+          render(json: kwargs.merge(host: true), status: kwargs[:status])
+        end
+      end
+      expect(rejected(klass).rendered[:json]).to include(host: true, errors: [{ param: "name", code: "missing" }])
+    end
+
+    it "delegates to a private render_error, the usual spelling for a helper that must not be an action" do
+      klass = host_with do
+        private
+
+        def render_error(message:, status:, code: nil, errors: nil)
+          render(json: { host: true, message: message, code: code, errors: errors }, status: status)
+        end
+      end
+      expect(rejected(klass).rendered[:json]).to include(host: true, errors: [{ param: "name", code: "missing" }])
+    end
+
+    # The gem always passes message:, code: and status:, so a private
+    # helper is used only when it takes all three and requires nothing else.
+    # Anything narrower was never consulted, and calling it would raise: a
+    # 500 on every rejection, the bug this delegation exists to avoid.
+    it "leaves a private render_error with some other signature alone, as before" do
+      inline = { success: false, error: { message: "Invalid parameters: name (missing)", code: "invalid_parameters",
+                                          details: [{ param: "name", code: "missing" }] } }
+      signatures = [
+        "message, status",
+        "message:, status:",
+        "message:, status: :bad_request",
+        "message:, status:, code:, details:",
+        "msg = nil, status: 500, message: nil"
+      ]
+      signatures.each do |signature|
+        klass = host_with do
+          class_eval <<~RUBY, __FILE__, __LINE__ + 1
+            # private def render_error(message:, status:) = render(json: { unrelated: true }, status: 500)
+            private def render_error(#{signature}) = render(json: { unrelated: true }, status: 500)
+          RUBY
+        end
+        expect(rejected(klass).rendered[:json]).to eq(inline), "for render_error(#{signature})"
+      end
+    end
+
+    it "passes errors: in the trailing Hash of a render_error(*args) host" do
+      klass = host_with do
+        def render_error(*args)
+          options = args.last
+          render(json: options.merge(host: true), status: options[:status])
+        end
+      end
+      expect(rejected(klass).rendered[:json]).to include(host: true, code: "invalid_parameters",
+                                                         errors: [{ param: "name", code: "missing" }])
+    end
+
+    it "still delegates, with errors:, to a render_error served by method_missing without respond_to_missing?" do
+      klass = host_with do
+        # define_method on purpose: this host is exactly the unusual shape
+        # (no respond_to_missing?) the lint cops would steer people away from.
+        define_method(:respond_to?) { |name, *rest| name == :render_error || super(name, *rest) }
+
+        define_method(:method_missing) do |name, *args, **kwargs, &block|
+          next super(name, *args, **kwargs, &block) unless name == :render_error
+
+          render(json: kwargs.merge(host: true), status: kwargs[:status])
+        end
+      end
+      expect(rejected(klass).rendered[:json]).to include(host: true, code: "invalid_parameters",
+                                                         errors: [{ param: "name", code: "missing" }])
+    end
+
+    it "renders the inline shape, not a 500, when only respond_to?(…, true) claims a render_error that has no Method" do
+      klass = host_with do
+        define_method(:respond_to?) { |name, include_all = false| (include_all && name == :render_error) || super(name, include_all) }
+      end
+      expect(rejected(klass).rendered[:json]).to include(success: false)
     end
   end
 
@@ -3198,6 +3845,35 @@ RSpec.describe Permittable do
           expect(&declaring(typed) { optional :blob, :string }).not_to raise_error
         end
 
+        it "catches a scalar declared over an array column, and says how to declare it" do
+          # sqlite has no array columns; this is the shape a PostgreSQL
+          # `t.string :tags, array: true` column reports.
+          column = Struct.new(:type, :array) { def array? = array }
+          model = Class.new do
+            define_singleton_method(:table_name) { "ducks" }
+            define_singleton_method(:table_exists?) { true }
+            define_singleton_method(:column_names) { %w[tags title] }
+            define_singleton_method(:columns_hash) { { "tags" => column.new(:string, true), "title" => column.new(:string, false) } }
+          end
+          expect(&declaring(model) { optional :tags, :string }).to raise_error(ArgumentError) do |e|
+            expect(e.message).to match(/'tags' is declared :string but the column is an array \(of :string\)/)
+            expect(e.message).to include("array :tags, of: :string")
+            expect(e.message).to include("virtual: true")
+          end
+          expect(&declaring(model) { optional :title, :string }).not_to raise_error
+
+          # An element type the adapter does not recognise reports as nil.
+          unknown = Class.new do
+            define_singleton_method(:table_name) { "ducks" }
+            define_singleton_method(:table_exists?) { true }
+            define_singleton_method(:column_names) { %w[shapes] }
+            define_singleton_method(:columns_hash) { { "shapes" => column.new(nil, true) } }
+          end
+          expect(&declaring(unknown) { optional :shapes, :string }).to raise_error(ArgumentError) do |e|
+            expect(e.message).to include("the column is an array (table: ducks)").and include("`array :shapes`")
+          end
+        end
+
         context "with a Rails enum" do
           # `enum` is spelled positionally from Rails 7.0 and by keyword before
           # it; the keyword form is gone in 8.0, and the matrix covers both.
@@ -3269,6 +3945,26 @@ RSpec.describe Permittable do
               .to raise_error(ArgumentError, /"0", "1"/)
             expect(&declaring(m) { optional :status, :string, in: "a".."z" })
               .to raise_error(ArgumentError, /in: EnumThing.statuses.keys/)
+          end
+
+          # permittable:generate's enum TODO says to admit the stored integers
+          # with in: and map them back with transform: (in: runs first). The
+          # guard refused that exact contract, failing the deploy of a draft
+          # its own generator recommended.
+          it "accepts the stored integers in in: when a transform: maps them back to names" do
+            m = enum_model
+            expect(&declaring(m) do
+              optional :status, :string, in: m.statuses.keys + m.statuses.values.map(&:to_s),
+                                         transform: ->(v) { m.statuses.key(v.to_i) || v }
+            end).not_to raise_error
+            # Still only the stored integers: anything else is refused, transform or not.
+            expect(&declaring(m) { optional :status, :string, in: %w[pending 7], transform: ->(v) { v } })
+              .to raise_error(ArgumentError, /"7"/)
+          end
+
+          it "names the transform: route when the stored integers are listed without one" do
+            expect(&declaring(enum_model) { optional :status, :string, in: %w[pending 1] })
+              .to raise_error(ArgumentError, /"1".*transform:/m)
           end
 
           it "holds a string-backed enum to the same rule, accepting its stored values too" do
@@ -3619,6 +4315,99 @@ RSpec.describe Permittable do
       expect(body["error"]["details"]).to eq([{ "param" => "user.age", "code" => "inclusion" }])
     end
 
+    describe "the envelope's content type" do
+      # respond_to sets the response's content type to the negotiated format
+      # BEFORE the block runs, and Rails' `render json:` only sets
+      # application/json when none is set yet. So with html listed first, the
+      # JSON envelope used to go out as text/html.
+      def build_negotiating_controller
+        IntegrationHarness.build_controller do
+          include Permittable
+
+          permit_params :create, root: :user do
+            required :name, :string
+          end
+
+          def create
+            respond_to do |format|
+              format.html { render json: { received: permitted_params } }
+              format.json { render json: { received: permitted_params } }
+            end
+          end
+        end
+      end
+
+      let(:browser_accept) { "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" }
+
+      it "is application/json for a browser form post to an action that negotiates with respond_to" do
+        result = IntegrationHarness.dispatch(build_negotiating_controller, :create, method: "POST",
+                                                                                    params: { user: { nme: "x" } },
+                                                                                    accept: browser_accept)
+        expect(result.status).to eq(422)
+        expect(result.header("Content-Type")).to start_with("application/json")
+        expect(JSON.parse(result.body)["success"]).to be(false)
+      end
+
+      it "is application/json for a JSON body sent with curl's Accept: */*" do
+        result = IntegrationHarness.dispatch(build_negotiating_controller, :create, method: "POST",
+                                                                                    json: { user: { nme: "x" } },
+                                                                                    accept: "*/*")
+        expect(result.status).to eq(422)
+        expect(result.header("Content-Type")).to start_with("application/json")
+        expect(JSON.parse(result.body)["error"]["code"]).to eq("invalid_parameters")
+      end
+
+      it "is application/json when the client asks for JSON" do
+        result = IntegrationHarness.dispatch(build_negotiating_controller, :create, method: "POST",
+                                                                                    json: { user: { nme: "x" } },
+                                                                                    accept: "application/json")
+        expect(result.status).to eq(422)
+        expect(result.header("Content-Type")).to start_with("application/json")
+      end
+
+      # A host that registers a vendor JSON type and negotiates it with
+      # respond_to already has a JSON media type on the response; the envelope
+      # must keep it rather than flatten it to application/json.
+      context "when the response already carries a vendor JSON media type" do
+        before { Mime::Type.register("application/vnd.api+json", :jsonapi) }
+        after { Mime::Type.unregister(:jsonapi) }
+
+        def build_jsonapi_controller
+          IntegrationHarness.build_controller do
+            include Permittable
+
+            permit_params :create, root: :user do
+              required :name, :string
+            end
+
+            def create
+              respond_to do |format|
+                format.html { render json: { received: permitted_params } }
+                format.jsonapi { render json: { received: permitted_params } }
+              end
+            end
+          end
+        end
+
+        it "keeps application/vnd.api+json on the envelope" do
+          result = IntegrationHarness.dispatch(build_jsonapi_controller, :create, method: "POST",
+                                                                                  json: { user: { nme: "x" } },
+                                                                                  accept: "application/vnd.api+json")
+          expect(result.status).to eq(422)
+          expect(result.header("Content-Type")).to start_with("application/vnd.api+json")
+          expect(JSON.parse(result.body)["error"]["code"]).to eq("invalid_parameters")
+        end
+      end
+
+      it "stays application/json for a controller that does not negotiate" do
+        result = IntegrationHarness.dispatch(build_api_controller, :create, method: "POST",
+                                                                            params: { user: { age: "12" } },
+                                                                            accept: browser_accept)
+        expect(result.status).to eq(422)
+        expect(result.header("Content-Type")).to start_with("application/json")
+      end
+    end
+
     it "renders 400 when the root key is missing" do
       result = IntegrationHarness.dispatch(build_api_controller, :create,
                                            method: "POST", params: { name: "rootless" })
@@ -3731,6 +4520,26 @@ RSpec.describe Permittable do
                                                                   path_params: { id: "1" })
         expect(result.status).to eq(200)
         expect(JSON.parse(result.body)).to eq("name" => "Jo")
+      end
+
+      # image_submit_tag renders <input type="image"> with no name, which a
+      # browser submits as the click point `x=12&y=7`; named, as `save.x`.
+      it "does not flag the click point of an image_submit_tag, which f.submit and f.button never send" do
+        controller = build_rootless_controller { optional :name, :string }
+        view = ActionView::Base.empty
+        expect(view.image_submit_tag("save.png")).not_to include("name=")
+        expect(view.image_submit_tag("save.png", name: "save")).to include('name="save"')
+
+        ["name=Jo&authenticity_token=t&x=12&y=7", "name=Jo&save.x=12&save.y=7",
+         "name=Jo&commit=Save", "name=Jo&button="].each do |body|
+          result = IntegrationHarness.dispatch(controller, :create, method: "POST", params: body)
+          expect(result.status).to eq(200), "for #{body}: #{result.body}"
+          expect(JSON.parse(result.body)).to eq("name" => "Jo")
+        end
+
+        result = IntegrationHarness.dispatch(controller, :create, method: "POST", params: "name=Jo&x=12")
+        expect(result.status).to eq(422)
+        expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "x", "code" => "unknown" }])
       end
 
       it "does not flag ParamsWrapper's copy of a JSON body under the wrapper key" do

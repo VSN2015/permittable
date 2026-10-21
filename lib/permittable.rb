@@ -132,11 +132,16 @@ require "permittable/filter_parameter_registry"
 # ("   " under :squish) cannot satisfy a required field by becoming "". An
 # authored `default:`/`example:` is stored as the contract reads it —
 # normalized and cast, so `default: "18"` on an :integer is 18, and an
-# array's read by the request walker itself. The one exception is a field
-# declaring `transform:`: its default is stored exactly AS AUTHORED, never
+# array's read by the request walker itself. The exceptions: a field
+# declaring `transform:` stores its default exactly AS AUTHORED, never
 # cast — `transform:` never runs on a default either (see OUTPUT RESHAPING),
-# so author such a default already in the shape the action should receive.
-# Either way it is deep-frozen on a copy, and each request gets its own deep
+# so author such a default already in the shape the action should receive —
+# and a `:json` field's is always stored as the walker reads a request's hash
+# (indifferent access, String keys; `transform:` or not), except that a
+# `:json` `example:` is stored as authored (in that same shape), whatever a
+# mutating `validate:` did to the copy it was checked on.
+# An `example:` is cast either way and never transformed: it documents what a
+# client sends. Either way it is deep-frozen on a copy, and each request gets its own deep
 # copy, so no request can corrupt it for the next.
 #
 # `nullable: true` splits that rule in two for one field, which is how a PATCH
@@ -189,8 +194,10 @@ require "permittable/filter_parameter_registry"
 #     into an Array. Runs only on request-supplied values: absent fields stay
 #     absent, and a `default:` is handed out exactly AS AUTHORED — validated
 #     against the field's own contract at class load (as any default is), but
-#     neither cast nor transformed — so a request sending a field's default
-#     gets the transformed value, a request omitting it the untransformed one.
+#     neither cast nor transformed (a `:json` field's is read as a request's
+#     hash is, indifferent with String keys, but no more than that) — so a
+#     request sending a field's default gets the transformed value, a
+#     request omitting it the untransformed one.
 #     Author a default already in the shape the action should receive:
 #     `transform: ->(v) { v.to_i }, default: 25` on a :string field hands both
 #     paths the Integer 25. A field with no `transform:` still gets its
@@ -226,14 +233,21 @@ module Permittable
   # unknown-keys check must not flag them.
   ROUTING_KEYS = %w[controller action format].freeze
   # Nor the keys an ordinary form POST carries — the CSRF token, the verb
-  # override, the encoding probe, and the submit button's name. Without this
-  # `unknown: :error` was unusable outside a JSON API: every browser form
-  # failed on the framework's own keys rather than on anything the client got
-  # wrong. Exempt from the CHECK only: unlike the routing keys these are NOT
-  # stripped from monitor mode's raw pass-through, where handing back an
-  # untouched params hash is the whole promise and a legacy action may well
-  # read `_method` itself.
-  FORM_KEYS = %w[authenticity_token _method utf8 commit].freeze
+  # override, the encoding probe, and the submit button's name: `commit` from
+  # f.submit/submit_tag, `button` from f.button/button_tag (which render
+  # <button name="button">, so a browser sends `button=` even with no
+  # value). Without this `unknown: :error` was unusable outside a JSON API:
+  # every browser form failed on the framework's own keys rather than on
+  # anything the client got wrong. Exempt from the CHECK only: unlike the
+  # routing keys these are NOT stripped from monitor mode's raw
+  # pass-through, where handing back an untouched params hash is the whole
+  # promise and a legacy action may well read `_method` itself.
+  #
+  # The click point of an image submit (image_submit_tag, which has no name
+  # of its own to exempt) is a form key too, but not a fixed one: `x` and `y`,
+  # or `<name>.x` and `<name>.y`, as a PAIR of digits. See
+  # permittable_image_submit_keys.
+  FORM_KEYS = %w[authenticity_token _method utf8 commit button].freeze
   # ROUTING_KEYS/FORM_KEYS name where the keys come FROM; these two name what
   # is DECIDED with them, which is what the call sites care about — and the
   # asymmetry between them is the deliberate point, so spell it once here
@@ -616,6 +630,12 @@ module Permittable
     class_attribute :permittable_contracts, instance_accessor: false, default: []
 
     rescue_from InvalidParameters, with: :render_invalid_parameters if respond_to?(:rescue_from)
+    # Registered here, at the include, and not at the first `permit_params`:
+    # the README documents `skip_before_action :enforce_params_contract`, and
+    # Rails raises when it is asked to skip a callback that is not defined
+    # yet. The cost is the order: this check runs before any callback
+    # declared after the include (see the README's "Per-request locales"),
+    # so a locale switch that must cover it is a `prepend_around_action`.
     before_action :enforce_params_contract if respond_to?(:before_action)
   end
 
@@ -676,17 +696,10 @@ module Permittable
     # Free-form hash. The shape is deliberately undeclared, so the only
     # checks are the bounds the field asked for: breadth (`length:`, the
     # top-level key count, same reading as an array's element count) and
-    # nesting (`max_depth:`). Shared with macro-time `default:`/`example:`
-    # checking, like check_scalar.
-    def check_json(field, value)
-      status, code = check_json_bounds(field, value)
-      return [status, code] unless status == :ok
-
-      check_custom(field[:validate], value)
-    end
-
-    # The structural half of check_json, which the request walker runs on
-    # its own so that it can copy an accepted hash before app code sees it.
+    # nesting (`max_depth:`). The walker (permittable_check_json) runs them
+    # before `validate:`, so that it can copy an accepted hash before app
+    # code sees it, and an authored `default:`/`example:` goes through that
+    # walker too (see AuthoredValues).
     def check_json_bounds(field, value)
       return [:error, "invalid_type"] unless value.is_a?(Hash)
       return [:error, "length"] if field[:length] && !length_ok?(field[:length], value.length)
@@ -879,14 +892,31 @@ module Permittable
       source.split(/[eE]/, 2).first.match?(/[1-9]/)
     end
 
+    # Rational#to_s is "1/2", which BigDecimal() cannot read, so the generic
+    # Numeric branch refused every Rational, even a whole one (3r).
     def cast_decimal(value)
       case value
+      when Rational then rational_to_decimal(value)
       when Numeric then finite_decimal(BigDecimal(value.to_s))
       when String then value.match?(NUMERIC_FORMAT) ? finite_decimal(BigDecimal(value), source: value) : [:error, "invalid_type"]
       else [:error, "invalid_type"]
       end
     rescue ArgumentError
       [:error, "invalid_type"]
+    end
+
+    # A Rational is exactly a decimal only when its reduced denominator has
+    # no prime factor but 2 and 5 (1/2, 3/40), and then it divides 10**k for
+    # k = its bit length, which is at least the exponent of either factor.
+    # Anything else (1/3) has no finite expansion, so a BigDecimal could hold
+    # it only rounded at a precision this gem would have to pick. That is the
+    # guess every other coercion here refuses, so it is invalid_type.
+    def rational_to_decimal(value)
+      denominator = value.denominator
+      scale = denominator.bit_length
+      return [:error, "invalid_type"] unless ((10**scale) % denominator).zero?
+
+      finite_decimal(BigDecimal("#{value.numerator * (10**scale) / denominator}e-#{scale}"))
     end
 
     # BigDecimal("NaN") and BigDecimal("Infinity") SUCCEED where Float()
@@ -983,11 +1013,34 @@ module Permittable
         # Time from components would have to reimplement DateTime.parse's
         # handling of offsets, zone names and sub-second precision, and
         # getting that subtly wrong costs more than the parse.
-        complete_date?(Date._parse(value)) ? [:ok, DateTime.parse(value).to_time.utc] : [:error, "invalid_type"]
+        #
+        # Parsed in the proleptic Gregorian calendar, which is what ISO 8601
+        # and Time use. DateTime.parse defaults to the 1582 Italian reform
+        # and read an earlier date as Julian; stdlib's DateTime#to_time then
+        # converts by day number, so "1500-01-01" became 1500-01-10 — unless
+        # the host had loaded ActiveSupport's DateTime#to_time, which
+        # converts by component. Gregorian, both agree.
+        found = Date._parse(value)
+        return [:error, "invalid_type"] unless complete_date?(found) && honoured_zone?(found)
+
+        [:ok, DateTime.parse(value, true, Date::GREGORIAN).to_time.utc]
       else [:error, "invalid_type"]
       end
     rescue ArgumentError, RangeError
       [:error, "invalid_type"]
+    end
+
+    # A zone the parser could not turn into an offset — an offset of a day
+    # or more ("+24:00", "-99:00", "+99") or an abbreviation it does not
+    # know ("XYZ") — is reported as a zone with no offset, or with one
+    # beyond a day, and DateTime.parse then reads the wall clock as UTC: an
+    # instant hours away from the one the client named. The client stated a
+    # zone, so it is refused rather than guessed at.
+    def honoured_zone?(found)
+      return true unless found.key?(:zone)
+
+      offset = found[:offset]
+      !offset.nil? && offset.abs < 86_400
     end
 
     # Presets only make sense on String input; a non-String value (JSON
@@ -1224,6 +1277,7 @@ module Permittable
       validate_array_authored_value!(field, :default) if field.key?(:default)
       validate_array_authored_value!(field, :example) if field.key?(:example)
       validate_message!(field)
+      freeze_desc!(field)
       @fields << field
     end
 
@@ -1300,6 +1354,7 @@ module Permittable
                   fields: nested_fields!(name, &block), **opts }
         field[:fields] = cascade_sensitive(field[:fields], field[:sensitive])
         validate_message!(field)
+        freeze_desc!(field)
       elsif type&.to_sym == JSON_TYPE
         assert_opts!(name, opts, JSON_OPTS)
         # `type:` is carried alongside `kind:` so the same `as(:json)` matcher
@@ -1404,6 +1459,7 @@ module Permittable
       validate_authored_value!(field, :default)
       validate_authored_value!(field, :example)
       validate_message!(field)
+      freeze_desc!(field)
     end
 
     # `in:` is a Range (bounds-checked with cover?), a list of values, or an
@@ -1419,19 +1475,34 @@ module Permittable
     # enum rule all read the members the runtime compares against. A member
     # no request value could ever equal is a contract mistake, and fails here
     # rather than as an `inclusion` on every request.
+    #
+    # An empty list or a reversed Range is refused for the same reason, but
+    # an object used as given is not asked: it is read on every request, so
+    # a live registry that is empty now (filled in an initializer or
+    # `after_initialize`, after `eager_load!` has run this) is the very use
+    # the README recommends it for.
     def resolve_in!(field)
       name = field[:name]
       allowed = field[:in]
       if allowed.is_a?(Range)
         assert_comparable_range!(field, allowed)
+        assert_satisfiable!(name, :in, allowed)
       elsif (members = Coercion.in_list(allowed))
         cast_in_members!(field, members)
+        assert_satisfiable!(name, :in, field[:in])
       elsif allowed.is_a?(String) || !allowed.respond_to?(:include?)
         raise ArgumentError, "#{LABEL}: :in for field :#{name} must be a Range, a list of values (an Array, Set, " \
                              "or a Hash read as its keys), or an object answering include? " \
                              "(got #{allowed.inspect})#{string_in_hint(allowed)}"
       end
-      assert_satisfiable!(name, :in, field[:in])
+    end
+
+    # An `in:` that is neither a Range nor a list the gem read and cast
+    # itself, so one resolve_in! kept exactly as given: its contents are the
+    # host's, and unknown at class load.
+    def live_in?(field)
+      allowed = field[:in]
+      !allowed.nil? && !allowed.is_a?(Range) && Coercion.in_list(allowed).nil?
     end
 
     def string_in_hint(allowed)
@@ -1509,6 +1580,7 @@ module Permittable
       validate_json_authored_value!(field, :default)
       validate_json_authored_value!(field, :example)
       validate_message!(field)
+      freeze_desc!(field)
     end
 
     def validate_max_depth!(name, depth)
@@ -1517,17 +1589,32 @@ module Permittable
       raise ArgumentError, "#{LABEL}: :max_depth for :#{name} must be a positive Integer"
     end
 
-    # Same rule as a scalar's authored value, over check_json: a `default:` or
-    # `example:` that its own bounds would reject fails at class load.
+    # Same rule as a scalar's authored value: a `default:` or `example:` that
+    # its own bounds would reject fails at class load. Like an array's, it is
+    # read by the request walker itself (see AuthoredValues), so it is checked
+    # as a request sending the same hash is. The raw Hash used to be checked
+    # instead: `validate: ->(p) { p[:theme] == "dark" }` passed a request's
+    # {"theme":"dark"}, which the walker reads indifferently, and refused the
+    # same Hash authored as `default:`. And a `validate:` that edits its
+    # argument edited the host's own Hash, which a request's deep copy spares.
+    #
+    # For a `default:` the walker's copy is what is stored, so the action, the
+    # export and the RSpec matcher all read what a request sending it would
+    # have produced. An `example:` is not: it documents what a client SENDS,
+    # so it is validated on that copy but stored as a fresh copy of the value
+    # AS AUTHORED (request-shaped, indifferent with String keys), which a
+    # `validate:` editing its argument cannot have added a key to or dropped
+    # one from. That matches every other example on a contract, which is never
+    # processed the way the action would see it.
     def validate_json_authored_value!(field, opt)
       return unless field.key?(opt)
       return if authored_nil!(field, opt)
       raise ArgumentError, "#{LABEL}: :#{opt} for :#{field[:name]} must be a Hash" unless field[opt].is_a?(Hash)
 
-      status, code = Coercion.check_json(field, field[opt])
-      raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{code})" unless status == :ok
+      status, read = AuthoredValues.read_json(field, field[opt])
+      raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{read})" unless status == :ok
 
-      field[opt] = freeze_authored(field[opt])
+      field[opt] = freeze_authored(opt == :example ? ActiveSupport::HashWithIndifferentAccess.new(field[opt]) : read)
     end
 
     # format / length / normalize reason about characters; on any other
@@ -1547,8 +1634,31 @@ module Permittable
         raise ArgumentError, "#{LABEL}: :length for :#{name} must be a non-negative Integer or a Range " \
                              "(got #{length.inspect})"
       end
+      validate_length_ends!(name, length) if length.is_a?(Range)
 
       assert_satisfiable!(name, :length, length)
+    end
+
+    # A length is a count, so each end of a Range is a non-negative whole
+    # number — an Integer, or a Float/Rational/BigDecimal with no fraction
+    # (`1..10.0` means ten) — or open: nil, or an infinite Float on its own
+    # side (`1..Float::INFINITY` predates endless Ranges). A negative end matched nothing (`..-1`
+    # rejected every value, forever, as the client's fault) or meant nothing
+    # (`-2..3` is `..3`), and a fractional one exported a minLength/maxLength
+    # the JSON Schema metaschema refuses — Ajv rejects the whole document.
+    def validate_length_ends!(name, length)
+      ok = length_end?(length.begin, -Float::INFINITY) && length_end?(length.end, Float::INFINITY)
+      return if ok
+
+      raise ArgumentError, "#{LABEL}: :length for :#{name} must have non-negative whole-number ends " \
+                           "(got #{length.inspect}); leave an end off for no bound, e.g. 1.. or ..80"
+    end
+
+    def length_end?(value, open)
+      return true if value.nil? || value == open
+      return false unless value.is_a?(Numeric) && value.real? && value.finite?
+
+      !value.negative? && value == value.to_i
     end
 
     # A reversed Range (5..2), an exclusive Range with equal endpoints
@@ -1639,7 +1749,7 @@ module Permittable
     # same value gets, and what used to be thrown away: `default: "18"` used
     # to be handed to every request omitting it as the String "18", and
     # `:boolean, default: "false"` gave the app a truthy String.
-    # With a `transform:`, the value is stored exactly AS AUTHORED instead —
+    # With a `transform:`, a default is stored exactly AS AUTHORED instead —
     # `transform:` never runs on a default (see AuthoredValues), so casting it
     # here would silently change its type out from under an author who, per
     # the README, writes such a default in the shape the action should
@@ -1647,6 +1757,17 @@ module Permittable
     # :string field means the app gets the Integer 25 either way, whether the
     # request sent "25" (cast then transformed) or omitted the field
     # (authored as the already-final Integer).
+    #
+    # An `example:` is cast either way. It documents what a client SENDS and
+    # never reaches the action, so that reason does not apply to it: under
+    # `transform:` it used to be published uncast, `"type": "integer",
+    # "examples": ["18"]`, the very lie the cast exists to stop.
+    #
+    # The one rule not checked is `in:` when it is an object used as given
+    # (see resolve_in!): a live registry is empty at class load, so
+    # `in: LIVE, default: "order.paid"` would be refused for a member it will
+    # hold by the first request. What it will contain is unknown then, so its
+    # `include?` is not asked; every other rule is still checked.
     def validate_authored_value!(field, opt)
       return unless field.key?(opt)
       return if authored_nil!(field, opt)
@@ -1655,10 +1776,10 @@ module Permittable
       # proc cannot rewrite the host's own literal.
       authored = field[opt].is_a?(String) ? field[opt].dup : field[opt]
       value = Coercion.apply_normalize(field[:normalize], authored)
-      status, result = Coercion.check_scalar(field, value)
+      status, result = Coercion.check_scalar(live_in?(field) ? field.except(:in) : field, value)
       raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{result})" unless status == :ok
 
-      field[opt] = freeze_authored(field[:transform] ? field[opt] : result)
+      field[opt] = freeze_authored(opt == :default && field[:transform] ? field[opt] : result)
     end
 
     # An array's authored value is validated by the REQUEST walker itself
@@ -1671,27 +1792,61 @@ module Permittable
     # cast only the top level of each element, and got every one of those
     # wrong.
     #
-    # What is STORED follows the same split as a scalar's: without
-    # `transform:`, the walker's read (exactly what a request sending it
-    # gets); with one, the array exactly AS AUTHORED — the walker still runs,
-    # so a declaration mistake (an element `validate:` refuses, a sub-field
-    # default out of bounds) still fails at class load, but its cast result
-    # is discarded rather than stored. The array's OWN `transform:` is
-    # deliberately never run on a default either way; a SUB-FIELD's
-    # `transform:` still runs during that walk, so "the walker's read" above
-    # really is what an equivalent request produces — see AuthoredValues.
+    # What is STORED for a default follows the same split as a scalar's:
+    # without `transform:`, the walker's read (exactly what a request sending
+    # it gets); with one, the array exactly AS AUTHORED — the walker still
+    # runs, so a declaration mistake (an element `validate:` refuses, a
+    # sub-field default out of bounds) still fails at class load, but its
+    # cast result is discarded rather than stored. The array's OWN
+    # `transform:` is deliberately never run on a default either way. A
+    # SUB-FIELD's `transform:` still runs during that walk, so "the walker's
+    # read" above really is what an equivalent request produces: all of them
+    # when the array has no `transform:` of its own, and, when it has one,
+    # those below an array declaring `validate:`, the only readers of their
+    # output (a request runs sub-field transforms, then that `validate:`,
+    # then the array's own transform) — see AuthoredValues.
+    #
+    # An `example:` is validated the same way, as a request would be, but what
+    # is STORED is a second read of it exactly as a client SENDS it: cast and
+    # normalized, with no `transform:` run at any depth and no sub-field
+    # `default:` filled in. Read through a sub-field's transform,
+    # `[{ price: "9.99" }]` under `transform: ->(d) { (d * 100).to_i }` was
+    # published as `[{ "price": 999 }]`: 100 times the price, and a `tags`
+    # split into an Array the server refuses. The two reads cannot be one: an
+    # array-level `validate:` must see the transformed sub-fields a request
+    # hands it (`i[:tags].is_a?(Array)`), so the validating read keeps them,
+    # and the stored read, which runs no `validate:`, discards them.
+    #
+    # The transforming read exists only for that `validate:`, so it runs only
+    # when one could consume it. Anywhere else its output is thrown away, yet
+    # it would still call app code at class load: `optional :id, :string,
+    # transform: ->(s) { Account.find(s) }` under an `example:` hit the
+    # database, or raised, at boot. Only an array carries a `validate:` that
+    # sees its transformed children: a scalar's or a :json field's runs on
+    # its own value before its own transform, and a nested hash takes none.
+    # Without one, the as-sent read both validates and is stored.
     def validate_array_authored_value!(field, opt)
       value = field[opt]
       return if authored_nil!(field, opt)
       raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} must be an Array" unless value.is_a?(Array)
 
-      read, violations = AuthoredValues.read_array(field, value)
+      as_sent = opt == :example && !array_validate_in?(field)
+      read, violations = AuthoredValues.read_array(field, value, as_sent: as_sent)
       unless violations.empty?
         raise ArgumentError, "#{LABEL}: :#{opt} for array :#{field[:name]} violates its own contract: " \
                              "#{AuthoredValues.summary(violations)}"
       end
 
-      field[opt] = freeze_authored(field[:transform] ? value : read)
+      read, = AuthoredValues.read_array(field, value, as_sent: true) if opt == :example && !as_sent
+      field[opt] = freeze_authored(opt == :default && field[:transform] ? value : read)
+    end
+
+    # Whether `field`, or any array or nested hash below it, declares an
+    # array-level `validate:`.
+    def array_validate_in?(field)
+      return true if field[:kind] == :array && field[:validate]
+
+      Array(field[:fields]).any? { |sub| array_validate_in?(sub) }
     end
 
     # A contract is frozen data, but `@fields.map(&:freeze)` freezes only the
@@ -1728,6 +1883,18 @@ module Permittable
       raise ArgumentError,
             "#{LABEL}: :#{opt} for field :#{field[:name]} is nil but the field is not nullable — " \
             "declare nullable: true to make an explicit null part of the contract"
+    end
+
+    # `desc:` is exported as the schema's `description`, and was handed out
+    # by reference: a caller appending to a generated document's
+    # description (" (deprecated)", a gsub! for localisation) rewrote the
+    # contract inside the frozen rule, and every later export in the process
+    # carried the edit. Frozen as a copy, like message:, default: and
+    # example:, so the host's own String is left as it passed it. The
+    # exporters hand out an unfrozen `dup` of it, so editing a generated
+    # document in place works and still cannot reach the contract.
+    def freeze_desc!(field)
+      field[:desc] = freeze_authored(field[:desc]) unless field[:desc].nil?
     end
 
     # `message:` customizes what the client reads for a violation on this
@@ -1829,7 +1996,7 @@ module Permittable
 
       rule = { actions: actions.flatten.map(&:to_s).freeze, root: root && root.to_sym,
                model: model_class, unknown: unknown, enforce: !!enforce, mode: mode, fields: fields,
-               finalize: builder.finalizer, desc: desc }.freeze
+               finalize: builder.finalizer, desc: desc&.deep_dup&.freeze }.freeze
       self.permittable_contracts = permittable_contracts + [rule]
     end
 
@@ -1876,10 +2043,11 @@ module Permittable
 
       types = checked.to_h { |f| [f[:name], f[:type]] }
       allowed = checked.select { |f| f.key?(:in) }.to_h { |f| [f[:name], f[:in]] }
+      transformed = checked.select { |f| f[:transform] }.map { |f| f[:name].to_sym }
       begin
         ColumnGuard.ensure_columns_on!(LABEL, model_class, *checked.map { |f| f[:name] },
                                        types: types, check_types: Permittable.check_column_types,
-                                       allowed: allowed)
+                                       allowed: allowed, transformed: transformed)
       rescue ArgumentError => e
         # The type error carries its own guidance; only the missing-column one
         # needs the virtual: hint appended.
@@ -1954,8 +2122,31 @@ module Permittable
     return nil unless action
 
     rule = self.class.permit_rule_for(action)
-    permitted_params(action) if rule && (rule[:enforce] || permittable_mode(rule) == :monitor)
+    return nil unless rule
+
+    if permittable_mode(rule) == :monitor
+      permittable_monitor_eagerly(action)
+    elsif rule[:enforce]
+      permitted_params(action)
+    end
     nil
+  end
+
+  # Monitor mode's promise is that the action runs, whatever the request
+  # holds — that is what makes it safe to turn on. Checking eagerly reads
+  # `params`, which raises ActionDispatch's ParseError on a body Rails
+  # cannot parse: a webhook action reading request.raw_post itself got a
+  # 400 instead of running. An exception from the contract's own code
+  # (validate:, transform:, finalize) became a 500 the same way. Either is
+  # now logged, by class only (a parse error's message can quote the body),
+  # and the action runs; one that reads permitted_params meets the same
+  # exception itself, as it would with no contract at all.
+  def permittable_monitor_eagerly(action)
+    permitted_params(action)
+  rescue StandardError => e
+    return unless respond_to?(:logger) && logger
+
+    logger.warn("#{LABEL}: [monitor] ##{action} could not be checked: #{e.class} — the action runs unchecked")
   end
 
   # The violation details recorded by validating `action` (default: the
@@ -2355,6 +2546,7 @@ module Permittable
         violations << permittable_violation(field, full, "invalid_type")
       end
     when :array
+      value = value.values if permittable_fields_for_records?(field, value)
       if value.is_a?(Array)
         result[key] = permittable_check_array(field, value, path: full, unknown: unknown, violations: violations)
       else
@@ -2363,8 +2555,22 @@ module Permittable
     end
   end
 
-  # Coercion.check_json, with the copy the result needs made in the middle.
-  # The opaque hash is handed over whole, and HashWithIndifferentAccess
+  # Whether `value` is an array of hashes sent the way Rails' fields_for
+  # sends one: `user[addresses_attributes][0][city]` reaches the params as a
+  # Hash keyed "0", "1", ... (or a timestamp, for a record added in the
+  # browser). Strong params permits exactly this shape (its
+  # fields_for_style?: every key an integer, every value a hash) and
+  # accepts_nested_attributes_for reads its values in order, so an
+  # `array ... do` field reads them as its elements. Paths then count the
+  # records in the order sent. An empty Hash, or one of scalars, is not this
+  # shape and stays invalid_type.
+  def permittable_fields_for_records?(field, value)
+    field[:fields] && value.is_a?(Hash) && !value.empty? &&
+      value.all? { |key, record| key.to_s.match?(/\A-?\d+\z/) && record.is_a?(Hash) }
+  end
+
+  # The bounds, then `validate:`, with the copy the result needs made in the
+  # middle. The opaque hash is handed over whole, and HashWithIndifferentAccess
   # rebuilt its containers but not the Strings inside them, so it is
   # deep-copied for the reason permittable_normalized copies a String — but
   # only once it is within its bounds. Copying first meant a megabyte
@@ -2425,8 +2631,9 @@ module Permittable
     # NOTHING violated, validate: included — a transform may rely on what
     # validate: checked (`Math.sqrt` after "all positive").
     elements_valid = violations.drop(before).all? { |v| permittable_unknown_key_violation?(v) }
-    if field[:validate] && elements_valid
-      status, code = Coercion.check_custom(field[:validate], out)
+    validator = permittable_array_validator(field)
+    if validator && elements_valid
+      status, code = Coercion.check_custom(validator, out)
       violations << permittable_violation(field, path, code) unless status == :ok
     end
     # Transform only a fully-valid array — a partially-nil one (element
@@ -2439,6 +2646,11 @@ module Permittable
   # without running app code over it at class load.
   def permittable_transform(field, value)
     field[:transform] ? field[:transform].call(value) : value
+  end
+
+  # A second seam, for the same reader: the array-level `validate:` to run.
+  def permittable_array_validator(field)
+    field[:validate]
   end
 
   def permittable_check_element(field, element, path, unknown:, violations:)
@@ -2517,6 +2729,7 @@ module Permittable
     if top_level
       extra -= UNCHECKED_TOP_LEVEL_KEYS + permittable_request_supplied_keys
       extra -= [permittable_configured_csrf_key].compact
+      extra -= permittable_image_submit_keys(hash, extra)
     end
     return if extra.empty?
 
@@ -2540,6 +2753,33 @@ module Permittable
     return [] unless respond_to?(:request) && request.respond_to?(:path_parameters)
 
     request.path_parameters.keys.map(&:to_s)
+  end
+
+  # The click point of an image submit among `keys` (the undeclared top-level
+  # keys). image_submit_tag renders <input type="image">, and a browser
+  # submitting through it posts where it was clicked: `x=12&y=7`, or
+  # `save.x=12&save.y=7` when the tag is named "save" (Rack keeps a dotted
+  # key as it is). Like the other FORM_KEYS these are the framework's own
+  # keys, so `unknown: :error` must not fail the form for them. Unlike them
+  # `x` and `y` are ordinary names a contract may really be sent, so a
+  # lone `x` is still flagged: a point is exempt only as a PAIR, both of
+  # them in `keys` (a declared `x` or `y` is not, and is checked as a field)
+  # and both digits, which is all a browser sends (coordinates are never
+  # negative or fractional). Read by bytes, since a client's key or value can
+  # be invalid UTF-8, which a regexp refuses to match, or another encoding
+  # altogether (a UTF-16 key makes `end_with?` raise).
+  def permittable_image_submit_keys(hash, keys)
+    by_bytes = keys.to_h { |key| [key.b, key] }
+    by_bytes.each_with_object([]) do |(bytes, key), point|
+      next unless bytes == "x" || bytes.end_with?(".x")
+
+      partner = by_bytes["#{bytes.delete_suffix('x')}y"]
+      point.push(key, partner) if partner && [key, partner].all? { |name| permittable_digits?(hash[name]) }
+    end
+  end
+
+  def permittable_digits?(value)
+    value.is_a?(String) && !value.empty? && value.each_byte.all? { |byte| byte.between?(48, 57) }
   end
 
   # FORM_KEYS bakes in "authenticity_token" — Rails' DEFAULT CSRF parameter
