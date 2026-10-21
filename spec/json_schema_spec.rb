@@ -73,6 +73,36 @@ RSpec.describe Permittable::JsonSchema do
       expect(prop["minLength"]).to eq(1)
       expect(prop["maxLength"]).to eq(10)
     end
+
+    # "" is absent for EVERY type, so a required :decimal/:date/:datetime
+    # rejects it as missing. They are strings on the wire, and `format` is
+    # only an annotation (and "decimal" is no format a validator knows), so
+    # minLength is the one keyword that makes the schema say so too.
+    it "gives a required decimal, date or datetime minLength 1, on its string encoding only" do
+      schema = schema_for do
+        required :price, :decimal
+        required :due_on, :date
+        required :starts_at, :datetime
+        optional :note, :decimal
+        optional :day, :date
+        required :n, :integer
+      end
+      props = schema["properties"]
+
+      expect(props["price"]).to include("type" => %w[string number], "minLength" => 1)
+      expect(props["due_on"]).to include("type" => "string", "minLength" => 1)
+      expect(props["starts_at"]).to include("type" => "string", "minLength" => 1)
+      expect(props["note"]).not_to have_key("minLength")
+      expect(props["day"]).not_to have_key("minLength")
+      expect(props["n"]).not_to have_key("minLength")
+    end
+
+    it "leaves a nullable decimal's \"\" alone, since it reads as an explicit null" do
+      prop = property("price") { required :price, :decimal, nullable: true }
+
+      expect(prop["type"]).to eq(%w[string number null])
+      expect(prop).not_to have_key("minLength")
+    end
   end
 
   describe "length:" do
@@ -80,6 +110,18 @@ RSpec.describe Permittable::JsonSchema do
       expect(property("a") { optional :a, :string, length: 2..5 }).to include("minLength" => 2, "maxLength" => 5)
       expect(property("a") { optional :a, :string, length: 4 }).to include("minLength" => 4, "maxLength" => 4)
       expect(property("a") { optional :a, :string, length: 1...10 }).to include("maxLength" => 9)
+    end
+
+    # An infinite end loaded and validated fine, then made the export raise
+    # JSON::GeneratorError ("Infinity not allowed in JSON").
+    it "exports an infinite end as no bound, so the document still serializes" do
+      expect(property("a") { optional :a, :string, length: 2..Float::INFINITY })
+        .to eq("type" => "string", "minLength" => 2)
+      expect(property("a") { optional :a, :string, length: -Float::INFINITY..3 })
+        .to eq("type" => "string", "maxLength" => 3)
+      expect(property("a") { array :a, of: :string, length: 1..Float::INFINITY })
+        .to include("minItems" => 1).and(satisfy { |schema| !schema.key?("maxItems") })
+      expect { JSON.generate(schema_for { optional :a, :string, length: 2..Float::INFINITY }) }.not_to raise_error
     end
   end
 
@@ -533,6 +575,48 @@ RSpec.describe Permittable::JsonSchema do
       expect(plain).to include("default" => "n/a", "examples" => ["reviewed"])
     end
 
+    it "withholds in:/format: from a sensitive: field — an allowlist of the only accepted secrets is worse than a default" do
+      # A value list, a Range and a hand-written pattern each describe the
+      # secret itself; the field is flagged the way any rule the schema
+      # cannot carry is, and the document is looser than the server there.
+      props = schema_for do
+        optional :pin,   :string,  in: %w[PIN_SECRET1 PIN_SECRET2], sensitive: true
+        optional :code,  :integer, in: 4000..4999, sensitive: true
+        optional :tag,   :string,  in: "a".."m", sensitive: true
+        optional :tok,   :string,  format: /\AFMT_SECRET\z/, sensitive: true
+        optional :flag,  :string,  format: /\A\bPAT_SECRET\b\z/, sensitive: true
+      end["properties"]
+
+      props.each_value do |prop|
+        expect(prop).to include("writeOnly" => true, "x-permittable-custom-validation" => true)
+        expect(prop.keys & %w[enum minimum maximum exclusiveMaximum pattern x-permittable-pattern x-permittable-range]).to be_empty
+      end
+      expect(JSON.generate(props)).not_to match(/SECRET|4000|4999|"m"/i)
+    end
+
+    it "withholds in:/format: from a child that inherited sensitive:, and still publishes an explicit opt-out" do
+      props = schema_for do
+        optional :payment, sensitive: true do
+          optional :pin, :string, in: %w[PIN_SECRET1], format: /\AFMT_SECRET\z/
+          optional :scheme, :string, in: %w[sepa swift], sensitive: false
+        end
+      end["properties"]["payment"]["properties"]
+      expect(props["pin"]).to eq("type" => "string", "writeOnly" => true,
+                                 "x-permittable-custom-validation" => true, "x-permittable-sensitive" => true)
+      expect(props["scheme"]).to eq("type" => "string", "enum" => %w[sepa swift])
+    end
+
+    it "keeps a format: preset's name and pattern on a sensitive: field — a preset is public, not a secret" do
+      prop = property("mail") { optional :mail, :string, format: :email, sensitive: true }
+      expect(prop).to include("format" => "email", "pattern" => a_kind_of(String), "writeOnly" => true)
+      expect(prop).not_to have_key("x-permittable-custom-validation")
+    end
+
+    it "does not flag a sensitive: field that declares neither in: nor format:" do
+      expect(property("ssn") { optional :ssn, :string, sensitive: true })
+        .not_to have_key("x-permittable-custom-validation")
+    end
+
     it "exports normalize: as x-permittable-normalize — the preset's name, or true for a custom proc" do
       # The server checks the NORMALIZED value, so minLength/maxLength/pattern
       # describe a string the client never sends. The step is not a keyword
@@ -558,6 +642,44 @@ RSpec.describe Permittable::JsonSchema do
       end["properties"]["payment"]["properties"]
       expect(props["card_number"]).to include("writeOnly" => true, "x-permittable-sensitive" => true)
       expect(props["id"]).not_to have_key("writeOnly")
+    end
+
+    it "omits default:/example: from a container holding a sensitive: field at any depth, which would carry its value" do
+      klass = Class.new(FakeController) { include Permittable }
+      klass.permit_params(:create) do
+        # The walker fills pan's own default: into the stored [{}].
+        array :cards, default: [{}] do
+          optional :pan, :string, sensitive: true, default: "4111111111111111"
+        end
+        array :tokens, example: [{ "secret" => "sk_live_EXAMPLE" }] do
+          required :secret, :string, sensitive: true
+        end
+        array :payees, default: [{ "bank" => { "iban" => "DE89370400440532013000" } }] do
+          optional :bank do
+            optional :iban, :string, sensitive: true
+          end
+        end
+        array :batches, example: [{ "cards" => [{ "cvv" => "737" }] }] do
+          array :cards do
+            optional :cvv, :string, sensitive: true
+          end
+        end
+        # Nothing sensitive inside, so nothing is withheld.
+        array :items, default: [{ "sku" => "A1" }], example: [{ "sku" => "B2" }] do
+          optional :sku, :string
+          optional :id, :string, sensitive: false
+        end
+      end
+      props = described_class.rule(klass.permit_rule_for(:create))["properties"]
+
+      %w[cards tokens payees batches].each do |name|
+        expect(props[name]).not_to have_key("default")
+        expect(props[name]).not_to have_key("examples")
+      end
+      expect(props["items"]).to include("default" => [{ "sku" => "A1" }], "examples" => [[{ "sku" => "B2" }]])
+
+      body = JSON.generate(Permittable::OpenAPI.request_body_for(klass, :create))
+      %w[4111111111111111 sk_live_EXAMPLE DE89370400440532013000 737].each { |value| expect(body).not_to include(value) }
     end
   end
 
@@ -705,6 +827,41 @@ RSpec.describe Permittable::JsonSchema do
       inner = schema["properties"]["user"]
       expect(inner["required"]).to eq(["name"])
       expect(inner["additionalProperties"]).to be(false)
+    end
+  end
+
+  describe "finalize" do
+    # A cross-field rule no single field's schema can carry, so a payload
+    # every field accepts can still be refused by violate!.
+    let(:booking) do
+      proc do
+        required :starts_on, :integer
+        required :ends_on, :integer
+        finalize do |p|
+          violate!(:ends_on, :before_start) if p[:ends_on] < p[:starts_on]
+          p
+        end
+      end
+    end
+
+    it "flags the rule's own object with x-permittable-finalize, inside the root: wrapper" do
+      expect(schema_for(&booking)).to include("x-permittable-finalize" => true)
+
+      rooted = schema_for(root: :booking, &booking)
+      expect(rooted).not_to have_key("x-permittable-finalize")
+      expect(rooted["properties"]["booking"]).to include("x-permittable-finalize" => true)
+
+      expect(schema_for { required :name, :string }).not_to have_key("x-permittable-finalize")
+    end
+
+    it "carries the flag into OpenAPI's requestBody and a standalone Contract's schema" do
+      klass = Class.new(FakeController) { include Permittable }
+      klass.permit_params(:create, root: :booking, &booking)
+      body = Permittable::OpenAPI.request_body_for(klass, :create)
+      expect(body.dig("content", "application/json", "schema", "properties", "booking"))
+        .to include("x-permittable-finalize" => true)
+
+      expect(Permittable::Contract.define(&booking).json_schema).to include("x-permittable-finalize" => true)
     end
   end
 end
