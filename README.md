@@ -1400,6 +1400,8 @@ Both work on a controller class, a controller instance, or a [standalone `Contra
 
 The negated forms follow the same rules as `not_to permit_param`: `not_to accept_params(...)` passes only when the contract rejects the payload, and `not_to reject_params(...)` only when it accepts it. Neither takes a qualifier — `not_to accept_params(...).returning(x)` would pass both on a rejection and on an acceptance returning anything else, so it raises and names the positive form — and both fail, rather than passing, when no rule covers the action or the subject declares no contracts.
 
+The matchers run **without a request**, so they know the controller's settings but not its route. The CSRF parameter name set at class level with `request_forgery_protection_token` is exempt from `unknown: :error` as it is at runtime, but a per-instance override is not seen, and neither are a route's **path parameters**: a payload `id` on a member action under `unknown: :error` is reported `unknown`, although a real `PATCH /users/1` carries it in the URL and is accepted. Leave path parameters out of the payload you pass to `accept_params` / `reject_params`.
+
 ### Standalone contracts (no controller)
 
 The same DSL, callable on any Hash — webhook payloads, job arguments, service-object inputs, CSV rows:

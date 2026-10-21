@@ -806,6 +806,70 @@ RSpec.describe "Permittable RSpec matchers" do
       expect(message).to include("accepted them but returned")
     end
 
+    context "with a CSRF parameter renamed by request_forgery_protection_token" do
+      # What ActionController::Base provides: a class-level setting with an
+      # instance reader, which is what permittable_configured_csrf_key asks.
+      let(:renamed) do
+        Class.new(FakeController) do
+          include Permittable
+
+          class_attribute :request_forgery_protection_token, default: :csrf_token
+
+          permit_params(:create, unknown: :error) { optional :name, :string }
+        end
+      end
+
+      it "exempts the renamed token from unknown: :error, as the controller does at runtime" do
+        expect(renamed).to accept_params(name: "x", csrf_token: "abc")
+        expect(renamed).not_to reject_params(name: "x", csrf_token: "abc")
+        expect(renamed.new(params: { name: "x", csrf_token: "abc" }).permittable_violations(:create)).to be_empty
+      end
+
+      it "no longer reports the renamed token as unknown" do
+        message = failure_of do
+          expect(renamed).to reject_params(name: "x", csrf_token: "abc").with_violation("csrf_token", :unknown)
+        end
+        expect(message).to include("to reject those params with csrf_token (unknown), but it accepted them")
+      end
+
+      it "still flags a key that is not the token" do
+        expect(renamed).to reject_params(name: "x", other: "abc").with_violation("other", :unknown)
+      end
+
+      it "still exempts the default authenticity_token, which FORM_KEYS always covers" do
+        expect(renamed).to accept_params(name: "x", authenticity_token: "abc")
+      end
+
+      it "reads the token off the controller class, so one with no token exempts only the default" do
+        plain = Class.new(FakeController) do
+          include Permittable
+
+          permit_params(:create, unknown: :error) { optional :name, :string }
+        end
+        expect(plain).to accept_params(name: "x", authenticity_token: "abc")
+        expect(plain).to reject_params(name: "x", csrf_token: "abc").with_violation("csrf_token", :unknown)
+      end
+
+      it "leaves a standalone Contract exempting nothing, a token name included" do
+        contract = Permittable::Contract.define(unknown: :error) { optional :name, :string }
+        expect(contract).to reject_params(name: "x", csrf_token: "abc").with_violation("csrf_token", :unknown)
+        expect(contract).to reject_params(name: "x", authenticity_token: "abc").with_violation("authenticity_token", :unknown)
+      end
+    end
+
+    # Documented in the README: the matchers run without a request, so there is
+    # no route to read path parameters from. A real PATCH /widgets/7 carries
+    # id in the URL and is accepted; the matcher is given only the payload.
+    it "reports a payload id as unknown, because it has no route to exempt path parameters" do
+      widgets = Class.new(FakeController) do
+        include Permittable
+
+        permit_params(:update, unknown: :error) { optional :name, :string }
+      end
+      expect(widgets).to reject_params(id: "7", name: "x").for_action(:update).with_violation("id", :unknown)
+      expect(widgets).to accept_params(name: "x").for_action(:update)
+    end
+
     it "describes itself readably" do
       expect(accept_params({}).for_action(:create).description).to eq("accept those params for #create")
       expect(reject_params({}).with_violation("a", :missing).description)
