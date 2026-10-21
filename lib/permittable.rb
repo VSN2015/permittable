@@ -1333,7 +1333,22 @@ module Permittable
 
     private
 
+    # A Contract is usable as a group because it answers #fields — but its
+    # finalize is not a field, so splicing would drop the contract's
+    # cross-field rule: a standalone Booking contract rejecting an ends_on
+    # before its starts_on, used by a controller that then accepts it. That
+    # is the drift `use` exists to prevent, so it is refused here, loudly,
+    # the way a field group's own finalize is. Also under only:/except: — a
+    # finalize is opaque, so there is no part of it to keep — which the
+    # message says, since that is the first thing a user tries.
     def group_fields!(group)
+      if group.is_a?(Contract) && group.rule[:finalize]
+        raise ArgumentError, "#{LABEL}: use cannot carry a Permittable::Contract's finalize, so the contract's " \
+                             "cross-field rule would be silently dropped. Selecting fields with only:/except: " \
+                             "does not lift this: the finalize cannot be split, so it is refused for any part " \
+                             "of the contract. To share both, declare the fields in a Permittable.fields " \
+                             "group that the contract and this block each use, and declare finalize in each"
+      end
       return group.fields if group.respond_to?(:fields)
 
       raise ArgumentError, "#{LABEL}: use expects a field group (Permittable.fields { ... }) or anything " \
