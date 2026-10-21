@@ -561,6 +561,12 @@ RSpec.describe Permittable::JsonSchema do
       expect(property("price") { optional :price, :decimal, example: BigDecimal("19.99") }["examples"]).to eq([19.99])
     end
 
+    # A DateTime default was stored as a DateTime, and so exported as a
+    # date-time under its own `format: date`.
+    it "exports a DateTime :date default: as the date it is stored as" do
+      expect(property("day") { optional :day, :date, default: DateTime.new(2026, 1, 5) }["default"]).to eq("2026-01-05")
+    end
+
     it "marks sensitive fields writeOnly and flags opaque callables as extensions" do
       props = schema_for do
         optional :ssn,  :string, sensitive: true
