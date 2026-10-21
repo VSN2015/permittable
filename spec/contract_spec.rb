@@ -152,6 +152,28 @@ RSpec.describe Permittable::Contract do
       expect { c.call!("caf\xC3" => 1) }.to raise_error(Permittable::InvalidParameters) { |e| expect(e.message).to be_valid_encoding }
     end
 
+    # The controller path converts params deeply through to_unsafe_h. A
+    # service object handed a slice of them — `CreateUser.call(user:
+    # params[:user])` — passed a plain Hash holding Parameters, which no
+    # Hash check recognised: a 400 for a root, 422 for a nested block.
+    it "reads ActionController::Parameters nested inside a plain Hash, as the controller path does" do
+      params = ActionController::Parameters.new(
+        user: { email: "a@b.co", age: "30" },
+        address: { city: "Hanoi" }, meta: { a: 1 }, items: [{ sku: "x" }]
+      )
+      expect(contract.call(user: params[:user]).params.to_h).to eq("email" => "a@b.co", "age" => 30, "plan" => "free")
+
+      rootless = described_class.define do
+        required(:address) { required :city, :string }
+        optional :meta, :json
+        array(:items) { required :sku, :string }
+      end
+      result = rootless.call(address: params[:address], meta: params[:meta], items: params[:items])
+      expect(result.violations).to eq([])
+      expect(result.params.to_h).to eq("address" => { "city" => "Hanoi" }, "meta" => { "a" => 1 }, "items" => [{ "sku" => "x" }])
+      expect(result.params[:meta]).not_to be_a(ActionController::Parameters)
+    end
+
     it "stays enforce-semantics even when the app-wide mode is monitor" do
       Permittable.mode = :monitor
       begin
@@ -267,6 +289,22 @@ RSpec.describe Permittable::Contract do
     expect(events.first[:details]).to eq([{ param: "user.email", code: "format" }])
   end
 
+  it "labels the violation event with the Contract and the \"call\" action, never nil" do
+    # README: payload[:action] is a String. A Contract has no action_name, so
+    # without a label here a subscriber doing payload[:action].to_sym or
+    # "#{payload[:controller]}##{payload[:action]}" got nil.
+    events = []
+    subscription = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
+      events << payload.slice(:controller, :action, :mode)
+    end
+    begin
+      contract.call(user: { email: "nope" })
+    ensure
+      ActiveSupport::Notifications.unsubscribe(subscription)
+    end
+    expect(events).to eq([{ controller: "Permittable::Contract", action: "call", mode: :enforce }])
+  end
+
   describe "without Rails loaded" do
     # spec_helper loads ActiveRecord, which pulls in every ActiveSupport core
     # extension and would mask a require the gem itself forgot. A standalone
@@ -329,6 +367,25 @@ RSpec.describe Permittable::Contract do
       )
     end
 
+    it "reads a :datetime before 1582 as the day it names, whatever the host has loaded" do
+      # ISO 8601 dates are proleptic Gregorian, like Time. DateTime.parse
+      # defaults to the 1582 Italian reform and reads an earlier date as
+      # Julian; stdlib's DateTime#to_time then converts by day number, so
+      # "1500-01-01" became 1500-01-10. ActiveSupport's DateTime#to_time
+      # converts by component instead, so a Rails app kept the day: the
+      # result depended on what the host had loaded. Only a clean process
+      # can see the stdlib half.
+      script = <<~RUBY
+        require "permittable"
+        contract = Permittable::Contract.define { required :at, :datetime }
+        print contract.call!(at: "1500-01-01T12:00:00+02:00")[:at].strftime("%F %T %Z")
+      RUBY
+      lib = File.expand_path("../lib", __dir__)
+      out, err, status = Open3.capture3(RbConfig.ruby, "-I", lib, "-e", script)
+      expect(status).to be_success, err
+      expect(out).to eq("1500-01-01 10:00:00 UTC")
+    end
+
     it "does not rewrite the caller's own Time while normalising it to UTC" do
       moment = Time.new(2026, 9, 5, 17, 30, 0, "+07:00")
       result = described_class.define { required :at, :datetime }.call!(at: moment)
@@ -347,6 +404,51 @@ RSpec.describe Permittable::Contract do
       expect(result[:at]).to eq(Time.utc(2026, 9, 5, 10, 30))
       expect(result[:at].utc?).to be(true)
       expect(result[:at]).not_to be(moment.utc)
+    end
+  end
+
+  describe "unknown: :log" do
+    let(:logged) do
+      described_class.define(unknown: :log) { required :name, :string }
+    end
+
+    it "warns through Rails.logger, read when the contract is called rather than when it is defined" do
+      lines = []
+      logger = Object.new
+      logger.define_singleton_method(:warn) { |message| lines << message }
+      stub_const("Rails", Module.new)
+      contract = logged
+      # Rails.logger is often assigned after the contracts' constants load.
+      Rails.define_singleton_method(:logger) { logger }
+
+      result = contract.call(name: "x", rogue: 1, "other" => 2)
+
+      expect(result.params.to_h).to eq("name" => "x")
+      expect(lines.length).to eq(1)
+      expect(lines.first).to match(/unknown parameter\(s\) ignored by the .*contract: rogue, other/)
+    end
+
+    it "still warns, on $stderr, when there is no Rails.logger to warn through" do
+      # A webhook payload or a CSV row in a plain Ruby script has no Rails at
+      # all; :log must not quietly behave like :ignore there.
+      hide_const("Rails")
+
+      expect { logged.call(name: "x", rogue: 1) }
+        .to output(/unknown parameter\(s\) ignored by the .*contract: rogue/).to_stderr
+    end
+
+    it "writes to whatever $stderr is at each call, not the one from the first call" do
+      hide_const("Rails")
+      contract = logged
+
+      expect { contract.call(name: "x", rogue: 1) }.to output(/rogue/).to_stderr
+      expect { contract.call(name: "x", other: 1) }.to output(/other/).to_stderr
+    end
+
+    it "stays quiet when nothing is undeclared" do
+      hide_const("Rails")
+
+      expect { logged.call(name: "x") }.not_to output.to_stderr
     end
   end
 end
