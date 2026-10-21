@@ -96,7 +96,10 @@ module Permittable
       end
 
       def matching(regexp)
-        @expected[:format] = regexp
+        # `format: "email"` names a preset exactly as `format: :email` does
+        # (see resolve_format!), so the matcher reads a String the same way;
+        # as a Symbol it also reports the preset the same way in a failure.
+        @expected[:format] = regexp.is_a?(String) ? regexp.to_sym : regexp
         self
       end
 
@@ -148,7 +151,7 @@ module Permittable
         @subject = resolve_subject(subject)
         raise ArgumentError, negated_qualifier_message unless @expected.empty?
 
-        %i[undeclared too_deep].include?(locate)
+        %i[undeclared too_deep misindexed].include?(locate)
       end
 
       def failure_message
@@ -156,6 +159,7 @@ module Permittable
         case @status
         when :no_rule then "#{subject} it #{@problem}"
         when :root_prefixed then "#{subject} #{root_prefix_hint}"
+        when :misindexed then "#{subject} #{misindexed_reason}"
         when :too_deep
           "#{subject} it is deeper than the opaque :json field #{label_for(@opaque[:path])} allows " \
           "(max_depth: #{@opaque[:field][:max_depth]})"
@@ -202,18 +206,21 @@ module Permittable
       # The one lookup both directions share. Sets @status to :no_rule,
       # :declared, :opaque (the path runs into a :json field, which accepts
       # any nested key without declaring it), :too_deep (it runs into one
-      # deeper than its max_depth: allows), :root_prefixed (the path starts
-      # with the rule's root: and resolves without it), or :undeclared.
+      # deeper than its max_depth: allows), :misindexed (it puts an [n] on
+      # a field the runtime refuses an Array for, or a second one on an
+      # array), :root_prefixed (the path starts with the rule's root: and
+      # resolves without it), or :undeclared.
       # Every per-run ivar is reset first: a matcher object can be reused
       # on another subject, and must not answer from the previous run.
       def locate
-        @rule = @field = @opaque = @problem = @missing_among = nil
+        @rule = @field = @opaque = @misindexed = @problem = @missing_among = nil
         @mismatches = []
         @rule = resolve_rule(@subject)
         return @status = :no_rule unless @rule
 
         @field = resolve_field(@rule[:fields], @segments)
         @status = if @field then :declared
+                  elsif @misindexed then :misindexed
                   elsif @opaque then opaque_within_depth? ? :opaque : :too_deep
                   elsif root_prefixed? then :root_prefixed
                   else :undeclared
@@ -247,6 +254,7 @@ module Permittable
       # field is opaque: it has no :fields, yet lets any nested key through,
       # so a path running past one is recorded rather than called missing,
       # along with how many container levels the rest of the path needs.
+      # An [n] on a declared field is held to the field's shape on the way.
       def resolve_field(fields, segments, depth = 0)
         name = segments[depth][:name].to_sym
         field = fields.find { |f| f[:name] == name }
@@ -254,15 +262,42 @@ module Permittable
           @missing_among = fields
           return nil
         end
+        if segments[depth][:indexes] > index_levels(field)
+          @misindexed = { path: field_path(segments, depth), field: field }
+          return nil
+        end
         return field if depth == segments.length - 1
 
         if field[:kind] == :json
-          @opaque = { path: segments.take(depth + 1).map { |seg| seg[:name] }.join("."), field: field,
-                      steps: steps_below(segments, depth) }
+          @opaque = { path: field_path(segments, depth), field: field, steps: steps_below(segments, depth) }
           return nil
         end
 
         resolve_field(field[:fields] || [], segments, depth + 1)
+      end
+
+      def field_path(segments, depth)
+        segments.take(depth + 1).map { |seg| seg[:name] }.join(".")
+      end
+
+      # How many [n] the runtime takes on a field's own segment. An array
+      # is one level deep (`of:` a scalar type, or with a block of hashes;
+      # the DSL has no array of arrays), and every other field refuses an
+      # Array as invalid_type, a :json field included: it takes a Hash.
+      # Below a :json field the path is opaque, [n] and all.
+      def index_levels(field)
+        field[:kind] == :array ? 1 : 0
+      end
+
+      def misindexed_reason
+        field = @misindexed[:field]
+        label = label_for(@misindexed[:path])
+        case field[:kind]
+        when :array then "#{label} is an array of #{field[:fields] ? 'hashes' : ":#{field[:of]}"}, not an array of arrays"
+        when :nested then "#{label} is a nested hash, not an array"
+        when :json then "#{label} is an opaque :json field, which takes a Hash, not an array"
+        else "#{label} is a :#{field[:type]} field, not an array"
+        end
       end
 
       # Each key or [n] step past the :json field descends into one more
@@ -289,7 +324,7 @@ module Permittable
         missing_among = @missing_among
         found = resolve_field(@rule[:fields], @segments.drop(1)) || (@opaque && opaque_within_depth?)
         @missing_among = missing_among
-        @opaque = nil
+        @opaque = @misindexed = nil
         found ? true : false
       end
 
@@ -304,8 +339,10 @@ module Permittable
       end
 
       # Accepts the runtime's own path form too — violation details say
-      # "line_items[0].sku" — so a path copied from one resolves: the [n]
-      # indexes are dropped for the walk and kept only as depth.
+      # "line_items[0].sku" — so a path copied from one resolves. The [n]
+      # indexes are not walked: each must land on an array field (see
+      # index_levels), except below a :json field, where they count only
+      # as depth.
       def path_segments!(path)
         raws = path.split(".", -1)
         matches = raws.map { |raw| SEGMENT.match(raw) }
@@ -364,8 +401,9 @@ module Permittable
         "expected the field to be #{expected}, but it is #{actual}" unless actual == expected
       end
 
-      # `matching(:email)` asserts the preset by name, `matching(/re/)` the
-      # Regexp itself.
+      # `matching(:email)` (or `matching("email")`, normalized to a Symbol by
+      # `matching`) asserts the preset by name, `matching(/re/)` the Regexp
+      # itself.
       def format_mismatch(field, expected)
         return option_mismatch(field, :format, expected) unless expected.is_a?(Symbol)
         return if field[:format_name] == expected
@@ -374,7 +412,21 @@ module Permittable
       end
 
       def default_mismatch(field, expected)
-        option_mismatch(field, :default, expected) unless field.key?(:default) && field[:default] == cast_default(field, expected)
+        option_mismatch(field, :default, expected) unless field.key?(:default) && same_default?(field, expected)
+      end
+
+      # A :json default is stored as authored, but the action reads it as
+      # a HashWithIndifferentAccess, String-keyed all the way down. The
+      # declaration's spelling, `with_default(theme: "dark")`, and the
+      # action's, `with_default("theme" => "dark")`, name the same default,
+      # so both sides are read that way before comparing.
+      def same_default?(field, expected)
+        declared = field[:default]
+        if field[:kind] == :json && declared.is_a?(Hash) && expected.is_a?(Hash)
+          ActiveSupport::HashWithIndifferentAccess.new(declared) == ActiveSupport::HashWithIndifferentAccess.new(expected)
+        else
+          declared == cast_default(field, expected)
+        end
       end
 
       # A contract stores its `default:` as the field reads it — cast,
@@ -388,7 +440,11 @@ module Permittable
       # (see validate_authored_value!/validate_array_authored_value!), so
       # `expected` is compared bare, not cast — the matcher would otherwise
       # compare a cast value against an uncast stored one and never match.
+      # A :json default is the exception: it is always stored as the walker
+      # reads the hash (indifferent, and never cast), so `expected` is read
+      # the same way, and `{ theme: "dark" }` matches `{ "theme" => "dark" }`.
       def cast_default(field, expected)
+        return cast_json_default(field, expected) if field[:kind] == :json
         return expected if field[:transform]
 
         case field[:kind]
@@ -406,6 +462,13 @@ module Permittable
           violations.empty? ? value : expected
         else expected
         end
+      end
+
+      def cast_json_default(field, expected)
+        return expected unless expected.is_a?(Hash)
+
+        status, value = AuthoredValues.read_json(field, expected)
+        status == :ok ? value : expected
       end
 
       # A contract stores an `in:` list cast by the field's type, so
@@ -483,8 +546,11 @@ module Permittable
         end
       end
 
+      # An anonymous controller class has no name, and a Contract instance
+      # never does, so the fallback names the kind of subject it is.
       def subject_name
-        (@subject.respond_to?(:name) && @subject.name) || "the controller"
+        (@subject.respond_to?(:name) && @subject.name) ||
+          (@subject.is_a?(Permittable::Contract) ? "the contract" : "the controller")
       end
 
       def path_label
@@ -520,14 +586,28 @@ module Permittable
       end
 
       # accept_params only: assert the cast, defaulted, transformed output.
+      # Refused on reject_params rather than ignored: rejected_ok? never
+      # reads it, so the chain would pass while its description claims an
+      # assertion that was never made.
       def returning(hash)
+        unless @expect_accepted
+          raise ArgumentError, "#{LABEL}: `returning` belongs to accept_params, not reject_params — " \
+                               "a rejected payload returns nothing to compare"
+        end
+
         @returning = hash
         self
       end
 
       # reject_params only: assert a particular violation is among those
-      # recorded. Repeatable; the code is optional.
+      # recorded. Repeatable; the code is optional. Refused on accept_params
+      # for the same reason returning is on reject_params.
       def with_violation(param, code = nil)
+        if @expect_accepted
+          raise ArgumentError, "#{LABEL}: `with_violation` belongs to reject_params, not accept_params — " \
+                               "an accepted payload has no violations"
+        end
+
         @expected_violations << { param: param.to_s, code: code&.to_s }
         self
       end
@@ -535,12 +615,28 @@ module Permittable
       # -- RSpec protocol -----------------------------------------------------
 
       def matches?(subject)
-        @subject = resolve_subject(subject)
-        rule = resolve_rule
+        rule = locate(subject)
         return false unless rule
 
         @violations, @result = run(rule)
         @expect_accepted ? accepted_ok? : rejected_ok?
+      end
+
+      # Defined explicitly rather than left to RSpec's `!matches?`: an
+      # unresolved rule makes matches? false, which a negation would read
+      # as a pass — `not_to accept_params(...).for_action(:craete)` passing
+      # on a typo, or on a controller that declares nothing at all. A
+      # qualifier is refused for the same reason permit_param refuses one:
+      # `not_to ...returning(x)` would pass both on a rejection and on an
+      # acceptance returning anything else.
+      def does_not_match?(subject) # rubocop:disable Naming/PredicatePrefix -- the RSpec protocol name
+        raise ArgumentError, negated_qualifier_message if @returning || !@expected_violations.empty?
+
+        rule = locate(subject)
+        return false unless rule
+
+        @violations, @result = run(rule)
+        @expect_accepted ? !accepted_ok? : !rejected_ok?
       end
 
       def failure_message
@@ -559,6 +655,8 @@ module Permittable
 
       def failure_message_when_negated
         verb = @expect_accepted ? "accept" : "reject"
+        return "expected #{subject_name} not to #{verb} those params#{action_label}, but it #{@problem}" if @problem
+
         "expected #{subject_name} not to #{verb} those params#{action_label}, but it did"
       end
 
@@ -575,6 +673,28 @@ module Permittable
       end
 
       private
+
+      # Resolves the subject and its rule, resetting every per-run ivar
+      # first so a matcher object reused across examples (or re-chained
+      # with another for_action) never reports a previous run's problem.
+      def locate(subject)
+        @problem = @violations = @result = nil
+        @subject = resolve_subject(subject)
+        resolve_rule
+      end
+
+      def negated_qualifier_message
+        call = @expect_accepted ? "accept_params" : "reject_params"
+        qualifiers = []
+        qualifiers << "returning #{@returning.inspect}" if @returning
+        qualifiers << "with_violation #{summary(@expected_violations)}" unless @expected_violations.empty?
+        "#{LABEL}: `not_to #{call}(...)` cannot take qualifiers (here: #{qualifiers.join(', ')}) — " \
+          "negating one is ambiguous, since it would pass both when the params are " \
+          "#{@expect_accepted ? 'rejected' : 'accepted'} and when they are #{@expect_accepted ? 'accepted' : 'rejected'} " \
+          "differently. Assert the outcome with the positive form " \
+          "(#{@expect_accepted ? 'reject_params' : 'accept_params'}(...), or #{call}(...) with the qualifier), " \
+          "or drop the qualifier to assert only that the params are not #{@expect_accepted ? 'accepted' : 'rejected'}."
+      end
 
       def accepted_ok?
         return false unless @violations.empty?
@@ -601,38 +721,55 @@ module Permittable
       # of @subject's own class: @subject may be a real controller, and
       # instantiating one outside the framework's own dispatch (no request,
       # no response, whatever else its own before_actions assume) is not
-      # safe in general. That means it does not automatically inherit any
-      # override @subject's class makes to permittable_check_unknown — which
-      # is exactly what a standalone Permittable::Contract relies on
-      # (Contract#initialize forces top_level: false, since standalone input
-      # has no router to exempt routing keys for). So that one override is
-      # replicated here for a Contract subject specifically, keeping the
-      # controller path (which is presumed to use the plain module default)
-      # byte-for-byte unchanged.
+      # safe in general.
+      #
+      # A standalone Permittable::Contract needs no stand-in: it always
+      # enforces, and #call is what its callers run, so the matcher runs
+      # exactly that — its input handling, its host's overrides (no
+      # router-key exemption from unknown:, its instrumentation label) and
+      # anything #call grows later. A stand-in skipped Contract's
+      # normalize_input: an Array or a String, which #call refuses with
+      # ArgumentError, read as {} here, so accept_params passed on an
+      # all-optional contract and reject_params(...).with_violation(:missing)
+      # on a required one.
       def run(rule)
+        return run_contract if @subject.is_a?(Permittable::Contract)
+
         host = Class.new do
           include Permittable
 
           attr_accessor :params
         end
-        mirror_contract_unknown_check(host) if @subject.is_a?(Permittable::Contract)
+        action = @action || rule[:actions].first || "call"
+        label_instrumentation(host, action)
         host.permittable_contracts = [rule.merge(mode: :enforce).freeze]
         instance = host.new
         instance.params = @params
-        action = @action || rule[:actions].first || "call"
         violations = instance.permittable_violations(action)
         result = violations.empty? ? instance.permitted_params(action) : nil
         [violations, result]
       end
 
-      # Mirrors Permittable::Contract's own host override verbatim (see
-      # lib/permittable/contract.rb): standalone input has no router and no
-      # request, so nothing is exempt from unknown: checking, top level or
-      # not.
-      def mirror_contract_unknown_check(host)
-        host.define_method(:permittable_check_unknown) do |fields, hash, path:, unknown:, top_level:, violations:| # rubocop:disable Lint/UnusedBlockArgument
-          super(fields, hash, path: path, unknown: unknown, top_level: false, violations: violations)
-        end
+      # A rejection instruments invalid_parameters.permittable exactly as a
+      # request would. The host is anonymous, so without this the payload
+      # carried controller: nil, action: nil — a subscriber following the
+      # README's shape (`payload[:controller].tr("/", ".")`) raised out of
+      # the matcher. Label it the way the subject itself would: a
+      # controller by its path (or name, or "the contract" when anonymous —
+      # an anonymous controller's controller_path is nil), a Contract as
+      # Contract#call does.
+      def label_instrumentation(host, action)
+        label = if @subject.is_a?(Permittable::Contract) then "Permittable::Contract"
+                elsif @subject.respond_to?(:controller_path) then @subject.controller_path || subject_name
+                else subject_name
+                end
+        host.define_method(:permittable_controller_name) { label }
+        host.define_method(:permittable_action_name) { action }
+      end
+
+      def run_contract
+        result = @subject.call(@params)
+        [result.violations, result.params]
       end
 
       def resolve_rule
@@ -666,8 +803,11 @@ module Permittable
         violations.map { |v| v[:code] ? "#{v[:param]} (#{v[:code]})" : v[:param] }.join(", ")
       end
 
+      # An anonymous controller class has no name, and a Contract instance
+      # never does, so the fallback names the kind of subject it is.
       def subject_name
-        (@subject.respond_to?(:name) && @subject.name) || "the contract"
+        (@subject.respond_to?(:name) && @subject.name) ||
+          (@subject.is_a?(Permittable::Contract) ? "the contract" : "the controller")
       end
 
       def action_label

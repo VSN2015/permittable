@@ -16,22 +16,31 @@ module Permittable
   #     the same as `{}`. JSON Schema cannot say that — `type: integer` reads
   #     null as a present value of the wrong type — so the schema rejects a
   #     null the server would accept and ignore.
-  #   * `validate:`/`transform:`/`finalize` are opaque callables — they never
-  #     change what a client may SEND, so fields carrying them are flagged
-  #     with `x-permittable-*` extensions rather than mistranslated.
+  #   * `validate:`/`transform:`/`finalize` are opaque callables the schema
+  #     cannot run, so the field carrying one (or, for `finalize`, the rule's
+  #     own object) is flagged with an `x-permittable-*` extension rather than
+  #     mistranslated. `transform:` only reshapes a value already accepted, so
+  #     it changes no verdict; `validate:` and `finalize` can refuse a value.
   #
-  # All three leave the schema STRICTER than the server, never looser: a
+  # The first two leave the schema STRICTER than the server, never looser: a
   # client that validates against the published document is conservative,
-  # never surprised by a 422. spec/schema_conformance_spec.rb holds that line,
+  # never surprised by a 422. The third does not: `validate:` and `finalize`
+  # leave it LOOSER (below). spec/schema_conformance_spec.rb holds the line,
   # asserting the direction of every divergence it permits.
   #
   # Where a rule has no JSON Schema keyword, the schema is LOOSER instead,
   # and a client following it can still earn a 422. Each such rule stays
-  # visible on its own field, and the conformance spec labels each one
-  # rather than letting it pass as agreement:
+  # visible in the schema (on its own field, or for `finalize` on the rule's
+  # object), and the conformance spec labels each one rather than letting it
+  # pass as agreement:
   #   * a `:json` field's `max_depth:` — `x-permittable-max-depth`;
   #   * a Range of non-numbers (`in: "a".."m"`) — `x-permittable-range`;
   #   * a `validate:` proc — `x-permittable-custom-validation`;
+  #   * a `finalize` block, whose `violate!` cross-field checks no field's
+  #     schema can carry — `x-permittable-finalize` on the rule's object;
+  #   * a `sensitive:` field's `in:` and `format:`, withheld because they
+  #     would publish the secret itself — the same marker (see
+  #     withholds_constraints?);
   #   * a `normalize:` step, which the server runs BEFORE it checks, so
   #     "   " passes a minLength of 3 and is then absent —
   #     `x-permittable-normalize`;
@@ -66,8 +75,16 @@ module Permittable
     # `root:` envelope when the rule declares one. The wrapper itself stays
     # permissive even under `unknown: :error` — the runtime never inspects
     # sibling keys outside the root.
+    #
+    # `finalize` is the one opaque callable that belongs to the rule, not to
+    # a field: it runs once every field has passed and can still refuse the
+    # payload (`ends_on` before `starts_on`), which no per-field keyword can
+    # say. The flag therefore rides on the rule's own object, inside the
+    # `root:` wrapper where the fields are, so a client or generator that
+    # reads the document knows the schema alone is not the whole verdict.
     def rule(permit_rule)
       schema = object(permit_rule[:fields], unknown: permit_rule[:unknown])
+      schema["x-permittable-finalize"] = true if permit_rule[:finalize]
       return schema unless permit_rule[:root]
 
       root = permit_rule[:root].to_s
@@ -125,10 +142,29 @@ module Permittable
     def scalar_schema(field)
       schema = SCALAR_SCHEMAS.fetch(field[:type]).deep_dup
       apply_format_name!(schema, field)
-      apply_in!(schema, field)
+      withheld = withholds_constraints?(field)
+      apply_in!(schema, field) unless withheld
       apply_string_bounds!(schema, field)
-      apply_pattern!(schema, field[:format])
+      apply_pattern!(schema, field[:format]) unless withheld
+      schema["x-permittable-custom-validation"] = true if withheld
       schema
+    end
+
+    # A `sensitive:` field's `in:` list/Range and hand-written `format:` ARE
+    # the secret: an enum of the only accepted PINs is an allowlist, and
+    # `pattern: "^FMT_SECRET$"` or a 4000..4999 range names or narrows the
+    # value the same way, so publishing them would defeat the redaction as
+    # surely as publishing a `default:` (see annotate). They are left out,
+    # with `x-permittable-custom-validation` as the only signal, which makes
+    # the exported schema LOOSER than the server for that field. A
+    # `format:` PRESET is the exception: it names a public rule, not a
+    # secret, so it keeps its `format` and `pattern`. `field[:sensitive]` is
+    # already resolved onto a cascaded child, so a child counts. Only a field
+    # that actually declares one of the two is flagged.
+    def withholds_constraints?(field)
+      return false unless field[:sensitive]
+
+      !field[:in].nil? || (!field[:format].nil? && field[:format_name].nil?)
     end
 
     # A `:json` field's shape is deliberately undeclared, so the schema says
@@ -293,15 +329,37 @@ module Permittable
       !allowed.nil? && !allowed.is_a?(Range) && Coercion.in_list(allowed).nil?
     end
 
+    # Every field whose schema admits a string gets its bounds here: :string,
+    # and the string encodings of :decimal, :date and :datetime. minLength
+    # and maxLength only ever constrain the string branch, so the number
+    # branch of a :decimal is untouched. `length:` itself is :string-only.
     def apply_string_bounds!(schema, field)
-      return unless field[:type] == :string
+      return unless Array(schema["type"]).include?("string")
 
       min, max = length_bounds(field[:length])
-      # "" is ABSENT and an absent required field violates, so a required
-      # string can never validly be empty — the schema says so.
-      min = 1 if field[:required] && min.to_i < 1
+      min = 1 if blank_floor?(field) && min.to_i < 1
       schema["minLength"] = min if min
       schema["maxLength"] = max if max
+    end
+
+    # "" is ABSENT whatever the type, and an absent required field violates,
+    # so a required field can never validly be "" — the schema says so. For
+    # :date, :datetime and :decimal that is the only thing the schema can say
+    # about a blank: `format` is an annotation, and "decimal" is no format a
+    # validator knows. (A whitespace-only string needs no floor there: those
+    # types refuse it as invalid_type, and the schema never claims to catch a
+    # cast failure. For :date and :datetime `format` at least names the
+    # failure to a validator that asserts it; for :decimal nothing does, so
+    # "   " passes the schema and earns a 422. That is a documented looser
+    # case, the same one as "abc" for a :decimal, and deliberately has no
+    # `pattern` to close it.)
+    #
+    # A nullable field is the exception: it reads "" as an explicit null, a
+    # value rather than an absence, so a floor would reject what the server
+    # takes. A nullable :string keeps the floor it has always had (stricter
+    # than the server, the safe direction); the other types start without.
+    def blank_floor?(field)
+      field[:required] && (field[:type] == :string || !field[:nullable])
     end
 
     def apply_pattern!(schema, regexp)
@@ -333,14 +391,26 @@ module Permittable
     # length: reasons about characters on strings and element count on
     # arrays; either way it is an exact Integer or a Range (possibly endless
     # / beginless, possibly exclusive).
+    # An infinite end (`1..Float::INFINITY`) is no bound, as for numeric
+    # `in:` — and JSON has no Infinity, so exporting it raised.
     def length_bounds(spec)
       case spec
       when Integer then [spec, spec]
       when Range
-        max = spec.end && spec.exclude_end? ? spec.end - 1 : spec.end
-        [spec.begin, max]
+        min = finite_length(spec.begin)
+        max = finite_length(spec.end)
+        max -= 1 if max && spec.exclude_end?
+        [min, max]
       else [nil, nil]
       end
+    end
+
+    # A whole-number Float/Rational end (`1..10.0`) is published as the
+    # Integer it means: minLength and friends are counts.
+    def finite_length(value)
+      return nil if value.nil? || (value.is_a?(Float) && value.infinite?)
+
+      value.to_i
     end
 
     # Documentation keys shared by every field kind. `default:`/`example:`
@@ -365,13 +435,18 @@ module Permittable
     # untranslatable or opaque fact in this file is handled: left out, with
     # the `x-permittable-*` extension (here, `writeOnly`/`x-permittable-
     # sensitive`) as the only signal that something is missing.
+    #
+    # The same goes for an array whose elements hold a sensitive field at
+    # any depth (see holds_sensitive?): its `default:`/`example:` carries
+    # that field's value, so it is omitted too.
     def annotate(schema, field)
       decimal_mode = field[:kind] == JSON_TYPE ? :string : :number
-      unless field[:sensitive]
+      unless holds_sensitive?(field)
         schema["default"] = json_value(field[:default], decimal: decimal_mode) if field.key?(:default)
         schema["examples"] = [json_value(field[:example], decimal: decimal_mode)] if field.key?(:example)
       end
-      schema["description"] = field[:desc] if field[:desc]
+      # dup: the stored desc is frozen; the export is editable and detached.
+      schema["description"] = field[:desc].dup if field[:desc]
       if field[:sensitive]
         schema["writeOnly"] = true
         schema["x-permittable-sensitive"] = true
@@ -380,6 +455,30 @@ module Permittable
       schema["x-permittable-transformed"] = true if field[:transform]
       apply_normalize!(schema, field)
       schema
+    end
+
+    # Is this field sensitive, or does it contain a sensitive field at any
+    # depth? A container's `default:`/`example:` is a whole value, so a
+    # sensitive sub-field's value is inside it. `array :cards, default:
+    # [{}]` with `optional :pan, sensitive: true, default: "4111..."` even
+    # stores `[{"pan" => "4111..."}]`, because the walker fills in each
+    # element's sub-field defaults (see AuthoredValues). Omitting pan's own
+    # default protected nothing while the array still published the value.
+    #
+    # The whole container value is omitted. Redacting only the sensitive
+    # keys inside it was the alternative, and it would mislead. Without the
+    # key, `[{}]` documents a default the server never hands out, since it
+    # fills pan in. An example without its required secret fails the very
+    # items schema it is attached to. A placeholder can fail the
+    # sub-field's own format or in:. The field's own default is omitted
+    # rather than replaced for the same reasons.
+    #
+    # The answer is read off the declaration, not the value, so even
+    # `default: []` is withheld. A value stored as authored (beside a
+    # `transform:`) can key its hashes by String or Symbol, and a check
+    # that has to find the sensitive key there is one more way to miss it.
+    def holds_sensitive?(field)
+      field[:sensitive] || Array(field[:fields]).any? { |child| holds_sensitive?(child) }
     end
 
     # The server checks the NORMALIZED string, so minLength/maxLength/pattern
