@@ -3,7 +3,8 @@ module Permittable
   #
   # `:envelope` (the default) is the gem's original shape: the host's
   # #render_error when the controller defines one (e.g. concerns_on_rails'
-  # Respondable), otherwise the identical inline JSON.
+  # Respondable; see host_render_error for a private one), otherwise the
+  # identical inline JSON.
   #
   # `:problem` renders RFC 9457 Problem Details — `application/problem+json`
   # with type/title/status/detail/instance members and the field violations as
@@ -44,19 +45,107 @@ module Permittable
     end
 
     def render_envelope(controller, message:, status:, code: nil, details: nil)
-      if controller.respond_to?(:render_error)
-        # errors: only when there are details — a host may document its
-        # render_error contract as `(message:, status:, code:)`, and an
-        # unconditional errors: kwarg would break those implementations.
+      public_host = controller.respond_to?(:render_error)
+      host = public_host ? host_method(controller) : private_host_method(controller)
+      if public_host || host
         kwargs = { message: message, code: code, status: status }
-        kwargs[:errors] = details if details
-        controller.render_error(**kwargs)
+        kwargs[:errors] = details if details && (host.nil? || takes_errors?(host))
+        host ? host.call(**kwargs) : controller.render_error(**kwargs)
       else
         error = { message: message }
         error[:code] = code if code
         error[:details] = details if details
-        controller.render(json: { success: false, error: error }, status: status)
+        # content_type: because `render json:` only supplies application/json
+        # when the response has none yet, and `respond_to` has already set the
+        # negotiated one (text/html for a browser form, or for `Accept: */*`
+        # with html listed first). Without it this JSON body goes out as HTML.
+        # A JSON type the response already carries (a registered
+        # application/vnd.api+json, say) is the host's choice and is kept.
+        options = { json: { success: false, error: error }, status: status }
+        options[:content_type] = "application/json" unless json_media_type?(response_media_type(controller))
+        controller.render(**options)
       end
+    end
+
+    # The media type (no parameters) the response already carries, or nil when
+    # it has none yet or the host has no response to ask.
+    def response_media_type(controller)
+      return nil unless controller.respond_to?(:response)
+
+      response = controller.response
+      return nil unless response
+
+      type = response.respond_to?(:media_type) ? response.media_type : response.content_type
+      return nil unless type
+
+      type.to_s.split(";").first.to_s.strip.downcase
+    end
+
+    def json_media_type?(type)
+      !type.nil? && (type == "application/json" || type.end_with?("+json"))
+    end
+
+    # The Method for the host's public render_error, or nil when the controller
+    # claims to respond (respond_to? is true) yet has no such method to
+    # inspect: one served by method_missing without respond_to_missing?.
+    # Master called it straight through with errors: included, and nil keeps
+    # doing exactly that rather than raising NameError out of the rescue_from
+    # handler.
+    def host_method(controller)
+      controller.method(:render_error)
+    rescue NameError
+      nil
+    end
+
+    # A private render_error is the usual spelling on an ApplicationController
+    # (a public method there is routable as an action in every subclass), so
+    # it is used too — but only when it is shaped like the documented keyword
+    # contract: a private `render_error(message, status)` helper written for
+    # something else was never consulted, and must not start turning every 422
+    # into a 500. Nil renders the inline shape.
+    def private_host_method(controller)
+      return nil unless controller.respond_to?(:render_error, true)
+
+      method = host_method(controller)
+      method if method && keyword_contract?(method.parameters)
+    end
+
+    # The keywords render_envelope may pass: message:, code: and status:
+    # always, errors: when the method takes it.
+    DELEGATED_KEYWORDS = %i[message code status errors].freeze
+
+    # Shaped like the documented contract: it takes message:, code: and
+    # status: (by name or through **), and requires nothing the gem does not
+    # pass — no positional argument, no keyword outside DELEGATED_KEYWORDS.
+    # `(message:, status:)` is a common private helper on an
+    # ApplicationController, and calling it with code: would raise.
+    def keyword_contract?(parameters)
+      return false if parameters.any? { |kind, _| kind == :req }
+
+      required = parameters.filter_map { |kind, name| name if kind == :keyreq }
+      return false unless (required - DELEGATED_KEYWORDS).empty?
+      return true if parameters.any? { |kind, _| kind == :keyrest }
+
+      (%i[message code status] - keyword_names(parameters)).empty?
+    end
+
+    # A rejection always carries details, so passing errors: whenever there
+    # are some passed it on every call — and a host documenting its contract
+    # as `(message:, status:, code:)`, which the README promises keeps
+    # working, raised ArgumentError out of the rescue_from handler: a 500 for
+    # every invalid request. errors: now goes only to a method that can take
+    # it: one naming it, taking **kwargs, or declaring no keywords at all
+    # (`*args`, which received it inside its trailing Hash before).
+    def takes_errors?(method)
+      parameters = method.parameters
+      return true if parameters.any? { |kind, _| kind == :keyrest }
+
+      names = keyword_names(parameters)
+      names.empty? || names.include?(:errors)
+    end
+
+    def keyword_names(parameters)
+      parameters.filter_map { |kind, name| name if %i[key keyreq].include?(kind) }
     end
 
     # Members are emitted in the order RFC 9457 documents them, so the wire

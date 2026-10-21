@@ -8,15 +8,23 @@ module Permittable
   #     its own `transform:` — see permittable_transform below for exactly
   #     which field that is and why. A SUB-FIELD's own transform: still
   #     runs, so what gets stored is what an equivalent request would
-  #     produce.
+  #     produce — for a default:, and, under a transforming array, only
+  #     where an array-level validate: reads its output. An example: is
+  #     read `as_sent`, which is what gets stored: no transform at any
+  #     depth, no sub-field default filled in and no array-level validate:.
+  #     When an array-level validate: exists somewhere in it, it is read
+  #     once more first, like a default, to VALIDATE it as a request would
+  #     be (see ContractBuilder, which decides). An example documents what a
+  #     client SENDS, so it must not be read through app code that reshapes
+  #     the value into what the action receives.
   #   * violations carry no `message:` — they become an ArgumentError for
   #     the contract's author, not a response for a client, and I18n may not
   #     be loaded yet.
   class AuthoredValues
     include Permittable
 
-    def self.read_array(field, value)
-      new.read_array(field, value)
+    def self.read_array(field, value, as_sent: false)
+      new.read_array(field, value, as_sent: as_sent)
     end
 
     def self.read_json(field, value)
@@ -28,9 +36,11 @@ module Permittable
     end
 
     # [value as a request would get it, violations]
-    def read_array(field, value)
+    def read_array(field, value, as_sent: false)
       violations = []
       @field = field
+      @as_sent = as_sent
+      @read_by_validate = fields_under_validate(field) if field[:transform]
       read = permittable_check_array(field, value, path: field[:name].to_s, unknown: :ignore, violations: violations)
       [read, violations]
     end
@@ -59,15 +69,65 @@ module Permittable
     # identical value silently diverge (and the exported OpenAPI default,
     # which reads this same value, documents one the server never produces).
     #
-    # When @field itself has a transform:, its result is discarded anyway
-    # (validate_array_authored_value! stores the value AS AUTHORED instead —
-    # see its comment), so nothing inside its subtree is worth reading
-    # transformed: suppressing every nested call too keeps that walk free of
-    # app code, exactly as a scalar default's cast-only check already is.
+    # When @field itself has a transform:, it never runs here either way and
+    # its result is discarded anyway (validate_array_authored_value! stores
+    # the value AS AUTHORED instead — see its comment). A sub-field's
+    # transform: output is another matter: a request runs it, then the
+    # array-level `validate:` on that result, and only then the array's own
+    # transform. So a `validate:` that reads `i[:tags].is_a?(Array)` must be
+    # handed the transformed `tags`, or a contract every request satisfies
+    # fails at class load. But a transform: is app code (`Account.find`), so
+    # under such an array it runs ONLY where its output is consumed: for a
+    # field below an array declaring `validate:` (the walked array counts),
+    # not merely somewhere in the same subtree, where a `validate:` on a
+    # sibling branch reads nothing of it. Without an own transform: of its
+    # own, @field's read is what gets stored, so every sub-field's runs.
+    #
+    # `as_sent` (the stored read of an example:) runs none, at any depth.
     def permittable_transform(field, value)
-      return value if @field[:transform] || field.equal?(@field)
+      return value if @as_sent || field.equal?(@field)
+      return value if @field[:transform] && !@read_by_validate.key?(field)
 
       super
+    end
+
+    # The fields below `field` whose output an array's `validate:` sees: all
+    # those under an array that declares one, counting `field` itself, by
+    # identity (the walker hands the very field hashes it was given).
+    def fields_under_validate(field, found = {}.compare_by_identity, under_validate: false)
+      under_validate ||= field[:kind] == :array && field[:validate]
+      Array(field[:fields]).each do |sub|
+        found[sub] = true if under_validate
+        fields_under_validate(sub, found, under_validate: under_validate)
+      end
+      found
+    end
+
+    # Nor does it run an array-level validate:, which expects the transformed
+    # sub-fields a request hands it. The validating read has already run it
+    # on exactly those, so the stored read, which would hand it the
+    # untransformed ones, must not (it could raise on a shape it never sees).
+    def permittable_array_validator(field)
+      super unless @as_sent
+    end
+
+    # What a client sends has no defaults filled in: an omitted sub-field
+    # stays omitted, at any depth, so the published example does not show a
+    # value (`cents: 0`) that no client sends. The walker fills them in; drop
+    # exactly what it filled, by the walker's own absence rule.
+    def permittable_check_hash(fields, hash, **)
+      result = super
+      return result unless @as_sent
+
+      fields.each do |field|
+        key = field[:name].to_s
+        next unless field.key?(:default)
+        next unless permittable_absent?(permittable_normalized(field, hash[key]), hash, key)
+        next if permittable_explicit_null?(field, hash, key)
+
+        result.delete(key)
+      end
+      result
     end
 
     def permittable_violation(_field, param, code)

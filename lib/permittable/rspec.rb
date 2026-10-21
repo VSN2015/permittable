@@ -96,7 +96,10 @@ module Permittable
       end
 
       def matching(regexp)
-        @expected[:format] = regexp
+        # `format: "email"` names a preset exactly as `format: :email` does
+        # (see resolve_format!), so the matcher reads a String the same way;
+        # as a Symbol it also reports the preset the same way in a failure.
+        @expected[:format] = regexp.is_a?(String) ? regexp.to_sym : regexp
         self
       end
 
@@ -364,8 +367,9 @@ module Permittable
         "expected the field to be #{expected}, but it is #{actual}" unless actual == expected
       end
 
-      # `matching(:email)` asserts the preset by name, `matching(/re/)` the
-      # Regexp itself.
+      # `matching(:email)` (or `matching("email")`, normalized to a Symbol by
+      # `matching`) asserts the preset by name, `matching(/re/)` the Regexp
+      # itself.
       def format_mismatch(field, expected)
         return option_mismatch(field, :format, expected) unless expected.is_a?(Symbol)
         return if field[:format_name] == expected
@@ -374,7 +378,21 @@ module Permittable
       end
 
       def default_mismatch(field, expected)
-        option_mismatch(field, :default, expected) unless field.key?(:default) && field[:default] == cast_default(field, expected)
+        option_mismatch(field, :default, expected) unless field.key?(:default) && same_default?(field, expected)
+      end
+
+      # A :json default is stored as authored, but the action reads it as
+      # a HashWithIndifferentAccess, String-keyed all the way down. The
+      # declaration's spelling, `with_default(theme: "dark")`, and the
+      # action's, `with_default("theme" => "dark")`, name the same default,
+      # so both sides are read that way before comparing.
+      def same_default?(field, expected)
+        declared = field[:default]
+        if field[:kind] == :json && declared.is_a?(Hash) && expected.is_a?(Hash)
+          ActiveSupport::HashWithIndifferentAccess.new(declared) == ActiveSupport::HashWithIndifferentAccess.new(expected)
+        else
+          declared == cast_default(field, expected)
+        end
       end
 
       # A contract stores its `default:` as the field reads it — cast,
@@ -494,8 +512,11 @@ module Permittable
         end
       end
 
+      # An anonymous controller class has no name, and a Contract instance
+      # never does, so the fallback names the kind of subject it is.
       def subject_name
-        (@subject.respond_to?(:name) && @subject.name) || "the controller"
+        (@subject.respond_to?(:name) && @subject.name) ||
+          (@subject.is_a?(Permittable::Contract) ? "the contract" : "the controller")
       end
 
       def path_label
@@ -627,13 +648,31 @@ module Permittable
           attr_accessor :params
         end
         mirror_contract_unknown_check(host) if @subject.is_a?(Permittable::Contract)
+        action = @action || rule[:actions].first || "call"
+        label_instrumentation(host, action)
         host.permittable_contracts = [rule.merge(mode: :enforce).freeze]
         instance = host.new
         instance.params = @params
-        action = @action || rule[:actions].first || "call"
         violations = instance.permittable_violations(action)
         result = violations.empty? ? instance.permitted_params(action) : nil
         [violations, result]
+      end
+
+      # A rejection instruments invalid_parameters.permittable exactly as a
+      # request would. The host is anonymous, so without this the payload
+      # carried controller: nil, action: nil — a subscriber following the
+      # README's shape (`payload[:controller].tr("/", ".")`) raised out of
+      # the matcher. Label it the way the subject itself would: a
+      # controller by its path (or name, or "the contract" when anonymous —
+      # an anonymous controller's controller_path is nil), a Contract as
+      # Contract#call does.
+      def label_instrumentation(host, action)
+        label = if @subject.is_a?(Permittable::Contract) then "Permittable::Contract"
+                elsif @subject.respond_to?(:controller_path) then @subject.controller_path || subject_name
+                else subject_name
+                end
+        host.define_method(:permittable_controller_name) { label }
+        host.define_method(:permittable_action_name) { action }
       end
 
       # Mirrors Permittable::Contract's own host override verbatim (see
@@ -677,8 +716,11 @@ module Permittable
         violations.map { |v| v[:code] ? "#{v[:param]} (#{v[:code]})" : v[:param] }.join(", ")
       end
 
+      # An anonymous controller class has no name, and a Contract instance
+      # never does, so the fallback names the kind of subject it is.
       def subject_name
-        (@subject.respond_to?(:name) && @subject.name) || "the contract"
+        (@subject.respond_to?(:name) && @subject.name) ||
+          (@subject.is_a?(Permittable::Contract) ? "the contract" : "the controller")
       end
 
       def action_label

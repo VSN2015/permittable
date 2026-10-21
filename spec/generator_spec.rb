@@ -101,6 +101,126 @@ RSpec.describe Permittable::Generator do
     end
   end
 
+  # Parentheses are optional in Ruby, and older controllers often leave them
+  # off. The scanner required them, so `permit :name, :email` matched
+  # nothing: the call vanished, its virtual keys with it, and the draft fell
+  # back to columns alone without a word.
+  describe ".scan of calls written without parentheses" do
+    it "reads a paren-less permit" do
+      scan = described_class.scan(<<~RUBY)
+        def user_params
+          params.require(:user).permit :name, :email, :password_confirmation
+        end
+      RUBY
+      expect([scan.calls, scan.root, scan.scalars]).to eq([1, :user, %i[name email password_confirmation]])
+
+      scan = described_class.scan("params.require(:user).permit :name if admin?")
+      expect(scan.scalars).to eq(%i[name])
+    end
+
+    it "follows a paren-less call across lines that end in a comma or sit inside brackets" do
+      scan = described_class.scan(<<~RUBY)
+        params.require(:user).permit :name,
+                                     tags: [],
+                                     address: [
+                                       :city,
+                                       :zip
+                                     ]
+        do_something_else(:not_a_field)
+      RUBY
+      expect(scan.scalars).to eq(%i[name])
+      expect(scan.arrays).to eq(%i[tags])
+      expect(scan.nested).to eq(address: %i[city zip])
+    end
+
+    it "ends a paren-less call at its line, even with a comment after it" do
+      scan = described_class.scan(<<~RUBY)
+        params.require(:user).permit :name # the display name
+        audit :not_a_field
+      RUBY
+      expect(scan.scalars).to eq(%i[name])
+    end
+
+    it "never reads a trailing modifier as an argument, or quotes it in a TODO" do
+      scan = described_class.scan("params.require(:user).permit if admin?")
+      expect([scan.calls, scan.unparsed]).to eq([0, []])
+      scan = described_class.scan(<<~RUBY)
+        params.require(:user).permit :name
+        params.require(:address).permit :city if admin?
+      RUBY
+      expect(scan.root).to eq(:user)
+      expect(scan.other_envelopes).to eq(address: ["params.require(:address).permit :city"])
+    end
+
+    it "reads a paren-less expect" do
+      scan = described_class.scan("params.expect user: [:name, :age]")
+      expect([scan.root, scan.scalars]).to eq([:user, %i[name age]])
+    end
+
+    it "still skips a paren-less call whose arguments hold a method call, rather than half-reading it" do
+      scan = described_class.scan("params.require(:user).permit :name, *policy(record).extra")
+      expect(scan.calls).to eq(0)
+    end
+  end
+
+  describe ".scan of a root spelled as a String" do
+    it "reads require(\"user\") and require('user') like require(:user)" do
+      scan = described_class.scan('params.require("user").permit(:name, :email)')
+      expect([scan.root, scan.scalars]).to eq([:user, %i[name email]])
+      expect(described_class.scan("params.require('user').permit :name").root).to eq(:user)
+      # Not a key a contract root can name: skipped, not guessed.
+      expect(described_class.scan('params.require("user name").permit(:name)').calls).to eq(0)
+    end
+  end
+
+  describe ".scan of a receiver that only ends in `params`" do
+    it "does not read user_params.permit as a rootless params.permit" do
+      scan = described_class.scan(<<~RUBY)
+        def user_params = params.require(:user)
+        def create_params = user_params.permit(:name, :email)
+      RUBY
+      expect(scan.calls).to eq(0)
+      expect(scan.scalars).to eq([])
+    end
+
+    it "keeps the root of the real call beside a helper that only ends in params" do
+      scan = described_class.scan(<<~RUBY)
+        def create_params = user_params.permit(:name, :email, :password_confirmation)
+        def user_params = params.require(:user).permit(:name, :email)
+      RUBY
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[name email])
+      expect(scan.calls).to eq(1)
+    end
+
+    it "does not read user_params.expect as a rootless params.expect" do
+      scan = described_class.scan("def create_params = user_params.expect(:name, :email)")
+      expect(scan.calls).to eq(0)
+      expect(scan.scalars).to eq([])
+    end
+
+    it "does not read an instance or global variable named like params" do
+      scan = described_class.scan("@params.permit(:name)\n$params.expect(:email)\n@user_params.permit(:age)")
+      expect(scan.calls).to eq(0)
+    end
+
+    it "reads @_params, the ivar Rails keeps the controller's params in, but not a lookalike" do
+      scan = described_class.scan("@_params.require(:user).permit(:name)\n@_params.expect(user: [:email])")
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[name email])
+      expect(scan.calls).to eq(2)
+
+      expect(described_class.scan("@@_params.permit(:a)\nx@_params.permit(:b)\n@my_params.permit(:c)").calls).to eq(0)
+    end
+
+    it "still reads params behind an explicit receiver or at the start of a line" do
+      scan = described_class.scan("self.params.require(:user).permit(:name)\n  params.expect(user: [:email])")
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[name email])
+      expect(scan.calls).to eq(2)
+    end
+  end
+
   describe ".scan of Rails 8 params.expect calls" do
     it "reads the required root envelope and its scalar keys" do
       scan = described_class.scan("params.expect(user: [:name, :age])")
@@ -308,19 +428,165 @@ RSpec.describe Permittable::Generator do
       expect(draft).not_to include("updated_at")
     end
 
-    it "skips every column of a composite primary key (Rails 7.1+ returns an Array)" do
-      composite = Class.new(TestModel) do
-        self.table_name = "gen_articles"
-
-        def self.primary_key
-          %w[id views]
+    # An auto-increment column is assigned wherever it sits in the key: MySQL
+    # allows `PRIMARY KEY (region, id)` with `id AUTO_INCREMENT`, and the
+    # adapter says so through `auto_increment?`. sqlite cannot declare that
+    # table (and older Rails' columns have no such flag), so the key is forced
+    # onto gen_articles and its `id` column answers as MySQL's would; the
+    # other part is the NOT NULL `title`.
+    context "when an auto-increment column is part of a composite primary key (Rails 7.1+ returns an Array)" do
+      before do
+        mysql_like = Class.new(SimpleDelegator) do
+          def auto_increment? = name == "id"
+          def respond_to_missing?(name, include_private = false) = name == :auto_increment? || super
         end
+        composite = Class.new(TestModel) do
+          self.table_name = "gen_articles"
+
+          def self.primary_key
+            %w[id title]
+          end
+        end
+        composite.define_singleton_method(:columns) { super().map { |column| mysql_like.new(column) } }
+        stub_const("GenCompositeArticle", composite)
       end
-      stub_const("GenCompositeArticle", composite)
-      draft = described_class.draft(model: GenCompositeArticle)
-      expect(draft).not_to include(":id")
-      expect(draft).not_to include(":views")
+
+      def create_rule(draft) = draft[/permit_params :create.*?^end/m]
+
+      it "leaves the auto-increment part out of the columns-only draft and requires the other part" do
+        draft = described_class.draft(model: GenCompositeArticle)
+        expect(draft).not_to include(":id")
+        expect(create_rule(draft)).to include("required :title, :string")
+      end
+
+      it "drafts the auto-increment part optional, never required, when the permit call lists it" do
+        scan = described_class.scan("params.require(:gen_composite_article).permit(:id, :title)")
+        draft = described_class.draft(model: GenCompositeArticle, scan: scan)
+        expect(create_rule(draft)).to include("optional :id, :integer", "required :title, :string")
+        expect(draft).not_to include("required :id")
+      end
+    end
+
+    # An adapter whose columns do not answer `auto_increment?` falls back to
+    # the integer of a single-column key.
+    it "falls back to the integer of a single-column key when the column has no auto_increment? flag" do
+      flagless = Class.new(SimpleDelegator) do
+        def respond_to_missing?(name, include_private = false) = name != :auto_increment? && super
+      end
+      model = Class.new(TestModel) { self.table_name = "gen_articles" }
+      model.define_singleton_method(:columns) { super().map { |column| flagless.new(column) } }
+      stub_const("GenFlaglessArticle", model)
+      expect(described_class.draft(model: GenFlaglessArticle)).not_to include(":id")
+    end
+
+    # The skip list is for columns drafted with nothing to say they are
+    # client input. A permit call that names one says so, and the column
+    # is as real as any other: typed from the schema, so the drift guard
+    # stays on.
+    context "when the permit call lists a primary key or a timestamp" do
+      let(:scan) { described_class.scan("params.require(:gen_article).permit(:id, :title, :created_at, :updated_at)") }
+      let(:draft) { described_class.draft(model: GenArticle, scan: scan) }
+
+      it "drafts them with their real types, not as virtual string fields" do
+        expect(draft).to include("optional :id, :integer")
+        expect(draft).to include("optional :created_at, :datetime")
+        expect(draft).to include("optional :updated_at, :datetime")
+        expect(draft).not_to include("virtual")
+        expect(draft).not_to include("not a database column")
+      end
+
+      it "drafts them optional although the columns are NOT NULL, since the database or Rails assigns them" do
+        expect(draft).to include("required :title, :string")
+        expect(draft.scan(/^\s*required :\w+/)).to eq(["  required :title"])
+      end
+
+      it "loads, and casts a timestamp a client sends as the column's type" do
+        enforced = draft.gsub("mode: :monitor", "mode: :enforce")
+        klass = permittable_class { class_eval(enforced) }
+        params = { gen_article: { title: "Hi", created_at: "2026-10-17T12:00:00Z" } }
+        permitted = controller(klass, params: params).permitted_params
+        expect(permitted["created_at"]).to respond_to(:year)
+      end
+
+      it "types every column of a composite primary key from the schema" do
+        composite = Class.new(TestModel) do
+          self.table_name = "gen_articles"
+
+          def self.primary_key
+            %w[id views]
+          end
+        end
+        stub_const("GenCompositeArticle", composite)
+        scan = described_class.scan("params.require(:gen_article).permit(:views, :title)")
+        draft = described_class.draft(model: GenCompositeArticle, scan: scan)
+        expect(draft).to include("optional :views, :integer")
+        expect(draft).not_to include("virtual")
+      end
+    end
+
+    # Only a key the database generates is assigned: a client has to send a
+    # natural key, and the column is NOT NULL with no default to say so.
+    context "when a primary key is the client's to send" do
+      before do
+        ActiveRecord::Schema.define do
+          create_table :gen_items, primary_key: :sku, id: :string do |t|
+            t.string :title, null: false
+          end
+          create_table :gen_order_lines, primary_key: %i[order_id pos] do |t|
+            t.integer :order_id, null: false
+            t.integer :pos, null: false
+            t.string :note
+          end
+          create_table :gen_tokens, id: :string, default: -> { "(lower(hex(randomblob(16))))" } do |t|
+            t.string :label
+          end
+        end
+        stub_const("GenItem", Class.new(TestModel) { self.table_name = "gen_items" })
+        stub_const("GenOrderLine", Class.new(TestModel) { self.table_name = "gen_order_lines" })
+        stub_const("GenToken", Class.new(TestModel) { self.table_name = "gen_tokens" })
+      end
+
+      after do
+        %i[gen_items gen_order_lines gen_tokens].each { |table| ActiveRecord::Base.connection.drop_table(table, if_exists: true) }
+      end
+
+      def create_rule(draft) = draft[/permit_params :create.*?^end/m]
+
+      it "drafts a natural string key the permit call lists as required on create" do
+        scan = described_class.scan("params.require(:gen_item).permit(:sku, :title)")
+        draft = described_class.draft(model: GenItem, scan: scan)
+        expect(create_rule(draft)).to include("required :sku, :string")
+        expect(draft[/permit_params :update.*?^end/m]).to include("optional :sku, :string")
+      end
+
+      it "drafts a natural string key as required when drafting from the columns alone" do
+        expect(create_rule(described_class.draft(model: GenItem))).to include("required :sku, :string")
+      end
+
+      it "drafts the parts of a composite key as required on create, not left out or optional" do
+        columns_only = described_class.draft(model: GenOrderLine)
+        expect(create_rule(columns_only)).to include("required :order_id, :integer", "required :pos, :integer")
+
+        scan = described_class.scan("params.require(:gen_order_line).permit(:order_id, :pos, :note)")
+        permitted = described_class.draft(model: GenOrderLine, scan: scan)
+        expect(create_rule(permitted)).to include("required :order_id, :integer", "required :pos, :integer")
+      end
+
+      it "still treats a key the database fills in (a default function) as assigned" do
+        expect(described_class.draft(model: GenToken)).not_to include(":id")
+
+        scan = described_class.scan("params.require(:gen_token).permit(:id, :label)")
+        draft = described_class.draft(model: GenToken, scan: scan)
+        expect(draft).to include("optional :id, :string")
+        expect(draft).not_to include("required")
+      end
+    end
+
+    it "still leaves the primary key and timestamps out when a scan names no field and the columns are drafted" do
+      scan = described_class.scan("params.require(:gen_article).permit(*PERMITTED)")
+      draft = described_class.draft(model: GenArticle, scan: scan)
       expect(draft).to include("required :title, :string")
+      expect(draft).not_to match(/:(id|created_at|updated_at)\b/)
     end
 
     it "maps a json column onto the opaque :json contract type" do
@@ -337,6 +603,53 @@ RSpec.describe Permittable::Generator do
 
       params = { gen_article: { title: "Hello", views: "3" } }
       expect(controller(klass, params: params).permitted_params).to eq("title" => "Hello", "views" => 3)
+    end
+  end
+
+  describe ".draft of nested attributes for a has_many" do
+    before do
+      ActiveRecord::Schema.define do
+        create_table(:gen_people) { |t| t.string :name }
+        create_table(:gen_addresses) do |t|
+          t.references :gen_person
+          t.string :city
+        end
+        create_table(:gen_profiles) do |t|
+          t.references :gen_person
+          t.string :bio
+        end
+      end
+      stub_const("GenAddress", Class.new(TestModel) { self.table_name = "gen_addresses" })
+      stub_const("GenProfile", Class.new(TestModel) { self.table_name = "gen_profiles" })
+      stub_const("GenPerson", Class.new(TestModel) do
+        self.table_name = "gen_people"
+        has_many :addresses, class_name: "GenAddress", foreign_key: :gen_person_id
+        has_one :profile, class_name: "GenProfile", foreign_key: :gen_person_id
+        accepts_nested_attributes_for :addresses, :profile
+      end)
+    end
+
+    after { %i[gen_people gen_addresses gen_profiles].each { |t| ActiveRecord::Base.connection.drop_table(t, if_exists: true) } }
+
+    let(:scan) do
+      described_class.scan("params.require(:gen_person).permit(:name, addresses_attributes: [:city], profile_attributes: [:bio])")
+    end
+
+    # fields_for sends a has_many's records as an index-keyed Hash, which a
+    # nested block read as unknown keys and silently dropped.
+    it "drafts a collection's nested attributes as an array, and a has_one's as a nested block" do
+      draft = described_class.draft(model: GenPerson, scan: scan)
+      expect(draft).to match(/^ +array :addresses_attributes do$/)
+      expect(draft).to match(/optional :profile_attributes do # TODO/)
+    end
+
+    it "produces a draft that keeps every record fields_for sends" do
+      source = described_class.draft(model: GenPerson, scan: scan)
+      klass = permittable_class { class_eval(source) }
+      sent = { gen_person: { name: "Jo", addresses_attributes: { "0" => { city: "Paris" }, "1" => { city: "Rome" } } } }
+      expect(controller(klass, params: sent).permittable_violations).to eq([])
+      expect(controller(klass, params: sent).permitted_params[:addresses_attributes])
+        .to eq([{ "city" => "Paris" }, { "city" => "Rome" }])
     end
   end
 
@@ -457,6 +770,26 @@ RSpec.describe Permittable::Generator do
         expect(draft).to match(
           /optional :status, .*; TODO: Rails also assigns the stored integers \(status: 1\).*GenOrder\.statuses\.values/
         )
+      end
+
+      # The TODO is advice to paste, so it has to survive the type guard and
+      # keep names intact: the obvious `key(v.to_i) || v` read "shipped" as
+      # 0 and handed the action "pending".
+      it "spells out a stored-integer recipe that loads under check_column_types and keeps names intact" do
+        expect(draft).to include("transform: ->(v) { GenOrder.statuses.key(Integer(v, exception: false)) || v }")
+        Permittable.check_column_types = true
+        klass = load_draft(<<~RUBY)
+          permit_params :update, root: :gen_order, model: GenOrder do
+            optional :status, :string, in: GenOrder.statuses.keys + GenOrder.statuses.values.map(&:to_s),
+                                       transform: ->(v) { GenOrder.statuses.key(Integer(v, exception: false)) || v }
+          end
+        RUBY
+        %w[1 shipped].each do |sent|
+          expect(controller(klass, params: { gen_order: { status: sent } }, action: "update").permitted_params)
+            .to eq("status" => "shipped"), "for #{sent}"
+        end
+      ensure
+        Permittable.check_column_types = false
       end
 
       it "leaves no stored-integer TODO on an enum whose stored values are strings" do
@@ -582,11 +915,20 @@ RSpec.describe Permittable::Generator do
         # Break reading two columns' defaults — an ordinary one and the
         # locking column — after the schema has loaded, so the error comes
         # from the introspection on top of it.
-        defaults = GenBrokenVehicle._default_attributes
-        allow(defaults).to receive(:[]).and_call_original
-        %w[name lock_version].each do |name|
-          allow(defaults).to receive(:[]).with(name).and_raise(ArgumentError, "misconfigured\nsecond line")
+        #
+        # Rails main freezes the model's attribute set, and rspec-mocks
+        # cannot proxy a frozen object, so the set is frozen here on every
+        # Rails line and the failure comes from a delegating stand-in that
+        # the model hands out in its place.
+        defaults = GenBrokenVehicle._default_attributes.freeze
+        broken = SimpleDelegator.new(defaults)
+        broken_names = %w[name lock_version]
+        broken.define_singleton_method(:[]) do |name|
+          raise ArgumentError, "misconfigured\nsecond line" if broken_names.include?(name)
+
+          defaults[name]
         end
+        allow(GenBrokenVehicle).to receive(:_default_attributes).and_return(broken)
       end
 
       let(:draft) { described_class.draft(model: GenBrokenVehicle) }
@@ -1220,6 +1562,78 @@ RSpec.describe Permittable::Generator do
     end
   end
 
+  # RuboCop's default Style/SymbolArray and Style/WordArray rewrite
+  # `[:name, :email]` into `%i[name email]`, and Rails reads the two alike.
+  describe ".scan of %i and %w word lists" do
+    it "reads `user: %i[name email]` as the user envelope, so the enforced draft accepts the form" do
+      scan = described_class.scan("params.expect(user: %i[name email])")
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[name email])
+      expect(scan.unparsed).to eq([])
+
+      enforced = described_class.draft(scan: scan).gsub("mode: :monitor", "mode: :enforce")
+      request = controller(permittable_class { class_eval(enforced) }, params: { user: { name: "Jo", email: "jo@x.io" } })
+      expect(request.permitted_params.to_h).to eq("name" => "Jo", "email" => "jo@x.io")
+    end
+
+    it "reads %I, %w and %W, over several lines, with any delimiter but a parenthesis" do
+      ["%I[name email]", "%w{name email}", "%W<name email>", "%i|name email|", "%i[\n  name\n  email\n]"].each do |list|
+        scan = described_class.scan("params.expect(user: #{list})")
+        expect([scan.root, scan.scalars, scan.unparsed]).to eq([:user, %i[name email], []]), list
+      end
+    end
+
+    it "reads a list given to permit, splatted or not, and as a nested hash's or an array's keys" do
+      scan = described_class.scan("params.require(:user).permit(%i[name], *%w[email], [:age], address: %i[city zip], tags: %i[])")
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[name email age])
+      expect(scan.nested).to eq(address: %i[city zip])
+      expect(scan.arrays).to eq(%i[tags])
+      expect(scan.unparsed).to eq([])
+    end
+
+    it "reads an empty word list as the array-of-scalars root `[]` is" do
+      scan = described_class.scan("params.expect(tag_names: %i[])")
+      expect(scan.root).to be_nil
+      expect(scan.arrays).to eq(%i[tag_names])
+    end
+
+    it "keeps the root when a word list sits beside other fields, and spells it into scalars" do
+      # Rails flattens `[%i[name email], :age]` to `[:name, :email, :age]`: a
+      # list is an array of hashes only when it is the outer list's one element.
+      ["[%i[name email], :age]", "[[:name, :email], :age]", "[:age, %w[name email]]"].each do |fields|
+        scan = described_class.scan("params.expect(user: #{fields})")
+        expect([scan.root, scan.scalars.sort, scan.unparsed]).to eq([:user, %i[age email name], []]), fields
+      end
+
+      scan = described_class.scan("params.expect(user: [%i[name email], :age])")
+      enforced = described_class.draft(scan: scan).gsub("mode: :monitor", "mode: :enforce")
+      request = controller(permittable_class { class_eval(enforced) }, params: { user: { name: "Jo", email: "jo@x.io", age: "3" } })
+      expect(request.permitted_params.to_h).to eq("name" => "Jo", "email" => "jo@x.io", "age" => "3")
+
+      scan = described_class.scan("params.expect(user: [%i[name email]])")
+      expect(scan.root).to be_nil
+      expect(scan.nested_arrays).to eq(user: %i[name email])
+    end
+
+    it "does not take a comma as a word list's delimiter, nor cut `%w,name email,` into pieces" do
+      scan = described_class.scan("params.require(:user).permit(:id, %w,name email,)")
+      expect(scan.root).to eq(:user)
+      expect(scan.scalars).to eq(%i[id])
+      expect(scan.unparsed).to eq(["%w,name email,"])
+    end
+
+    it "keeps the root of an envelope whose value it cannot read, with a TODO for the value" do
+      ["%i[first-name]", "%I[name \#{prefix}_email]", "permitted_keys"].each do |value|
+        scan = described_class.scan("params.expect(user: #{value})")
+        expect([scan.root, scan.unparsed]).to eq([:user, [value]]), value
+      end
+
+      draft = described_class.draft(scan: described_class.scan("params.expect(user: %i[name first-name])\nparams.permit(:page)"))
+      expect(draft).to include("# TODO: belongs to another envelope (user): user: %i[name first-name]")
+    end
+  end
+
   describe ".scan of a body shape beside an expect envelope" do
     it "says it is outside the envelope rather than calling it a route param" do
       draft = described_class.draft(scan: described_class.scan("params.expect(:id, post: [:title], tag_names: [])"))
@@ -1412,7 +1826,9 @@ RSpec.describe Permittable::Generator do
       "Post.find(params.expect(:id))\nparams.permit(:page)\nparams.expect(post: [:title])",
       "params.permit(:page)\nparams.expect(post: [:title], tag_names: [])",
       "params.require(:u).permit(:name, meta: [ , ], opts: [[ ]])",
-      "params.expect(u: [:name, meta: [[ ]]])"
+      "params.expect(u: [:name, meta: [[ ]]])",
+      "params.expect(post: %i[title body], items: [%i[sku]])",
+      "params.require(:u).permit(*%i[name], address: %w[city], tags: %i[], meta: %i[a-b])"
     ].each do |source|
       it "loads the draft of #{source.inspect}" do
         expect { load_draft(described_class.draft(scan: described_class.scan(source))) }.not_to raise_error
@@ -1448,6 +1864,16 @@ RSpec.describe Permittable::Generator do
       expect(draft).to include("root: :gen_post, model: GenPost")
       expect(draft).to include("required :title, :string")
       expect(draft).to include("optional :draft_token, :string, virtual: true")
+    end
+
+    it "keeps the model's root when the permit call is on a helper that only ends in params" do
+      controller = Class.new { def self.controller_name = "gen_posts" }
+      source = <<~RUBY
+        def post_params = params.require(:gen_post)
+        def create_params = post_params.permit(:title)
+      RUBY
+      draft = described_class.for_controller(controller, source: source)
+      expect(draft).to include("root: :gen_post, model: GenPost")
     end
 
     it "accepts an explicit model" do
@@ -1536,6 +1962,104 @@ RSpec.describe Permittable::Generator do
     it "reads Permittable.audit_ignore by default" do
       Permittable.audit_ignore = ["users"]
       expect(described_class.targets([users])).to eq({})
+    end
+
+    # A draft for an action the controller does not define guards nothing,
+    # and the audit lists it as stale. The audit's own reading of what a
+    # controller defines decides (see Audit.missing_action?), so a real
+    # ActionController is the thing to ask.
+    context "with controllers that do not define every drafted action" do
+      def real_controller(name, parent = ActionController::Base, &body)
+        stub_const(name, Class.new(parent, &body))
+      end
+
+      let(:both) do
+        real_controller("SweepPostsController") do
+          def create = head(:created)
+          def update = head(:ok)
+        end
+      end
+      let(:sessions) do
+        real_controller("SweepSessionsController") do
+          def create = head(:created)
+          def destroy = head(:no_content)
+        end
+      end
+      let(:webhooks) { real_controller("SweepWebhooksController") { def receive = head(:accepted) } }
+
+      it "drafts every action of a controller that defines them all" do
+        expect(described_class.targets([both], ignore: [], root: nil)).to eq(both => [])
+      end
+
+      it "leaves out a drafted action the controller does not define" do
+        expect(described_class.targets([sessions], ignore: [], root: nil)).to eq(sessions => [:update])
+      end
+
+      it "skips a controller that defines none of them" do
+        base = real_controller("SweepApplicationController") { include Permittable }
+        expect(described_class.targets([webhooks, base], ignore: [], root: nil)).to eq({})
+      end
+
+      it "counts an action a parent controller defines" do
+        child = real_controller("SweepChildSessionsController", sessions)
+        expect(described_class.targets([child], ignore: [], root: nil)).to eq(child => [:update])
+      end
+
+      it "takes every action as defined when the controller has an action_missing handler" do
+        catch_all = real_controller("SweepCatchAllController") { def action_missing(_name, *) = head(:ok) }
+        expect(described_class.targets([catch_all], ignore: [], root: nil)).to eq(catch_all => [])
+      end
+
+      it "takes both actions as defined when building the controller raises a ScriptError" do
+        # Audit.dispatchable? builds the controller and rescues only a
+        # StandardError, so this would otherwise end the whole sweep.
+        abstract = real_controller("SweepAbstractController") do
+          def initialize = raise(NotImplementedError, "subclass responsibility")
+          def create = head(:created)
+        end
+        expect(described_class.targets([abstract, sessions], ignore: [], root: nil)).to eq(abstract => [], sessions => [:update])
+        expect(described_class.undefined_actions(abstract)).to eq([])
+      end
+
+      it "adds an ignored action to the undefined ones" do
+        targets = described_class.targets([sessions], ignore: ["sweep_sessions#create"], root: nil)
+        expect(targets).to eq({})
+        targets = described_class.targets([both], ignore: ["sweep_posts#create"], root: nil)
+        expect(targets).to eq(both => [:create])
+      end
+    end
+  end
+
+  # A controller named to the task is drafted whole, even when covered or
+  # ignored — but not for an action it does not define, unless it defines
+  # neither: then the draft is the only thing the name could have asked for.
+  describe ".named_target" do
+    def real_controller(name, &body)
+      stub_const(name, Class.new(ActionController::Base, &body))
+    end
+
+    it "leaves out the one drafted action the controller does not define" do
+      sessions = real_controller("NamedSessionsController") do
+        def create = head(:created)
+      end
+      expect(described_class.named_target(sessions)).to eq([:update])
+    end
+
+    it "leaves nothing out when the controller defines both" do
+      both = real_controller("NamedBothController") do
+        def create = head(:created)
+        def update = head(:ok)
+      end
+      expect(described_class.named_target(both)).to eq([])
+    end
+
+    it "drafts both when the controller defines neither" do
+      webhooks = real_controller("NamedWebhooksController") { def receive = head(:accepted) }
+      expect(described_class.named_target(webhooks)).to eq([])
+    end
+
+    it "leaves nothing out of a controller that cannot list its actions" do
+      expect(described_class.named_target(Class.new(FakeController))).to eq([])
     end
   end
 end
