@@ -452,6 +452,35 @@ RSpec.describe "Permittable RSpec matchers" do
       .to include("relative to root: :user")
   end
 
+  it "takes an [n] index only where the runtime does: once, on an array field" do
+    shapes = Class.new(FakeController) do
+      include Permittable
+
+      permit_params(:create) do
+        optional :items do
+          required :sku, :string
+        end
+        optional :coupon, :string
+        optional :meta, :json
+        array :rows do
+          array :cells, of: :integer
+        end
+      end
+    end
+    {
+      "items[0].sku" => ":items is a nested hash, not an array",
+      "coupon[2]" => ":coupon is a :string field, not an array",
+      "meta[0].a" => ":meta is an opaque :json field, which takes a Hash, not an array",
+      "rows[0][0].cells" => ":rows is an array of hashes, not an array of arrays",
+      "rows[0].cells[0][1]" => "\"rows.cells\" is an array of :integer, not an array of arrays"
+    }.each do |path, reason|
+      expect(failure_of { expect(shapes).to permit_param(path) }).to include("but #{reason}")
+      expect(shapes).not_to permit_param(path)
+    end
+    expect(shapes).to permit_param("rows[0].cells[1]").as_array(of: :integer)
+    expect(shapes).to permit_param("meta.a[0][1].b")
+  end
+
   it "fails a root-prefixed path with a hint, instead of listing what is declared" do
     message = failure_of { expect(controller).to permit_param("user.email").for_action(:create) }
     expect(message).to include("paths are relative to root: :user")

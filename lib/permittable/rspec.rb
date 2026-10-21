@@ -151,7 +151,7 @@ module Permittable
         @subject = resolve_subject(subject)
         raise ArgumentError, negated_qualifier_message unless @expected.empty?
 
-        %i[undeclared too_deep].include?(locate)
+        %i[undeclared too_deep misindexed].include?(locate)
       end
 
       def failure_message
@@ -159,6 +159,7 @@ module Permittable
         case @status
         when :no_rule then "#{subject} it #{@problem}"
         when :root_prefixed then "#{subject} #{root_prefix_hint}"
+        when :misindexed then "#{subject} #{misindexed_reason}"
         when :too_deep
           "#{subject} it is deeper than the opaque :json field #{label_for(@opaque[:path])} allows " \
           "(max_depth: #{@opaque[:field][:max_depth]})"
@@ -205,18 +206,21 @@ module Permittable
       # The one lookup both directions share. Sets @status to :no_rule,
       # :declared, :opaque (the path runs into a :json field, which accepts
       # any nested key without declaring it), :too_deep (it runs into one
-      # deeper than its max_depth: allows), :root_prefixed (the path starts
-      # with the rule's root: and resolves without it), or :undeclared.
+      # deeper than its max_depth: allows), :misindexed (it puts an [n] on
+      # a field the runtime refuses an Array for, or a second one on an
+      # array), :root_prefixed (the path starts with the rule's root: and
+      # resolves without it), or :undeclared.
       # Every per-run ivar is reset first: a matcher object can be reused
       # on another subject, and must not answer from the previous run.
       def locate
-        @rule = @field = @opaque = @problem = @missing_among = nil
+        @rule = @field = @opaque = @misindexed = @problem = @missing_among = nil
         @mismatches = []
         @rule = resolve_rule(@subject)
         return @status = :no_rule unless @rule
 
         @field = resolve_field(@rule[:fields], @segments)
         @status = if @field then :declared
+                  elsif @misindexed then :misindexed
                   elsif @opaque then opaque_within_depth? ? :opaque : :too_deep
                   elsif root_prefixed? then :root_prefixed
                   else :undeclared
@@ -250,6 +254,7 @@ module Permittable
       # field is opaque: it has no :fields, yet lets any nested key through,
       # so a path running past one is recorded rather than called missing,
       # along with how many container levels the rest of the path needs.
+      # An [n] on a declared field is held to the field's shape on the way.
       def resolve_field(fields, segments, depth = 0)
         name = segments[depth][:name].to_sym
         field = fields.find { |f| f[:name] == name }
@@ -257,15 +262,42 @@ module Permittable
           @missing_among = fields
           return nil
         end
+        if segments[depth][:indexes] > index_levels(field)
+          @misindexed = { path: field_path(segments, depth), field: field }
+          return nil
+        end
         return field if depth == segments.length - 1
 
         if field[:kind] == :json
-          @opaque = { path: segments.take(depth + 1).map { |seg| seg[:name] }.join("."), field: field,
-                      steps: steps_below(segments, depth) }
+          @opaque = { path: field_path(segments, depth), field: field, steps: steps_below(segments, depth) }
           return nil
         end
 
         resolve_field(field[:fields] || [], segments, depth + 1)
+      end
+
+      def field_path(segments, depth)
+        segments.take(depth + 1).map { |seg| seg[:name] }.join(".")
+      end
+
+      # How many [n] the runtime takes on a field's own segment. An array
+      # is one level deep (`of:` a scalar type, or with a block of hashes;
+      # the DSL has no array of arrays), and every other field refuses an
+      # Array as invalid_type, a :json field included: it takes a Hash.
+      # Below a :json field the path is opaque, [n] and all.
+      def index_levels(field)
+        field[:kind] == :array ? 1 : 0
+      end
+
+      def misindexed_reason
+        field = @misindexed[:field]
+        label = label_for(@misindexed[:path])
+        case field[:kind]
+        when :array then "#{label} is an array of #{field[:fields] ? 'hashes' : ":#{field[:of]}"}, not an array of arrays"
+        when :nested then "#{label} is a nested hash, not an array"
+        when :json then "#{label} is an opaque :json field, which takes a Hash, not an array"
+        else "#{label} is a :#{field[:type]} field, not an array"
+        end
       end
 
       # Each key or [n] step past the :json field descends into one more
@@ -292,7 +324,7 @@ module Permittable
         missing_among = @missing_among
         found = resolve_field(@rule[:fields], @segments.drop(1)) || (@opaque && opaque_within_depth?)
         @missing_among = missing_among
-        @opaque = nil
+        @opaque = @misindexed = nil
         found ? true : false
       end
 
@@ -307,8 +339,10 @@ module Permittable
       end
 
       # Accepts the runtime's own path form too — violation details say
-      # "line_items[0].sku" — so a path copied from one resolves: the [n]
-      # indexes are dropped for the walk and kept only as depth.
+      # "line_items[0].sku" — so a path copied from one resolves. The [n]
+      # indexes are not walked: each must land on an array field (see
+      # index_levels), except below a :json field, where they count only
+      # as depth.
       def path_segments!(path)
         raws = path.split(".", -1)
         matches = raws.map { |raw| SEGMENT.match(raw) }
