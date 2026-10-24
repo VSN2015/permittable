@@ -142,6 +142,22 @@ module Permittable
       end
     end
 
+    # Every controller class a Rails route can reach, for the rake tasks:
+    # ActionController::Metal and everything below it. The tasks used to
+    # collect ActionController::Base and ::API descendants only, so a bare
+    # Metal controller — the usual shape of a lean webhook endpoint, and a
+    # host this gem supports — had no audit row, never counted against
+    # [strict], and its contracts were missing from the export. Base and API
+    # themselves are Metal descendants too; they are the framework's abstract
+    # bases, which no route names, and the old lists never held them.
+    # Anonymous classes cannot be routed to, so only named ones are kept.
+    def rails_controllers
+      return [] unless defined?(::ActionController::Metal)
+
+      frameworks = %w[ActionController::Base ActionController::API]
+      ::ActionController::Metal.descendants.uniq.select { |controller| controller.name && !frameworks.include?(controller.name) }
+    end
+
     # The root a controller's source must be inside to be audited:
     # Rails.root, unless Permittable.audit_ignore_outside_root is off — or nil
     # without Rails, where there is no app to be outside of.
