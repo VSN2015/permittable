@@ -295,7 +295,7 @@ RSpec.describe Permittable::OpenAPI do
         end
         patch = widgets_document(controller) { resources :widgets, only: :update }["paths"]["/widgets/{id}"]["patch"]
 
-        expect(patch["parameters"].first["schema"]).to eq("type" => "integer")
+        expect(patch["parameters"].first["schema"]).to eq("type" => "integer", "x-permittable-finite" => true)
         expect(patch).not_to have_key("requestBody")
       end
 
@@ -372,7 +372,8 @@ RSpec.describe Permittable::OpenAPI do
         %w[post patch].each { |verb| expect(paths[verb]["parameters"].first["schema"]).to eq("type" => "string") }
         expect(paths["get"]["parameters"].first["schema"]).to eq("type" => "string")
         body = ->(verb) { paths[verb]["requestBody"]["content"]["application/json"]["schema"] }
-        expect(body.call("post")["properties"]["id"]).to eq("type" => "array", "items" => { "type" => "integer" })
+        expect(body.call("post")["properties"]["id"])
+          .to eq("type" => "array", "items" => { "type" => "integer", "x-permittable-finite" => true })
         expect(body.call("patch")["properties"]["id"]["type"]).to eq("object")
         expect(paths["get"]["requestBody"]["content"]["application/json"]["schema"]["properties"]["id"])
           .to eq("type" => "object")
@@ -393,8 +394,8 @@ RSpec.describe Permittable::OpenAPI do
         paths = widgets_document(controller) { resources :widgets, only: %i[show update destroy] }["paths"]
         schema = ->(verb) { paths["/widgets/{id}"][verb]["parameters"].first["schema"] }
 
-        expect(schema.call("get")).to eq("type" => "integer")
-        expect(schema.call("patch")).to eq("type" => "integer")
+        expect(schema.call("get")).to eq("type" => "integer", "x-permittable-finite" => true)
+        expect(schema.call("patch")).to eq("type" => "integer", "x-permittable-finite" => true)
         expect(schema.call("delete")).to eq("type" => "string", "enum" => %w[a b], "description" => "Which one")
       end
 
