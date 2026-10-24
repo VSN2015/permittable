@@ -28,13 +28,23 @@ module Permittable
       date: :temporal, datetime: :temporal, time: :temporal, timestamp: :temporal, timestamptz: :temporal
     }.freeze
 
+    # The contract type an `array ..., of:` takes for a column element type,
+    # for the array-column hint. Only scalar element types: `of:` takes no
+    # other, so a jsonb[] column gets the hint without an `of:`.
+    ARRAY_ELEMENT_TYPES = {
+      string: :string, text: :string, citext: :string, uuid: :string,
+      integer: :integer, bigint: :integer, float: :float, decimal: :decimal, boolean: :boolean,
+      date: :date, datetime: :datetime, timestamp: :datetime, timestamptz: :datetime
+    }.freeze
+
     module_function
 
     # `types:` teaches the error message: a Symbol/String applies to every
     # listed field, a Hash maps field => type. The raised ArgumentError then
     # appends a ready-to-paste migration command. `allowed:` maps field =>
-    # its `in:`, for the fields that declare one; only the enum rule reads it.
-    def ensure_columns_on!(label, klass, *fields, types: nil, check_types: false, allowed: nil)
+    # its `in:`, for the fields that declare one, and `transformed:` lists
+    # the fields that declare a `transform:`; only the enum rule reads them.
+    def ensure_columns_on!(label, klass, *fields, types: nil, check_types: false, allowed: nil, transformed: nil)
       return false unless schema_reachable?(klass)
 
       fields.flatten.compact.each do |field|
@@ -44,7 +54,7 @@ module Permittable
                 "#{column_migration_hint(klass, field, types)}"
         end
 
-        ensure_column_type!(label, klass, field, types, allowed) if check_types
+        ensure_column_type!(label, klass, field, types, allowed, transformed: transformed) if check_types
       end
       true
     end
@@ -54,16 +64,21 @@ module Permittable
     # TYPE_GROUPS) and stays silent unless both sides are known, so it can
     # only fire on a genuine cross-family mismatch — a contract still saying
     # :datetime after the column became a string, say.
-    def ensure_column_type!(label, klass, field, types, allowed = nil)
+    def ensure_column_type!(label, klass, field, types, allowed = nil, transformed: nil)
       declared = types.is_a?(Hash) ? types[field.to_sym] : types
       column = klass.columns_hash[field.to_s]
       return unless declared && column
+
+      ensure_not_array_column!(label, klass, field, declared, column)
 
       wanted = TYPE_GROUPS[declared.to_sym]
       enum = enum_attribute?(klass, field)
       # Checked before the column's type, which an enum's contract does not
       # depend on: see ensure_enum_contract!.
-      return ensure_enum_contract!(label, klass, field, declared, allowed && allowed[field.to_sym]) if enum && wanted == :text
+      if enum && wanted == :text
+        return ensure_enum_contract!(label, klass, field, declared, allowed && allowed[field.to_sym],
+                                     transformed: Array(transformed).include?(field.to_sym))
+      end
 
       # `column.type` is nil for a SQL type the adapter does not recognise
       # (a PostGIS geometry column without the extension loaded, a custom
@@ -88,6 +103,24 @@ module Permittable
             "(table: #{klass.table_name}). #{fix}"
     end
 
+    # A PostgreSQL array column reports its ELEMENT type as `type`, so
+    # `optional :tags, :string` over `t.string :tags, array: true` sits in
+    # the same group as the column and the group check passes — yet the
+    # field rejects as invalid_type every array the column stores. Only a
+    # scalar or :json field reaches this guard (an `array` field is
+    # implicitly virtual), and neither accepts an Array, so any declaration
+    # over an array column is the wrong shape.
+    def ensure_not_array_column!(label, klass, field, declared, column)
+      return unless column.respond_to?(:array?) && column.array?
+
+      element = ARRAY_ELEMENT_TYPES[column.type&.to_sym]
+      spelled = element ? "array :#{field}, of: :#{element}" : "array :#{field}"
+      raise ArgumentError,
+            "#{label}: '#{field}' is declared :#{declared} but the column is an array#{" (of :#{column.type})" if column.type} " \
+            "(table: #{klass.table_name}), so every array it stores would be rejected as invalid_type. " \
+            "Declare it `#{spelled}`, or declare the field virtual: true if it is not backed by this column."
+    end
+
     # `model:` is only duck-typed on column_names, hence the respond_to?.
     def enum_attribute?(klass, field)
       klass.respond_to?(:defined_enums) && klass.defined_enums.key?(field.to_s)
@@ -107,25 +140,31 @@ module Permittable
     # Accepted means what the enum's cast accepts: every name, plus every
     # stored value that is a String (a string-backed enum takes `"p"` for
     # `pro:` as readily as `"pro"`). An integer-backed enum's stored values
-    # are not accepted — a request carries `"0"`, which maps to nothing. A
-    # Range, or anything else without a finite list, cannot be checked, so it
-    # is refused rather than trusted.
+    # are not accepted — a request carries `"0"`, which maps to nothing —
+    # unless the field declares a `transform:`, which runs after `in:` and is
+    # how permittable:generate's TODO maps them back to names. Only the stored
+    # integers are admitted that way; the transform is app code, trusted to
+    # do what the TODO spells. A Range, or anything else without a finite
+    # list, cannot be checked, so it is refused rather than trusted.
     #
     # Only `enum` is recognised. The attribute API (`attribute :x, :datetime`
     # over a string column) is left compared against the column by choice:
     # an enum's mapping says exactly which strings are valid, an attribute
     # override says nothing a contract could be checked against.
-    def ensure_enum_contract!(label, klass, field, declared, listed)
+    def ensure_enum_contract!(label, klass, field, declared, listed, transformed: false)
       problem =
         if listed.nil?
           "declared :#{declared} without an in:"
         elsif listed.is_a?(Range) || !listed.respond_to?(:to_a)
           "declared :#{declared} with an in: that does not list its values"
         else
-          stray = listed.to_a - enum_values(klass, field)
+          accepted = enum_values(klass, field)
+          accepted += stored_integers(klass, field) if transformed
+          stray = listed.to_a - accepted
           return if stray.empty?
 
-          "declared :#{declared} with an in: listing values it would refuse: #{stray.map(&:inspect).join(', ')}"
+          "declared :#{declared} with an in: listing values it would refuse: #{stray.map(&:inspect).join(', ')}" \
+            "#{stored_integer_hint(klass, field, stray, transformed)}"
         end
 
       raise ArgumentError,
@@ -137,6 +176,16 @@ module Permittable
     def enum_values(klass, field)
       mapping = klass.defined_enums[field.to_s]
       mapping.keys.map(&:to_s) + mapping.values.grep(String)
+    end
+
+    def stored_integers(klass, field)
+      klass.defined_enums[field.to_s].values.grep(Integer).map(&:to_s)
+    end
+
+    def stored_integer_hint(klass, field, stray, transformed)
+      return "" if transformed || !stray.intersect?(stored_integers(klass, field))
+
+      " (a stored integer is accepted only beside a transform: mapping it back to its name)"
     end
 
     # `Order.statuses.keys` when the enum's plural reader exists, and the

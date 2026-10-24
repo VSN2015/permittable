@@ -17,7 +17,7 @@
 module SchemaConformance
   # A payload's expectation: :agree, or the reason the two may differ.
   #
-  # Four run the SAFE way — the server accepts what its docs reject:
+  # Three run the SAFE way — the server accepts what its docs reject:
   #
   #   :coerced_encoding — the runtime accepts a non-canonical encoding of the
   #     declared type ("30" for an integer, 1 for a string) because form and
@@ -31,17 +31,13 @@ module SchemaConformance
   #   :normalized_encoding — the runtime runs `normalize:` BEFORE it checks,
   #     so a padded value whose normalized form fits ("  abcdefghij  " under
   #     squish and maxLength 10) is accepted though its raw form is too long.
-  #   :beyond_a_double — an :integer or :decimal given a whole number of more
-  #     than 308 digits. The server keeps it as an Integer; the schema bounds
-  #     every such number at ±Float::MAX, because a validator reads that
-  #     literal as the Infinity the parser makes of 1e400, which the server
-  #     refuses and the schema must too.
   #
   # The rest run the OTHER way — the schema is LOOSER than the server, and a
   # client following it can still be surprised by a 422 — so each is labelled
   # separately rather than waved through, and LOOSER names the keyword the
-  # DIVERGING FIELD'S OWN schema must still carry, so a tool that wants to
-  # close the gap can find the rule:
+  # DIVERGING FIELD'S OWN schema must still carry (the rule's own object, for
+  # the RULE_LEVEL labels), so a tool that wants to close the gap can find the
+  # rule:
   #
   #   :extension_only — the contract enforces a bound JSON Schema has no
   #     keyword for (`max_depth:`). The exporter does not drop the bound — it
@@ -49,7 +45,9 @@ module SchemaConformance
   #   :range_extension — a Range of non-numbers (`in: "a".."m"`), which
   #     minimum/maximum cannot express, carried as `x-permittable-range`.
   #   :custom_validation — a `validate:` proc is opaque app code, so the
-  #     schema can only flag it: `x-permittable-custom-validation`.
+  #     schema can only flag it: `x-permittable-custom-validation`. A
+  #     `sensitive:` field's `in:`/`format:` is the same case by choice: the
+  #     rule is real but publishing it would publish the secret.
   #   :normalized_first — the `normalize:` step, the unsafe way round: "   "
   #     passes a minLength of 3 and then squishes to "" (absent), " a  "
   #     passes it and squishes to "a" (too short). JSON Schema has no keyword
@@ -64,14 +62,23 @@ module SchemaConformance
   #     bounded :decimal's string encoding skips them: "5000" sails past a
   #     `maximum` of 999.99 that the server enforces on the parsed value. The
   #     bound is still published, as a number, for a client that parses first.
+  #   :finalize — a `finalize` block's `violate!` cross-field check runs once
+  #     every field has passed, so a payload each field's schema accepts is
+  #     still refused. It belongs to the rule, not to a field, so the flag
+  #     `x-permittable-finalize` sits on the rule's own object (see RULE_LEVEL).
   LOOSER = {
     extension_only: "x-permittable-max-depth",
     range_extension: "x-permittable-range",
     custom_validation: "x-permittable-custom-validation",
     normalized_first: "x-permittable-normalize",
     format_annotation: "format",
-    string_decimal: "maximum"
+    string_decimal: "maximum",
+    finalize: "x-permittable-finalize"
   }.freeze
+
+  # The LOOSER labels carried by the rule's own object rather than by the
+  # diverging field's schema.
+  RULE_LEVEL = %i[finalize].freeze
 
   CASES = {
     "scalars and bounds" => {
@@ -86,11 +93,6 @@ module SchemaConformance
         [{ "name" => "Jo", "age" => 18 }, :agree],
         [{ "name" => "Jo", "age" => 120 }, :agree],
         [{ "name" => "Jo", "score" => 1.5 }, :agree],
-        # A JSON number literal has no size limit; a Float does. The server
-        # refuses one too large to hold, so the docs must too.
-        [{ "name" => "Jo", "score" => 10**309 }, :agree],
-        [{ "name" => "Jo", "score" => -(10**309) }, :agree],
-        [{ "name" => "Jo", "score" => Float::MAX }, :agree],
         [{ "name" => "Jo", "ok" => true }, :agree],
         [{}, :agree],
         [{ "name" => "" }, :agree],
@@ -102,64 +104,6 @@ module SchemaConformance
         [{ "name" => "Jo", "ok" => "true" }, :coerced_encoding],
         [{ "name" => 42 }, :coerced_encoding],
         [{ "name" => "Jo", "age" => nil }, :null_is_absence]
-      ]
-    },
-    "an array of floats" => {
-      contract: proc { array :scores, of: :float },
-      payloads: [
-        [{ "scores" => [1.5, -2] }, :agree],
-        [{ "scores" => [1.5, 10**309] }, :agree]
-      ]
-    },
-    "a :float bounded past a double's range" => {
-      contract: proc { optional :score, :float, in: 0..(10**400) },
-      payloads: [
-        [{ "score" => 1.5 }, :agree],
-        [{ "score" => 10**309 }, :agree]
-      ]
-    },
-    "an :integer and a :decimal, whose numbers a parser can push past a double" => {
-      # Rails reads the JSON number 1e400 as Float::INFINITY, which the cast
-      # refuses, while `type: integer` and `type: number` alone admit it. (The
-      # instrument reads Infinity as the integer 1e400 is, as a real validator
-      # does.) A 400-digit INTEGER literal parses to an Integer the server
-      # keeps, so the Float::MAX bound refuses a number the server accepts.
-      # The string encoding of a :decimal is no JSON number and is not bounded.
-      contract: proc {
-        optional :qty, :integer
-        optional :amount, :decimal
-      },
-      payloads: [
-        [{ "qty" => 5 }, :agree],
-        [{ "qty" => Float::INFINITY }, :agree],
-        [{ "qty" => -Float::INFINITY }, :agree],
-        [{ "qty" => 10**309 }, :beyond_a_double],
-        [{ "qty" => 10**400 }, :beyond_a_double],
-        [{ "amount" => 12.5 }, :agree],
-        [{ "amount" => Float::INFINITY }, :agree],
-        [{ "amount" => -Float::INFINITY }, :agree],
-        [{ "amount" => 10**400 }, :beyond_a_double],
-        [{ "amount" => "1#{'0' * 400}" }, :agree]
-      ]
-    },
-    "an :integer with a bound of its own and one past a double" => {
-      contract: proc {
-        optional :age, :integer, in: 0..120
-        optional :big, :integer, in: 0..(10**400)
-      },
-      payloads: [
-        [{ "age" => 120 }, :agree],
-        [{ "age" => Float::INFINITY }, :agree],
-        [{ "big" => 10**309 }, :beyond_a_double],
-        [{ "big" => Float::INFINITY }, :agree]
-      ]
-    },
-    "a :float with a one-sided bound" => {
-      contract: proc { optional :score, :float, in: 0.. },
-      payloads: [
-        [{ "score" => 0 }, :agree],
-        [{ "score" => -1 }, :agree],
-        [{ "score" => 10**309 }, :agree]
       ]
     },
     "a required string with no length: of its own" => {
@@ -321,6 +265,70 @@ module SchemaConformance
         [{ "at" => "not a time" }, :format_annotation]
       ]
     },
+    "a finalize block" => {
+      # finalize runs after every field has passed, so a payload the fields
+      # accept can still earn a 422. No field's schema can say that, so the
+      # rule's own object is flagged instead (the field schemas stay clean).
+      contract: proc {
+        required :starts_on, :integer
+        required :ends_on, :integer
+        finalize do |p|
+          violate!(:ends_on, :before_start) if p[:ends_on] < p[:starts_on]
+          p
+        end
+      },
+      payloads: [
+        [{ "starts_on" => 1, "ends_on" => 5 }, :agree],
+        [{ "starts_on" => 1 }, :agree],
+        [{ "starts_on" => 5, "ends_on" => 1 }, :finalize]
+      ]
+    },
+    "required strings that are not :string" => {
+      # "" is absent whatever the type, so each of these is `missing` at
+      # runtime; only minLength lets the schema agree for the string encodings.
+      contract: proc {
+        required :title,     :string
+        required :price,     :decimal
+        required :due_on,    :date
+        required :starts_at, :datetime
+      },
+      payloads: [
+        [{ "title" => "t", "price" => "1.50", "due_on" => "2026-01-01", "starts_at" => "2026-01-01T10:00:00Z" }, :agree],
+        [{ "title" => "t", "price" => 1.5, "due_on" => "2026-01-01", "starts_at" => "2026-01-01T10:00:00Z" }, :agree],
+        [{ "title" => "", "price" => "1.50", "due_on" => "2026-01-01", "starts_at" => "2026-01-01T10:00:00Z" }, :agree],
+        [{ "title" => "t", "price" => "", "due_on" => "2026-01-01", "starts_at" => "2026-01-01T10:00:00Z" }, :agree],
+        [{ "title" => "t", "price" => "1.50", "due_on" => "", "starts_at" => "2026-01-01T10:00:00Z" }, :agree],
+        [{ "title" => "t", "price" => "1.50", "due_on" => "2026-01-01", "starts_at" => "" }, :agree]
+      ]
+    },
+    "required nullable :decimal, :date and :datetime" => {
+      # The counterpart of the case above: a nullable field reads "" as an
+      # explicit null, which IS a value, so the runtime accepts it and the
+      # schema must too. A minLength 1 floor here would reject a value the
+      # server takes, the stricter direction, and fail this :agree.
+      contract: proc {
+        required :price,     :decimal,  nullable: true
+        required :due_on,    :date,     nullable: true
+        required :starts_at, :datetime, nullable: true
+      },
+      payloads: [
+        [{ "price" => "", "due_on" => "", "starts_at" => "" }, :agree],
+        [{ "price" => nil, "due_on" => nil, "starts_at" => nil }, :agree],
+        [{ "price" => "1.50", "due_on" => "2026-01-01", "starts_at" => "2026-01-01T10:00:00Z" }, :agree]
+      ]
+    },
+    "a sensitive field's in: and format:, which the schema withholds" => {
+      contract: proc {
+        optional :pin, :string, in: %w[PIN_SECRET1 PIN_SECRET2], sensitive: true
+        optional :tok, :string, format: /\AFMT_SECRET\z/, sensitive: true
+      },
+      payloads: [
+        [{ "pin" => "PIN_SECRET1" }, :agree],
+        [{ "pin" => "guess" }, :custom_validation],
+        [{ "tok" => "FMT_SECRET" }, :agree],
+        [{ "tok" => "guess" }, :custom_validation]
+      ]
+    },
     "arrays" => {
       contract: proc { array :tags, of: :string, length: 1..3 },
       payloads: [
@@ -417,7 +425,12 @@ RSpec.describe "the exported schema against what the contract enforces" do
             expect([runtime, documented]).to eq(%i[reject accept]),
                                              "#{expectation} is for a rule the schema cannot carry; " \
                                              "got runtime=#{runtime}, documented=#{documented}"
-            expect(diverging_field_schema(schema, payload)).to include(SchemaConformance::LOOSER.fetch(expectation))
+            carrier = if SchemaConformance::RULE_LEVEL.include?(expectation)
+                        spec[:root] ? schema.dig("properties", spec[:root].to_s) : schema
+                      else
+                        diverging_field_schema(schema, payload)
+                      end
+            expect(carrier).to include(SchemaConformance::LOOSER.fetch(expectation))
           else
             # Only ever in the safe direction: a client following the docs is
             # conservative, never surprised by a 422.

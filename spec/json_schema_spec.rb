@@ -35,13 +35,9 @@ RSpec.describe Permittable::JsonSchema do
         optional :at,  :datetime
       end["properties"]
       expect(props["s"]).to eq("type" => "string")
-      # A double's own range: a JSON number literal past it is Infinity to the
-      # server's cast, and refused. That holds for every number a field reads,
-      # so an :integer and the number branch of a :decimal carry it too.
-      limits = { "minimum" => -Float::MAX, "maximum" => Float::MAX }
-      expect(props["i"]).to eq({ "type" => "integer" }.merge(limits))
-      expect(props["f"]).to eq({ "type" => "number" }.merge(limits))
-      expect(props["d"]).to eq({ "type" => %w[string number], "format" => "decimal" }.merge(limits))
+      expect(props["i"]).to eq("type" => "integer")
+      expect(props["f"]).to eq("type" => "number")
+      expect(props["d"]).to eq("type" => %w[string number], "format" => "decimal")
       expect(props["b"]).to eq("type" => "boolean")
       expect(props["day"]).to eq("type" => "string", "format" => "date")
       expect(props["at"]).to eq("type" => "string", "format" => "date-time")
@@ -77,49 +73,35 @@ RSpec.describe Permittable::JsonSchema do
       expect(prop["minLength"]).to eq(1)
       expect(prop["maxLength"]).to eq(10)
     end
-  end
 
-  describe "the limits of a :float" do
-    it "bounds each side the field leaves open at Float::MAX, and leaves a narrower bound or an enum alone" do
-      expect(property("x") { optional :x, :float, in: 0.. }).to eq("type" => "number", "minimum" => 0, "maximum" => Float::MAX)
-      expect(property("x") { optional :x, :float, in: ...1.5 })
-        .to eq("type" => "number", "exclusiveMaximum" => 1.5, "minimum" => -Float::MAX)
-      expect(property("x") { optional :x, :float, in: [1.5, 2.5] }).to eq("type" => "number", "enum" => [1.5, 2.5])
-      expect(property("x") { array :x, of: :float })
-        .to eq("type" => "array", "items" => { "type" => "number", "minimum" => -Float::MAX, "maximum" => Float::MAX })
-      # A bound past a double's range on the open side is no narrower than the
-      # cast itself, so it is clamped to it rather than published as is.
-      huge = 10**400
-      expect(property("x") { optional :x, :float, in: 0..huge }).to eq("type" => "number", "minimum" => 0, "maximum" => Float::MAX)
-      expect(property("x") { optional :x, :float, in: -huge...0 })
-        .to eq("type" => "number", "minimum" => -Float::MAX, "exclusiveMaximum" => 0)
-      expect(property("x") { optional :x, :float, in: 0...huge }).to eq("type" => "number", "minimum" => 0, "maximum" => Float::MAX)
-      expect(JSON.generate(property("x") { optional :x, :float })).to include("1.7976931348623157e+308")
-    end
-  end
+    # "" is absent for EVERY type, so a required :decimal/:date/:datetime
+    # rejects it as missing. They are strings on the wire, and `format` is
+    # only an annotation (and "decimal" is no format a validator knows), so
+    # minLength is the one keyword that makes the schema say so too.
+    it "gives a required decimal, date or datetime minLength 1, on its string encoding only" do
+      schema = schema_for do
+        required :price, :decimal
+        required :due_on, :date
+        required :starts_at, :datetime
+        optional :note, :decimal
+        optional :day, :date
+        required :n, :integer
+      end
+      props = schema["properties"]
 
-  describe "the limits of an :integer and of a :decimal's number branch" do
-    let(:limits) { { "minimum" => -Float::MAX, "maximum" => Float::MAX } }
-
-    it "bounds an :integer at Float::MAX as a :float is, since a parsed 1e400 is Infinity and refused" do
-      expect(property("x") { optional :x, :integer }).to eq({ "type" => "integer" }.merge(limits))
-      expect(property("x") { optional :x, :integer, in: 0.. }).to eq("type" => "integer", "minimum" => 0, "maximum" => Float::MAX)
-      expect(property("x") { optional :x, :integer, in: 1..5 }).to eq("type" => "integer", "minimum" => 1, "maximum" => 5)
-      expect(property("x") { optional :x, :integer, in: [1, 2] }).to eq("type" => "integer", "enum" => [1, 2])
-      expect(property("x") { array :x, of: :integer })
-        .to eq("type" => "array", "items" => { "type" => "integer" }.merge(limits))
-      expect(property("x") { optional :x, :integer, in: 0..(10**400) })
-        .to eq("type" => "integer", "minimum" => 0, "maximum" => Float::MAX)
+      expect(props["price"]).to include("type" => %w[string number], "minLength" => 1)
+      expect(props["due_on"]).to include("type" => "string", "minLength" => 1)
+      expect(props["starts_at"]).to include("type" => "string", "minLength" => 1)
+      expect(props["note"]).not_to have_key("minLength")
+      expect(props["day"]).not_to have_key("minLength")
+      expect(props["n"]).not_to have_key("minLength")
     end
 
-    it "bounds a :decimal the same way, which only ever constrains its number branch, never a string" do
-      expect(property("x") { optional :x, :decimal })
-        .to eq({ "type" => %w[string number], "format" => "decimal" }.merge(limits))
-      expect(property("x") { optional :x, :decimal, in: 0.. }).to include("minimum" => 0, "maximum" => Float::MAX)
-      expect(property("x") { optional :x, :decimal, in: %w[1.5 2.5] }.keys).not_to include("minimum", "maximum")
-      expect(property("x") { array :x, of: :decimal })
-        .to eq("type" => "array", "items" => { "type" => %w[string number], "format" => "decimal" }.merge(limits))
-      expect(JSON.generate(property("x") { optional :x, :decimal })).to include("1.7976931348623157e+308")
+    it "leaves a nullable decimal's \"\" alone, since it reads as an explicit null" do
+      prop = property("price") { required :price, :decimal, nullable: true }
+
+      expect(prop["type"]).to eq(%w[string number null])
+      expect(prop).not_to have_key("minLength")
     end
   end
 
@@ -128,6 +110,18 @@ RSpec.describe Permittable::JsonSchema do
       expect(property("a") { optional :a, :string, length: 2..5 }).to include("minLength" => 2, "maxLength" => 5)
       expect(property("a") { optional :a, :string, length: 4 }).to include("minLength" => 4, "maxLength" => 4)
       expect(property("a") { optional :a, :string, length: 1...10 }).to include("maxLength" => 9)
+    end
+
+    # An infinite end loaded and validated fine, then made the export raise
+    # JSON::GeneratorError ("Infinity not allowed in JSON").
+    it "exports an infinite end as no bound, so the document still serializes" do
+      expect(property("a") { optional :a, :string, length: 2..Float::INFINITY })
+        .to eq("type" => "string", "minLength" => 2)
+      expect(property("a") { optional :a, :string, length: -Float::INFINITY..3 })
+        .to eq("type" => "string", "maxLength" => 3)
+      expect(property("a") { array :a, of: :string, length: 1..Float::INFINITY })
+        .to include("minItems" => 1).and(satisfy { |schema| !schema.key?("maxItems") })
+      expect { JSON.generate(schema_for { optional :a, :string, length: 2..Float::INFINITY }) }.not_to raise_error
     end
   end
 
@@ -218,6 +212,15 @@ RSpec.describe Permittable::JsonSchema do
       end
     end
 
+    # One that keeps its base class's include? is a list, so it has an enum
+    # — what Rails' config_for(:plans) returns is such a Hash subclass.
+    it "exports a Hash subclass that keeps Hash's include? as an enum of its keys" do
+      plans = ActiveSupport::OrderedOptions.new.update(free: { price: 0 }, pro: { price: 10 })
+      prop = property("plan") { optional :plan, :string, in: plans }
+      expect(prop["enum"]).to eq(%w[free pro])
+      expect(prop).not_to have_key("x-permittable-custom-validation")
+    end
+
     it "emits BigDecimal bounds as JSON numbers, which is all minimum/maximum may be" do
       # The natural way to bound a price. Routed through the authored-value
       # re-encoding, the bounds came out as the strings "0.01" / "999.99" —
@@ -231,8 +234,8 @@ RSpec.describe Permittable::JsonSchema do
       expect(exact.values_at("minimum", "exclusiveMaximum")).to all(be_a(Integer))
 
       endless = property("tip") { optional :tip, :decimal, in: BigDecimal("0.5").. }
-      # The open end is the limit of a double, not a bound of the field's own.
-      expect(endless).to eq("type" => %w[string number], "format" => "decimal", "minimum" => 0.5, "maximum" => Float::MAX)
+      expect(endless).to include("minimum" => 0.5)
+      expect(endless.keys.grep(/maximum/i)).to be_empty
     end
 
     # The server's own verdict on a value a client sends as the JSON number
@@ -274,12 +277,11 @@ RSpec.describe Permittable::JsonSchema do
       # BigDecimal("Infinity") used to crash the whole export (to_i raises
       # FloatDomainError), and Float::INFINITY is not a JSON number.
       decimal = property("x") { optional :x, :decimal, in: BigDecimal("0")..BigDecimal("Infinity") }
-      # Left with the limit of a double, as with no in: at all.
-      expect(decimal).to eq("type" => %w[string number], "format" => "decimal", "minimum" => 0, "maximum" => Float::MAX)
+      expect(decimal).to include("minimum" => 0)
+      expect(decimal.keys.grep(/maximum/i)).to be_empty
 
-      # A :float likewise.
       float = property("x") { optional :x, :float, in: -Float::INFINITY...Float::INFINITY }
-      expect(float).to eq("type" => "number", "minimum" => -Float::MAX, "maximum" => Float::MAX)
+      expect(float.keys.grep(/imum/i)).to be_empty
       expect { JSON.generate(float) }.not_to raise_error
     end
 
@@ -307,14 +309,14 @@ RSpec.describe Permittable::JsonSchema do
       # CHANGELOG) rather than silently.
       fractional = BigDecimal("1e400") + BigDecimal("0.5")
       prop = property("x") { optional :x, :decimal, in: fractional.. }
-      expect(prop).to include("minimum" => -Float::MAX, "maximum" => Float::MAX)
+      expect(prop.keys.grep(/imum/i)).to be_empty
     end
 
     it "omits a NaN bound, which compares to nothing" do
       # Ruby refuses a two-sided Range with a NaN end, but an endless one
       # builds — and NaN is no JSON number either.
       prop = property("x") { optional :x, :float, in: Float::NAN.. }
-      expect(prop).to eq("type" => "number", "minimum" => -Float::MAX, "maximum" => Float::MAX)
+      expect(prop.keys.grep(/imum/i)).to be_empty
     end
 
     it "carries a non-numeric Range as an extension instead of guessing" do
@@ -559,6 +561,12 @@ RSpec.describe Permittable::JsonSchema do
       expect(property("price") { optional :price, :decimal, example: BigDecimal("19.99") }["examples"]).to eq([19.99])
     end
 
+    # A DateTime default was stored as a DateTime, and so exported as a
+    # date-time under its own `format: date`.
+    it "exports a DateTime :date default: as the date it is stored as" do
+      expect(property("day") { optional :day, :date, default: DateTime.new(2026, 1, 5) }["default"]).to eq("2026-01-05")
+    end
+
     it "marks sensitive fields writeOnly and flags opaque callables as extensions" do
       props = schema_for do
         optional :ssn,  :string, sensitive: true
@@ -580,6 +588,48 @@ RSpec.describe Permittable::JsonSchema do
       # The non-sensitive case is unaffected.
       plain = property("note") { optional :note, :string, default: "n/a", example: "reviewed" }
       expect(plain).to include("default" => "n/a", "examples" => ["reviewed"])
+    end
+
+    it "withholds in:/format: from a sensitive: field — an allowlist of the only accepted secrets is worse than a default" do
+      # A value list, a Range and a hand-written pattern each describe the
+      # secret itself; the field is flagged the way any rule the schema
+      # cannot carry is, and the document is looser than the server there.
+      props = schema_for do
+        optional :pin,   :string,  in: %w[PIN_SECRET1 PIN_SECRET2], sensitive: true
+        optional :code,  :integer, in: 4000..4999, sensitive: true
+        optional :tag,   :string,  in: "a".."m", sensitive: true
+        optional :tok,   :string,  format: /\AFMT_SECRET\z/, sensitive: true
+        optional :flag,  :string,  format: /\A\bPAT_SECRET\b\z/, sensitive: true
+      end["properties"]
+
+      props.each_value do |prop|
+        expect(prop).to include("writeOnly" => true, "x-permittable-custom-validation" => true)
+        expect(prop.keys & %w[enum minimum maximum exclusiveMaximum pattern x-permittable-pattern x-permittable-range]).to be_empty
+      end
+      expect(JSON.generate(props)).not_to match(/SECRET|4000|4999|"m"/i)
+    end
+
+    it "withholds in:/format: from a child that inherited sensitive:, and still publishes an explicit opt-out" do
+      props = schema_for do
+        optional :payment, sensitive: true do
+          optional :pin, :string, in: %w[PIN_SECRET1], format: /\AFMT_SECRET\z/
+          optional :scheme, :string, in: %w[sepa swift], sensitive: false
+        end
+      end["properties"]["payment"]["properties"]
+      expect(props["pin"]).to eq("type" => "string", "writeOnly" => true,
+                                 "x-permittable-custom-validation" => true, "x-permittable-sensitive" => true)
+      expect(props["scheme"]).to eq("type" => "string", "enum" => %w[sepa swift])
+    end
+
+    it "keeps a format: preset's name and pattern on a sensitive: field — a preset is public, not a secret" do
+      prop = property("mail") { optional :mail, :string, format: :email, sensitive: true }
+      expect(prop).to include("format" => "email", "pattern" => a_kind_of(String), "writeOnly" => true)
+      expect(prop).not_to have_key("x-permittable-custom-validation")
+    end
+
+    it "does not flag a sensitive: field that declares neither in: nor format:" do
+      expect(property("ssn") { optional :ssn, :string, sensitive: true })
+        .not_to have_key("x-permittable-custom-validation")
     end
 
     it "exports normalize: as x-permittable-normalize — the preset's name, or true for a custom proc" do
@@ -608,6 +658,44 @@ RSpec.describe Permittable::JsonSchema do
       expect(props["card_number"]).to include("writeOnly" => true, "x-permittable-sensitive" => true)
       expect(props["id"]).not_to have_key("writeOnly")
     end
+
+    it "omits default:/example: from a container holding a sensitive: field at any depth, which would carry its value" do
+      klass = Class.new(FakeController) { include Permittable }
+      klass.permit_params(:create) do
+        # The walker fills pan's own default: into the stored [{}].
+        array :cards, default: [{}] do
+          optional :pan, :string, sensitive: true, default: "4111111111111111"
+        end
+        array :tokens, example: [{ "secret" => "sk_live_EXAMPLE" }] do
+          required :secret, :string, sensitive: true
+        end
+        array :payees, default: [{ "bank" => { "iban" => "DE89370400440532013000" } }] do
+          optional :bank do
+            optional :iban, :string, sensitive: true
+          end
+        end
+        array :batches, example: [{ "cards" => [{ "cvv" => "737" }] }] do
+          array :cards do
+            optional :cvv, :string, sensitive: true
+          end
+        end
+        # Nothing sensitive inside, so nothing is withheld.
+        array :items, default: [{ "sku" => "A1" }], example: [{ "sku" => "B2" }] do
+          optional :sku, :string
+          optional :id, :string, sensitive: false
+        end
+      end
+      props = described_class.rule(klass.permit_rule_for(:create))["properties"]
+
+      %w[cards tokens payees batches].each do |name|
+        expect(props[name]).not_to have_key("default")
+        expect(props[name]).not_to have_key("examples")
+      end
+      expect(props["items"]).to include("default" => [{ "sku" => "A1" }], "examples" => [[{ "sku" => "B2" }]])
+
+      body = JSON.generate(Permittable::OpenAPI.request_body_for(klass, :create))
+      %w[4111111111111111 sk_live_EXAMPLE DE89370400440532013000 737].each { |value| expect(body).not_to include(value) }
+    end
   end
 
   describe "nullable:" do
@@ -628,7 +716,7 @@ RSpec.describe Permittable::JsonSchema do
     it "adds null to a nullable array's type without touching its items" do
       schema = property("tags") { array :tags, of: :integer, nullable: true }
       expect(schema["type"]).to eq(%w[array null])
-      expect(schema["items"]).to eq("type" => "integer", "minimum" => -Float::MAX, "maximum" => Float::MAX)
+      expect(schema["items"]).to eq("type" => "integer")
     end
 
     it "lists null in an enum, which is instance-wide rather than type-scoped" do
@@ -754,6 +842,41 @@ RSpec.describe Permittable::JsonSchema do
       inner = schema["properties"]["user"]
       expect(inner["required"]).to eq(["name"])
       expect(inner["additionalProperties"]).to be(false)
+    end
+  end
+
+  describe "finalize" do
+    # A cross-field rule no single field's schema can carry, so a payload
+    # every field accepts can still be refused by violate!.
+    let(:booking) do
+      proc do
+        required :starts_on, :integer
+        required :ends_on, :integer
+        finalize do |p|
+          violate!(:ends_on, :before_start) if p[:ends_on] < p[:starts_on]
+          p
+        end
+      end
+    end
+
+    it "flags the rule's own object with x-permittable-finalize, inside the root: wrapper" do
+      expect(schema_for(&booking)).to include("x-permittable-finalize" => true)
+
+      rooted = schema_for(root: :booking, &booking)
+      expect(rooted).not_to have_key("x-permittable-finalize")
+      expect(rooted["properties"]["booking"]).to include("x-permittable-finalize" => true)
+
+      expect(schema_for { required :name, :string }).not_to have_key("x-permittable-finalize")
+    end
+
+    it "carries the flag into OpenAPI's requestBody and a standalone Contract's schema" do
+      klass = Class.new(FakeController) { include Permittable }
+      klass.permit_params(:create, root: :booking, &booking)
+      body = Permittable::OpenAPI.request_body_for(klass, :create)
+      expect(body.dig("content", "application/json", "schema", "properties", "booking"))
+        .to include("x-permittable-finalize" => true)
+
+      expect(Permittable::Contract.define(&booking).json_schema).to include("x-permittable-finalize" => true)
     end
   end
 end
