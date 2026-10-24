@@ -4,25 +4,24 @@
 # summary goes to stderr.
 #
 #   bin/rails permittable:generate                      # every uncovered controller not
-#                                                       # left out by Permittable.audit_ignore
+#                                                       # left out by Permittable.audit_ignore,
+#                                                       # for the actions it defines
 #   bin/rails "permittable:generate[UsersController]"   # one controller, even if covered
 namespace :permittable do
   desc "Draft Permittable contracts from models and existing permit calls"
   task :generate, [:controller] => :environment do |_t, task_args|
     Rails.application.eager_load!
 
-    bases = []
-    bases << ActionController::Base if defined?(ActionController::Base)
-    bases << ActionController::API if defined?(ActionController::API)
-    controllers = bases.flat_map(&:descendants).uniq.select(&:name)
+    controllers = Permittable::Audit.rails_controllers
 
     # { controller => actions to leave out of its draft }. A named controller
-    # is drafted whole, even if covered or ignored; the sweep skips both, and
-    # leaves out what Permittable.audit_ignore names (see Generator.targets).
+    # is drafted even if covered or ignored; the sweep skips both, and leaves
+    # out what Permittable.audit_ignore names. Either leaves out an action the
+    # controller does not define (see Generator.targets and named_target).
     if task_args[:controller]
       controllers = controllers.select { |c| c.name == task_args[:controller] }
       abort "Permittable: no controller named #{task_args[:controller]} was found" if controllers.empty?
-      targets = controllers.to_h { |c| [c, []] }
+      targets = controllers.to_h { |c| [c, Permittable::Generator.named_target(c)] }
     else
       targets = Permittable::Generator.targets(controllers)
     end

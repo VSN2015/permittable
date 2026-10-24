@@ -152,6 +152,28 @@ RSpec.describe Permittable::Contract do
       expect { c.call!("caf\xC3" => 1) }.to raise_error(Permittable::InvalidParameters) { |e| expect(e.message).to be_valid_encoding }
     end
 
+    # The controller path converts params deeply through to_unsafe_h. A
+    # service object handed a slice of them — `CreateUser.call(user:
+    # params[:user])` — passed a plain Hash holding Parameters, which no
+    # Hash check recognised: a 400 for a root, 422 for a nested block.
+    it "reads ActionController::Parameters nested inside a plain Hash, as the controller path does" do
+      params = ActionController::Parameters.new(
+        user: { email: "a@b.co", age: "30" },
+        address: { city: "Hanoi" }, meta: { a: 1 }, items: [{ sku: "x" }]
+      )
+      expect(contract.call(user: params[:user]).params.to_h).to eq("email" => "a@b.co", "age" => 30, "plan" => "free")
+
+      rootless = described_class.define do
+        required(:address) { required :city, :string }
+        optional :meta, :json
+        array(:items) { required :sku, :string }
+      end
+      result = rootless.call(address: params[:address], meta: params[:meta], items: params[:items])
+      expect(result.violations).to eq([])
+      expect(result.params.to_h).to eq("address" => { "city" => "Hanoi" }, "meta" => { "a" => 1 }, "items" => [{ "sku" => "x" }])
+      expect(result.params[:meta]).not_to be_a(ActionController::Parameters)
+    end
+
     it "stays enforce-semantics even when the app-wide mode is monitor" do
       Permittable.mode = :monitor
       begin
@@ -160,6 +182,62 @@ RSpec.describe Permittable::Contract do
         expect(result.params).to be_nil
       ensure
         Permittable.mode = :enforce
+      end
+    end
+
+    # A contract is handed a Hash by a job, a service or a CSV row, and a
+    # Numeric there is not always an Integer or a Float. Whatever it is, the
+    # answer is a value or an invalid_type violation: an exception out of
+    # #call is a 500 where a 422 is due. A controller never receives these (a
+    # request body has no Complex), so this is the standalone surface only.
+    describe "an exotic Numeric, for every scalar type" do
+      # Foreign code: a Numeric subclass is free to make any conversion fail.
+      let(:hostile) do
+        Class.new(Numeric) do
+          %i[to_f to_i to_s zero?].each { |name| define_method(name) { |*| raise "no #{name}" } }
+        end.new
+      end
+      # Prints fine, but cannot become a Float.
+      let(:no_float) do
+        Class.new(Numeric) do
+          def to_f = raise("no to_f")
+          def to_s(*) = "7"
+        end.new
+      end
+
+      # Complex(1, 0) is a :float / :integer / :decimal violation for the same
+      # reason as Complex(1, 1): it is not a real number, and "1+0i" is not how
+      # any of the three is spelled. A :boolean takes it as `1 == Complex(1, 0)`
+      # does, like 1.0 and Rational(1), so that cell is not pinned here.
+      {
+        integer: { complex: :invalid, real_complex: :invalid, hostile: :invalid, no_float: :invalid },
+        float: { complex: :invalid, real_complex: :invalid, hostile: :invalid, no_float: :invalid },
+        decimal: { complex: :invalid, real_complex: :invalid, hostile: :invalid, no_float: BigDecimal("7") },
+        boolean: { complex: :invalid, real_complex: :any, hostile: :invalid, no_float: :invalid },
+        date: { complex: :invalid, real_complex: :invalid, hostile: :invalid, no_float: :invalid },
+        datetime: { complex: :invalid, real_complex: :invalid, hostile: :invalid, no_float: :invalid },
+        # A Numeric is stringified, so a Complex is a String; one that cannot
+        # print is not.
+        string: { complex: "1+1i", real_complex: "1+0i", hostile: :invalid, no_float: "7" }
+      }.each do |type, expectations|
+        expectations.each do |name, expected|
+          it "answers a #{name} input to #{type} with a value or a violation, never an exception" do
+            input = { complex: Complex(1, 1), real_complex: Complex(1, 0), hostile: hostile, no_float: no_float }.fetch(name)
+            result = nil
+            expect { result = described_class.define { optional :x, type }.call(x: input) }.not_to raise_error
+
+            case expected
+            when :invalid then expect(result.violations).to eq([{ param: "x", code: "invalid_type" }])
+            when :any then nil
+            else expect(result.params["x"]).to eq(expected)
+            end
+          end
+        end
+      end
+
+      it "rejects a Complex whose imaginary part is a float zero, which Complex#to_f also refuses" do
+        expect(described_class.define { optional :x, :float }.call(x: Complex(1, 0.0)).violations)
+          .to eq([{ param: "x", code: "invalid_type" }])
       end
     end
   end
@@ -209,6 +287,22 @@ RSpec.describe Permittable::Contract do
     end
     expect(events.length).to eq(1)
     expect(events.first[:details]).to eq([{ param: "user.email", code: "format" }])
+  end
+
+  it "labels the violation event with the Contract and the \"call\" action, never nil" do
+    # README: payload[:action] is a String. A Contract has no action_name, so
+    # without a label here a subscriber doing payload[:action].to_sym or
+    # "#{payload[:controller]}##{payload[:action]}" got nil.
+    events = []
+    subscription = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
+      events << payload.slice(:controller, :action, :mode)
+    end
+    begin
+      contract.call(user: { email: "nope" })
+    ensure
+      ActiveSupport::Notifications.unsubscribe(subscription)
+    end
+    expect(events).to eq([{ controller: "Permittable::Contract", action: "call", mode: :enforce }])
   end
 
   describe "without Rails loaded" do
@@ -273,6 +367,25 @@ RSpec.describe Permittable::Contract do
       )
     end
 
+    it "reads a :datetime before 1582 as the day it names, whatever the host has loaded" do
+      # ISO 8601 dates are proleptic Gregorian, like Time. DateTime.parse
+      # defaults to the 1582 Italian reform and reads an earlier date as
+      # Julian; stdlib's DateTime#to_time then converts by day number, so
+      # "1500-01-01" became 1500-01-10. ActiveSupport's DateTime#to_time
+      # converts by component instead, so a Rails app kept the day: the
+      # result depended on what the host had loaded. Only a clean process
+      # can see the stdlib half.
+      script = <<~RUBY
+        require "permittable"
+        contract = Permittable::Contract.define { required :at, :datetime }
+        print contract.call!(at: "1500-01-01T12:00:00+02:00")[:at].strftime("%F %T %Z")
+      RUBY
+      lib = File.expand_path("../lib", __dir__)
+      out, err, status = Open3.capture3(RbConfig.ruby, "-I", lib, "-e", script)
+      expect(status).to be_success, err
+      expect(out).to eq("1500-01-01 10:00:00 UTC")
+    end
+
     it "does not rewrite the caller's own Time while normalising it to UTC" do
       moment = Time.new(2026, 9, 5, 17, 30, 0, "+07:00")
       result = described_class.define { required :at, :datetime }.call!(at: moment)
@@ -291,6 +404,51 @@ RSpec.describe Permittable::Contract do
       expect(result[:at]).to eq(Time.utc(2026, 9, 5, 10, 30))
       expect(result[:at].utc?).to be(true)
       expect(result[:at]).not_to be(moment.utc)
+    end
+  end
+
+  describe "unknown: :log" do
+    let(:logged) do
+      described_class.define(unknown: :log) { required :name, :string }
+    end
+
+    it "warns through Rails.logger, read when the contract is called rather than when it is defined" do
+      lines = []
+      logger = Object.new
+      logger.define_singleton_method(:warn) { |message| lines << message }
+      stub_const("Rails", Module.new)
+      contract = logged
+      # Rails.logger is often assigned after the contracts' constants load.
+      Rails.define_singleton_method(:logger) { logger }
+
+      result = contract.call(name: "x", rogue: 1, "other" => 2)
+
+      expect(result.params.to_h).to eq("name" => "x")
+      expect(lines.length).to eq(1)
+      expect(lines.first).to match(/unknown parameter\(s\) ignored by the .*contract: rogue, other/)
+    end
+
+    it "still warns, on $stderr, when there is no Rails.logger to warn through" do
+      # A webhook payload or a CSV row in a plain Ruby script has no Rails at
+      # all; :log must not quietly behave like :ignore there.
+      hide_const("Rails")
+
+      expect { logged.call(name: "x", rogue: 1) }
+        .to output(/unknown parameter\(s\) ignored by the .*contract: rogue/).to_stderr
+    end
+
+    it "writes to whatever $stderr is at each call, not the one from the first call" do
+      hide_const("Rails")
+      contract = logged
+
+      expect { contract.call(name: "x", rogue: 1) }.to output(/rogue/).to_stderr
+      expect { contract.call(name: "x", other: 1) }.to output(/other/).to_stderr
+    end
+
+    it "stays quiet when nothing is undeclared" do
+      hide_const("Rails")
+
+      expect { logged.call(name: "x") }.not_to output.to_stderr
     end
   end
 end

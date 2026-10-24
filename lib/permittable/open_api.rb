@@ -188,7 +188,9 @@ module Permittable
       operation = {}
       key = controller_key(controller)
       operation["operationId"] = "#{key.tr('/', '_')}_#{action}" if key && action != "*"
-      operation["description"] = rule[:desc] if rule[:desc]
+      # dup: the stored desc is frozen, and a caller editing the generated
+      # document in place must neither raise nor reach the contract.
+      operation["description"] = rule[:desc].dup if rule[:desc]
       operation["requestBody"] = rule_request_body(rule)
       operation["responses"] = responses_for(rule)
       # The docs must not promise a 422 the server doesn't yet send. Only
@@ -196,6 +198,12 @@ module Permittable
       # Permittable.mode is runtime configuration the export can't see.
       operation["x-permittable-mode"] = "monitor" if rule[:mode] == :monitor
       operation["x-permittable-catch-all"] = true if action == "*"
+      # `finalize` is flagged on the rule's object schema too (see
+      # JsonSchema.rule), but that sits inside the requestBody, and an
+      # operation can end up with no body (every field a path variable) while
+      # finalize still refuses requests. The operation is the one object that
+      # is always there, so the marker rides on it as well.
+      operation["x-permittable-finalize"] = true if rule[:finalize]
       operation
     end
 
@@ -249,14 +257,25 @@ module Permittable
     # once — not counted as an operation colliding with itself. `template`
     # is the route's own spelling when collapse_shapes placed it under
     # another route's, nil otherwise.
+    #
+    # Only OpenAPI's own verbs name a slot. Rails routes any verb in
+    # ActionDispatch::Request::HTTP_METHODS — `via: :report`, `:mkcalendar`,
+    # `:search` and the rest of WebDAV and CalDAV — but a Path Item has fields
+    # for eight, and any other key makes the whole document invalid. A route
+    # on such a verb places nothing; an operation reached by no other route
+    # lands under x-permittable-controllers, as an unrouted one does.
     def route_targets(routes)
       return {} if routes.nil?
 
-      routes.group_by { |route| [route[:controller].to_s, route[:action].to_s] }
+      routes.select { |route| OPENAPI_VERBS.include?(verb_of(route)) }
+            .group_by { |route| [route[:controller].to_s, route[:action].to_s] }
             .transform_values do |matching|
               matching.map { |route| [route[:path], verb_of(route), route[:template]] }.uniq
             end
     end
+
+    # The fixed fields of an OpenAPI 3.1 Path Item that hold an operation.
+    OPENAPI_VERBS = %w[get put post delete options head patch trace].freeze
 
     # OpenAPI forbids two path templates that differ only in their variable
     # names: `/{locale}` and `/{slug}` are one path to it. rails_routes keeps
@@ -732,6 +751,14 @@ module Permittable
     # named in its shadows rather than emitted. Distinct shapes are both
     # kept; OpenAPI allows `/x/new` beside `/x/{a}`.
     #
+    # Before any of that, a variant that is no request path of its own is
+    # dropped (request_path?). An absent group at the start of a route
+    # leaves them: `/(:locale)(/:theme)` without :locale is `//{theme}`,
+    # but Rails squeezes `GET //dark` to `GET /dark`, which binds :locale
+    # (or, constrained away from it, no route at all); and
+    # `(/:locale(/:region))` with nothing present is empty, so the route
+    # does not answer `GET /`.
+    #
     # The list is then reversed, which puts every group's ABSENT variant
     # first at every nesting level, the order the document lists them in.
     # The variants of one route share an operation, and it is the operationId
@@ -756,6 +783,8 @@ module Permittable
 
       kept = {}
       first_of_shape = {}
+      # Such a variant matches no request, so it shadows nothing either.
+      variants = variants.select { |tokens| request_path?(tokens) }
       variants.each_with_index do |tokens, index|
         next if variants.take(index).any? { |earlier| shadowed?(earlier, tokens) }
 
@@ -849,6 +878,16 @@ module Permittable
     def render(tokens)
       path = tokens.map { |token| token.is_a?(Param) ? "{#{token.name}}" : token }.join
       path.empty? ? "/" : path
+    end
+
+    # Whether a variant could be a request's path. Rails normalizes the
+    # path before it matches any route (Journey::Router::Utils.
+    # normalize_path, from 6.1 to 8.1): it is given a leading "/", and every
+    # run of slashes is squeezed to one. So a variant that does not start
+    # with "/", or that holds two in a row, is matched by no request: the
+    # URL a client would build from it reaches the router as another path.
+    def request_path?(tokens)
+      tokens.first == "/" && tokens.each_cons(2).none? { |pair| pair == %w[/ /] }
     end
 
     # Whether Rails, trying `earlier` first, leaves `later` no URL: wherever

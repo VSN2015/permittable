@@ -67,6 +67,58 @@ RSpec.describe Permittable::OpenAPI do
       expect(operation["responses"].keys).to eq(%w[400 422])
     end
 
+    # The same class of leak #76, #78 and #79 closed for other authored values:
+    # the contract keeps a frozen copy, and every export hands out a fresh,
+    # editable String, so post-processing a generated document in place
+    # (" (deprecated)", a gsub! for localisation) works and leaks nowhere.
+    describe "desc:" do
+      let(:rule_desc) { +"Register a user" }
+      let(:field_descs) do
+        { name: +"Display name", address: +"Where they live", tags: +"Labels", meta: +"Free-form" }
+      end
+      let(:klass) do
+        rule_desc = self.rule_desc
+        descs = field_descs
+        controller_class do
+          permit_params(:create, desc: rule_desc) do
+            required :name, :string, desc: descs[:name]
+            optional(:address, desc: descs[:address]) { required :zip, :string, desc: +"Postcode" }
+            array :tags, of: :string, desc: descs[:tags]
+            optional :meta, :json, desc: descs[:meta]
+          end
+        end
+      end
+
+      def exported_descriptions
+        operation = described_class.operations_for(klass)["create"]
+        properties = Permittable::JsonSchema.rule(klass.permit_rule_for(:create))["properties"]
+        [operation["description"], *properties.values.map { |schema| schema["description"] },
+         properties.dig("address", "properties", "zip", "description")]
+      end
+
+      it "exports editable descriptions, on the operation and on every field kind" do
+        expect(exported_descriptions.map(&:frozen?)).to all(be(false))
+        expect { exported_descriptions.each { |text| text << " (deprecated)" } }.not_to raise_error
+        expect { exported_descriptions.each { |text| text.gsub!("e", "E") } }.not_to raise_error
+      end
+
+      it "leaves later exports and the stored rule unchanged after an in-place edit" do
+        exported_descriptions.each { |text| text << " (deprecated)" }
+        expect(exported_descriptions).to eq(["Register a user", "Display name", "Where they live", "Labels",
+                                             "Free-form", "Postcode"])
+        rule = klass.permit_rule_for(:create)
+        stored = [rule[:desc], *rule[:fields].map { |f| f[:desc] }]
+        expect(stored).to eq(["Register a user", "Display name", "Where they live", "Labels", "Free-form"])
+        expect(stored.map(&:frozen?)).to all(be(true))
+      end
+
+      it "leaves the host's own Strings as it passed them" do
+        klass
+        expect([rule_desc, *field_descs.values].map(&:frozen?)).to all(be(false))
+        expect(rule_desc).to eq("Register a user")
+      end
+    end
+
     it "omits the 400 response for rootless contracts (only a missing root renders 400)" do
       klass = controller_class { permit_params(:index) { optional :page, :integer } }
       expect(described_class.operations_for(klass)["index"]["responses"].keys).to eq(["422"])
@@ -78,6 +130,22 @@ RSpec.describe Permittable::OpenAPI do
 
       enforced = controller_class { permit_params(:create) { required :name, :string } }
       expect(described_class.operations_for(enforced)["create"]).not_to have_key("x-permittable-mode")
+    end
+
+    # The rule's object schema carries the flag too, but a requestBody can be
+    # absent (an operation whose only fields are path variables), and the
+    # operation is what is always there.
+    it "flags a rule's finalize on the operation itself, so the marker outlives its requestBody" do
+      klass = controller_class do
+        permit_params(:create, root: :user) do
+          required :name, :string
+          finalize { |p| p }
+        end
+        permit_params(:update) { required :name, :string }
+      end
+      operations = described_class.operations_for(klass)
+      expect(operations["create"]["x-permittable-finalize"]).to be(true)
+      expect(operations["update"]).not_to have_key("x-permittable-finalize")
     end
 
     it "resolves each action through permit_rule_for, so the last matching rule wins" do
@@ -126,6 +194,28 @@ RSpec.describe Permittable::OpenAPI do
       expect(doc["paths"]["/users"]["post"]["operationId"]).to eq("users_create")
       expect(doc["x-permittable-controllers"]["users"].keys).to eq(["archive"])
       expect(doc["components"]["schemas"]).to have_key("PermittableInvalidParameters")
+    end
+
+    # Rails routes any verb in ActionDispatch::Request::HTTP_METHODS, WebDAV
+    # and CalDAV ones included, but a Path Item has fields for eight. A
+    # `report` key made the whole document fail validation.
+    it "documents only OpenAPI's own verbs under paths, and keeps an operation reached by no other verb visible" do
+      klass = controller_class(path: "calendars") do
+        permit_params(:query) { optional :q, :string }
+        permit_params(:sync) { optional :token, :string }
+      end
+      doc = described_class.document(
+        controllers: [klass],
+        routes: [
+          { controller: "calendars", action: "query", verb: "REPORT", path: "/calendars" },
+          { controller: "calendars", action: "query", verb: "SEARCH", path: "/calendars" },
+          { controller: "calendars", action: "query", verb: "POST", path: "/calendars" },
+          { controller: "calendars", action: "sync", verb: "MKCALENDAR", path: "/calendars/sync" }
+        ]
+      )
+      expect(doc["paths"].keys).to eq(["/calendars"])
+      expect(doc["paths"]["/calendars"].keys).to eq(["post"])
+      expect(doc["x-permittable-controllers"]["calendars"].keys).to eq(["sync"])
     end
 
     it "declares a path parameter for every variable the path templates" do
@@ -1189,6 +1279,68 @@ RSpec.describe Permittable::OpenAPI do
           expect(app.routes.recognize_path("/x/new")).to eq(controller: "x", action: "y")
           expect(app.routes.recognize_path("/x/foo")).to eq(controller: "x", action: "y", a: "foo")
           expect(paths_of(app)).to eq(["/x", "/x/{a}", "/x/new", "/x/new/{a}"])
+        end
+
+        # Rails normalizes a request path before it matches one: the path
+        # starts with a slash, and every run of slashes is squeezed to one.
+        # An absent group at the start of a route can leave a variant that
+        # no request is: `/(:locale)(/:theme)` without :locale is
+        # `//{theme}`, and `(/:locale(/:region))` with nothing present is
+        # empty. Each path documented must reach the action with exactly the
+        # parameters it names.
+        {
+          'scope "(:locale)" { scope "(:theme)" { get "" } }' => [
+            proc { scope("(:locale)") { scope("(:theme)") { get "", to: "x#y" } } },
+            ["/", "/{locale}", "/{locale}/{theme}"]
+          ],
+          'scope "(:locale)" { get "(:page)" }' => [
+            proc { scope("(:locale)") { get "(:page)", to: "x#y" } }, ["/", "/{locale}", "/{locale}/{page}"]
+          ],
+          'get "(:a)(/:b)"' => [proc { get "(:a)(/:b)", to: "x#y" }, ["/", "/{a}", "/{a}/{b}"]],
+          'get "(:locale)(/:page)"' => [proc { get "(:locale)(/:page)", to: "x#y" }, ["/", "/{locale}", "/{locale}/{page}"]],
+          'get "(:locale(/:region))"' => [proc { get "(:locale(/:region))", to: "x#y" }, ["/{locale}", "/{locale}/{region}"]],
+          'get "(:a)(.:b)"' => [proc { get "(:a)(.:b)", to: "x#y" }, ["/{a}", "/{a}.{b}"]]
+        }.each do |drawn, (draw, paths)|
+          it "documents only the paths Rails dispatches as documented for #{drawn}" do
+            app = app_with(&draw)
+            expect(paths_of(app)).to eq(paths)
+            paths.each do |path|
+              names = path.scan(/\{(\w+)\}/).flatten
+              url = path.gsub(/\{(\w+)\}/) { "#{Regexp.last_match(1)}-value" }
+              expect(app.routes.recognize_path(url))
+                .to eq(controller: "x", action: "y", **names.to_h { |name| [name.to_sym, "#{name}-value"] })
+            end
+          end
+        end
+
+        # `GET //dark` is `GET /dark` to Rails, which :locale takes first, so
+        # the `//{theme}` variant documented a parameter never bound. With a
+        # constraint turning "dark" away from :locale, the URL reaches no
+        # route at all: it is dropped, not listed as a variant the
+        # constraint keeps reachable.
+        it "drops the variant an absent leading group leaves with two slashes in a row" do
+          app = app_with { scope("(:locale)") { scope("(:theme)") { get "", to: "x#y" } } }
+          expect(app.routes.recognize_path("//dark")).to eq(controller: "x", action: "y", locale: "dark")
+          expect(paths_of(app)).not_to include("//{theme}")
+
+          constrained = app_with { get "(:locale)(/:theme)", to: "x#y", constraints: { locale: /en|fr/ } }
+          expect(constrained.routes.recognize_path("/en")).to eq(controller: "x", action: "y", locale: "en")
+          expect { constrained.routes.recognize_path("//dark") }.to raise_error(ActionController::RoutingError)
+          expect(described_class.rails_routes(constrained).map { |r| [r[:path], r[:shadows]] })
+            .to eq([["/", nil], ["/{locale}", nil], ["/{locale}/{theme}", nil]])
+        end
+
+        # The route's whole path is one optional group, so with it absent
+        # nothing is left, and Rails does not answer `GET /` here. A route
+        # whose absent groups leave a bare slash does answer it.
+        it "documents / only for a route that answers it" do
+          app = app_with { get "(:locale(/:region))", to: "x#y" }
+          expect { app.routes.recognize_path("/") }.to raise_error(ActionController::RoutingError)
+          expect(paths_of(app)).not_to include("/")
+
+          rooted = app_with { get "(:locale)(/:region)", to: "x#y" }
+          expect(rooted.routes.recognize_path("/")).to eq(controller: "x", action: "y")
+          expect(paths_of(rooted)).to include("/")
         end
       end
 

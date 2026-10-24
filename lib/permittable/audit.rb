@@ -142,6 +142,22 @@ module Permittable
       end
     end
 
+    # Every controller class a Rails route can reach, for the rake tasks:
+    # ActionController::Metal and everything below it. The tasks used to
+    # collect ActionController::Base and ::API descendants only, so a bare
+    # Metal controller — the usual shape of a lean webhook endpoint, and a
+    # host this gem supports — had no audit row, never counted against
+    # [strict], and its contracts were missing from the export. Base and API
+    # themselves are Metal descendants too; they are the framework's abstract
+    # bases, which no route names, and the old lists never held them.
+    # Anonymous classes cannot be routed to, so only named ones are kept.
+    def rails_controllers
+      return [] unless defined?(::ActionController::Metal)
+
+      frameworks = %w[ActionController::Base ActionController::API]
+      ::ActionController::Metal.descendants.uniq.select { |controller| controller.name && !frameworks.include?(controller.name) }
+    end
+
     # The root a controller's source must be inside to be audited:
     # Rails.root, unless Permittable.audit_ignore_outside_root is off — or nil
     # without Rails, where there is no app to be outside of.
@@ -378,16 +394,22 @@ module Permittable
     # entries; what was ignored follows in sections of its own, then any
     # ignore entry that matched nothing — `unmatched` defaults to checking
     # Permittable.audit_ignore, the list `entries` defaults to.
+    #
+    # With no routed action at all there is no table or summary, but the
+    # stale and unmatched sections still follow: that is when a contract no
+    # route reaches, or an ignore entry naming nothing, most needs saying.
     def format(entries, stale: {}, unmatched: unmatched_ignores(entries))
-      return "Permittable audit: no routed actions to report.\n" if entries.empty?
-
-      ignored, entries = entries.partition(&:ignored?)
-      out = entries.group_by(&:controller).map { |key, group| controller_block(key, group) }
-      out << summary_lines(summary(entries), rows: entries.length)
+      ignored, audited = entries.partition(&:ignored?)
+      out = entries.empty? ? ["Permittable audit: no routed actions to report."] : table_lines(audited)
       out << stale_lines(stale) unless stale.empty?
       out << ignored_lines(ignored) unless ignored.empty?
       out << unmatched_lines(unmatched) unless unmatched.empty?
       "#{out.join("\n")}\n"
+    end
+
+    def table_lines(entries)
+      entries.group_by(&:controller).map { |key, group| controller_block(key, group) } <<
+        summary_lines(summary(entries), rows: entries.length)
     end
 
     def controller_block(key, group)
