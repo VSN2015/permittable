@@ -1438,6 +1438,75 @@ RSpec.describe Permittable::OpenAPI do
         end
       end
 
+      # An engine route whose groups can all be absent, `(:locale(/:region))`,
+      # has no path of its own for the nothing-present variant: Rails does not
+      # answer the mount's own path with it. Joined onto the mount's tokens
+      # that empty variant read as the mount path itself, a phantom route.
+      describe "an engine route whose groups can all be absent" do
+        def status_of(app, verb, path)
+          Rack::MockRequest.new(app.routes).request(verb, path).status
+        end
+
+        def dispatched?(app, verb, path)
+          status_of(app, verb, path)
+          true
+        rescue ActionDispatch::MissingController, ActionController::RoutingError
+          true # the route matched; the controller is not defined in this spec (which error is Rails' version's)
+        end
+
+        it "documents no path for the mount point itself (mounted at /)" do
+          eng = engine("LocaleEngine") { post "(:locale(/:region))", to: "home#create" }
+          app = rails_app { mount eng => "/" }
+          expect(status_of(app, "POST", "/")).to eq(404)
+          expect(paths_of(app).map(&:last)).to eq(%w[/{locale} /{locale}/{region}])
+        end
+
+        it "documents no path for the mount point itself (mounted at /m)" do
+          eng = engine("LocaleEngine") { get "(:locale(/:region))", to: "home#show" }
+          app = rails_app { mount eng => "/m" }
+          expect(status_of(app, "GET", "/m")).to eq(404)
+          expect(dispatched?(app, "GET", "/m/en")).to be(true)
+          expect(paths_of(app).map(&:last)).to eq(%w[/m/{locale} /m/{locale}/{region}])
+        end
+
+        it "leaves the route out of the export's paths for the mount point" do
+          eng = engine("LocaleEngine") { post "(:locale(/:region))", to: "home#create" }
+          klass = controller_class(path: "home") { permit_params(:create) { optional :name, :string } }
+          app = rails_app { mount eng => "/" }
+          doc = described_class.document(controllers: [klass], routes: described_class.rails_routes(app))
+          expect(doc["paths"].keys).to eq(%w[/{locale} /{locale}/{region}])
+        end
+
+        it "still drops the variant a leading absent group leaves with two slashes" do
+          eng = engine("LocaleEngine") { get "(:locale)(/:theme)", to: "home#show" }
+          app = rails_app { mount eng => "/" }
+          expect(paths_of(app).map(&:last)).to eq(%w[/ /{locale} /{locale}/{theme}])
+        end
+      end
+
+      # The same name in the mount and in an engine route is one template
+      # variable named twice; OpenAPI forbids two parameters with one name
+      # and location, so it is declared once.
+      describe "a parameter name shared by the mount and an engine route" do
+        it "declares the path parameter once" do
+          eng = engine("SharedEngine") { get ":id", to: "things#show" }
+          klass = controller_class(path: "things") { permit_params(:show) { optional :q, :string } }
+          app = rails_app { mount eng, at: "/t/:id" }
+          doc = described_class.document(controllers: [klass], routes: described_class.rails_routes(app))
+          expect(doc["paths"].keys).to eq(["/t/{id}/{id}"])
+          expect(doc["paths"]["/t/{id}/{id}"]["get"]["parameters"].map { |p| p.values_at("name", "in") })
+            .to eq([%w[id path]])
+        end
+
+        it "declares each distinct name once, in the order the path names them" do
+          eng = engine("SharedEngine") { get ":id/:other", to: "things#show" }
+          klass = controller_class(path: "things") { permit_params(:show) { optional :q, :string } }
+          app = rails_app { mount eng, at: "/t/:id" }
+          doc = described_class.document(controllers: [klass], routes: described_class.rails_routes(app))
+          expect(doc["paths"]["/t/{id}/{id}/{other}"]["get"]["parameters"].map { |p| p["name"] }).to eq(%w[id other])
+        end
+      end
+
       # A mount's `via:` limits the verbs it hands to the engine: another verb
       # is a 404 at the mount, never the engine's route.
       describe "a mount with via:" do

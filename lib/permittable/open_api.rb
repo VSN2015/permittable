@@ -491,7 +491,10 @@ module Permittable
     # what an :id is and the exporter does not guess: a path segment arrives as
     # a string, so that is what it is documented as.
     def with_path_parameters(operation, path)
-      variables = path.scan(/\{(\w+)\}/).flatten
+      # A name the path templates twice (a mount and an engine route both
+      # name `:id`) is declared once: OpenAPI forbids two parameters with
+      # one name and location.
+      variables = path.scan(/\{(\w+)\}/).flatten.uniq
       return operation if variables.empty?
 
       parameters = variables.map do |name|
@@ -646,8 +649,8 @@ module Permittable
     # the engine.
     #
     # A parameter the mount and an engine route both name (`/{id}/.../{id}`)
-    # is not renamed; the template then has one variable where Rails binds
-    # two, and the README says so.
+    # is not renamed: the template names it twice, the operation declares it
+    # once, and the README says so.
     def rails_routes(app, engines: true)
       drop_shadowed(collect_routes(app.routes, engines: engines, prefixes: [Prefix.new([], [])], parents: [],
                                                visiting: [].freeze, reachable: true))
@@ -818,7 +821,11 @@ module Permittable
     # first is left out (see Prefix), and the shadowing above then judges the
     # rest.
     def optional_variants(spec, requirements = {}, prefixes = [Prefix.new([], [])])
-      own = variant_tokens(spec, requirements)
+      # The route's own variants are judged before a mount's path is put in
+      # front of them: an empty one (`(:locale(/:region))` with nothing
+      # present) is no request path, but joined onto a mount it would read as
+      # the mount's own path, which Rails does not hand to that route.
+      own = variant_tokens(spec, requirements).select { |tokens| request_path?(tokens) }
       variants = prefixes.flat_map do |prefix|
         own.map { |tokens| join_paths(prefix.tokens, tokens) }
            .reject { |joined| prefix.shadowed_by.any? { |earlier| shadowed?(earlier, joined.first(earlier.length)) } }

@@ -913,6 +913,21 @@ RSpec.describe Permittable::Audit do
         .to eq("billing/invoices" => ["create"])
     end
 
+    # An engine route whose groups can all be absent answers no request for the
+    # mount's own path (Rails: 404), so the audit has no row for it.
+    it "has no row for the mount's own path when an engine route's groups can all be absent" do
+      klass = Class.new(Rails::Engine) { def self.find_root(_from) = Pathname.new(Dir.tmpdir) }
+      stub_const("AuditLocaleEngine", klass)
+      klass.routes.draw { post "(:locale(/:region))", to: "home#create" }
+      route_set = ActionDispatch::Routing::RouteSet.new
+      route_set.draw { mount klass => "/" }
+
+      expect(Rack::MockRequest.new(route_set).post("/").status).to eq(404)
+      found = described_class.entries(controllers: [bare_class("home")],
+                                      routes: Permittable::OpenAPI.rails_routes(Struct.new(:routes).new(route_set)))
+      expect(found.map(&:path)).to contain_exactly("/{locale}", "/{locale}/{region}")
+    end
+
     it "still ignores an engine controller defined outside the app root" do
       Dir.mktmpdir do |dir|
         file = File.join(dir, "gems", "billing", "refunds_controller.rb")
