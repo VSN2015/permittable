@@ -1450,8 +1450,10 @@ RSpec.describe Permittable::OpenAPI do
         def dispatched?(app, verb, path)
           status_of(app, verb, path)
           true
-        rescue ActionDispatch::MissingController, ActionController::RoutingError
-          true # the route matched; the controller is not defined in this spec (which error is Rails' version's)
+        rescue ActionDispatch::MissingController, ActionController::RoutingError, AbstractController::ActionNotFound
+          # the route matched; the controller or action is not defined in this spec
+          # (which error is Rails' version's, or that of an earlier spec's controller)
+          true
         end
 
         it "documents no path for the mount point itself (mounted at /)" do
