@@ -62,6 +62,16 @@ module SchemaConformance
   #     bounded :decimal's string encoding skips them: "5000" sails past a
   #     `maximum` of 999.99 that the server enforces on the parsed value. The
   #     bound is still published, as a number, for a client that parses first.
+  #   :non_finite — an :integer, :float or :decimal's number branch given a
+  #     JSON number literal past a double's range (`1e400`), which Rails
+  #     parses to Infinity and the cast refuses as invalid_type. A validator
+  #     that does not enforce finite numbers (Ajv with `strict: false` or
+  #     `strictNumbers: false`) admits it, since `type: integer`/`number` set
+  #     no bound. The field carries `x-permittable-finite` to say so; default
+  #     Ajv refuses it. The instrument reads Infinity as such a validator
+  #     does. (A whole number of over 308 digits is refused by a :float's cast
+  #     and by that validator's Infinity alike, yet kept by the :integer and
+  #     :decimal casts, so for those it is not a divergence.)
   #   :finalize — a `finalize` block's `violate!` cross-field check runs once
   #     every field has passed, so a payload each field's schema accepts is
   #     still refused. It belongs to the rule, not to a field, so the flag
@@ -73,6 +83,7 @@ module SchemaConformance
     normalized_first: "x-permittable-normalize",
     format_annotation: "format",
     string_decimal: "maximum",
+    non_finite: "x-permittable-finite",
     finalize: "x-permittable-finalize"
   }.freeze
 
@@ -104,6 +115,44 @@ module SchemaConformance
         [{ "name" => "Jo", "ok" => "true" }, :coerced_encoding],
         [{ "name" => 42 }, :coerced_encoding],
         [{ "name" => "Jo", "age" => nil }, :null_is_absence]
+      ]
+    },
+    "an :integer, :float and :decimal, whose number a lax validator reads as Infinity" => {
+      contract: proc {
+        optional :qty, :integer
+        optional :score, :float
+        optional :amount, :decimal
+      },
+      payloads: [
+        [{ "qty" => 5 }, :agree],
+        [{ "qty" => 10**400 }, :agree],
+        [{ "qty" => Float::INFINITY }, :non_finite],
+        [{ "qty" => -Float::INFINITY }, :non_finite],
+        [{ "score" => 1.5 }, :agree],
+        # A :float cannot hold a 309-digit integer literal, though the schema
+        # takes any integer for `type: number`.
+        [{ "score" => 10**309 }, :non_finite],
+        [{ "score" => Float::INFINITY }, :non_finite],
+        [{ "amount" => 12.5 }, :agree],
+        [{ "amount" => Float::INFINITY }, :non_finite],
+        [{ "amount" => -Float::INFINITY }, :non_finite]
+      ]
+    },
+    # A Range bound beyond a double's range (`0..10**400`) is NOT in this
+    # case: a JS validator parses that `maximum` as Infinity, so it does not
+    # bound the field, but this file's Ruby validator compares
+    # `Float::INFINITY <= 10**400` exactly and cannot see it. The unit spec
+    # for x-permittable-finite in json_schema_spec.rb guards that label.
+    "numbers bounded on both sides by in:, which no validator can read as Infinity" => {
+      contract: proc {
+        optional :age, :integer, in: 0..120
+        optional :ratio, :float, in: [0.5, 1.5]
+      },
+      payloads: [
+        [{ "age" => 120 }, :agree],
+        [{ "age" => Float::INFINITY }, :agree],
+        [{ "ratio" => 1.5 }, :agree],
+        [{ "ratio" => Float::INFINITY }, :agree]
       ]
     },
     "a required string with no length: of its own" => {

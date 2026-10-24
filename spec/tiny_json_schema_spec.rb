@@ -55,4 +55,26 @@ RSpec.describe TinyJsonSchema do
       end
     end
   end
+
+  describe "an integer" do
+    # JSON text 1e400 is an integer to a validator that does not enforce
+    # finite numbers (for example Ajv with `strictNumbers: false`, which
+    # `strict: false` implies); Rails parses it to Float::INFINITY. The instrument
+    # reads that stand-in as the integer it denotes, so a schema with no
+    # bounds is seen to admit it rather than to refuse it by type.
+    it "reads the Infinity a parser makes of 1e400 as one, and a fraction as none" do
+      schema = { "type" => "integer" }
+      expect(described_class.valid?(schema, Float::INFINITY)).to be(true)
+      expect(described_class.valid?(schema, -Float::INFINITY)).to be(true)
+      expect(described_class.valid?(schema, 10**400)).to be(true)
+      expect(described_class.valid?(schema, 1.5)).to be(false)
+      expect(described_class.valid?(schema, Float::NAN)).to be(false)
+    end
+
+    it "bounds it like any other number" do
+      schema = { "type" => "integer", "minimum" => -Float::MAX, "maximum" => Float::MAX }
+      expect(described_class.valid?(schema, Float::INFINITY)).to be(false)
+      expect(described_class.valid?(schema, -Float::INFINITY)).to be(false)
+    end
+  end
 end
