@@ -1403,6 +1403,400 @@ RSpec.describe Permittable::OpenAPI do
         expect { paths_for("/un(matched(.:format)") }.to raise_error(ArgumentError, %r{/un\(matched})
       end
     end
+
+    # An engine mounted in the app answers requests under its mount point, so
+    # its routes are the app's. Real Rails::Engine classes and real route
+    # sets, as `mount` builds them.
+    describe "mounted engines" do
+      # A named engine class (a mount needs a railtie name) whose routes are
+      # drawn from `draw`. The root is pinned so Rails does not go looking.
+      def engine(name, &draw)
+        klass = Class.new(Rails::Engine) { def self.find_root(_from) = Pathname.new(Dir.tmpdir) }
+        stub_const(name, klass)
+        klass.routes.draw(&draw)
+        klass
+      end
+
+      def paths_of(app, **options)
+        described_class.rails_routes(app, **options).map { |r| [r[:controller], r[:action], r[:verb], r[:path]] }
+      end
+
+      before(:all) do
+        require "rails/engine"
+      rescue LoadError
+        skip "railties is not available in this bundle"
+      end
+
+      it "prefixes the engine's paths with the mount's" do
+        billing = engine("BillingEngine") { post "refunds", to: "refunds#create" }
+        app = rails_app { mount billing => "/billing" }
+        expect(paths_of(app)).to eq([["refunds", "create", "post", "/billing/refunds"]])
+      end
+
+      it "tags a route reached through a mount with [mount, route], an app route with its index" do
+        billing = engine("BillingEngine") do
+          get "a", to: "a#index"
+          get "b", to: "b#index"
+        end
+        app = rails_app do
+          get "x", to: "x#index"
+          mount billing => "/billing"
+        end
+        expect(described_class.rails_routes(app).map { |r| r[:route] }).to eq([0, [1, 0], [1, 1]])
+      end
+
+      it "keeps an engine mounted twice apart" do
+        billing = engine("BillingEngine") { post "refunds", to: "refunds#create" }
+        app = rails_app do
+          mount billing => "/billing", as: :one
+          mount billing => "/invoicing", as: :two
+        end
+        found = described_class.rails_routes(app)
+        expect(found.map { |r| r[:path] }).to eq(%w[/billing/refunds /invoicing/refunds])
+        expect(found.map { |r| r[:route] }.uniq.length).to eq(2)
+      end
+
+      it "joins an engine mounted at / without doubling the slash" do
+        billing = engine("BillingEngine") do
+          root to: "home#index"
+          get "refunds", to: "refunds#index"
+        end
+        app = rails_app { mount billing => "/" }
+        expect(paths_of(app).map(&:last)).to eq(%w[/ /refunds])
+      end
+
+      it "gives an engine's root route the mount's own path" do
+        billing = engine("BillingEngine") { root to: "home#index" }
+        app = rails_app { mount billing => "/billing" }
+        expect(paths_of(app).map(&:last)).to eq(["/billing"])
+      end
+
+      it "expands a mount under an optional scope like any route" do
+        billing = engine("BillingEngine") { post "refunds", to: "refunds#create" }
+        app = rails_app { scope("(:locale)") { mount billing => "/billing" } }
+        expect(paths_of(app).map(&:last)).to eq(%w[/billing/refunds /{locale}/billing/refunds])
+      end
+
+      it "templates a dynamic mount point and keeps its constraint" do
+        billing = engine("BillingEngine") { get "refunds", to: "refunds#index" }
+        app = rails_app { mount billing => ":tenant", constraints: { tenant: /\d+/ } }
+        expect(paths_of(app).map(&:last)).to eq(["/{tenant}/refunds"])
+      end
+
+      it "follows an engine mounted in an engine, with a nested route id" do
+        inner = engine("InnerEngine") { get "deep", to: "deep#index" }
+        outer = engine("OuterEngine") do
+          get "shallow", to: "shallow#index"
+          mount inner => "/inner"
+        end
+        app = rails_app do
+          get "x", to: "x#index"
+          mount outer => "/outer"
+        end
+        found = described_class.rails_routes(app)
+        expect(found.map { |r| r[:path] }).to eq(%w[/x /outer/shallow /outer/inner/deep])
+        expect(found.last[:route]).to eq([1, 1, 0])
+      end
+
+      it "stops at an engine that mounts itself" do
+        cyclic = engine("CyclicEngine") { get "ping", to: "ping#index" }
+        cyclic.routes.draw do
+          get "ping", to: "ping#index"
+          mount CyclicEngine => "/again", as: :again
+        end
+        app = rails_app { mount cyclic => "/c" }
+        expect(paths_of(app).map(&:last)).to eq(["/c/ping"])
+      end
+
+      # Rails tries the routes in order with the mount standing where it is
+      # drawn: an app route ahead of the mount answers before the engine is
+      # asked, and an engine route that matches answers the request, so an app
+      # route behind it is never reached. Only an engine with no route for the
+      # request passes it on (X-Cascade).
+      describe "shadowing across the app and a mounted engine" do
+        let(:billing_engine) { engine("BillingEngine") { post "refunds", to: "refunds#create" } }
+
+        it "lets an app route ahead of the mount answer, and the engine's behind it be dropped" do
+          billing = billing_engine
+          app = rails_app do
+            post "billing/refunds", to: "legacy#create"
+            mount billing => "/billing"
+          end
+          expect(paths_of(app)).to eq([%w[legacy create post /billing/refunds]])
+        end
+
+        it "lets an engine route answer, and an app route behind the mount be dropped" do
+          billing = billing_engine
+          app = rails_app do
+            mount billing => "/billing"
+            post "billing/refunds", to: "late#create"
+          end
+          expect(paths_of(app)).to eq([%w[refunds create post /billing/refunds]])
+        end
+
+        it "keeps an app route behind the mount when the engine has no route for its path" do
+          billing = billing_engine
+          app = rails_app do
+            mount billing => "/billing"
+            post "billing/other", to: "late#create"
+          end
+          expect(paths_of(app).map(&:last)).to eq(%w[/billing/refunds /billing/other])
+        end
+
+        it "keeps both when the mount is constrained and so passes some requests on" do
+          billing = billing_engine
+          app = rails_app do
+            mount billing => "/billing", constraints: { subdomain: "api" }
+            post "billing/refunds", to: "late#create"
+          end
+          expect(paths_of(app)).to eq([%w[refunds create post /billing/refunds],
+                                       %w[late create post /billing/refunds]])
+        end
+
+        it "keeps both when the engine's own route is constrained" do
+          constrained = engine("ConstrainedEngine") { post "refunds", to: "refunds#create", constraints: { subdomain: "api" } }
+          app = rails_app do
+            mount constrained => "/billing"
+            post "billing/refunds", to: "late#create"
+          end
+          expect(paths_of(app).map(&:first)).to eq(%w[refunds late])
+        end
+
+        # The export placed the slot by the order of `controllers:`, which is
+        # load order, so the document named whichever controller came first.
+        describe "in the export" do
+          let(:engine_controller) do
+            controller_class(path: "refunds") { permit_params(:create) { optional :amount, :integer } }
+          end
+          let(:app_controller) do
+            controller_class(path: "legacy") { permit_params(:create) { optional :note, :string } }
+          end
+
+          def operation_at_slot(app, controllers)
+            doc = described_class.document(controllers: controllers, routes: described_class.rails_routes(app))
+            doc["paths"]["/billing/refunds"]["post"]["operationId"]
+          end
+
+          it "names the app route that comes first, whichever controller is listed first" do
+            billing = billing_engine
+            app = rails_app do
+              post "billing/refunds", to: "legacy#create"
+              mount billing => "/billing"
+            end
+            expect(operation_at_slot(app, [engine_controller, app_controller])).to eq("legacy_create")
+            expect(operation_at_slot(app, [app_controller, engine_controller])).to eq("legacy_create")
+          end
+
+          it "names the engine route that comes first, whichever controller is listed first" do
+            billing = billing_engine
+            app = rails_app do
+              mount billing => "/billing"
+              post "billing/refunds", to: "legacy#create"
+            end
+            expect(operation_at_slot(app, [engine_controller, app_controller])).to eq("refunds_create")
+            expect(operation_at_slot(app, [app_controller, engine_controller])).to eq("refunds_create")
+          end
+        end
+      end
+
+      # The mount's own path is matched first, unanchored, and the first
+      # variant of an optional segment that fits wins; Rails never goes back
+      # into the mount for another variant when the engine has no route. So
+      # under `scope "(:locale)"` a mount at "/" takes /posts as the locale
+      # "posts", and the engine's /posts is never reached without a locale.
+      describe "a mount that ends in an optional segment" do
+        let(:blog_engine) do
+          engine("BlogEngine") do
+            root to: "posts#home"
+            get "posts", to: "posts#index"
+            post "posts", to: "posts#create"
+            get "archive(/:year)", to: "posts#archive"
+            get "posts/:id", to: "posts#show"
+          end
+        end
+
+        def listed(app)
+          described_class.rails_routes(app).map { |r| "#{r[:verb]} #{r[:path]} #{r[:action]}" }
+        end
+
+        it "documents only the paths that carry the segment, but still the engine's root" do
+          blog = blog_engine
+          app = rails_app { scope("(:locale)") { mount blog => "/" } }
+          expect(listed(app)).to eq(
+            ["get / home", "get /{locale} home",
+             "get /{locale}/posts index", "post /{locale}/posts create",
+             "get /{locale}/archive archive", "get /{locale}/archive/{year} archive",
+             "get /{locale}/posts/{id} show"]
+          )
+        end
+
+        it "does the same for a mount point that ends in a group" do
+          blog = blog_engine
+          app = rails_app { mount blog => "/m(/:slug)", as: :m }
+          expect(listed(app)).to eq(
+            ["get /m home", "get /m/{slug} home",
+             "get /m/{slug}/posts index", "post /m/{slug}/posts create",
+             "get /m/{slug}/archive archive", "get /m/{slug}/archive/{year} archive",
+             "get /m/{slug}/posts/{id} show"]
+          )
+        end
+
+        it "keeps both variants when the segment is not the mount's last" do
+          blog = blog_engine
+          app = rails_app { scope("(:locale)") { mount blog => "/blog" } }
+          expect(listed(app)).to include("get /blog/posts index", "get /{locale}/blog/posts index",
+                                         "get /blog/posts/{id} show", "get /{locale}/blog/posts/{id} show")
+        end
+
+        it "keeps both variants when a constraint stops the segment taking an engine's path" do
+          blog = blog_engine
+          app = rails_app { scope("(:locale)", locale: /en|fr/) { mount blog => "/" } }
+          expect(listed(app)).to include("get /posts index", "get /{locale}/posts index",
+                                         "post /posts create", "get /posts/{id} show")
+        end
+
+        it "judges each mount of a nest against the mounts above it" do
+          inner = engine("DeepEngine") { get "deep", to: "deep#index" }
+          outer = engine("WrapEngine") { mount inner => "/inner(/:slug)", as: :inner }
+          app = rails_app { scope("(:locale)") { mount outer => "/" } }
+          expect(listed(app)).to eq(["get /{locale}/inner/{slug}/deep index"])
+        end
+      end
+
+      # An engine route whose groups can all be absent, `(:locale(/:region))`,
+      # has no path of its own for the nothing-present variant: Rails does not
+      # answer the mount's own path with it. Joined onto the mount's tokens
+      # that empty variant read as the mount path itself, a phantom route.
+      describe "an engine route whose groups can all be absent" do
+        def status_of(app, verb, path)
+          Rack::MockRequest.new(app.routes).request(verb, path).status
+        end
+
+        def dispatched?(app, verb, path)
+          status_of(app, verb, path)
+          true
+        rescue ActionDispatch::MissingController, ActionController::RoutingError, AbstractController::ActionNotFound
+          # the route matched; the controller or action is not defined in this spec
+          # (which error is Rails' version's, or that of an earlier spec's controller)
+          true
+        end
+
+        it "documents no path for the mount point itself (mounted at /)" do
+          eng = engine("LocaleEngine") { post "(:locale(/:region))", to: "home#create" }
+          app = rails_app { mount eng => "/" }
+          expect(status_of(app, "POST", "/")).to eq(404)
+          expect(paths_of(app).map(&:last)).to eq(%w[/{locale} /{locale}/{region}])
+        end
+
+        it "documents no path for the mount point itself (mounted at /m)" do
+          eng = engine("LocaleEngine") { get "(:locale(/:region))", to: "home#show" }
+          app = rails_app { mount eng => "/m" }
+          expect(status_of(app, "GET", "/m")).to eq(404)
+          expect(dispatched?(app, "GET", "/m/en")).to be(true)
+          expect(paths_of(app).map(&:last)).to eq(%w[/m/{locale} /m/{locale}/{region}])
+        end
+
+        it "leaves the route out of the export's paths for the mount point" do
+          eng = engine("LocaleEngine") { post "(:locale(/:region))", to: "home#create" }
+          klass = controller_class(path: "home") { permit_params(:create) { optional :name, :string } }
+          app = rails_app { mount eng => "/" }
+          doc = described_class.document(controllers: [klass], routes: described_class.rails_routes(app))
+          expect(doc["paths"].keys).to eq(%w[/{locale} /{locale}/{region}])
+        end
+
+        it "still drops the variant a leading absent group leaves with two slashes" do
+          eng = engine("LocaleEngine") { get "(:locale)(/:theme)", to: "home#show" }
+          app = rails_app { mount eng => "/" }
+          expect(paths_of(app).map(&:last)).to eq(%w[/ /{locale} /{locale}/{theme}])
+        end
+      end
+
+      # The same name in the mount and in an engine route is one template
+      # variable named twice; OpenAPI forbids two parameters with one name
+      # and location, so it is declared once.
+      describe "a parameter name shared by the mount and an engine route" do
+        it "declares the path parameter once" do
+          eng = engine("SharedEngine") { get ":id", to: "things#show" }
+          klass = controller_class(path: "things") { permit_params(:show) { optional :q, :string } }
+          app = rails_app { mount eng, at: "/t/:id" }
+          doc = described_class.document(controllers: [klass], routes: described_class.rails_routes(app))
+          expect(doc["paths"].keys).to eq(["/t/{id}/{id}"])
+          expect(doc["paths"]["/t/{id}/{id}"]["get"]["parameters"].map { |p| p.values_at("name", "in") })
+            .to eq([%w[id path]])
+        end
+
+        it "declares each distinct name once, in the order the path names them" do
+          eng = engine("SharedEngine") { get ":id/:other", to: "things#show" }
+          klass = controller_class(path: "things") { permit_params(:show) { optional :q, :string } }
+          app = rails_app { mount eng, at: "/t/:id" }
+          doc = described_class.document(controllers: [klass], routes: described_class.rails_routes(app))
+          expect(doc["paths"]["/t/{id}/{id}/{other}"]["get"]["parameters"].map { |p| p["name"] }).to eq(%w[id other])
+        end
+      end
+
+      # A mount's `via:` limits the verbs it hands to the engine: another verb
+      # is a 404 at the mount, never the engine's route.
+      describe "a mount with via:" do
+        let(:shop_engine) do
+          engine("ShopEngine") do
+            get "orders", to: "orders#index"
+            post "orders", to: "orders#create"
+            match "ping", to: "orders#ping", via: :all
+          end
+        end
+
+        it "documents only the verbs the mount allows" do
+          shop = shop_engine
+          app = rails_app { mount shop, at: "/g", via: :get }
+          expect(paths_of(app).map { |r| r.values_at(2, 3) }).to eq([%w[get /g/orders], %w[get /g/ping]])
+        end
+
+        it "takes a list of verbs" do
+          shop = shop_engine
+          app = rails_app { mount shop, at: "/g", via: %i[post put] }
+          expect(paths_of(app).map { |r| r.values_at(2, 3) }).to eq([%w[post /g/orders], %w[post /g/ping], %w[put /g/ping]])
+        end
+
+        it "applies at every level of a nest" do
+          shop_engine # defines ShopEngine, which the wrapper mounts
+          wrap = engine("WrapEngine") { mount ShopEngine, at: "/s", via: %i[get post] }
+          app = rails_app { mount wrap, at: "/w", via: :post }
+          expect(paths_of(app).map { |r| r.values_at(2, 3) }).to eq([%w[post /w/s/orders], %w[post /w/s/ping]])
+        end
+
+        it "documents every verb of a mount with no via:" do
+          shop = shop_engine
+          app = rails_app { mount shop, at: "/g" }
+          expect(paths_of(app).map(&:last).tally).to eq("/g/orders" => 2, "/g/ping" => 5)
+        end
+      end
+
+      it "skips a Rack mount that is not an engine" do
+        app = rails_app do
+          mount ->(_env) { [200, {}, []] } => "/sidekiq"
+          get "x", to: "x#index"
+        end
+        expect(paths_of(app).map(&:last)).to eq(["/x"])
+      end
+
+      it "restores the single route set with engines: false" do
+        billing = engine("BillingEngine") { post "refunds", to: "refunds#create" }
+        app = rails_app do
+          get "x", to: "x#index"
+          mount billing => "/billing"
+        end
+        expect(paths_of(app, engines: false).map(&:last)).to eq(["/x"])
+      end
+
+      it "places the engine's operations under paths in the export" do
+        billing = engine("BillingEngine") { post "refunds", to: "refunds#create" }
+        klass = controller_class(path: "refunds") { permit_params(:create) { required :amount, :integer } }
+        app = rails_app { mount billing => "/billing" }
+        doc = described_class.document(controllers: [klass], routes: described_class.rails_routes(app))
+        expect(doc["paths"].keys).to eq(["/billing/refunds"])
+        expect(doc).not_to have_key("x-permittable-controllers")
+      end
+    end
   end
 
   describe "the documented error shape" do
