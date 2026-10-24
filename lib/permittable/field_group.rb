@@ -25,7 +25,8 @@ module Permittable
   #       use UserFields
   #     end
   #
-  #     # PATCH: same fields, nothing mandatory.
+  #     # PATCH: same fields, nothing mandatory, no defaults (a default
+  #     # would reset plan to "free" on every PATCH that omits it).
   #     permit_params :update, root: :user, model: User do
   #       use UserFields, optional: true
   #     end

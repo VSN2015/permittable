@@ -1,4 +1,7 @@
 require "action_controller"
+# Rails' own form helpers, so a spec can post exactly what a rendered
+# date_select or datetime_select submits.
+require "action_view"
 require "rack/mock"
 
 # Dispatches a single action through the REAL ActionController stack —
@@ -18,7 +21,8 @@ module IntegrationHarness
   module_function
 
   # `params:` (a Hash) is form-encoded into the request body — how the specs
-  # exercise real ActionController::Parameters bodies. `json:` sends the Hash
+  # exercise real ActionController::Parameters bodies; a String is sent as an
+  # already-encoded form body, verbatim. `json:` sends the Hash
   # as an application/json body instead (what ParamsWrapper acts on), and
   # `path_params:` stands in for what the router would have matched out of
   # the URL — Rails merges both into `params` exactly as a routed request
@@ -29,11 +33,13 @@ module IntegrationHarness
   # `:input` set Rack::MockRequest ignores `:params`, and `json:` would
   # overwrite `raw_json:`, so a pair used to send one body and silently drop
   # the other. Put form-style fields in `query:` alongside a JSON body.
+  # `accept:` sets the request's Accept header, for specs about content
+  # negotiation (respond_to picks a format from it).
   # `instance:` dispatches on that controller object instead of a fresh one
   # per request, to pin down state that must not survive from one request to
   # the next.
   def dispatch(controller_class, action, method: "GET", query: "", params: nil, json: nil, raw_json: nil,
-               path_params: nil, instance: nil)
+               path_params: nil, instance: nil, accept: nil)
     bodies = { params: params, json: json, raw_json: raw_json }.compact
     if bodies.size > 1
       raise ArgumentError, "IntegrationHarness.dispatch sends one request body, " \
@@ -51,6 +57,7 @@ module IntegrationHarness
     # Without a logger, ActionDispatch logs a body it fails to parse to $stderr.
     env["action_dispatch.logger"] = Logger.new(nil) if raw_json
     env["action_dispatch.request.path_parameters"] = path_params if path_params
+    env["HTTP_ACCEPT"] = accept if accept
     status, headers, body =
       if instance
         request = ActionDispatch::Request.new(env)
