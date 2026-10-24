@@ -38,6 +38,33 @@ RSpec.describe "permittable:audit and permittable:generate with an ignore list",
         def create = head(:created)
       end
     RUBY
+    # Bare ActionController::Metal, the usual shape of a lean webhook
+    # endpoint: neither Base nor API, and the tasks used to collect only
+    # those two, so this unguarded POST had no row and [strict] passed.
+    "app/controllers/hooks_controller.rb" => <<~RUBY,
+      class HooksController < ActionController::Metal
+        include ActionController::Head
+
+        def receive = head(:accepted)
+      end
+    RUBY
+    # Metal with a contract: enforced at runtime, so it belongs in the export.
+    "app/controllers/pings_controller.rb" => <<~RUBY,
+      class PingsController < ActionController::Metal
+        include AbstractController::Rendering
+        include ActionController::Rendering
+        include ActionController::Renderers::All
+        include ActionController::Head
+        include AbstractController::Callbacks
+        include ActionController::Rescue
+        include ActionController::StrongParameters
+        include Permittable
+
+        permit_params(:create, enforce: true) { required :host, :string }
+
+        def create = head(:created)
+      end
+    RUBY
     # Never routed: the generator drafts from controllers, not routes.
     "app/controllers/notes_controller.rb" => <<~RUBY,
       class NotesController < ApplicationController
@@ -107,6 +134,8 @@ RSpec.describe "permittable:audit and permittable:generate with an ignore list",
     Rails.application.routes.draw do
       post "widgets", to: "widgets#create"
       post "uploads", to: "gem_uploads#create"
+      post "hooks", to: "hooks#receive"
+      post "pings", to: "pings#create"
       match "*path", to: "application#not_found", via: :all
     end
     Rails.application.load_tasks
@@ -129,8 +158,12 @@ RSpec.describe "permittable:audit and permittable:generate with an ignore list",
     end
 
     results = {}
-    Permittable.audit_ignore = %w[application#not_found widget]
+    Permittable.audit_ignore = %w[application#not_found widget hooks]
     results["ignored"] = run_task("permittable:audit", "strict")
+
+    Permittable.audit_ignore = %w[application#not_found]
+    results["metal"] = run_task("permittable:audit", "strict")
+    results["openapi"] = run_task("permittable:openapi")
 
     Permittable.audit_ignore = []
     results["unignored"] = run_task("permittable:audit", "strict")
@@ -187,9 +220,25 @@ RSpec.describe "permittable:audit and permittable:generate with an ignore list",
       expect(ignored["out"]).to match(/^Permittable\.audit_ignore entries that match no routed action .*\n  widget$/)
     end
 
+    it "audits a bare ActionController::Metal controller, and fails on its unguarded POST" do
+      metal = results["metal"]
+      expect(metal["out"]).to match(%r{^hooks\n  POST +/hooks +receive +no contract — ACCEPTS A BODY})
+      expect(metal["out"]).to match(%r{^pings\n  POST +/pings +create +enforce})
+      expect(metal["aborted"]).to be(true)
+      expect(metal["err"]).to include("1 routed action accepts a request body with no contract covering it")
+    end
+
     it "still fails on the catch-all once it is not ignored" do
       expect(results["unignored"]["aborted"]).to be(true)
       expect(results["unignored"]["err"]).to include("with no contract covering it")
+    end
+  end
+
+  describe "permittable:openapi" do
+    it "exports a Metal controller's contract alongside Base ones" do
+      paths = JSON.parse(results["openapi"]["out"])["paths"]
+      expect(paths.keys).to include("/widgets", "/pings")
+      expect(paths["/pings"]["post"]["requestBody"]["content"]["application/json"]["schema"]["required"]).to eq(["host"])
     end
   end
 
@@ -225,6 +274,146 @@ RSpec.describe "permittable:audit and permittable:generate with an ignore list",
 
     it "drafts a controller from outside Rails.root once that default is off" do
       expect(results["generate_all"]["out"]).to include("GemUploadsController")
+    end
+  end
+end
+
+# An engine kept inside the app (a modular monolith's engines/ directory) and
+# mounted in it. The two tasks read the app's route set, which holds only the
+# mount; unless rails_routes follows it, the engine's unguarded POST passes
+# `[strict]`, its covered action is reported as stale, and the export lists it
+# outside `paths`. Nothing here requires the engine's controllers by hand:
+# only eager_load! can find them, which is what an app relies on.
+RSpec.describe "permittable:audit and permittable:openapi with a mounted engine", :integration do
+  before(:all) do
+    require "rails"
+  rescue LoadError
+    skip "railties is not available in this bundle"
+  end
+
+  MOUNTED_ENGINE_FILES = {
+    "config/routes.rb" => <<~RUBY,
+      Rails.application.routes.draw do
+        post "widgets", to: "widgets#create"
+        mount Billing::Engine, at: "/billing"
+      end
+    RUBY
+    "app/controllers/widgets_controller.rb" => <<~RUBY,
+      class WidgetsController < ActionController::Base
+        include Permittable
+        permit_params(:create) { required :name, :string }
+        def create = head(:created)
+      end
+    RUBY
+    "engines/billing/lib/billing/engine.rb" => <<~RUBY,
+      module Billing
+        class Engine < ::Rails::Engine
+          isolate_namespace Billing
+        end
+      end
+    RUBY
+    "engines/billing/config/routes.rb" => <<~RUBY,
+      Billing::Engine.routes.draw do
+        post "invoices", to: "invoices#create"
+        post "refunds", to: "refunds#create"
+      end
+    RUBY
+    "engines/billing/app/controllers/billing/invoices_controller.rb" => <<~RUBY,
+      module Billing
+        class InvoicesController < ActionController::Base
+          include Permittable
+          permit_params(:create) { required :amount, :integer }
+          def create = head(:created)
+        end
+      end
+    RUBY
+    "engines/billing/app/controllers/billing/refunds_controller.rb" => <<~RUBY
+      module Billing
+        class RefundsController < ActionController::Base
+          def create = head(:created)
+        end
+      end
+    RUBY
+  }.freeze
+
+  MOUNTED_ENGINE_SCRIPT = <<~RUBY.freeze
+    require "logger"
+    require "json"
+    require "stringio"
+    require "rails"
+    require "action_controller/railtie"
+    require "permittable"
+
+    require File.join(ENV.fetch("PERMITTABLE_PROBE_ROOT"), "engines/billing/lib/billing/engine.rb")
+
+    class ProbeApp < Rails::Application
+      config.root = ENV.fetch("PERMITTABLE_PROBE_ROOT")
+      config.load_defaults Rails::VERSION::STRING.to_f
+      config.eager_load = false
+      config.logger = Logger.new(IO::NULL)
+      config.secret_key_base = "x" * 64
+    end
+
+    ProbeApp.initialize!
+    Rails.application.load_tasks
+
+    def run_task(name, *args)
+      out, err = StringIO.new, StringIO.new
+      $stdout, $stderr = out, err
+      aborted = false
+      begin
+        Rake::Task[name].reenable
+        Rake::Task[name].invoke(*args)
+      rescue SystemExit => e
+        aborted = !e.success?
+        err.puts(e.message)
+      ensure
+        $stdout, $stderr = STDOUT, STDERR
+      end
+      { "out" => out.string, "err" => err.string, "aborted" => aborted }
+    end
+
+    print JSON.generate("audit" => run_task("permittable:audit", "strict"),
+                        "openapi" => run_task("permittable:openapi"))
+  RUBY
+
+  def self.results
+    @results ||= Dir.mktmpdir do |dir|
+      root = File.join(dir, "app")
+      MOUNTED_ENGINE_FILES.each do |relative, source|
+        FileUtils.mkdir_p(File.dirname(File.join(root, relative)))
+        File.write(File.join(root, relative), source)
+      end
+      lib = File.expand_path("../lib", __dir__)
+      env = { "PERMITTABLE_PROBE_ROOT" => root, "RAILS_ENV" => "test" }
+      out, err, status = Open3.capture3(env, RbConfig.ruby, "-I", lib, "-e", MOUNTED_ENGINE_SCRIPT)
+      raise "Rails boot failed:\n#{err}" unless status.success?
+
+      JSON.parse(out)
+    end
+  end
+
+  let(:results) { self.class.results }
+
+  describe "permittable:audit[strict]" do
+    it "fails on the engine's unguarded POST" do
+      expect(results["audit"]["aborted"]).to be(true), results["audit"]["out"]
+      expect(results["audit"]["err"]).to include("1 routed action accepts a request body")
+      expect(results["audit"]["out"]).to match(%r{POST\s+/billing/refunds\s+create})
+    end
+
+    it "lists the engine's covered action under its mounted path, not as stale" do
+      out = results["audit"]["out"]
+      expect(out).to match(%r{POST\s+/billing/invoices\s+create\s+enforce})
+      expect(out).not_to include("no route reaches")
+    end
+  end
+
+  describe "permittable:openapi" do
+    it "puts the engine's operation under its mounted path" do
+      doc = JSON.parse(results["openapi"]["out"])
+      expect(doc["paths"].keys).to include("/billing/invoices")
+      expect(doc.fetch("x-permittable-controllers", {})).not_to have_key("billing/invoices")
     end
   end
 end
