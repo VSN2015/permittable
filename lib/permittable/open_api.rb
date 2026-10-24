@@ -373,7 +373,7 @@ module Permittable
         else
           free.each do |path, verb, template|
             holder = (paths[path] ||= {})
-            placed = with_path_parameters(operation, path)
+            placed = with_path_parameters(operation, path, controller.permit_rule_for(action), template || path)
             holder[verb] = template ? placed.merge("x-permittable-path" => template) : placed
             slots << OperationSlot.new(holder, verb, verb, operation["operationId"], owner, path)
           end
@@ -488,21 +488,88 @@ module Permittable
     # OpenAPI 3.1 requires every variable in a path template to be declared as
     # a path parameter — a document templating {id} without declaring it is
     # invalid, which every member route produced. The route set does not say
-    # what an :id is and the exporter does not guess: a path segment arrives as
-    # a string, so that is what it is documented as.
-    def with_path_parameters(operation, path)
+    # what an :id is, so a variable is a string unless the contract says
+    # otherwise: a rootless contract field named like one is that parameter's
+    # schema (path_fields), and leaves the body schema.
+    #
+    # `own` is the route's own spelling of the template, which differs
+    # from `path` when collapse_shapes placed the route under another
+    # route's spelling: the same shape, so the names pair up by position.
+    def with_path_parameters(operation, path, rule, own = path)
       variables = path.scan(/\{(\w+)\}/).flatten
       return operation if variables.empty?
 
+      own_names = own.scan(/\{(\w+)\}/).flatten
+      fields = path_fields(rule, variables.zip(own_names))
       parameters = variables.map do |name|
-        { "name" => name, "in" => "path", "required" => true, "schema" => { "type" => "string" } }
+        schema = fields[name] ? path_schema(fields[name]) : { "type" => "string" }
+        { "name" => name, "in" => "path", "required" => true, "schema" => schema }
       end
       # Inserted ahead of requestBody, where a reader of the document expects
       # it; emission stays deterministic either way.
       operation.each_with_object({}) do |(key, value), out|
-        out["parameters"] = parameters if key == "requestBody"
-        out[key] = value
+        if key == "requestBody"
+          out["parameters"] = parameters
+          value = body_without(rule, fields.values, own_names)
+        end
+        out[key] = value unless value.nil?
       end
+    end
+
+    # { path variable => the contract's field for it }. Rails merges the
+    # route's path parameters over the request's, so a field the route fills
+    # from the URL is read from the URL, never from the body: `id` in the
+    # body is overwritten, and a request that leaves it out is fine. A rooted
+    # contract reads its fields from inside the root, which a path parameter
+    # never reaches, so only a rootless one has such fields, and only at its
+    # top level. `names` pairs each variable of the placed path with the
+    # route's own name for it.
+    #
+    # Only a scalar field moves. A URL segment is one string, so an array or
+    # a hash can never be what it carries (`POST /defs/1,2` against
+    # `array :id` is a 422). Such a field stays in the body, where a client
+    # can at least say what it means.
+    def path_fields(rule, names)
+      return {} if rule[:root]
+
+      names.filter_map do |variable, own|
+        field = rule[:fields].find { |f| f[:name].to_s == own }
+        [variable, field] if field && field[:kind] == :scalar
+      end.to_h
+    end
+
+    # A moved field's schema as the path parameter documents it. The URL
+    # always supplies the segment, so a `default:` never applies and the
+    # value is never null: `nullable:` would only add "null" to the type.
+    def path_schema(field)
+      JsonSchema.field(field.except(:default, :nullable))
+    end
+
+    # The requestBody for `rule` without the fields a path parameter took
+    # over; nil, to leave it out, when that was every field. Such a body
+    # would be an empty object. An action declared with no fields at all
+    # keeps the empty body it always had.
+    #
+    # `unknown: :error` forbids every key the contract does not declare, but
+    # the runtime exempts the route's path parameters from that check and
+    # then overwrites them with the URL's values: `PATCH /widgets/7` with
+    # {"id":7,"name":"x"} is a 200 whether or not the contract declares `id`.
+    # That is the payload a Rails form, or a client sending a record back,
+    # produces, so the schema must not forbid it. Each name the route
+    # templates therefore stays in the body as an unconstrained property,
+    # any value and never required, since the value is read from the URL and
+    # nothing in the body can make the request wrong. A rooted contract
+    # needs none of this: its wrapper object is permissive already.
+    def body_without(rule, moved, templated)
+      rest = rule[:fields] - moved
+      return if rest.empty? && !moved.empty?
+
+      body = rule_request_body(moved.empty? ? rule : rule.merge(fields: rest))
+      return body unless rule[:unknown] == :error && !rule[:root]
+
+      properties = body["content"]["application/json"]["schema"]["properties"]
+      templated.each { |name| properties[name] ||= {} }
+      body
     end
 
     # Drops every descriptor for a verb and concrete path that an earlier,
