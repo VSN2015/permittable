@@ -221,11 +221,18 @@ module Permittable
     # (a list, or a Range with both ends) is finite for any validator, so it
     # carries no label. A `sensitive:` field whose `in:` is withheld is
     # labelled as though it had none, so the label says nothing about it.
+    # A bound beyond a double's range (`0..10**400`) does not count as one: it
+    # is published exactly, but a JS validator parses it as Infinity, so
+    # `1e400` still passes.
     def label_finite!(schema)
       return if schema.key?("enum")
-      return if schema.key?("minimum") && (schema.key?("maximum") || schema.key?("exclusiveMaximum"))
+      return if finite_bound?(schema, "minimum") && (finite_bound?(schema, "maximum") || finite_bound?(schema, "exclusiveMaximum"))
 
       schema["x-permittable-finite"] = true
+    end
+
+    def finite_bound?(schema, keyword)
+      schema.key?(keyword) && schema[keyword].to_f.finite?
     end
 
     # A list is stored cast by the field's type, so its enum is what the

@@ -138,6 +138,11 @@ module SchemaConformance
         [{ "amount" => -Float::INFINITY }, :non_finite]
       ]
     },
+    # A Range bound beyond a double's range (`0..10**400`) is NOT in this
+    # case: a JS validator parses that `maximum` as Infinity, so it does not
+    # bound the field, but this file's Ruby validator compares
+    # `Float::INFINITY <= 10**400` exactly and cannot see it. The unit spec
+    # for x-permittable-finite in json_schema_spec.rb guards that label.
     "numbers bounded on both sides by in:, which no validator can read as Infinity" => {
       contract: proc {
         optional :age, :integer, in: 0..120
