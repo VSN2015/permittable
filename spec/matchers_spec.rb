@@ -902,7 +902,7 @@ RSpec.describe "Permittable RSpec matchers" do
       it "fails with a clear error, not a silent skip, when Rails keeps it nowhere known" do
         hide_const("ActionDispatch::Request::Utils")
         hide_const("ActionDispatch::Http::Utils")
-        expect { accept_params(tags: ["a", "b"]).for_action(:create).matches?(tagged) }
+        expect { accept_params(tags: %w[a b]).for_action(:create).matches?(tagged) }
           .to raise_error(/ActionDispatch::Http::Utils.*ActionDispatch::Request::Utils/)
       end
 
