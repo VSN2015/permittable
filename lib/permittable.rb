@@ -1051,9 +1051,16 @@ module Permittable
     # Time#to_date: that keeps the instant's day NUMBER and labels it in the
     # Julian calendar before the 1582 reform, so Time.utc(1500, 1, 1) came
     # out as 1499-12-23 while "1500-01-01" was 1500-01-01.
+    #
+    # A day the 1582 reform skipped (1582-10-05..14) is no Date, as the String
+    # "1582-10-10" is none, so it is nil here and every caller gives its usual
+    # error. :datetime is proleptic Gregorian and does accept those days; the
+    # two differ there by design, :date being the String path's calendar.
     def date_of_instant(instant)
       utc = instant.to_time.getutc
-      Date.new(utc.year, utc.month, utc.day) if utc == utc.beginning_of_day
+      return unless utc == utc.beginning_of_day && Date.valid_date?(utc.year, utc.month, utc.day)
+
+      Date.new(utc.year, utc.month, utc.day)
     end
 
     # A zoneless String parses as UTC regardless of the host timezone
@@ -1272,7 +1279,7 @@ module Permittable
     # class-load error a reason where a request gets `invalid_type`.
     def instant_as_date(member)
       date = date_of_instant(member)
-      date ? [:ok, date] : [:error, "not midnight UTC, so it never equals a date"]
+      date ? [:ok, date] : [:error, "not midnight UTC of an existing day, so it never equals a date"]
     end
 
     # What an exported enum lists for one member: the cast value, re-encoded

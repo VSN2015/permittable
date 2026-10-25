@@ -882,6 +882,20 @@ RSpec.describe Permittable do
       expect(permittable_class(&field).permit_rule_for(:create)[:fields].first[:in].map(&:iso8601)).to eq(["1500-01-01"])
     end
 
+    # 1582-10-05..14 never existed in the Date calendar the String path uses
+    # (the reform skipped them), so an instant on one of those days is not a
+    # date: a request gets invalid_type and an in: member or default: the
+    # usual class-load error naming the field, not a bare Date::Error.
+    it "refuses a midnight-UTC Time on a day the 1582 reform skipped, like the String, naming the field" do
+      gap = Time.utc(1582, 10, 10)
+      expect(violations_for({ on: gap }, &decl).details).to eq([{ param: "on", code: "invalid_type" }])
+      expect(violations_for({ on: "1582-10-10" }, &decl).details).to eq([{ param: "on", code: "invalid_type" }])
+      expect { permittable_class { permit_params(:create) { optional :on, :date, in: [gap] } } }
+        .to raise_error(ArgumentError, /:in for field :on contains .*, which is not a valid :date/)
+      expect { permittable_class { permit_params(:create) { optional :on, :date, default: gap } } }
+        .to raise_error(ArgumentError, /:default for field :on violates its own contract \(invalid_type\)/)
+    end
+
     # The disagreements that reading caused: a noon DateTime default: was
     # stored as noon (and exported under `format: date` as a date-time), and
     # a noon DateTime was accepted on its own but refused as `inclusion` by
