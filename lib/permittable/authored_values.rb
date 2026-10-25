@@ -130,6 +130,27 @@ module Permittable
       result
     end
 
+    # An authored hash is exported as a schema `default`/`example`, and JSON
+    # has no NaN or Infinity: JSON.generate raises on them when the document
+    # is written, long after the class loaded. A request cannot carry one
+    # (JSON has none; a form sends Strings), so only the authored value is
+    # held to it, here, and not permittable_check_json for every request.
+    def permittable_check_json(field, value)
+      status, read = super
+      return [:error, "invalid_type"] if status == :ok && non_finite_inside?(value)
+
+      [status, read]
+    end
+
+    def non_finite_inside?(value)
+      case value
+      when Float then !value.finite?
+      when Hash then value.each_value.any? { |v| non_finite_inside?(v) }
+      when Array then value.any? { |v| non_finite_inside?(v) }
+      else false
+      end
+    end
+
     def permittable_violation(_field, param, code)
       { param: param, code: code.to_s }
     end
