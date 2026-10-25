@@ -574,6 +574,17 @@ RSpec.describe Permittable::OpenAPI do
         expect(body_schema(post)["required"]).to eq(%w[widget])
       end
 
+      it "keeps a name in the body when any route sharing the slot leaves it to the client" do
+        paths = widgets_document(controller) do
+          post "dup", to: "widgets#create", defaults: { kind: "l" }, constraints: ->(r) { r.headers["X-L"] }
+          post "dup", to: "widgets#create"
+        end["paths"]
+
+        body = body_schema(paths["/dup"]["post"])
+        expect(body["properties"].keys).to eq(%w[kind name])
+        expect(body["required"]).to eq(%w[kind])
+      end
+
       it "names the defaults on the descriptor, leaving controller, action and format out" do
         route_set = ActionDispatch::Routing::RouteSet.new.tap do |routes|
           routes.draw do

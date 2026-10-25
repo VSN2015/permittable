@@ -270,8 +270,12 @@ module Permittable
       routes.select { |route| OPENAPI_VERBS.include?(verb_of(route)) }
             .group_by { |route| [route[:controller].to_s, route[:action].to_s] }
             .transform_values do |matching|
-              matching.map { |route| [route[:path], verb_of(route), route[:template], route[:defaults]] }
-                      .uniq { |slot| slot.first(3) }
+              matching.group_by { |route| [route[:path], verb_of(route), route[:template]] }.map do |slot, same|
+                # Several routes can reach one slot (a constrained one ahead
+                # of a plain one): a name leaves the body only if every one
+                # of them fills it.
+                [*slot, same.map { |route| Array(route[:defaults]) }.reduce(:&)]
+              end
             end
     end
 
