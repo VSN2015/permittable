@@ -594,6 +594,18 @@ RSpec.describe "Permittable RSpec matchers" do
       expect(users).to accept_params(valid).for_action(:create)
     end
 
+    it "takes an upload for a :file field" do
+      avatars = Class.new(FakeController) do
+        include Permittable
+
+        def self.name = "AvatarsController"
+        permit_params(:create, root: :user) { required :avatar, :file }
+      end
+      upload = Rack::Test::UploadedFile.new(StringIO.new("png"), "image/png", original_filename: "a.png")
+      expect(avatars).to accept_params({ user: { avatar: upload } }).for_action(:create)
+      expect(avatars).to reject_params({ user: { avatar: "a.png" } }).for_action(:create)
+    end
+
     it "asserts the cast, defaulted output with returning" do
       expect(users).to accept_params(valid).for_action(:create)
                                            .returning("name" => "Jo", "email" => "a@b.co", "age" => 30, "plan" => "free")

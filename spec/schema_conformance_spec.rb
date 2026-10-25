@@ -66,6 +66,10 @@ module SchemaConformance
   #     every field has passed, so a payload each field's schema accepts is
   #     still refused. It belongs to the rule, not to a field, so the flag
   #     `x-permittable-finalize` sits on the rule's own object (see RULE_LEVEL).
+  #   :file_upload — a :file field takes only an upload object, which no JSON
+  #     value is, so a JSON body naming one is always refused; the schema,
+  #     which describes the multipart body's string, accepts any string. It
+  #     is flagged `contentMediaType` on the field.
   LOOSER = {
     extension_only: "x-permittable-max-depth",
     range_extension: "x-permittable-range",
@@ -73,7 +77,8 @@ module SchemaConformance
     normalized_first: "x-permittable-normalize",
     format_annotation: "format",
     string_decimal: "maximum",
-    finalize: "x-permittable-finalize"
+    finalize: "x-permittable-finalize",
+    file_upload: "contentMediaType"
   }.freeze
 
   # The LOOSER labels carried by the rule's own object rather than by the
@@ -81,6 +86,13 @@ module SchemaConformance
   RULE_LEVEL = %i[finalize].freeze
 
   CASES = {
+    "a :file field, which only a multipart upload can fill" => {
+      contract: proc { optional :avatar, :file },
+      payloads: [
+        [{}, :agree],
+        [{ "avatar" => "abc" }, :file_upload]
+      ]
+    },
     "scalars and bounds" => {
       contract: proc {
         required :name, :string, length: 1..8
@@ -451,7 +463,7 @@ RSpec.describe "the exported schema against what the contract enforces" do
       keywords_in(schema)
     end.uniq
     # Annotations carry no assertion, so the validator ignores them by design.
-    annotations = %w[default description examples writeOnly format]
+    annotations = %w[default description examples writeOnly format contentMediaType]
     unchecked = emitted - annotations - %w[
       type enum minimum maximum exclusiveMaximum minLength maxLength pattern
       required properties additionalProperties items minItems maxItems

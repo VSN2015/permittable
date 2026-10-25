@@ -153,10 +153,123 @@ module Permittable
     end
 
     def rule_request_body(rule)
+      media_type = body_media_type(rule)
+      schema = JsonSchema.rule(rule)
+      schema = form_schema(schema, rule) if media_type == "multipart/form-data"
       {
         "required" => !!(rule[:root] || rule[:fields].any? { |f| f[:required] }),
-        "content" => { "application/json" => { "schema" => JsonSchema.rule(rule) } }
+        "content" => { media_type => { "schema" => schema } }
       }
+    end
+
+    # A multipart body is not one JSON object: each part is a form field, and
+    # Rails reads the part NAMES. `user[avatar]` is the avatar of the `user`
+    # hash and a repeated `docs[]` is an array, so the schema's properties
+    # carry those names, flat, instead of nesting `user` as a single part
+    # (which a client would send as one JSON part, unable to hold the file).
+    # An array of hashes is sent in the indexed form Rails' fields_for renders
+    # (`items[0][photo]`, `items[1][photo]`, which the runtime reads), so its
+    # leaves are `patternProperties` with an anchored pattern each. What a
+    # flat body cannot say, a container's own `required`, bounds, `nullable`,
+    # `desc:` and `validate:` marker, rides in `x-permittable-form-groups`,
+    # keyed by the container's bracket name.
+    def form_schema(json_schema, rule)
+      form = { properties: {}, patterns: {}, required: [], groups: {} }
+      flatten_form(json_schema, [], true, form, skip_group: rule[:root] && rule[:root].to_s)
+      schema = { "type" => "object", "properties" => form[:properties] }
+      schema["patternProperties"] = form[:patterns] unless form[:patterns].empty?
+      schema["required"] = form[:required] unless form[:required].empty?
+      schema["x-permittable-form-groups"] = form[:groups] unless form[:groups].empty?
+      schema["x-permittable-finalize"] = true if rule[:finalize]
+      schema
+    end
+
+    GROUP_KEYS = %w[minItems maxItems description x-permittable-custom-validation].freeze
+
+    # `path` is the part name as segments: a key, or :index for the number
+    # an array of hashes' element carries. A path with no :index is a plain
+    # property name; one with an :index becomes a pattern. `required` is
+    # relative to the element inside an array of hashes: patterns cannot
+    # carry it, but a group inside the element (`items[][info]`) can.
+    def flatten_form(schema, path, required, form, skip_group: nil)
+      if form_container?(schema, "object")
+        form_group!(schema, path, required, form, skip_group)
+        schema["properties"].each do |key, child|
+          flatten_form(child, path + [key], required && schema.fetch("required", []).include?(key), form,
+                       skip_group: skip_group)
+        end
+      elsif form_container?(schema, "array") && form_container?(schema["items"], "object")
+        form_group!(schema, path, required, form, skip_group)
+        flatten_form(schema["items"], path + [:index], true, form, skip_group: skip_group)
+      else
+        if Array(schema["type"]).include?("array")
+          schema, required = form_list(schema, path, required, form)
+          path += [""]
+        end
+        form_leaf!(schema, path, required, form)
+      end
+    end
+
+    # A nullable array's null is an empty part named without the `[]`
+    # (`docs=""`); `docs[]=""` is an empty array. So the `docs[]` leaf loses
+    # "null" and the group entry, under the name the null is sent as, says so,
+    # and carries `required` too: listing `docs[]` as required would refuse
+    # the null, which sends no `docs[]` part. Returns [leaf schema, required].
+    def form_list(schema, path, required, form)
+      types = Array(schema["type"])
+      return [schema, required] unless types.include?("null")
+
+      form[:groups][form_name(path.map { |k| k == :index ? "" : k })] = { "required" => required, "nullable" => true }
+      types -= ["null"]
+      [schema.merge("type" => types.one? ? types.first : types), false]
+    end
+
+    def form_leaf!(schema, path, required, form)
+      if path.include?(:index)
+        form[:patterns][form_pattern(path)] = schema
+      else
+        name = form_name(path)
+        form[:properties][name] = schema
+        form[:required] << name if required
+      end
+    end
+
+    def form_name(path)
+      path.each_with_index.map { |key, i| i.zero? ? key.to_s : "[#{key}]" }.join
+    end
+
+    def form_pattern(path)
+      body = path.each_with_index.map do |key, i|
+        text = key == :index ? '\\d+' : key.to_s.gsub(JsonSchema::EcmaPattern::SYNTAX_ESCAPE) { |c| "\\#{c}" }
+        i.zero? ? text : "\\[#{text}\\]"
+      end
+      "^#{body.join}$"
+    end
+
+    def form_group!(schema, path, required, form, skip_group)
+      return if path.empty? || path == [skip_group] || path.last == :index
+
+      group = { "required" => required }
+      group["nullable"] = true if Array(schema["type"]).include?("null")
+      GROUP_KEYS.each { |key| group[key] = schema[key] if schema.key?(key) }
+      form[:groups][form_name(path.map { |k| k == :index ? "" : k })] = group
+    end
+
+    def form_container?(schema, kind)
+      return false unless schema.is_a?(Hash) && Array(schema["type"]).include?(kind)
+
+      kind == "array" ? schema.key?("items") : schema["properties"].is_a?(Hash)
+    end
+
+    # An upload cannot travel in JSON, so a rule with a :file field anywhere
+    # in it describes a multipart/form-data body; every other rule stays
+    # application/json.
+    def body_media_type(rule)
+      rule[:fields].any? { |f| file_field?(f) } ? "multipart/form-data" : "application/json"
+    end
+
+    def file_field?(field)
+      field[:type] == :file || field[:of] == :file || (field[:fields] || []).any? { |f| file_field?(f) }
     end
 
     # { action => operation } for every action the controller's contracts
@@ -570,7 +683,7 @@ module Permittable
       body = rule_request_body(moved.empty? ? rule : rule.merge(fields: rest))
       return body unless rule[:unknown] == :error && !rule[:root]
 
-      properties = body["content"]["application/json"]["schema"]["properties"]
+      properties = body["content"].values.first["schema"]["properties"]
       templated.each { |name| properties[name] ||= {} }
       body
     end

@@ -2989,6 +2989,98 @@ RSpec.describe Permittable do
     end
   end
 
+  describe ":file (uploads)" do
+    let(:upload) { Rack::Test::UploadedFile.new(StringIO.new("hello"), "text/plain", original_filename: "a.txt") }
+    let(:decl) { proc { permit_params(:create) { optional :avatar, :file } } }
+
+    it "passes a Rack::Test::UploadedFile through uncast" do
+      expect(permit({ avatar: upload }, &decl)[:avatar]).to equal(upload)
+    end
+
+    it "passes an ActionDispatch::Http::UploadedFile through uncast" do
+      http = ActionDispatch::Http::UploadedFile.new(tempfile: Tempfile.new("up"), filename: "a.txt", type: "text/plain")
+      expect(permit({ avatar: http }, &decl)[:avatar]).to equal(http)
+    end
+
+    it "refuses anything else as invalid_type, a String included" do
+      ["hello", 1, true, { a: 1 }, ["x"]].each do |value|
+        expect(violations_for({ avatar: value }, &decl).details).to eq([{ param: "avatar", code: "invalid_type" }])
+      end
+    end
+
+    it "reads nil and \"\" as absent, which is what an empty file input sends" do
+      expect(permit({ avatar: "" }, &decl)).not_to have_key(:avatar)
+      must = proc { permit_params(:create) { required :avatar, :file } }
+      expect(violations_for({ avatar: "" }, &must).details).to eq([{ param: "avatar", code: "missing" }])
+    end
+
+    it "takes required, nullable, validate:, transform:, desc: and sensitive:" do
+      blk = proc do
+        permit_params(:create) do
+          optional :a, :file, nullable: true, desc: "Avatar", sensitive: true,
+                              validate: ->(f) { f.size <= 3 }, transform: ->(f) { f.original_filename }
+        end
+      end
+      expect(violations_for({ a: upload }, &blk).details).to eq([{ param: "a", code: "invalid" }])
+      small = Rack::Test::UploadedFile.new(StringIO.new("hi"), "text/plain", original_filename: "s.txt")
+      expect(permit({ a: small }, &blk)[:a]).to eq("s.txt")
+      expect(permit({ a: "" }, &blk)[:a]).to be_nil
+    end
+
+    it "refuses in:, length:, format:, normalize:, default: and example: at class load" do
+      { in: %w[a], length: 1..2, format: :email, normalize: :strip, default: "x", example: "x" }.each do |opt, value|
+        expect { permittable_class { permit_params(:create) { optional :f, :file, opt => value } } }
+          .to raise_error(ArgumentError, /:#{opt} is not supported on :file fields \(field :f is :file\)/)
+      end
+    end
+
+    it "works as the element type of an array, dropping a blank element as #111 does" do
+      files = proc { permit_params(:create) { array :docs, of: :file, length: 0..2 } }
+      expect(permit({ docs: ["", upload] }, &files)[:docs]).to eq([upload])
+      expect(violations_for({ docs: [upload, "x"] }, &files).details).to eq([{ param: "docs[1]", code: "invalid_type" }])
+      expect { permittable_class { permit_params(:create) { array :docs, of: :file, default: [] } } }
+        .to raise_error(ArgumentError, /:default is not supported on :file fields/)
+    end
+
+    describe "through a real multipart request", :integration do
+      let(:controller) do
+        IntegrationHarness.build_controller do
+          include Permittable
+
+          permit_params :create, root: :doc, unknown: :error do
+            required :title, :string
+            optional :file, :file, validate: ->(f) { f.original_filename.end_with?(".txt") }
+            array :files, of: :file
+          end
+
+          def create
+            render json: { names: [permitted_params[:file], *permitted_params[:files]].compact.map(&:original_filename) }
+          end
+        end
+      end
+
+      it "accepts the uploads a multipart body carries" do
+        result = IntegrationHarness.dispatch(
+          controller, :create, method: "POST",
+                               multipart: [["doc[title]", "t"], ["doc[file]", "hi", "a.txt"],
+                                           ["doc[files][]", "hi", "b.txt"], ["doc[files][]", "", nil]]
+        )
+        expect(result.status).to eq(200)
+        expect(JSON.parse(result.body)["names"]).to eq(%w[a.txt b.txt])
+      end
+
+      it "still runs validate: on the upload" do
+        result = IntegrationHarness.dispatch(controller, :create, method: "POST",
+                                                                  multipart: [["doc[title]", "t"], ["doc[file]", "hi", "a.bin"]])
+        expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "doc.file", "code" => "invalid" }])
+        # a plain field where an upload belongs is refused by type
+        result = IntegrationHarness.dispatch(controller, :create, method: "POST",
+                                                                  multipart: [["doc[title]", "t"], ["doc[file]", "plain text"]])
+        expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "doc.file", "code" => "invalid_type" }])
+      end
+    end
+  end
+
   describe "array length: as a bound, not just a report" do
     it "stops at the length violation instead of checking every element" do
       decl = proc { permit_params(:create) { array :tags, of: :string, length: 0..2 } }
@@ -3113,6 +3205,11 @@ RSpec.describe Permittable do
       expect(Permittable.filter_parameter_registry.include?("ssn")).to be(true)
       expect(Permittable.filter_parameter_registry.include?("iban")).to be(true)
       expect(Permittable.filter_parameter_registry.include?("name")).to be(false)
+    end
+
+    it "registers a sensitive: :file field, so its filename is filtered from the logs" do
+      permittable_class { permit_params(:create) { optional :passport_scan, :file, sensitive: true } }
+      expect(Permittable.filter_parameter_registry.include?("passport_scan")).to be(true)
     end
 
     it "cascades sensitive: from a nested block to every field inside it" do
@@ -4125,6 +4222,18 @@ RSpec.describe Permittable do
             optional :password, :string, virtual: true
             array    :tag_names, of: :string
             optional(:address) { required :city, :string }
+          end
+        end
+      end.not_to raise_error
+    end
+
+    it "does not demand a column for a :file field, which is an attachment" do
+      m = model
+      expect do
+        permittable_class do
+          permit_params(:create, model: m) do
+            required :name, :string
+            optional :avatar, :file
           end
         end
       end.not_to raise_error

@@ -1,4 +1,5 @@
 require "json"
+require "open3"
 require "action_dispatch"
 
 RSpec.describe Permittable::OpenAPI do
@@ -237,6 +238,205 @@ RSpec.describe Permittable::OpenAPI do
       doc = described_class.document(controllers: [klass],
                                      routes: [{ controller: "users", action: "create", verb: "post", path: "/users" }])
       expect(doc["paths"]["/users"]["post"]).not_to have_key("parameters")
+    end
+
+    context "with a :file field" do
+      def upload_document(controller, &draw)
+        route_set = ActionDispatch::Routing::RouteSet.new.tap { |routes| routes.draw(&draw) }
+        described_class.document(controllers: [controller],
+                                 routes: described_class.rails_routes(Struct.new(:routes).new(route_set)))
+      end
+
+      let(:uploads) do
+        IntegrationHarness.build_controller do
+          include Permittable
+
+          def self.controller_path = "avatars"
+          permit_params :create, root: :avatar, unknown: :error do
+            required :name, :string
+            required :image, :file
+            array :tags, of: :string
+            optional :address do
+              required :city, :string
+              optional :scan, :file
+            end
+            array :items, length: 0..3, desc: "Line items" do
+              optional :photo, :file
+              optional :label, :string
+              array :marks, of: :string
+            end
+            optional :meta, nullable: true, desc: "Extras" do
+              required :pin, :string
+            end
+            array :spare, of: :file, nullable: true
+          end
+          permit_params(:update) do
+            required :id, :integer
+            array :docs, of: :file
+            optional :cover, :file
+          end
+          permit_params(:destroy) { required :reason, :string }
+          def create
+            items = permitted_params[:items].map do |i|
+              i.to_h.transform_values { |v| v.respond_to?(:original_filename) ? v.original_filename : v }
+            end
+            render(json: { names: permitted_params[:image].original_filename, items: items })
+          end
+        end
+      end
+
+      let(:paths) do
+        upload_document(uploads) { resources :avatars, only: %i[create update destroy] }["paths"]
+      end
+
+      def multipart_schema(operation)
+        content = operation["requestBody"]["content"]
+        expect(content.keys).to eq(["multipart/form-data"])
+        content["multipart/form-data"]["schema"]
+      end
+
+      it "documents the body as multipart/form-data, and only for the operations that carry a file" do
+        expect(multipart_schema(paths["/avatars"]["post"])).to be_a(Hash)
+        expect(multipart_schema(paths["/avatars/{id}"]["patch"])).to be_a(Hash)
+        expect(paths["/avatars/{id}"]["delete"]["requestBody"]["content"].keys).to eq(["application/json"])
+      end
+
+      it "names the parts the way Rails reads them: a rooted rule's brackets, [] for arrays, nesting in brackets" do
+        schema = multipart_schema(paths["/avatars"]["post"])
+        file = { "type" => "string", "contentMediaType" => "application/octet-stream" }
+        expect(schema["properties"]).to eq(
+          "avatar[name]" => { "type" => "string", "minLength" => 1 },
+          "avatar[image]" => file,
+          "avatar[tags][]" => { "type" => "array", "items" => { "type" => "string" } },
+          "avatar[address][city]" => { "type" => "string", "minLength" => 1 },
+          "avatar[address][scan]" => file,
+          "avatar[meta][pin]" => { "type" => "string", "minLength" => 1 },
+          "avatar[spare][]" => { "type" => "array", "items" => file }
+        )
+        # a required leaf is required only while every parent on its way is
+        expect(schema["required"]).to eq(["avatar[name]", "avatar[image]"])
+      end
+
+      it "sends an array of hashes with an index, as fields_for renders it, one pattern per leaf" do
+        patterns = multipart_schema(paths["/avatars"]["post"])["patternProperties"]
+        file = { "type" => "string", "contentMediaType" => "application/octet-stream" }
+        expect(patterns).to eq(
+          '^avatar\[items\]\[\d+\]\[photo\]$' => file,
+          '^avatar\[items\]\[\d+\]\[label\]$' => { "type" => "string" },
+          '^avatar\[items\]\[\d+\]\[marks\]\[\]$' => { "type" => "array", "items" => { "type" => "string" } }
+        )
+      end
+
+      it "keeps what the flat body cannot say in x-permittable-form-groups, one entry per container" do
+        groups = multipart_schema(paths["/avatars"]["post"])["x-permittable-form-groups"]
+        expect(groups).to eq(
+          "avatar[address]" => { "required" => false },
+          "avatar[items]" => { "required" => false, "maxItems" => 3, "minItems" => 0, "description" => "Line items" },
+          "avatar[meta]" => { "required" => false, "nullable" => true, "description" => "Extras" },
+          "avatar[spare]" => { "required" => false, "nullable" => true }
+        )
+      end
+
+      context "with containers inside an array element, odd names and nullable containers" do
+        let(:forms) do
+          IntegrationHarness.build_controller do
+            include Permittable
+
+            def self.controller_path = "forms"
+            permit_params :create, root: :avatar do
+              array :items, required: true do
+                required :photo, :file
+                required :info do
+                  required :code, :string
+                end
+              end
+              array :'line-items' do
+                optional :'scan-file', :file
+                optional :'my note', :string
+              end
+              array :docs, of: :file, nullable: true
+              array :need, of: :file, required: true, nullable: true
+              optional :meta, nullable: true do
+                optional :kind, :string
+              end
+            end
+            def create
+              render(json: permitted_params.to_h.slice("docs", "need", "meta"))
+            end
+          end
+        end
+
+        let(:schema) do
+          operation = upload_document(forms) { resources :forms, only: %i[create] }["paths"]["/forms"]["post"]
+          multipart_schema(operation)
+        end
+
+        it "marks a hash that an element requires as required, as the runtime does" do
+          expect(schema["x-permittable-form-groups"]["avatar[items][][info]"]).to eq("required" => true)
+        end
+
+        it "escapes only ECMA-262 syntax characters in a pattern, so Unicode mode compiles it" do
+          patterns = schema["patternProperties"].keys.grep(/line/)
+          expect(patterns).to eq(['^avatar\[line-items\]\[\d+\]\[scan-file\]$', '^avatar\[line-items\]\[\d+\]\[my note\]$'])
+          unless ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).any? { |d| File.executable?(File.join(d, "node")) }
+            skip "node is not on PATH"
+          end
+
+          script = 'JSON.parse(require("fs").readFileSync(0, "utf8")).forEach(p => new RegExp(p, "u"))'
+          _out, err, status = Open3.capture3("node", "-e", script, stdin_data: JSON.generate(schema["patternProperties"].keys))
+          expect(status).to be_success, err
+        end
+
+        it "documents a nullable container's null under the bracket name a client sends it as" do
+          expect(schema["properties"]["avatar[docs][]"]["type"]).to eq("array")
+          expect(schema["x-permittable-form-groups"]).to include("avatar[docs]" => { "required" => false, "nullable" => true },
+                                                                 "avatar[need]" => { "required" => true, "nullable" => true },
+                                                                 "avatar[meta]" => { "required" => false, "nullable" => true })
+          # its null has no [] part, so the required list cannot demand one; the group says required
+          expect(schema.fetch("required", [])).not_to include("avatar[need][]")
+          required = [["avatar[items][0][photo]", "x", "p.txt"], ["avatar[items][0][info][code]", "c"]]
+          nulls = %w[docs need meta].map { |name| ["avatar[#{name}]", ""] }
+          result = IntegrationHarness.dispatch(forms, :create, method: "POST", multipart: required + nulls)
+          expect([result.status, JSON.parse(result.body)]).to eq([200, { "docs" => nil, "need" => nil, "meta" => nil }])
+        end
+      end
+
+      it "names a rootless rule's parts by their bare names, and an array of files docs[]" do
+        patch = paths["/avatars/{id}"]["patch"]
+        expect(multipart_schema(patch)["properties"].keys).to eq(["docs[]", "cover"])
+        expect(multipart_schema(patch)["properties"]["docs[]"])
+          .to eq("type" => "array", "items" => { "type" => "string", "contentMediaType" => "application/octet-stream" })
+      end
+
+      it "still moves a rootless path-named field out of a multipart body" do
+        patch = paths["/avatars/{id}"]["patch"]
+        expect(patch["parameters"].first["name"]).to eq("id")
+        expect(multipart_schema(patch)["properties"]).not_to have_key("id")
+      end
+
+      it "describes a body the server accepts: a request built from the exported part names" do
+        schema = multipart_schema(paths["/avatars"]["post"])
+        parts = schema["properties"].flat_map do |name, leaf|
+          file = (leaf["items"] || leaf).key?("contentMediaType")
+          Array.new(leaf["type"] == "array" ? 2 : 1) { |i| [name, file ? "hi" : "text", (file ? "f#{i}.txt" : nil)] }
+        end
+        # two elements, the second without its optional photo, named from the patterns
+        schema["patternProperties"].each_key do |pattern|
+          template = pattern[1..-2].delete("\\")
+          file = schema["patternProperties"][pattern]["contentMediaType"]
+          [0, 1].each do |i|
+            next if file && i == 1
+
+            parts << [template.sub("d+", i.to_s), "v#{i}", (file ? "p.txt" : nil)]
+          end
+        end
+        result = IntegrationHarness.dispatch(uploads, :create, method: "POST", multipart: parts)
+        expect([result.status,
+                JSON.parse(result.body)]).to eq([200,
+                                                 { "names" => "f0.txt",
+                                                   "items" => [{ "photo" => "p.txt", "label" => "v0", "marks" => ["v0"] },
+                                                               { "label" => "v1", "marks" => ["v1"] }] }])
+      end
     end
 
     # Rails merges the router's path parameters over the body's keys, so a
