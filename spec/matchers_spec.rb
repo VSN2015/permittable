@@ -857,6 +857,60 @@ RSpec.describe "Permittable RSpec matchers" do
       end
     end
 
+    # A real request never delivers a null array element: Rails' default
+    # perform_deep_munge strips them from every array before Permittable
+    # reads params. The matchers hand the payload to a bare host, so they
+    # run it through the same normalization a request gets.
+    context "with a null array element, as Rails' deep munge sees it" do
+      let(:tagged) do
+        Class.new(FakeController) do
+          include Permittable
+
+          permit_params(:create) do
+            array :tags, of: :string, length: 2..2
+            optional :json, :json
+          end
+        end
+      end
+
+      def with_deep_munge(value)
+        original = ActionDispatch::Request::Utils.perform_deep_munge
+        ActionDispatch::Request::Utils.perform_deep_munge = value
+        yield
+      ensure
+        ActionDispatch::Request::Utils.perform_deep_munge = original
+      end
+
+      it "drops the null before the contract sees it, as a request does" do
+        expect(tagged).to accept_params(tags: ["a", "b", nil]).for_action(:create).returning("tags" => %w[a b])
+        expect(tagged).to reject_params(tags: ["a", nil]).for_action(:create).with_violation("tags", :length)
+        expect(tagged).not_to reject_params(tags: ["a", nil, "b"]).for_action(:create)
+      end
+
+      it "drops it inside a :json value too" do
+        expect(tagged).to accept_params(tags: %w[a b], json: { list: [1, nil] }).for_action(:create)
+                                                                                .returning("tags" => %w[a b], "json" => { "list" => [1] })
+      end
+
+      it "does not mutate the payload it was given" do
+        payload = { tags: ["a", "b", nil] }
+        expect(tagged).to accept_params(payload).for_action(:create)
+        expect(payload).to eq(tags: ["a", "b", nil])
+      end
+
+      it "still sees the null when the app turned perform_deep_munge off" do
+        with_deep_munge(false) do
+          expect(tagged).to reject_params(tags: ["a", nil]).for_action(:create).with_violation("tags[1]", :invalid_type)
+          expect(tagged).not_to accept_params(tags: ["a", "b", nil]).for_action(:create)
+        end
+      end
+
+      it "leaves a standalone Contract alone, where a null element is still invalid_type" do
+        contract = Permittable::Contract.define { array :tags, of: :string }
+        expect(contract).to reject_params(tags: ["a", nil]).with_violation("tags[1]", :invalid_type)
+      end
+    end
+
     # Documented in the README: the matchers run without a request, so there is
     # no route to read path parameters from. A real PATCH /widgets/7 carries
     # id in the URL and is accepted; the matcher is given only the payload.

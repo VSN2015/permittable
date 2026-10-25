@@ -749,7 +749,7 @@ module Permittable
         mirror_csrf_key(host)
         host.permittable_contracts = [rule.merge(mode: :enforce).freeze]
         instance = host.new
-        instance.params = @params
+        instance.params = request_params
         violations = instance.permittable_violations(action)
         result = violations.empty? ? instance.permitted_params(action) : nil
         [violations, result]
@@ -770,6 +770,30 @@ module Permittable
                 end
         host.define_method(:permittable_controller_name) { label }
         host.define_method(:permittable_action_name) { action }
+      end
+
+      # What a controller reads as `params`: the payload after the
+      # normalization every request goes through, ActionDispatch's
+      # Request::Utils. Under the default perform_deep_munge it removes nil
+      # from every array, so a JSON `{"tags": ["a", null]}` reaches the
+      # contract as ["a"], and `length:` never counts the null. Handing the
+      # raw payload over made reject_params(tags: ["a", nil]) pass for a
+      # request that is a 200. An app that turned perform_deep_munge off
+      # still sees the null, because the setting is read, not assumed.
+      # A copy goes in: the normalizer rewrites arrays in place, and the
+      # payload belongs to the spec.
+      def request_params
+        return @params unless defined?(ActionDispatch::Request::Utils)
+
+        ActionDispatch::Request::Utils.normalize_encode_params(copy_payload(@params))
+      end
+
+      def copy_payload(value)
+        case value
+        when Hash then value.to_h { |key, item| [key, copy_payload(item)] }
+        when Array then value.map { |item| copy_payload(item) }
+        else value
+        end
       end
 
       def run_contract
