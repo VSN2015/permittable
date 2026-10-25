@@ -386,6 +386,25 @@ RSpec.describe Permittable::Contract do
       expect(out).to eq("1500-01-01 10:00:00 UTC")
     end
 
+    it "reads a midnight-UTC Time or DateTime on a :date before 1582 as the day it names, whatever the host has loaded" do
+      # Time#to_date labels the instant's day number in the Julian calendar
+      # before the reform, so Time.utc(1500, 1, 1) was 1499-12-23, while the
+      # String "1500-01-01" has always been that day. Stdlib and
+      # ActiveSupport differ in how they get there; a clean process sees
+      # the stdlib half.
+      script = <<~RUBY
+        require "permittable"
+        contract = Permittable::Contract.define { required :on, :date }
+        puts contract.call!(on: Time.utc(1500, 1, 1))[:on].iso8601
+        puts contract.call!(on: DateTime.new(1500, 1, 1, 0, 0, 0, 0, Date::GREGORIAN))[:on].iso8601
+        puts contract.call!(on: "1500-01-01")[:on].iso8601
+      RUBY
+      lib = File.expand_path("../lib", __dir__)
+      out, err, status = Open3.capture3(RbConfig.ruby, "-I", lib, "-e", script)
+      expect(status).to be_success, err
+      expect(out.split).to eq(%w[1500-01-01] * 3)
+    end
+
     it "does not rewrite the caller's own Time while normalising it to UTC" do
       moment = Time.new(2026, 9, 5, 17, 30, 0, "+07:00")
       result = described_class.define { required :at, :datetime }.call!(at: moment)

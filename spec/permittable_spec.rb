@@ -856,6 +856,46 @@ RSpec.describe Permittable do
       end
     end
 
+    # Time#to_date keeps the instant's day NUMBER and labels it in the Julian
+    # calendar before the 1582 reform, so Time.utc(1500, 1, 1) became
+    # 1499-12-23 — while the string "1500-01-01" has always been that very
+    # day (and :datetime reads it back by component). The instant is read
+    # by its UTC components, as the String is, so both paths agree.
+    it "reads a midnight-UTC Time, DateTime or TimeWithZone before 1582 as the day it names, like the String" do
+      string = permit({ on: "1500-01-01" }, &decl)[:on]
+      [Time.utc(1500, 1, 1), DateTime.new(1500, 1, 1, 0, 0, 0, 0, Date::GREGORIAN), DateTime.new(1500, 1, 1),
+       Time.utc(1500, 1, 1).in_time_zone("Tokyo"), "1500-01-01T00:00:00Z"].each do |value|
+        read = permit({ on: value }, &decl)[:on]
+        expect(read.iso8601).to eq("1500-01-01"), "for #{value.inspect}"
+        expect(read).to eq(string).and(be_an_instance_of(Date)), "for #{value.inspect}"
+        expect(read.start).to eq(string.start), "for #{value.inspect}"
+      end
+      expect(permit({ on: Time.utc(1500, 1, 1) }, &decl)[:on]).to eq(Date.new(1500, 1, 1))
+      # A modern date, as the control.
+      expect(permit({ on: Time.utc(2026, 9, 5) }, &decl)[:on]).to eq(Date.new(2026, 9, 5))
+    end
+
+    it "matches a pre-1582 Time in: member and a pre-1582 Time default: against the date a request sends" do
+      field = proc { permit_params(:create) { optional :on, :date, in: [Time.utc(1500, 1, 1)], default: Time.utc(1500, 1, 1) } }
+      expect(permit({ on: "1500-01-01" }, &field)[:on]).to eq(Date.new(1500, 1, 1))
+      expect(permit({}, &field)[:on].iso8601).to eq("1500-01-01")
+      expect(permittable_class(&field).permit_rule_for(:create)[:fields].first[:in].map(&:iso8601)).to eq(["1500-01-01"])
+    end
+
+    # 1582-10-05..14 never existed in the Date calendar the String path uses
+    # (the reform skipped them), so an instant on one of those days is not a
+    # date: a request gets invalid_type and an in: member or default: the
+    # usual class-load error naming the field, not a bare Date::Error.
+    it "refuses a midnight-UTC Time on a day the 1582 reform skipped, like the String, naming the field" do
+      gap = Time.utc(1582, 10, 10)
+      expect(violations_for({ on: gap }, &decl).details).to eq([{ param: "on", code: "invalid_type" }])
+      expect(violations_for({ on: "1582-10-10" }, &decl).details).to eq([{ param: "on", code: "invalid_type" }])
+      expect { permittable_class { permit_params(:create) { optional :on, :date, in: [gap] } } }
+        .to raise_error(ArgumentError, /:in for field :on contains .*, which is not a valid :date/)
+      expect { permittable_class { permit_params(:create) { optional :on, :date, default: gap } } }
+        .to raise_error(ArgumentError, /:default for field :on violates its own contract \(invalid_type\)/)
+    end
+
     # The disagreements that reading caused: a noon DateTime default: was
     # stored as noon (and exported under `format: date` as a date-time), and
     # a noon DateTime was accepted on its own but refused as `inclusion` by
