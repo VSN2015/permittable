@@ -406,6 +406,52 @@ RSpec.describe Permittable do
       expect { permittable_class { permit_params(:create) { optional :at, :datetime, in: [Time.now] } } }.not_to raise_error
     end
 
+    # The same holds for a default: and an example:. The export prints the
+    # Rational third as .333333333, so a client sending the published default
+    # got a different instant than the action got for an omitted field.
+    it "refuses a :datetime default: or example: finer than a nanosecond, at any depth" do
+      third = Time.utc(2026, 1, 1, 0, 0, Rational(1, 3))
+      declarations = {
+        "scalar default" => proc { optional :at, :datetime, default: third },
+        "scalar example" => proc { optional :at, :datetime, example: third },
+        "array default" => proc { array :ats, of: :datetime, default: [Time.utc(2026, 1, 1), third] },
+        "array example" => proc { array :ats, of: :datetime, example: [third] },
+        "array of hashes default" => proc {
+          array :events, default: [{ at: third }] do
+            required :at, :datetime
+          end
+        },
+        "array of hashes example" => proc {
+          array :events, example: [{ at: Time.at(1.1).utc }] do
+            required :at, :datetime
+          end
+        },
+        "sub-field default" => proc {
+          array :events, default: [{}] do
+            optional :at, :datetime, default: third
+          end
+        }
+      }
+      declarations.each do |label, declaration|
+        expect { permittable_class { permit_params(:create, &declaration) } }
+          .to raise_error(ArgumentError, /violates its own contract.*finer than a nanosecond.*\.round\(9\)/), label
+      end
+    end
+
+    it "still accepts a :datetime default: or example: to the nanosecond, a String of any precision, and the clock" do
+      exact = Time.at(1, 100_000_000, :nsec).utc
+      decl = proc do
+        permit_params(:create) do
+          optional :at, :datetime, default: exact, example: Time.at(1.1).utc.round(9)
+          optional :now, :datetime, default: Time.now, example: Time.now
+          optional :str, :datetime, default: "2026-01-01T00:00:00.1234567891Z"
+          array :ats, of: :datetime, default: [exact], example: [Time.utc(2026, 1, 1)]
+        end
+      end
+      expect(permit({}, &decl)[:at]).to eq(exact)
+      expect(permit({}, &decl)[:ats]).to eq([exact])
+    end
+
     # A String member is cast exactly as a request sending that string is, and
     # published as written, so any precision it spells is reachable.
     it "still accepts a String :datetime :in member with more than nine fractional digits" do
