@@ -2863,14 +2863,16 @@ RSpec.describe Permittable do
           .to raise_error(ArgumentError, /:example for field :m violates its own contract \(depth\)/)
       end
 
+      holds_non_finite = ->(at) { "holds NaN or Infinity at #{Regexp.escape(at)}, which JSON cannot carry" }
+
       # JSON has no NaN or Infinity: the exported default/example would make
       # JSON.generate raise when the document is written, long after the load.
       it "refuses an authored default:/example: holding a NaN or infinite Float, at any depth, at class load" do
         [Float::NAN, Float::INFINITY, -Float::INFINITY].each do |bad|
-          [{ "x" => bad }, { "x" => [1, { "y" => bad }] }].each do |value|
+          { { "x" => bad } => "x", { "x" => [1, { "y" => bad }] } => "x[1].y" }.each do |value, at|
             %i[default example].each do |opt|
               expect { permittable_class { permit_params(:create) { optional :m, :json, opt => value } } }
-                .to raise_error(ArgumentError, /:#{opt} for field :m violates its own contract \(invalid_type\)/)
+                .to raise_error(ArgumentError, /:#{opt} for field :m violates its own contract \(#{holds_non_finite.call(at)}\)/)
             end
           end
         end
@@ -2880,7 +2882,8 @@ RSpec.describe Permittable do
         %i[default example].each do |opt|
           expect do
             permittable_class { permit_params(:create) { array(:items, opt => [{ "m" => { "x" => Float::NAN } }]) { optional :m, :json } } }
-          end.to raise_error(ArgumentError, /:#{opt} for array :items violates its own contract: items\[0\]\.m \(invalid_type\)/)
+          end.to raise_error(ArgumentError,
+                             /:#{opt} for array :items violates its own contract: items\[0\]\.m \(#{holds_non_finite.call('x')}\)/)
         end
       end
 

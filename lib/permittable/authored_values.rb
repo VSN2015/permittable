@@ -137,17 +137,20 @@ module Permittable
     # held to it, here, and not permittable_check_json for every request.
     def permittable_check_json(field, value)
       status, read = super
-      return [:error, "invalid_type"] if status == :ok && non_finite_inside?(value)
+      return [status, read] unless status == :ok
+
+      at = non_finite_path(value, "")
+      return [:error, "holds NaN or Infinity at #{at}, which JSON cannot carry"] if at
 
       [status, read]
     end
 
-    def non_finite_inside?(value)
+    # Where the first NaN or infinite Float sits, as `a.b[1].c`, or nil.
+    def non_finite_path(value, path)
       case value
-      when Float then !value.finite?
-      when Hash then value.each_value.any? { |v| non_finite_inside?(v) }
-      when Array then value.any? { |v| non_finite_inside?(v) }
-      else false
+      when Float then path unless value.finite?
+      when Hash then value.each_pair.lazy.filter_map { |k, v| non_finite_path(v, path.empty? ? k.to_s : "#{path}.#{k}") }.first
+      when Array then value.each_with_index.lazy.filter_map { |v, i| non_finite_path(v, "#{path}[#{i}]") }.first
       end
     end
 
