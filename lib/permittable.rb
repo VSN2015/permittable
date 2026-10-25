@@ -2158,12 +2158,29 @@ module Permittable
       missing = []
       missing << "AbstractController::Callbacks" if (rule[:enforce] || monitored) && !respond_to?(:before_action)
       missing << "ActionController::Rescue" if rule[:enforce] && !monitored && !respond_to?(:rescue_from)
-      return if missing.empty?
+      if missing.empty?
+        return unless rule[:enforce] && !monitored && permittable_rescue_inside_callbacks?
+
+        raise ArgumentError,
+              "#{LABEL}: permit_params on #{name || inspect}, an ActionController::Metal controller, cannot rescue " \
+              "this enforce: true rule: include ActionController::Rescue after AbstractController::Callbacks, " \
+              "as ActionController::Base does. Included before it, Rescue wraps only the action, so the " \
+              "before_action's InvalidParameters escapes as a 500"
+      end
 
       raise ArgumentError,
             "#{LABEL}: permit_params on #{name || inspect}, an ActionController::Metal controller, cannot run " \
             "this #{monitored ? 'monitor-mode' : 'enforce: true'} rule: include #{missing.join(' and ')} " \
             "before permit_params (ActionController::Rescue after AbstractController::Callbacks, as ActionController::Base does)"
+    end
+
+    # A module included later sits earlier in the ancestors and so runs
+    # outside the others' process_action: Rescue is only around the
+    # callbacks when it was included after them.
+    def permittable_rescue_inside_callbacks?
+      rescue_at = ancestors.index(::ActionController::Rescue)
+      callbacks_at = ancestors.index(::AbstractController::Callbacks)
+      !rescue_at.nil? && !callbacks_at.nil? && rescue_at > callbacks_at
     end
 
     def resolve_permit_model(model)

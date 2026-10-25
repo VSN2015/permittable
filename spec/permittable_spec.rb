@@ -4814,6 +4814,25 @@ RSpec.describe Permittable do
           end.to raise_error(ArgumentError, /include ActionController::Rescue/)
         end
 
+        # A module included later is in front: Rescue included first wraps only
+        # the action, so the before_action's InvalidParameters escapes as a 500.
+        [%i[rescue callbacks permittable], %i[permittable rescue callbacks], %i[rescue permittable callbacks]].each do |order|
+          it "raises at class load for an enforce: true rule when Rescue is included before Callbacks (#{order.join(', ')})" do
+            expect do
+              build_metal(order) { permit_params(:create, enforce: true) { required :name, :string } }
+            end.to raise_error(ArgumentError, /include ActionController::Rescue after AbstractController::Callbacks/)
+          end
+        end
+
+        it "lets Rescue come before Callbacks for a rule that never raises from a callback" do
+          expect do
+            build_metal(%i[rescue callbacks permittable]) do
+              permit_params(:create, enforce: true, mode: :monitor) { required :name, :string }
+              permit_params(:update) { required :name, :string }
+            end
+          end.not_to raise_error
+        end
+
         it "lets a lazy rule, which the action can rescue itself, and a monitor rule without Rescue load" do
           expect do
             build_metal(%i[permittable]) { permit_params(:create) { required :name, :string } }
