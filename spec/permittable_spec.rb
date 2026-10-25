@@ -2863,6 +2863,36 @@ RSpec.describe Permittable do
           .to raise_error(ArgumentError, /:example for field :m violates its own contract \(depth\)/)
       end
 
+      holds_non_finite = ->(at) { "holds NaN or Infinity at #{Regexp.escape(at)}, which JSON cannot carry" }
+
+      # JSON has no NaN or Infinity: the exported default/example would make
+      # JSON.generate raise when the document is written, long after the load.
+      it "refuses an authored default:/example: holding a NaN or infinite Float, at any depth, at class load" do
+        [Float::NAN, Float::INFINITY, -Float::INFINITY].each do |bad|
+          { { "x" => bad } => "x", { "x" => [1, { "y" => bad }] } => "x[1].y" }.each do |value, at|
+            %i[default example].each do |opt|
+              expect { permittable_class { permit_params(:create) { optional :m, :json, opt => value } } }
+                .to raise_error(ArgumentError, /:#{opt} for field :m violates its own contract \(#{holds_non_finite.call(at)}\)/)
+            end
+          end
+        end
+      end
+
+      it "refuses a non-finite Float in a :json value inside an array's default:/example: too" do
+        %i[default example].each do |opt|
+          expect do
+            permittable_class { permit_params(:create) { array(:items, opt => [{ "m" => { "x" => Float::NAN } }]) { optional :m, :json } } }
+          end.to raise_error(ArgumentError,
+                             /:#{opt} for array :items violates its own contract: items\[0\]\.m \(#{holds_non_finite.call('x')}\)/)
+        end
+      end
+
+      it "still reads a request's hash as it always did, finite or not: only the authored value is held to JSON" do
+        decl = proc { permit_params(:create) { optional :m, :json } }
+        expect(permit({ m: { "x" => 1.5 } }, &decl)[:m]).to eq("x" => 1.5)
+        expect(permit({ m: { "x" => Float::NAN } }, &decl)[:m]["x"]).to be_nan
+      end
+
       it "reads an authored default:/example: as a request's hash is read: indifferent, and a copy" do
         theme = ->(prefs) { %w[light dark].include?(prefs[:theme]) }
         expect(permit({ prefs: { "theme" => "dark" } }) { permit_params(:create) { optional :prefs, :json, validate: theme } }[:prefs])

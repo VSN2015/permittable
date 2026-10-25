@@ -130,6 +130,30 @@ module Permittable
       result
     end
 
+    # An authored hash is exported as a schema `default`/`example`, and JSON
+    # has no NaN or Infinity: JSON.generate raises on them when the document
+    # is written, long after the class loaded. A request cannot carry one
+    # (JSON has none; a form sends Strings), so only the authored value is
+    # held to it, here, and not permittable_check_json for every request.
+    def permittable_check_json(field, value)
+      status, read = super
+      return [status, read] unless status == :ok
+
+      at = non_finite_path(value, "")
+      return [:error, "holds NaN or Infinity at #{at}, which JSON cannot carry"] if at
+
+      [status, read]
+    end
+
+    # Where the first NaN or infinite Float sits, as `a.b[1].c`, or nil.
+    def non_finite_path(value, path)
+      case value
+      when Float then path unless value.finite?
+      when Hash then value.each_pair.lazy.filter_map { |k, v| non_finite_path(v, path.empty? ? k.to_s : "#{path}.#{k}") }.first
+      when Array then value.each_with_index.lazy.filter_map { |v, i| non_finite_path(v, "#{path}[#{i}]") }.first
+      end
+    end
+
     def permittable_violation(_field, param, code)
       { param: param, code: code.to_s }
     end
