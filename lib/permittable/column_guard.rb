@@ -49,6 +49,8 @@ module Permittable
 
       fields.flatten.compact.each do |field|
         unless klass.column_names.include?(field.to_s)
+          raise ArgumentError, ignored_column_message(label, klass, field) if ignored_column?(klass, field)
+
           raise ArgumentError,
                 "#{label}: '#{field}' does not exist in the database (table: #{klass.table_name})." \
                 "#{column_migration_hint(klass, field, types)}"
@@ -202,6 +204,20 @@ module Permittable
 
     def model_expr(klass)
       klass.name || "Model"
+    end
+
+    # `klass.column_names` leaves out `self.ignored_columns`, so an ignored
+    # column that IS in the database reads as missing. Raising stays right
+    # (`Model.new(field: ...)` raises UnknownAttributeError), but the
+    # migration the missing-column message teaches would duplicate it.
+    def ignored_column?(klass, field)
+      klass.respond_to?(:ignored_columns) && klass.ignored_columns.map(&:to_s).include?(field.to_s)
+    end
+
+    def ignored_column_message(label, klass, field)
+      "#{label}: '#{field}' is in #{model_expr(klass)}'s ignored_columns (table: #{klass.table_name}), " \
+        "so the model ignores that column and assigning it raises ActiveModel::UnknownAttributeError. " \
+        "Remove it from ignored_columns, or declare the field virtual: true if the app handles it itself."
     end
 
     def column_migration_hint(klass, field, types)

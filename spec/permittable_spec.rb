@@ -4116,6 +4116,26 @@ RSpec.describe Permittable do
       end
     end
 
+    it "says the model ignores a column that is in the database, and suggests no migration" do
+      m = model
+      m.ignored_columns += ["age"]
+      expect do
+        permittable_class { permit_params(:create, model: m) { optional :age, :integer } }
+      end.to raise_error(ArgumentError) do |e|
+        expect(e.message).to match(/'age' is in Model's ignored_columns \(table: permit_users\), so the model ignores that column/)
+        expect(e.message).to match(/Remove it from ignored_columns, or declare the field virtual: true/)
+        expect(e.message).not_to match(/does not exist in the database|generate migration/)
+      end
+    end
+
+    it "accepts an ignored column declared virtual: true" do
+      m = model
+      m.ignored_columns += ["age"]
+      expect do
+        permittable_class { permit_params(:create, model: m) { optional :age, :integer, virtual: true } }
+      end.not_to raise_error
+    end
+
     it "skips virtual fields and (implicitly) nested/array fields" do
       m = model
       expect do
