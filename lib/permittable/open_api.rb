@@ -270,7 +270,8 @@ module Permittable
       routes.select { |route| OPENAPI_VERBS.include?(verb_of(route)) }
             .group_by { |route| [route[:controller].to_s, route[:action].to_s] }
             .transform_values do |matching|
-              matching.map { |route| [route[:path], verb_of(route), route[:template]] }.uniq
+              matching.map { |route| [route[:path], verb_of(route), route[:template], route[:defaults]] }
+                      .uniq { |slot| slot.first(3) }
             end
     end
 
@@ -371,9 +372,9 @@ module Permittable
           slots << OperationSlot.new(holder, action, nil, operation["operationId"], owner) unless holder.key?(action)
           holder[action] = operation
         else
-          free.each do |path, verb, template|
+          free.each do |path, verb, template, defaults|
             holder = (paths[path] ||= {})
-            placed = with_path_parameters(operation, path, controller.permit_rule_for(action), template || path)
+            placed = with_path_parameters(operation, path, controller.permit_rule_for(action), template || path, defaults)
             holder[verb] = template ? placed.merge("x-permittable-path" => template) : placed
             slots << OperationSlot.new(holder, verb, verb, operation["operationId"], owner, path)
           end
@@ -495,14 +496,22 @@ module Permittable
     # `own` is the route's own spelling of the template, which differs
     # from `path` when collapse_shapes placed the route under another
     # route's spelling: the same shape, so the names pair up by position.
-    def with_path_parameters(operation, path, rule, own = path)
+    #
+    # `defaults` names what the route fills from its `defaults:` (see
+    # route_defaults). The router merges those over the body like a
+    # templated name, so they leave the body the same way, but the URL does
+    # not carry them and they are no path parameter. A name the path
+    # templates is that parameter instead: `get "o(/:id)", defaults:
+    # { id: 5 }` is a parameter on `/o/{id}` and a default only on `/o`.
+    def with_path_parameters(operation, path, rule, own = path, defaults = [])
       # A name the path templates twice (a mount and an engine route both
       # name `:id`) is declared once: OpenAPI forbids two parameters with
       # one name and location.
       variables = path.scan(/\{(\w+)\}/).flatten.uniq
-      return operation if variables.empty?
-
       own_names = own.scan(/\{(\w+)\}/).flatten
+      supplied = Array(defaults) - own_names
+      return operation if variables.empty? && supplied.empty?
+
       fields = path_fields(rule, path.scan(/\{(\w+)\}/).flatten.zip(own_names).uniq(&:first))
       parameters = variables.map do |name|
         schema = fields[name] ? path_schema(fields[name]) : { "type" => "string" }
@@ -512,8 +521,8 @@ module Permittable
       # it; emission stays deterministic either way.
       operation.each_with_object({}) do |(key, value), out|
         if key == "requestBody"
-          out["parameters"] = parameters
-          value = body_without(rule, fields.values, own_names)
+          out["parameters"] = parameters unless parameters.empty?
+          value = body_without(rule, fields.values + default_fields(rule, supplied), own_names + supplied)
         end
         out[key] = value unless value.nil?
       end
@@ -541,6 +550,16 @@ module Permittable
       end.to_h
     end
 
+    # The rootless contract's fields for the names the route's `defaults:`
+    # fill. Unlike a path parameter's, any kind of field goes: the router
+    # overwrites the body's value whatever its shape, and no parameter has to
+    # carry it.
+    def default_fields(rule, names)
+      return [] if rule[:root]
+
+      rule[:fields].select { |f| names.include?(f[:name].to_s) }
+    end
+
     # A moved field's schema as the path parameter documents it. The URL
     # always supplies the segment, so a `default:` never applies and the
     # value is never null: `nullable:` would only add "null" to the type.
@@ -561,7 +580,8 @@ module Permittable
     # produces, so the schema must not forbid it. Each name the route
     # templates therefore stays in the body as an unconstrained property,
     # any value and never required, since the value is read from the URL and
-    # nothing in the body can make the request wrong. A rooted contract
+    # nothing in the body can make the request wrong. A name the route's
+    # `defaults:` fill is treated the same. A rooted contract
     # needs none of this: its wrapper object is permissive already.
     def body_without(rule, moved, templated)
       rest = rule[:fields] - moved
@@ -757,6 +777,9 @@ module Permittable
         if engines && (mounted = mounted_routes(route)) && visiting.none? { |above| above.equal?(mounted) }
           found = collect_routes(mounted, engines: engines, prefixes: mount_prefixes(prefixes, route), parents: Array(id),
                                           visiting: visiting, reachable: reachable && unconditional?(route))
+          # What the mount fills reaches the engine's requests too.
+          mount_defaults = route_defaults(route)
+          found = found.map { |d| d.merge(defaults: (mount_defaults + Array(d[:defaults])).uniq) } unless mount_defaults.empty?
           verbs = route.verb.to_s.downcase.split("|")
           next verbs.empty? ? found : found.select { |descriptor| verbs.include?(descriptor[:verb]) }
         end
@@ -769,6 +792,7 @@ module Permittable
         verb = ALL_VERBS if verb.empty?
 
         variants = optional_variants(route.path.spec, requirements, prefixes)
+        defaults = route_defaults(route)
         # Read once per route; drop_shadowed reads it, then strips it.
         unconditional = reachable && unconditional?(route)
         # One route can answer several verbs (`match via: [:patch, :put]`, and
@@ -780,10 +804,23 @@ module Permittable
           variants.map do |path, shadows|
             descriptor = { controller: requirements[:controller], action: requirements[:action],
                            verb: single.downcase, path: path, route: id, unconditional: unconditional }
+            descriptor = descriptor.merge(defaults: defaults) unless defaults.empty?
             shadows.empty? ? descriptor : descriptor.merge(shadows: shadows)
           end
         end
       end
+    end
+
+    # The names a route fills from its `defaults:` (`scope`, `resources` and
+    # `mount` take them too), as strings. The router puts them into
+    # path_parameters beside the URL's own, so the client cannot set them;
+    # `controller`, `action` and `format` are the router's own keys and
+    # are left out, as the runtime leaves them out of `unknown:`. A
+    # hand-built route that cannot say fills nothing.
+    def route_defaults(route)
+      return [] unless route.respond_to?(:defaults)
+
+      route.defaults.keys.map(&:to_s) - %w[controller action format]
     end
 
     # The Prefix of each variant of a mount's path under each of `prefixes`,

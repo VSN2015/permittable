@@ -464,6 +464,128 @@ RSpec.describe Permittable::OpenAPI do
       end
     end
 
+    # A route's `defaults:` are path parameters too: Rails fills them into
+    # path_parameters, which overwrite the body's keys, so `POST /w/special`
+    # with {"kind":"zzz"} is a 200 with kind "x". The client controls none
+    # of them, and no URL carries them, so they are no path parameter either.
+    context "with a rootless field the route fills from defaults:" do
+      def widgets_document(controller, &draw)
+        route_set = ActionDispatch::Routing::RouteSet.new.tap { |routes| routes.draw(&draw) }
+        described_class.document(controllers: [controller],
+                                 routes: described_class.rails_routes(Struct.new(:routes).new(route_set)))
+      end
+
+      def body_schema(operation) = operation.dig("requestBody", "content", "application/json", "schema")
+
+      let(:controller) do
+        IntegrationHarness.build_controller do
+          include Permittable
+
+          def self.controller_path = "widgets"
+          permit_params(:create) do
+            required :kind, :string, in: %w[x y]
+            optional :name, :string
+          end
+          permit_params(:update, unknown: :error) do
+            required :id, :integer, in: 1..99
+            optional :name, :string
+          end
+          permit_params(:destroy, unknown: :error) { optional :name, :string }
+          def create = render(json: permitted_params)
+          def update = render(json: permitted_params)
+        end
+      end
+
+      it "leaves the field out of the body and its required list, and declares no path parameter" do
+        post = widgets_document(controller) do
+          post "w/special", to: "widgets#create", defaults: { kind: "x" }
+        end["paths"]["/w/special"]["post"]
+
+        expect(post).not_to have_key("parameters")
+        expect(body_schema(post)).to eq("type" => "object", "properties" => { "name" => { "type" => "string" } })
+        # What the runtime does with it: the default wins over any body.
+        %w[x y zzz].each do |kind|
+          reply = IntegrationHarness.dispatch(controller, :create, method: "POST", path_params: { kind: "x" },
+                                                                   json: { kind: kind })
+          expect([reply.status, JSON.parse(reply.body)]).to eq([200, { "kind" => "x" }])
+        end
+      end
+
+      it "keeps the name as a free, never-required property under unknown: :error, declared or not" do
+        paths = widgets_document(controller) do
+          patch "w/special", to: "widgets#update", defaults: { id: "5" }
+          delete "w/special", to: "widgets#destroy", defaults: { kind: "x" }
+        end["paths"]["/w/special"]
+
+        expect(body_schema(paths["patch"])).to eq(
+          "type" => "object", "properties" => { "name" => { "type" => "string" }, "id" => {} },
+          "additionalProperties" => false
+        )
+        expect(body_schema(paths["delete"])).to eq(
+          "type" => "object", "properties" => { "name" => { "type" => "string" }, "kind" => {} },
+          "additionalProperties" => false
+        )
+        ok = IntegrationHarness.dispatch(controller, :update, method: "PATCH", path_params: { id: "5" },
+                                                              json: { id: 500 })
+        expect(ok.status).to eq(200)
+      end
+
+      it "treats an optional segment's default as the path parameter only where the URL carries it" do
+        paths = widgets_document(controller) do
+          patch "o(/:id)", to: "widgets#update", defaults: { id: "5" }
+        end["paths"]
+
+        bare = paths["/o"]["patch"]
+        expect(bare).not_to have_key("parameters")
+        expect(body_schema(bare)["properties"]).to eq("name" => { "type" => "string" }, "id" => {})
+        expect(body_schema(bare)).not_to have_key("required")
+        expect(paths["/o/{id}"]["patch"]["parameters"].map { |p| p["name"] }).to eq(%w[id])
+        expect(paths["/o/{id}"]["patch"]["parameters"].first["schema"]).to include("type" => "integer")
+      end
+
+      it "drops a body the defaults left empty, and leaves the router's own format default alone" do
+        post = widgets_document(controller) do
+          post "w/special", to: "widgets#create", defaults: { kind: "x", format: "json" }
+        end["paths"]["/w/special"]["post"]
+        expect(body_schema(post)["properties"].keys).to eq(%w[name])
+
+        only_kind = IntegrationHarness.build_controller do
+          include Permittable
+
+          def self.controller_path = "widgets"
+          permit_params(:create) { required :kind, :string }
+        end
+        post = widgets_document(only_kind) do
+          post "w/special", to: "widgets#create", defaults: { kind: "x" }
+        end["paths"]["/w/special"]["post"]
+        expect(post).not_to have_key("requestBody")
+      end
+
+      it "leaves a rooted contract's body alone, its field being inside the root" do
+        rooted = IntegrationHarness.build_controller do
+          include Permittable
+
+          def self.controller_path = "widgets"
+          permit_params(:create, root: :widget) { required :kind, :string }
+        end
+        post = widgets_document(rooted) do
+          post "w/special", to: "widgets#create", defaults: { kind: "x" }
+        end["paths"]["/w/special"]["post"]
+        expect(body_schema(post)["required"]).to eq(%w[widget])
+      end
+
+      it "names the defaults on the descriptor, leaving controller, action and format out" do
+        route_set = ActionDispatch::Routing::RouteSet.new.tap do |routes|
+          routes.draw do
+            post "w/special", to: "widgets#create", defaults: { kind: "x", format: "json" }
+            post "plain", to: "widgets#create"
+          end
+        end
+        routes = described_class.rails_routes(Struct.new(:routes).new(route_set))
+        expect(routes.map { |r| [r[:path], r[:defaults]] }).to eq([["/w/special", %w[kind]], ["/plain", nil]])
+      end
+    end
+
     it "keeps a colliding operation visible instead of overwriting it" do
       users = controller_class(path: "users") { permit_params(:create) { required :name, :string } }
       clones = controller_class(path: "clones") { permit_params(:create) { required :other, :string } }
@@ -1443,6 +1565,30 @@ RSpec.describe Permittable::OpenAPI do
           mount billing => "/billing"
         end
         expect(described_class.rails_routes(app).map { |r| r[:route] }).to eq([0, [1, 0], [1, 1]])
+      end
+
+      it "names the defaults of an engine route and of the mount it is reached through" do
+        billing = engine("BillingEngine") do
+          post "refunds", to: "refunds#create", defaults: { kind: "x" }
+          post "plain", to: "refunds#create"
+        end
+        app = rails_app { mount billing => "/billing", defaults: { region: "eu" } }
+        routes = described_class.rails_routes(app)
+        expect(routes.map { |r| [r[:path], r[:defaults]] })
+          .to eq([["/billing/refunds", %w[region kind]], ["/billing/plain", %w[region]]])
+
+        refunds = controller_class(path: "refunds") do
+          permit_params(:create) do
+            required :kind, :string
+            required :region, :string
+            optional :name, :string
+          end
+        end
+        doc = described_class.document(controllers: [refunds], routes: routes)
+        body = ->(path) { doc["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"] }
+        expect(body.call("/billing/refunds")["properties"].keys).to eq(%w[name])
+        expect(body.call("/billing/plain")["properties"].keys).to eq(%w[kind name])
+        expect(body.call("/billing/plain")["required"]).to eq(%w[kind])
       end
 
       it "keeps an engine mounted twice apart" do
