@@ -218,7 +218,11 @@ module Permittable
   extend ActiveSupport::Concern
 
   LABEL = "Permittable".freeze
-  SCALAR_TYPES = %i[string integer float decimal boolean date datetime].freeze
+  SCALAR_TYPES = %i[string integer float decimal boolean date datetime file].freeze
+  # An upload, as multipart params carry it. It is a scalar in strong params'
+  # sense (an upload object is permitted), but it is never cast, and a
+  # request's String can never be one.
+  FILE_TYPE = :file
   # Not a scalar: an opaque hash whose shape is deliberately undeclared, for
   # the json/jsonb column a contract has to be able to carry.
   JSON_TYPE = :json
@@ -746,6 +750,7 @@ module Permittable
     end
 
     def cast(type, value)
+      return cast_file(value) if type == FILE_TYPE
       return [:error, "invalid_type"] unless scalar_shaped?(value)
       return public_send("cast_#{type}", value) unless value.is_a?(String)
       # Bytes that are not valid in the String's OWN encoding are not text in
@@ -817,6 +822,17 @@ module Permittable
       value.encode(Encoding::UTF_8, invalid: :replace, undef: :replace)
     rescue EncodingError
       value.dup.force_encoding(Encoding::UTF_8).scrub
+    end
+
+    # Exactly the upload objects ActionController::Parameters permits as
+    # scalars (its PERMITTED_SCALAR_TYPES): what Rails' multipart parser
+    # builds, and what rack-test sends. Each constant is looked up at call
+    # time, so the gem loads and a standalone Contract works without
+    # ActionDispatch or rack-test. The object is handed back as it came.
+    def cast_file(value)
+      upload = (defined?(ActionDispatch::Http::UploadedFile) && value.is_a?(ActionDispatch::Http::UploadedFile)) ||
+               (defined?(Rack::Test::UploadedFile) && value.is_a?(Rack::Test::UploadedFile))
+      upload ? [:ok, value] : [:error, "invalid_type"]
     end
 
     # Arrays, hashes, and nested ActionController::Parameters
@@ -1297,6 +1313,7 @@ module Permittable
   class ContractBuilder
     SCALAR_OPTS = %i[in format length default normalize validate virtual sensitive transform message desc example
                      nullable].freeze
+    FILE_REFUSED_OPTS = %i[in format length default normalize example].freeze
     NESTED_OPTS = %i[virtual sensitive message desc nullable].freeze
     JSON_OPTS   = %i[length max_depth default validate virtual sensitive transform message desc example
                      nullable].freeze
@@ -1348,6 +1365,7 @@ module Permittable
       name = field_name!(name)
       assert_opts!(name, opts, ARRAY_OPTS)
       required = opts.delete(:required) ? true : false
+      refuse_file_opts!(name, opts.keys & %i[default example], FILE_TYPE) if opts[:of]&.to_sym == FILE_TYPE
 
       field = { name: name, kind: :array, required: required, **opts }
       if field[:required] && field.key?(:default)
@@ -1553,6 +1571,7 @@ module Permittable
 
     def validate_scalar_opts!(field)
       name = field[:name]
+      refuse_file_opts!(name, field.keys & FILE_REFUSED_OPTS, FILE_TYPE) if field[:type] == FILE_TYPE
       if field[:required] && field.key?(:default)
         raise ArgumentError, "#{LABEL}: field :#{name} is required and cannot have a :default (default implies optional)"
       end
@@ -1728,6 +1747,17 @@ module Permittable
 
     # format / length / normalize reason about characters; on any other
     # type they would silently apply to a cast non-String and mislead.
+    # An upload is passed through as it came, so what shapes a String or
+    # picks a value to stand in for one has nothing to act on. `validate:`
+    # is where a size or content-type check belongs.
+    def refuse_file_opts!(name, opts, type)
+      opt = opts.first
+      return unless opt
+
+      raise ArgumentError, "#{LABEL}: :#{opt} is not supported on :#{type} fields (field :#{name} is :#{type}); " \
+                           "use validate: for a size or content-type check"
+    end
+
     def validate_string_only_opts!(field)
       return if field[:type] == :string
 
@@ -2146,8 +2176,12 @@ module Permittable
     # The drift guard. Nested/array fields are implicitly virtual — only
     # scalar fields, and the opaque `:json` field standing in for a
     # json/jsonb column, map one-to-one onto columns.
+    #
+    # A :file field is an upload, which maps to an attachment (ActiveStorage's
+    # has_one_attached, Shrine) rather than a column, so it is never demanded
+    # a column, as if it were virtual: true.
     def guard_contract_columns!(model_class, fields)
-      checked = fields.select { |f| %i[scalar json].include?(f[:kind]) && !f[:virtual] }
+      checked = fields.select { |f| %i[scalar json].include?(f[:kind]) && !f[:virtual] && f[:type] != FILE_TYPE }
       return if checked.empty?
 
       types = checked.to_h { |f| [f[:name], f[:type]] }
