@@ -605,6 +605,12 @@ array    :attachments, of: :file, length: 0..5
 
 `:file` takes `required:`, `nullable:`, `validate:`, `transform:`, `desc:`, `sensitive:`, `virtual:` and `message:`. `in:`, `length:`, `format:`, `normalize:`, `default:` and `example:` are refused at class load. A form's empty file input sends `""`, which is absent as everywhere else. The [drift guard](#the-schema-drift-guard) does not look for a column behind a `:file` field (an attachment is not a column), and the OpenAPI export documents an operation with a file as `multipart/form-data`, its properties named the way Rails reads the parts (`user[avatar]`, `docs[]`, `user[address][scan]`). An array of hashes is sent with an index (`items[0][photo]`, `items[0][name]`, `items[1][photo]`, …), as Rails' `fields_for` renders it, and the document describes those leaves with anchored `patternProperties`. What a flat body cannot carry, a container's own `required`, `minItems`/`maxItems`, `nullable`, `description` and custom-validation marker, is kept in the body's `x-permittable-form-groups`, keyed by the container's bracket name (`user[items]`), with `[]` standing for the index of a container inside an element (`user[items][][info]`). Send a nullable container's null as an empty part named by that bracket name, without `[]` (`user[docs]=""`; `user[docs][]=""` is an empty array). The children of an optional hash are required only when the hash is sent (the group entry says the hash is optional), and `patternProperties` cannot mark a leaf of an array element required.
 
+An ActiveStorage direct upload (`form.file_field :avatar, direct_upload: true`) sends the file from the browser straight to the storage service, and the form then submits only the blob's signed id, a String, which a `:file` field refuses as `invalid_type`. Declare such a field `:string` and attach the signed id (`record.avatar.attach(signed_id)`):
+
+```ruby
+optional :avatar, :string # direct upload: a signed blob id
+```
+
 Arrays are **optional unless `required: true`**, and `length:` on an array constrains the element **count**.
 
 An array of hashes also accepts the shape Rails' `fields_for` sends for nested attributes: `user[addresses_attributes][0][city]` reaches the params as a Hash keyed `"0"`, `"1"`, … and is read as the records it encodes, in the order sent, exactly as strong params and `accepts_nested_attributes_for` read it. Only that shape qualifies: every key an integer and every value a hash.
