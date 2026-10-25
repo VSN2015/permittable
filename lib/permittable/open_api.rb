@@ -103,20 +103,28 @@ module Permittable
     # module is an action_methods entry. A method is the framework's when it
     # is defined in one of its gems, by whichever module or class_attribute
     # put it on the controller; a method the app defines, in the class or in a
-    # concern of its own, stays an action. So does one a superclass declares,
-    # even a framework controller's (Rails::HealthController#show): modules
-    # and the controller's own class_attribute readers are what Rails
-    # leaves out of a Base controller, never a method of a class in its chain.
+    # concern of its own, stays an action. So does one a superclass declares in
+    # its own file, even a framework controller's (Rails::HealthController#show):
+    # a method defined elsewhere in a gem, such as the class_attribute readers
+    # an app's parent class gets from the modules it includes, is not one.
     def framework_method?(controller, action)
       return false unless controller.respond_to?(:instance_method)
 
       method = controller.instance_method(action)
-      return false if method.owner.is_a?(Class) && method.owner != controller
-
       file = method.source_location&.first
-      !file.nil? && framework_roots.any? { |root| file.start_with?(root) }
+      return false if file.nil? || framework_roots.none? { |root| file.start_with?(root) }
+
+      !declared_by_superclass?(method, controller, file)
     rescue NameError
       false
+    end
+
+    # Whether `method` is written in the file that defines its owner, a class
+    # other than the controller itself. An anonymous owner has no such file.
+    def declared_by_superclass?(method, controller, file)
+      owner = method.owner
+      owner.is_a?(Class) && owner != controller && !owner.name.nil? &&
+        Object.const_source_location(owner.name)&.first == file
     end
 
     # Resolved lazily, like concern_methods: the gems load after this file.

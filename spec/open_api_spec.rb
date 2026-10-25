@@ -206,22 +206,42 @@ RSpec.describe Permittable::OpenAPI do
     end
 
     # A framework controller's own action, such as Rails::HealthController#show,
-    # is defined in a Rails gem too, but it is an action of the app's subclass:
-    # what is dropped is a method no class in the chain declares as its own.
-    # A stand-in, `head` aliased as `show`, so it holds on 6.1.
+    # is defined in a Rails gem too, but it is an action of the app's subclass.
+    # Rails::WelcomeController is in every Rails this gem supports.
     it "keeps an action inherited from a framework controller, which is defined in a Rails gem", :integration do
-      parent = Class.new(ActionController::Metal) do
-        include ActionController::Head
+      require "logger"
+      require "rails"
+      require "rails/application_controller"
+      require "rails/welcome_controller"
+      klass = Class.new(Rails::WelcomeController) do
+        include Permittable
 
-        alias_method :show, :head
+        permit_params { optional :q, :string }
+      end
+      expect(klass.instance_method(:index).owner).to eq(Rails::WelcomeController)
+      expect(described_class.operations_for(klass).keys).to eq(%w[index])
+    end
+
+    # The same rule must not keep what an app's own parent class gets from
+    # the framework modules it includes: a class_attribute reader is owned by
+    # that class, but it is defined in ActiveSupport, not in the class's file.
+    it "still leaves out the class attributes a parent that includes the framework modules defines", :integration do
+      parent = Class.new(ActionController::Metal) do
+        include AbstractController::Callbacks
+        include ActionController::Renderers::All
+        include ActionController::Rescue
+        include ActionController::Rendering
       end
       klass = Class.new(parent) do
         include Permittable
 
         permit_params { optional :q, :string }
+
+        def create = nil
+        def own = nil
       end
-      expect(klass.instance_method(:show).owner).to eq(parent)
-      expect(described_class.operations_for(klass).keys).to eq(%w[show])
+      expect(klass.action_methods).to include("__callbacks", "_renderers", "rescue_handlers")
+      expect(described_class.operations_for(klass).keys).to eq(%w[create own])
     end
 
     # Ruby reports a method's source_location as a realpath, and Bundler's
