@@ -106,11 +106,11 @@ module Permittable
     # An authored :datetime Time must survive the export's nine digits, at
     # any depth, as a scalar `default:` or `example:` must (see Coercion).
     def permittable_check_scalar(field, value)
-      Coercion.refuse_finer_than_nanosecond(field[:type], value, super)
+      Coercion.refuse_finer_than_nanosecond(field[:type], super)
     end
 
     def permittable_cast_element(field, element)
-      Coercion.refuse_finer_than_nanosecond(field[:of], element, super)
+      Coercion.refuse_finer_than_nanosecond(field[:of], super)
     end
 
     # Nor does it run an array-level validate:, which expects the transformed

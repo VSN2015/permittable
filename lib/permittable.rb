@@ -1246,10 +1246,11 @@ module Permittable
       [:error, "finer than a nanosecond, so it never equals a request; round it, e.g. with .round(9)"]
     end
 
-    # Whether `raw`, authored as a Time-like for a :datetime field and cast to
-    # `cast_value`, holds more than the nine digits the export prints. A
-    # String is cast exactly as a request sending it is, and published as
-    # written, so whatever precision it spells is reachable.
+    # Whether `raw`, authored as a Time-like `in:` member of a :datetime
+    # field and cast to `cast_value`, holds more than the nine digits the
+    # export prints. A String `in:` member is exempt: it is cast exactly as a
+    # request sending it is, and published as written (see
+    # published_in_member), so whatever precision it spells is reachable.
     def finer_than_nanosecond?(type, raw, cast_value)
       type == :datetime && !raw.is_a?(String) && !whole_nanoseconds?(cast_value)
     end
@@ -1258,9 +1259,12 @@ module Permittable
     # `in:` member: the exported schema prints it to nine digits, so a value
     # finer than that was published as a different instant than the action
     # got for an omitted field, and a client sending the published default
-    # was not sending the default. `outcome` is the cast's [status, value].
-    def refuse_finer_than_nanosecond(type, raw, outcome)
-      return outcome unless outcome.first == :ok && finer_than_nanosecond?(type, raw, outcome.last)
+    # was not sending the default. Unlike an `in:` member, a String is NOT
+    # exempt here: a default or example is stored as the cast Time and
+    # exported from that, never as written, so "...00.1234567891Z" printed
+    # as .123456789Z. `outcome` is the cast's [status, value].
+    def refuse_finer_than_nanosecond(type, outcome)
+      return outcome unless outcome.first == :ok && type == :datetime && !whole_nanoseconds?(outcome.last)
 
       [:error, "finer than a nanosecond, so the export publishes a different instant; round it, e.g. with .round(9)"]
     end
@@ -1905,7 +1909,7 @@ module Permittable
       authored = field[opt].is_a?(String) ? field[opt].dup : field[opt]
       value = Coercion.apply_normalize(field[:normalize], authored)
       status, result = Coercion.refuse_finer_than_nanosecond(
-        field[:type], value, Coercion.check_scalar(live_in?(field) ? field.except(:in) : field, value)
+        field[:type], Coercion.check_scalar(live_in?(field) ? field.except(:in) : field, value)
       )
       raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{result})" unless status == :ok
 

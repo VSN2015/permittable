@@ -426,6 +426,9 @@ RSpec.describe Permittable do
             required :at, :datetime
           end
         },
+        "String default" => proc { optional :at, :datetime, default: "2026-01-01T00:00:00.1234567891Z" },
+        "String example" => proc { optional :at, :datetime, example: "2026-01-01T00:00:00.1234567891Z" },
+        "String in an array default" => proc { array :ats, of: :datetime, default: ["2026-01-01T00:00:00.1234567891Z"] },
         "sub-field default" => proc {
           array :events, default: [{}] do
             optional :at, :datetime, default: third
@@ -438,13 +441,13 @@ RSpec.describe Permittable do
       end
     end
 
-    it "still accepts a :datetime default: or example: to the nanosecond, a String of any precision, and the clock" do
+    it "still accepts a :datetime default: or example: to the nanosecond, a 9-digit String, and the clock" do
       exact = Time.at(1, 100_000_000, :nsec).utc
       decl = proc do
         permit_params(:create) do
           optional :at, :datetime, default: exact, example: Time.at(1.1).utc.round(9)
           optional :now, :datetime, default: Time.now, example: Time.now
-          optional :str, :datetime, default: "2026-01-01T00:00:00.1234567891Z"
+          optional :str, :datetime, default: "2026-01-01T00:00:00.123456789Z", example: "2026-01-01T00:00:00.5Z"
           array :ats, of: :datetime, default: [exact], example: [Time.utc(2026, 1, 1)]
         end
       end
