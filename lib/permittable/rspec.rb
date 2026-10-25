@@ -781,16 +781,21 @@ module Permittable
       # request that is a 200. An app that turned perform_deep_munge off
       # still sees the null, because the setting is read, not assumed.
       # A copy goes in: the normalizer rewrites arrays in place, and the
-      # payload belongs to the spec.
+      # payload belongs to the spec. The copy stringifies Symbol keys, which
+      # the normalizer's HashWithIndifferentAccess does anyway but only after
+      # it has read a Symbol :tempfile key as an upload, a key a request
+      # (String keys only) never has. A Parameters payload is unwrapped first
+      # so it is normalized like the Hash it wraps.
       def request_params
         return @params unless defined?(ActionDispatch::Request::Utils)
 
-        ActionDispatch::Request::Utils.normalize_encode_params(copy_payload(@params))
+        payload = @params.respond_to?(:to_unsafe_h) ? @params.to_unsafe_h : @params
+        ActionDispatch::Request::Utils.normalize_encode_params(copy_payload(payload))
       end
 
       def copy_payload(value)
         case value
-        when Hash then value.to_h { |key, item| [key, copy_payload(item)] }
+        when Hash then value.to_h { |key, item| [key.is_a?(Symbol) ? key.to_s : key, copy_payload(item)] }
         when Array then value.map { |item| copy_payload(item) }
         else value
         end

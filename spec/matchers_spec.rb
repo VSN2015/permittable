@@ -905,6 +905,27 @@ RSpec.describe "Permittable RSpec matchers" do
         end
       end
 
+      it "normalizes an ActionController::Parameters payload like the equivalent Hash" do
+        payload = ActionController::Parameters.new(tags: ["a", "b", nil])
+        expect(tagged).to accept_params(payload).for_action(:create).returning("tags" => %w[a b])
+      end
+
+      # Rails turns a Hash with a :tempfile key into an UploadedFile. A payload
+      # is written with Symbol keys, which a JSON or form request never has.
+      it "does not read a Symbol :tempfile key as an upload" do
+        files = Class.new(FakeController) do
+          include Permittable
+
+          permit_params(:create) do
+            required(:doc) { required :tempfile, :string }
+            required :tempfile, :string
+            optional :meta, :json
+          end
+        end
+        expect(files).to accept_params(doc: { tempfile: "abc" }, tempfile: "abc", meta: { tempfile: nil })
+          .for_action(:create)
+      end
+
       it "leaves a standalone Contract alone, where a null element is still invalid_type" do
         contract = Permittable::Contract.define { array :tags, of: :string }
         expect(contract).to reject_params(tags: ["a", nil]).with_violation("tags[1]", :invalid_type)
