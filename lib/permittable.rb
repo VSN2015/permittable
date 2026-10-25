@@ -640,15 +640,14 @@ module Permittable
 
   included do
     class_attribute :permittable_contracts, instance_accessor: false, default: []
+    # Whether the gem itself ever registered its rescue_from / before_action
+    # for this class (a subclass inherits the answer). Asking the callback
+    # chain instead would bring back a check the app took out with
+    # `skip_before_action :enforce_params_contract`.
+    class_attribute :permittable_rescue_registered, :permittable_callback_registered,
+                    instance_accessor: false, default: false
 
-    rescue_from InvalidParameters, with: :render_invalid_parameters if respond_to?(:rescue_from)
-    # Registered here, at the include, and not at the first `permit_params`:
-    # the README documents `skip_before_action :enforce_params_contract`, and
-    # Rails raises when it is asked to skip a callback that is not defined
-    # yet. The cost is the order: this check runs before any callback
-    # declared after the include (see the README's "Per-request locales"),
-    # so a locale switch that must cover it is a `prepend_around_action`.
-    before_action :enforce_params_contract if respond_to?(:before_action)
+    permittable_register_hooks
   end
 
   # Strict params-shaped coercion, shared by request-time validation and
@@ -2106,6 +2105,8 @@ module Permittable
       rule = { actions: actions.flatten.map(&:to_s).freeze, root: root && root.to_sym,
                model: model_class, unknown: unknown, enforce: !!enforce, mode: mode, fields: fields,
                finalize: builder.finalizer, desc: desc&.deep_dup&.freeze }.freeze
+      permittable_register_hooks
+      permittable_ensure_runnable!(rule)
       self.permittable_contracts = permittable_contracts + [rule]
     end
 
@@ -2118,6 +2119,69 @@ module Permittable
     end
 
     private
+
+    # Registers the rescue_from handler and the before_action the gem relies
+    # on, each once per class, as soon as the class can take them. They used
+    # to be registered at the include alone, so a bare ActionController::Metal
+    # controller that included Permittable BEFORE AbstractController::Callbacks
+    # and ActionController::Rescue never got them: an `enforce: true` rule let
+    # bad requests through, and a violation escaped as a 500. Called at the
+    # include and again at every permit_params, which is where such a class
+    # has by now been given its modules. The callback is still registered
+    # ahead of any declared after this point (see the README's "Per-request
+    # locales").
+    def permittable_register_hooks
+      if !permittable_rescue_registered && respond_to?(:rescue_from)
+        rescue_from InvalidParameters, with: :render_invalid_parameters
+        self.permittable_rescue_registered = true
+      end
+      return if permittable_callback_registered || !respond_to?(:before_action)
+
+      # Registered at the include, and not at the first `permit_params`, when
+      # the host has callbacks by then: the README documents
+      # `skip_before_action :enforce_params_contract`, and Rails raises when it
+      # is asked to skip a callback that is not defined yet. The cost is the
+      # order: this check runs before any callback declared after the include,
+      # so a locale switch that must cover it is a `prepend_around_action`.
+      before_action :enforce_params_contract
+      self.permittable_callback_registered = true
+    end
+
+    # A bare ActionController::Metal controller has neither callbacks nor
+    # rescue_from until the app includes them, and a rule that needs one of
+    # them would otherwise load and then not run: raise at class load, naming
+    # the module. Other hosts (a plain class, a duck) are left as they are.
+    def permittable_ensure_runnable!(rule)
+      return unless defined?(::ActionController::Metal) && self < ::ActionController::Metal
+
+      monitored = rule[:mode] == :monitor
+      missing = []
+      missing << "AbstractController::Callbacks" if (rule[:enforce] || monitored) && !respond_to?(:before_action)
+      missing << "ActionController::Rescue" if rule[:enforce] && !monitored && !respond_to?(:rescue_from)
+      if missing.empty?
+        return unless rule[:enforce] && !monitored && permittable_rescue_inside_callbacks?
+
+        raise ArgumentError,
+              "#{LABEL}: permit_params on #{name || inspect}, an ActionController::Metal controller, cannot rescue " \
+              "this enforce: true rule: include ActionController::Rescue after AbstractController::Callbacks, " \
+              "as ActionController::Base does. Included before it, Rescue wraps only the action, so the " \
+              "before_action's InvalidParameters escapes as a 500"
+      end
+
+      raise ArgumentError,
+            "#{LABEL}: permit_params on #{name || inspect}, an ActionController::Metal controller, cannot run " \
+            "this #{monitored ? 'monitor-mode' : 'enforce: true'} rule: include #{missing.join(' and ')} " \
+            "before permit_params (ActionController::Rescue after AbstractController::Callbacks, as ActionController::Base does)"
+    end
+
+    # A module included later sits earlier in the ancestors and so runs
+    # outside the others' process_action: Rescue is only around the
+    # callbacks when it was included after them.
+    def permittable_rescue_inside_callbacks?
+      rescue_at = ancestors.index(::ActionController::Rescue)
+      callbacks_at = ancestors.index(::AbstractController::Callbacks)
+      !rescue_at.nil? && !callbacks_at.nil? && rescue_at > callbacks_at
+    end
 
     def resolve_permit_model(model)
       case model
