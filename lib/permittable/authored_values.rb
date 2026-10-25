@@ -114,11 +114,13 @@ module Permittable
     # What a client sends has no defaults filled in: an omitted sub-field
     # stays omitted, at any depth, so the published example does not show a
     # value (`cents: 0`) that no client sends. The walker fills them in; drop
-    # exactly what it filled, by the walker's own absence rule.
+    # exactly what it filled, by the walker's own absence rule, judged on the
+    # hash the walker walked: one with the date parts read into their field.
     def permittable_check_hash(fields, hash, **)
       result = super
       return result unless @as_sent
 
+      hash = permittable_read_date_parts(fields, hash)
       fields.each do |field|
         key = field[:name].to_s
         next unless field.key?(:default)

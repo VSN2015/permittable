@@ -2249,6 +2249,28 @@ RSpec.describe Permittable do
       expect(controller(klass, params: { items: sent }).permitted_params[:items]).to eq([{ "tags" => %w[a b] }])
     end
 
+    it "stores and publishes an example: written with date parts as the date it spells, not as an absent sub-field's default" do
+      parts = { "on(1i)" => "2026", "on(2i)" => "10", "on(3i)" => "17" }
+      time_parts = parts.merge("at(1i)" => "2026", "at(2i)" => "10", "at(3i)" => "17", "at(4i)" => "9", "at(5i)" => "30")
+      klass = permittable_class do
+        permit_params(:create) do
+          array :items, example: [parts] do
+            optional :on, :date, default: Date.new(2000, 1, 1)
+          end
+          array :stamps, example: [time_parts] do
+            optional :at, :datetime, default: "2000-01-01T00:00:00Z"
+          end
+          array :nested, example: [{ "meta" => parts }] do
+            optional(:meta) { optional :on, :date, default: Date.new(2000, 1, 1) }
+          end
+        end
+      end
+      examples = Permittable::JsonSchema.rule(klass.permit_rule_for("create"))["properties"].transform_values { |s| s["examples"] }
+      expect(examples["items"]).to eq([[{ "on" => "2026-10-17" }]])
+      expect(examples["stamps"].first.first["at"]).to start_with("2026-10-17T09:30:00")
+      expect(examples["nested"]).to eq([[{ "meta" => { "on" => "2026-10-17" } }]])
+    end
+
     it "runs no sub-field transform: over an example: at class load when no container validate: consumes it" do
       boom = ->(_) { raise "no database at class load" }
       sent = [{ "id" => "1", "meta" => { "tag" => "t" }, "rows" => [{ "n" => "2" }] }]
