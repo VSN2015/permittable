@@ -204,6 +204,44 @@ RSpec.describe Permittable::OpenAPI do
       expect(klass.action_methods).to include("render", "head", "locale=", "__callbacks")
       expect(described_class.operations_for(klass).keys).to eq(%w[create stats])
     end
+
+    # A framework controller's own action, such as Rails::HealthController#show,
+    # is defined in a Rails gem too, but it is an action of the app's subclass:
+    # what is dropped is a method no class in the chain declares as its own.
+    # A stand-in, `head` aliased as `show`, so it holds on 6.1.
+    it "keeps an action inherited from a framework controller, which is defined in a Rails gem", :integration do
+      parent = Class.new(ActionController::Metal) do
+        include ActionController::Head
+
+        alias_method :show, :head
+      end
+      klass = Class.new(parent) do
+        include Permittable
+
+        permit_params { optional :q, :string }
+      end
+      expect(klass.instance_method(:show).owner).to eq(parent)
+      expect(described_class.operations_for(klass).keys).to eq(%w[show])
+    end
+
+    # Ruby reports a method's source_location as a realpath, and Bundler's
+    # full_gem_path for a git or path gem is only expanded, so a symlinked
+    # install path never matched and the filter did nothing.
+    describe ".framework_roots" do
+      after { described_class.instance_variable_set(:@framework_roots, nil) }
+
+      it "resolves a symlinked gem path to the real one, the way source_location reports it" do
+        Dir.mktmpdir do |dir|
+          real = File.join(File.realpath(dir), "real")
+          Dir.mkdir(real)
+          link = File.join(dir, "link")
+          File.symlink(real, link)
+          described_class.instance_variable_set(:@framework_roots, nil)
+          allow(Gem).to receive(:loaded_specs).and_return("actionpack" => double(full_gem_path: link))
+          expect(described_class.framework_roots).to eq([File.join(real, "")])
+        end
+      end
+    end
   end
 
   describe ".document" do

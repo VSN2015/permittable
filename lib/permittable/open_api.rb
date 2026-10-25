@@ -103,20 +103,31 @@ module Permittable
     # module is an action_methods entry. A method is the framework's when it
     # is defined in one of its gems, by whichever module or class_attribute
     # put it on the controller; a method the app defines, in the class or in a
-    # concern of its own, stays an action.
+    # concern of its own, stays an action. So does one a superclass declares,
+    # even a framework controller's (Rails::HealthController#show): modules
+    # and the controller's own class_attribute readers are what Rails
+    # leaves out of a Base controller, never a method of a class in its chain.
     def framework_method?(controller, action)
       return false unless controller.respond_to?(:instance_method)
 
-      file = controller.instance_method(action).source_location&.first
+      method = controller.instance_method(action)
+      return false if method.owner.is_a?(Class) && method.owner != controller
+
+      file = method.source_location&.first
       !file.nil? && framework_roots.any? { |root| file.start_with?(root) }
     rescue NameError
       false
     end
 
     # Resolved lazily, like concern_methods: the gems load after this file.
+    # Real paths, which is what source_location reports: a gem's own path is
+    # only expanded, so one reached through a symlink would never match.
     def framework_roots
       @framework_roots ||= FRAMEWORK_GEMS.filter_map do |name|
-        Gem.loaded_specs[name]&.full_gem_path&.then { |path| File.join(path, "") }
+        path = Gem.loaded_specs[name]&.full_gem_path or next
+        File.join(File.realpath(path), "")
+      rescue SystemCallError
+        File.join(path, "")
       end.freeze
     end
 
