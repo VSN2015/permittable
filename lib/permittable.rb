@@ -1885,7 +1885,15 @@ module Permittable
       # proc cannot rewrite the host's own literal.
       authored = field[opt].is_a?(String) ? field[opt].dup : field[opt]
       value = Coercion.apply_normalize(field[:normalize], authored)
-      status, result = Coercion.check_scalar(live_in?(field) ? field.except(:in) : field, value)
+      # The walker's absence rule: on a nullable field a value that reads as
+      # absent ("" or one normalizing to "") is the explicit nil a request
+      # sending it gets, with nothing to cast or check — as an array's
+      # nullable sub-field already reads it (see AuthoredValues).
+      status, result = if field[:nullable] && Coercion.absent_value?(value)
+                         [:ok, nil]
+                       else
+                         Coercion.check_scalar(live_in?(field) ? field.except(:in) : field, value)
+                       end
       raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{result})" unless status == :ok
 
       field[opt] = freeze_authored(opt == :default && field[:transform] ? field[opt] : result)

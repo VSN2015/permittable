@@ -97,6 +97,21 @@ RSpec.describe "Permittable RSpec matchers" do
     expect(message).to include('expected default: "nope"')
   end
 
+  it "reads a with_default that is absent on a nullable field as the nil the contract stores" do
+    blank = Class.new(FakeController) do
+      include Permittable
+
+      permit_params(:create) do
+        optional :nickname, :string, nullable: true, default: ""
+        optional :bio, :string, nullable: true, normalize: :strip, default: "   "
+      end
+    end
+
+    expect(blank).to permit_param(:nickname).with_default("")
+    expect(blank).to permit_param(:nickname).with_default(nil)
+    expect(blank).to permit_param(:bio).with_default("  ")
+  end
+
   it "reads a :json with_default as the contract reads its default:, with String or Symbol keys" do
     opaque = Class.new(FakeController) do
       include Permittable
