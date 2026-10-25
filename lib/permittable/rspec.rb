@@ -749,7 +749,7 @@ module Permittable
         mirror_csrf_key(host)
         host.permittable_contracts = [rule.merge(mode: :enforce).freeze]
         instance = host.new
-        instance.params = @params
+        instance.params = request_params
         violations = instance.permittable_violations(action)
         result = violations.empty? ? instance.permitted_params(action) : nil
         [violations, result]
@@ -770,6 +770,52 @@ module Permittable
                 end
         host.define_method(:permittable_controller_name) { label }
         host.define_method(:permittable_action_name) { action }
+      end
+
+      # What a controller reads as `params`: the payload after the
+      # normalization every request goes through, ActionDispatch's Utils.
+      # Under the default perform_deep_munge it removes nil
+      # from every array, so a JSON `{"tags": ["a", null]}` reaches the
+      # contract as ["a"], and `length:` never counts the null. Handing the
+      # raw payload over made reject_params(tags: ["a", nil]) pass for a
+      # request that is a 200. An app that turned perform_deep_munge off
+      # still sees the null, because the setting is read, not assumed.
+      # A copy goes in: the normalizer rewrites arrays in place, and the
+      # payload belongs to the spec. The copy stringifies Symbol keys, which
+      # the normalizer's HashWithIndifferentAccess does anyway but only after
+      # it has read a Symbol :tempfile key as an upload, a key a request
+      # (String keys only) never has. A Parameters payload is unwrapped first
+      # so it is normalized like the Hash it wraps.
+      def request_params
+        utils = request_utils
+        return @params unless utils
+
+        payload = @params.respond_to?(:to_unsafe_h) ? @params.to_unsafe_h : @params
+        utils.normalize_encode_params(copy_payload(payload))
+      end
+
+      # Rails main moved the class from ActionDispatch::Request::Utils to
+      # ActionDispatch::Http::Utils. nil only when ActionDispatch is not
+      # loaded at all (a non-Rails stand-in controller); once it is, a rename
+      # this does not know raises instead of silently skipping the
+      # normalization, which would bring the false greens back.
+      def request_utils
+        return unless defined?(ActionDispatch)
+
+        if defined?(ActionDispatch::Http::Utils) then ActionDispatch::Http::Utils
+        elsif defined?(ActionDispatch::Request::Utils) then ActionDispatch::Request::Utils
+        else
+          raise "Permittable's matchers cannot find Rails' parameter normalizer: neither " \
+                "ActionDispatch::Http::Utils nor ActionDispatch::Request::Utils is defined"
+        end
+      end
+
+      def copy_payload(value)
+        case value
+        when Hash then value.to_h { |key, item| [key.is_a?(Symbol) ? key.to_s : key, copy_payload(item)] }
+        when Array then value.map { |item| copy_payload(item) }
+        else value
+        end
       end
 
       def run_contract

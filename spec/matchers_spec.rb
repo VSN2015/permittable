@@ -857,6 +857,106 @@ RSpec.describe "Permittable RSpec matchers" do
       end
     end
 
+    # A real request never delivers a null array element: Rails' default
+    # perform_deep_munge strips them from every array before Permittable
+    # reads params. The matchers hand the payload to a bare host, so they
+    # run it through the same normalization a request gets.
+    context "with a null array element, as Rails' deep munge sees it" do
+      let(:tagged) do
+        Class.new(FakeController) do
+          include Permittable
+
+          permit_params(:create) do
+            array :tags, of: :string, length: 2..2
+            optional :json, :json
+          end
+        end
+      end
+
+      # Rails moved the class from ActionDispatch::Request::Utils to
+      # ActionDispatch::Http::Utils (main). A rename the matchers do not know
+      # fails here, loudly, rather than skipping the normalization.
+      def rails_utils
+        [("ActionDispatch::Http::Utils" if defined?(ActionDispatch::Http::Utils)),
+         ("ActionDispatch::Request::Utils" if defined?(ActionDispatch::Request::Utils))]
+          .compact.map { |name| Object.const_get(name) }.first or
+          raise "neither ActionDispatch::Http::Utils nor ActionDispatch::Request::Utils exists"
+      end
+
+      def with_deep_munge(value)
+        utils = rails_utils
+        original = utils.perform_deep_munge
+        utils.perform_deep_munge = value
+        yield
+      ensure
+        utils.perform_deep_munge = original if utils
+      end
+
+      it "finds the normalizer where Rails main keeps it, ActionDispatch::Http::Utils" do
+        real = rails_utils
+        hide_const("ActionDispatch::Request::Utils")
+        stub_const("ActionDispatch::Http::Utils", real)
+        expect(tagged).to accept_params(tags: ["a", "b", nil]).for_action(:create).returning("tags" => %w[a b])
+      end
+
+      it "fails with a clear error, not a silent skip, when Rails keeps it nowhere known" do
+        hide_const("ActionDispatch::Request::Utils")
+        hide_const("ActionDispatch::Http::Utils")
+        expect { accept_params(tags: %w[a b]).for_action(:create).matches?(tagged) }
+          .to raise_error(/ActionDispatch::Http::Utils.*ActionDispatch::Request::Utils/)
+      end
+
+      it "drops the null before the contract sees it, as a request does" do
+        expect(tagged).to accept_params(tags: ["a", "b", nil]).for_action(:create).returning("tags" => %w[a b])
+        expect(tagged).to reject_params(tags: ["a", nil]).for_action(:create).with_violation("tags", :length)
+        expect(tagged).not_to reject_params(tags: ["a", nil, "b"]).for_action(:create)
+      end
+
+      it "drops it inside a :json value too" do
+        expect(tagged).to accept_params(tags: %w[a b], json: { list: [1, nil] }).for_action(:create)
+                                                                                .returning("tags" => %w[a b], "json" => { "list" => [1] })
+      end
+
+      it "does not mutate the payload it was given" do
+        payload = { tags: ["a", "b", nil] }
+        expect(tagged).to accept_params(payload).for_action(:create)
+        expect(payload).to eq(tags: ["a", "b", nil])
+      end
+
+      it "still sees the null when the app turned perform_deep_munge off" do
+        with_deep_munge(false) do
+          expect(tagged).to reject_params(tags: ["a", nil]).for_action(:create).with_violation("tags[1]", :invalid_type)
+          expect(tagged).not_to accept_params(tags: ["a", "b", nil]).for_action(:create)
+        end
+      end
+
+      it "normalizes an ActionController::Parameters payload like the equivalent Hash" do
+        payload = ActionController::Parameters.new(tags: ["a", "b", nil])
+        expect(tagged).to accept_params(payload).for_action(:create).returning("tags" => %w[a b])
+      end
+
+      # Rails turns a Hash with a :tempfile key into an UploadedFile. A payload
+      # is written with Symbol keys, which a JSON or form request never has.
+      it "does not read a Symbol :tempfile key as an upload" do
+        files = Class.new(FakeController) do
+          include Permittable
+
+          permit_params(:create) do
+            required(:doc) { required :tempfile, :string }
+            required :tempfile, :string
+            optional :meta, :json
+          end
+        end
+        expect(files).to accept_params(doc: { tempfile: "abc" }, tempfile: "abc", meta: { tempfile: nil })
+          .for_action(:create)
+      end
+
+      it "leaves a standalone Contract alone, where a null element is still invalid_type" do
+        contract = Permittable::Contract.define { array :tags, of: :string }
+        expect(contract).to reject_params(tags: ["a", nil]).with_violation("tags[1]", :invalid_type)
+      end
+    end
+
     # Documented in the README: the matchers run without a request, so there is
     # no route to read path parameters from. A real PATCH /widgets/7 carries
     # id in the URL and is accepted; the matcher is given only the payload.

@@ -726,7 +726,7 @@ In [exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) the field is `{
 
 ### Absence, defaults, and partial updates
 
-`nil` and `""` are **both treated as absent** — the query-parameter convention, where an untouched form field arrives as an empty string. Boolean `false` is present. `normalize:` runs *before* this rule, so a field declared `normalize: :squish` treats `"   "` as absent too: whitespace cannot satisfy a `required` field by becoming `""`. The same goes for a `""` **element** of a scalar `array ..., of:`: it is dropped before casting and before `length:` counts, because `collection_check_boxes` and `select multiple: true` always send a hidden `""` so that unchecking everything still sends the key. A `null` element, which no form sends, is still `invalid_type`.
+`nil` and `""` are **both treated as absent** — the query-parameter convention, where an untouched form field arrives as an empty string. Boolean `false` is present. `normalize:` runs *before* this rule, so a field declared `normalize: :squish` treats `"   "` as absent too: whitespace cannot satisfy a `required` field by becoming `""`. The same goes for a `""` **element** of a scalar `array ..., of:`: it is dropped before casting and before `length:` counts, because `collection_check_boxes` and `select multiple: true` always send a hidden `""` so that unchecking everything still sends the key. A `null` element, which no form sends, never reaches a Rails controller's contract under the default `perform_deep_munge` (Rails drops it from every array first); on a standalone `Contract`, or with deep munge off, it is still `invalid_type`.
 
 That single rule produces the behaviour you want from a `PATCH`:
 
@@ -765,7 +765,7 @@ Three more readings worth knowing:
 
 - **`required` + `nullable`** is coherent, and means what it says in SQL: the client *must* state the field, and `null` is a legal statement. A missing key still violates.
 - **`default: nil`** — legal only on a nullable field — gives the `PUT` reading, where absence *also* means clear.
-- **On arrays and nested blocks**, `nullable:` applies to the array or object itself, never to its contents. `{ "tags": null }` yields `nil` (distinct from `[]`, which still gets length-checked); a null *element* inside `tags` is still `invalid_type`.
+- **On arrays and nested blocks**, `nullable:` applies to the array or object itself, never to its contents. `{ "tags": null }` yields `nil` (distinct from `[]`, which still gets length-checked); a null *element* inside `tags` is still `invalid_type` wherever Rails has not already dropped it (a standalone `Contract`, or `perform_deep_munge` off).
 
 Exported [OpenAPI](#exporting-openapi-docs-that-cannot-drift) tells the truth about all of this: a nullable field's `type` gains `"null"`, and a nullable `in:` set lists `null` in its `enum`.
 
@@ -1402,7 +1402,7 @@ Both work on a controller class, a controller instance, or a [standalone `Contra
 
 The negated forms follow the same rules as `not_to permit_param`: `not_to accept_params(...)` passes only when the contract rejects the payload, and `not_to reject_params(...)` only when it accepts it. Neither takes a qualifier — `not_to accept_params(...).returning(x)` would pass both on a rejection and on an acceptance returning anything else, so it raises and names the positive form — and both fail, rather than passing, when no rule covers the action or the subject declares no contracts.
 
-The matchers run **without a request**, so they know the controller's settings but not its route. The CSRF parameter name set at class level with `request_forgery_protection_token` is exempt from `unknown: :error` as it is at runtime, but a per-instance override is not seen, and neither are a route's **path parameters**: a payload `id` on a member action under `unknown: :error` is reported `unknown`, although a real `PATCH /users/1` carries it in the URL and is accepted. Leave path parameters out of the payload you pass to `accept_params` / `reject_params`.
+The matchers run **without a request**, so they know the controller's settings but not its route. The CSRF parameter name set at class level with `request_forgery_protection_token` is exempt from `unknown: :error` as it is at runtime, but a per-instance override is not seen, and neither are a route's **path parameters**: a payload `id` on a member action under `unknown: :error` is reported `unknown`, although a real `PATCH /users/1` carries it in the URL and is accepted. Leave path parameters out of the payload you pass to `accept_params` / `reject_params`. On a controller the payload goes through the same normalization a request gets, so a `nil` array element is dropped as Rails drops it (unless the app turned `perform_deep_munge` off); a standalone `Contract` gets the payload as given.
 
 ### Standalone contracts (no controller)
 
