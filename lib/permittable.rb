@@ -1046,9 +1046,14 @@ module Permittable
     # with a time of day always got. Shared by cast_date and
     # instant_as_date, so a value and an in: member cannot be read
     # differently; and always a plain Date, never the DateTime it came as.
+    #
+    # Built from the UTC components, as a String is (cast_date), not with
+    # Time#to_date: that keeps the instant's day NUMBER and labels it in the
+    # Julian calendar before the 1582 reform, so Time.utc(1500, 1, 1) came
+    # out as 1499-12-23 while "1500-01-01" was 1500-01-01.
     def date_of_instant(instant)
       utc = instant.to_time.getutc
-      utc.to_date if utc == utc.beginning_of_day
+      Date.new(utc.year, utc.month, utc.day) if utc == utc.beginning_of_day
     end
 
     # A zoneless String parses as UTC regardless of the host timezone

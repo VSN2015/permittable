@@ -856,6 +856,32 @@ RSpec.describe Permittable do
       end
     end
 
+    # Time#to_date keeps the instant's day NUMBER and labels it in the Julian
+    # calendar before the 1582 reform, so Time.utc(1500, 1, 1) became
+    # 1499-12-23 — while the string "1500-01-01" has always been that very
+    # day (and :datetime reads it back by component). The instant is read
+    # by its UTC components, as the String is, so both paths agree.
+    it "reads a midnight-UTC Time, DateTime or TimeWithZone before 1582 as the day it names, like the String" do
+      string = permit({ on: "1500-01-01" }, &decl)[:on]
+      [Time.utc(1500, 1, 1), DateTime.new(1500, 1, 1, 0, 0, 0, 0, Date::GREGORIAN), DateTime.new(1500, 1, 1),
+       Time.utc(1500, 1, 1).in_time_zone("Tokyo"), "1500-01-01T00:00:00Z"].each do |value|
+        read = permit({ on: value }, &decl)[:on]
+        expect(read.iso8601).to eq("1500-01-01"), "for #{value.inspect}"
+        expect(read).to eq(string).and(be_an_instance_of(Date)), "for #{value.inspect}"
+        expect(read.start).to eq(string.start), "for #{value.inspect}"
+      end
+      expect(permit({ on: Time.utc(1500, 1, 1) }, &decl)[:on]).to eq(Date.new(1500, 1, 1))
+      # A modern date, as the control.
+      expect(permit({ on: Time.utc(2026, 9, 5) }, &decl)[:on]).to eq(Date.new(2026, 9, 5))
+    end
+
+    it "matches a pre-1582 Time in: member and a pre-1582 Time default: against the date a request sends" do
+      field = proc { permit_params(:create) { optional :on, :date, in: [Time.utc(1500, 1, 1)], default: Time.utc(1500, 1, 1) } }
+      expect(permit({ on: "1500-01-01" }, &field)[:on]).to eq(Date.new(1500, 1, 1))
+      expect(permit({}, &field)[:on].iso8601).to eq("1500-01-01")
+      expect(permittable_class(&field).permit_rule_for(:create)[:fields].first[:in].map(&:iso8601)).to eq(["1500-01-01"])
+    end
+
     # The disagreements that reading caused: a noon DateTime default: was
     # stored as noon (and exported under `format: date` as a date-time), and
     # a noon DateTime was accepted on its own but refused as `inclusion` by
