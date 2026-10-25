@@ -4788,6 +4788,7 @@ RSpec.describe Permittable do
         subclass = Class.new(base) do
           include AbstractController::Callbacks
           include ActionController::Rescue
+
           permit_params(:update, enforce: true) { required :name, :string }
           def update = head(:accepted)
         end
