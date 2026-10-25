@@ -176,6 +176,34 @@ RSpec.describe Permittable::OpenAPI do
       expect(operations).not_to have_key("permitted_params")
       expect(operations).not_to have_key("enforce_params_contract")
     end
+
+    # Rails reads a controller's internal methods off its nearest abstract
+    # class. For one built on Metal that is Metal itself, which has none of
+    # the modules the controller includes, so `render`, `head`, `locale=`
+    # and the readers its callbacks and renderers define all counted as actions.
+    it "leaves the framework's own methods out of a catch-all's expansion on a Metal controller, and keeps the app's",
+       :integration do
+      stats = Module.new do
+        def stats = nil
+      end
+      klass = Class.new(ActionController::Metal) do
+        include AbstractController::Rendering
+        include ActionController::Rendering
+        include ActionController::Renderers::All
+        include ActionController::Head
+        include AbstractController::Callbacks
+        include ActionController::Rescue
+        include ActionController::StrongParameters
+        include Permittable
+        include stats
+
+        permit_params(enforce: true) { required :host, :string }
+
+        def create = head(:created)
+      end
+      expect(klass.action_methods).to include("render", "head", "locale=", "__callbacks")
+      expect(described_class.operations_for(klass).keys).to eq(%w[create stats])
+    end
   end
 
   describe ".document" do

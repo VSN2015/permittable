@@ -91,6 +91,35 @@ module Permittable
       @concern_methods ||= Permittable.public_instance_methods(false).map(&:to_s).freeze
     end
 
+    # Gems whose public methods are the framework's own: the ones a controller
+    # gets from the modules Rails mixes in (Rendering, Head, Callbacks, ViewPaths,
+    # Rescuable, ...) and from the class attributes those define on it.
+    FRAMEWORK_GEMS = %w[actionpack actionview activesupport activemodel railties].freeze
+
+    # Rails reads a controller's internal methods off its nearest abstract
+    # class: ActionController::Base includes all of those modules, so they are
+    # internal on a Base or API controller, but ActionController::Metal includes
+    # none, so on one built directly on it every public method of an included
+    # module is an action_methods entry. A method is the framework's when it
+    # is defined in one of its gems, by whichever module or class_attribute
+    # put it on the controller; a method the app defines, in the class or in a
+    # concern of its own, stays an action.
+    def framework_method?(controller, action)
+      return false unless controller.respond_to?(:instance_method)
+
+      file = controller.instance_method(action).source_location&.first
+      !file.nil? && framework_roots.any? { |root| file.start_with?(root) }
+    rescue NameError
+      false
+    end
+
+    # Resolved lazily, like concern_methods: the gems load after this file.
+    def framework_roots
+      @framework_roots ||= FRAMEWORK_GEMS.filter_map do |name|
+        Gem.loaded_specs[name]&.full_gem_path&.then { |path| File.join(path, "") }
+      end.freeze
+    end
+
     # Shared `components` for any document referencing Permittable responses.
     #
     # Unlike a rule's monitor mode — which the exporter reads only from the
@@ -176,7 +205,8 @@ module Permittable
       return explicit unless contracts.any? { |rule| rule[:actions].empty? }
       return explicit + ["*"] unless controller.respond_to?(:action_methods)
 
-      explicit + (controller.action_methods.map(&:to_s).sort - explicit - concern_methods)
+      actions = controller.action_methods.map(&:to_s).sort - explicit - concern_methods
+      explicit + actions.reject { |action| framework_method?(controller, action) }
     end
 
     def operation_for(controller, action)
