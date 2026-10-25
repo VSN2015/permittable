@@ -386,6 +386,28 @@ RSpec.describe Permittable::Contract do
       expect(out).to eq("1500-01-01 10:00:00 UTC")
     end
 
+    it "reads a :date String with a time or zone as an instant, whatever the host has loaded" do
+      # The instant is read through the :datetime cast, and DateTime#to_time
+      # differs between stdlib and ActiveSupport, so check it in a clean process.
+      script = <<~RUBY
+        require "json"
+        require "permittable"
+        contract = Permittable::Contract.define { required :on, :date }
+        out = ["2026-09-05T00:00:00Z", "2026-09-05T05:00:00+05:00", "1500-01-01T00:00:00Z",
+               "2026-09-05T10:00:00Z", "2026-09-05T23:30:00-05:00", "2026-09-05T25:00:00Z",
+               "2026-09-05T10:00:00+24:00"].map do |value|
+          result = contract.call(on: value)
+          result.valid? ? result.params[:on].to_s : result.violations.first[:code]
+        end
+        print JSON.generate(out)
+      RUBY
+      lib = File.expand_path("../lib", __dir__)
+      out, err, status = Open3.capture3(RbConfig.ruby, "-I", lib, "-e", script)
+      expect(status).to be_success, err
+      expect(JSON.parse(out)).to eq(%w[2026-09-05 2026-09-05 1500-01-01 invalid_type invalid_type
+                                       invalid_type invalid_type])
+    end
+
     it "does not rewrite the caller's own Time while normalising it to UTC" do
       moment = Time.new(2026, 9, 5, 17, 30, 0, "+07:00")
       result = described_class.define { required :at, :datetime }.call!(at: moment)

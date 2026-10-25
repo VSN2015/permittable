@@ -387,6 +387,16 @@ RSpec.describe Permittable do
       end
     end
 
+    # A String member goes through the same cast, so it is held to the same
+    # reading: "T10:00" is an instant with a time of day, not a date.
+    it "refuses a String member of a :date field that names a time of day, and takes one at midnight UTC" do
+      decl = proc { permit_params(:create) { optional :day, :date, in: ["2026-09-05T00:00:00Z", "Sep 6, 2026"] } }
+      expect(permittable_class(&decl).permit_rule_for(:create)[:fields].first[:in])
+        .to eq([Date.new(2026, 9, 5), Date.new(2026, 9, 6)])
+      expect { permittable_class { permit_params(:create) { optional :day, :date, in: ["2026-01-01T10:00"] } } }
+        .to raise_error(ArgumentError, /:in for field :day contains "2026-01-01T10:00", which is not a valid :date/)
+    end
+
     # A request's fraction is a finite decimal, and the export prints at most
     # nine digits, so a member finer than a nanosecond (Time.at(1.1) holds
     # 1.100000000000000088817...) was published as an enum value the server
@@ -792,8 +802,30 @@ RSpec.describe Permittable do
       %w[2026-09-05 2026/09/05].each do |value|
         expect(permit({ on: value }, &decl)[:on]).to eq(Date.new(2026, 9, 5)), "for #{value}"
       end
-      ["Sep 5, 2026", "5 September 2026", "2026-09-05T10:00:00Z"].each do |value|
+      ["Sep 5, 2026", "5 September 2026"].each do |value|
         expect(permit({ on: value }, &decl)[:on]).to eq(Date.new(2026, 9, 5)), "for #{value}"
+      end
+    end
+
+    # A String that carries a time or a zone is read the way a Time is: as the
+    # instant it names, which is a date only at exactly midnight UTC. It used
+    # to keep just the calendar day and drop the rest, so "T25:00:00Z",
+    # "T99:99:99Z" and "+24:00" were accepted, and "T23:30:00-05:00" (which is
+    # the next day in UTC) came back as the day before.
+    #
+    # Date._parse drops a zone that has no time beside it ("2026-09-05 EST"
+    # reports the date alone), so that stays the plain date it always was.
+    it "reads a String with a time or zone as an instant, a date only at midnight UTC" do
+      ["2026-09-05T00:00:00", "2026-09-05T00:00:00Z", "2026-09-05T00:00:00.000+00:00", "2026-09-05 00:00 UTC",
+       "2026-09-05T05:00:00+05:00", "2026-09-04T19:00:00-05:00", "2026-09-05 UTC", "2026-09-05 EST"].each do |value|
+        expect(permit({ on: value }, &decl)[:on])
+          .to be_an_instance_of(Date).and(eq(Date.new(2026, 9, 5))), "for #{value}"
+      end
+      ["2026-09-05T10:00:00Z", "2026-09-05T10:00:00", "2026-09-05T00:00:00-05:00", "2026-09-05T00:00:00.5Z",
+       "2026-09-05T23:30:00-05:00", "2026-09-05T00:00:01Z", "2026-09-05 00:00 EST", "2026-09-05T00:00:00+05:00",
+       "2026-09-05T25:00:00Z", "2026-09-05T99:99:99Z", "2026-09-05T10:00:00+24:00", "2026-09-05T00:00:00XYZ"].each do |value|
+        expect(violations_for({ on: value }, &decl).details)
+          .to eq([{ param: "on", code: "invalid_type" }]), "for #{value}"
       end
     end
 
