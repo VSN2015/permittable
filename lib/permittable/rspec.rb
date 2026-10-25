@@ -773,8 +773,8 @@ module Permittable
       end
 
       # What a controller reads as `params`: the payload after the
-      # normalization every request goes through, ActionDispatch's
-      # Request::Utils. Under the default perform_deep_munge it removes nil
+      # normalization every request goes through, ActionDispatch's Utils.
+      # Under the default perform_deep_munge it removes nil
       # from every array, so a JSON `{"tags": ["a", null]}` reaches the
       # contract as ["a"], and `length:` never counts the null. Handing the
       # raw payload over made reject_params(tags: ["a", nil]) pass for a
@@ -787,10 +787,27 @@ module Permittable
       # (String keys only) never has. A Parameters payload is unwrapped first
       # so it is normalized like the Hash it wraps.
       def request_params
-        return @params unless defined?(ActionDispatch::Request::Utils)
+        utils = request_utils
+        return @params unless utils
 
         payload = @params.respond_to?(:to_unsafe_h) ? @params.to_unsafe_h : @params
-        ActionDispatch::Request::Utils.normalize_encode_params(copy_payload(payload))
+        utils.normalize_encode_params(copy_payload(payload))
+      end
+
+      # Rails main moved the class from ActionDispatch::Request::Utils to
+      # ActionDispatch::Http::Utils. nil only when ActionDispatch is not
+      # loaded at all (a non-Rails stand-in controller); once it is, a rename
+      # this does not know raises instead of silently skipping the
+      # normalization, which would bring the false greens back.
+      def request_utils
+        return unless defined?(ActionDispatch)
+
+        if defined?(ActionDispatch::Http::Utils) then ActionDispatch::Http::Utils
+        elsif defined?(ActionDispatch::Request::Utils) then ActionDispatch::Request::Utils
+        else
+          raise "Permittable's matchers cannot find Rails' parameter normalizer: neither " \
+                "ActionDispatch::Http::Utils nor ActionDispatch::Request::Utils is defined"
+        end
       end
 
       def copy_payload(value)

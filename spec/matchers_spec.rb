@@ -873,12 +873,37 @@ RSpec.describe "Permittable RSpec matchers" do
         end
       end
 
+      # Rails moved the class from ActionDispatch::Request::Utils to
+      # ActionDispatch::Http::Utils (main). A rename the matchers do not know
+      # fails here, loudly, rather than skipping the normalization.
+      def rails_utils
+        [("ActionDispatch::Http::Utils" if defined?(ActionDispatch::Http::Utils)),
+         ("ActionDispatch::Request::Utils" if defined?(ActionDispatch::Request::Utils))]
+          .compact.map { |name| Object.const_get(name) }.first or
+          raise "neither ActionDispatch::Http::Utils nor ActionDispatch::Request::Utils exists"
+      end
+
       def with_deep_munge(value)
-        original = ActionDispatch::Request::Utils.perform_deep_munge
-        ActionDispatch::Request::Utils.perform_deep_munge = value
+        utils = rails_utils
+        original = utils.perform_deep_munge
+        utils.perform_deep_munge = value
         yield
       ensure
-        ActionDispatch::Request::Utils.perform_deep_munge = original
+        utils.perform_deep_munge = original if utils
+      end
+
+      it "finds the normalizer where Rails main keeps it, ActionDispatch::Http::Utils" do
+        real = rails_utils
+        hide_const("ActionDispatch::Request::Utils")
+        stub_const("ActionDispatch::Http::Utils", real)
+        expect(tagged).to accept_params(tags: ["a", "b", nil]).for_action(:create).returning("tags" => %w[a b])
+      end
+
+      it "fails with a clear error, not a silent skip, when Rails keeps it nowhere known" do
+        hide_const("ActionDispatch::Request::Utils")
+        hide_const("ActionDispatch::Http::Utils")
+        expect { accept_params(tags: ["a", "b"]).for_action(:create).matches?(tagged) }
+          .to raise_error(/ActionDispatch::Http::Utils.*ActionDispatch::Request::Utils/)
       end
 
       it "drops the null before the contract sees it, as a request does" do
