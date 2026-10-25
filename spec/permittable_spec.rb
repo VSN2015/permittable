@@ -4679,6 +4679,159 @@ RSpec.describe Permittable do
       expect(body["error"]["details"]).to eq([{ "param" => "user.age", "code" => "inclusion" }])
     end
 
+    # A bare Metal controller has no callbacks and no rescue_from until the
+    # app includes AbstractController::Callbacks and ActionController::Rescue,
+    # and a developer adding modules one by one may put `include Permittable`
+    # first. The gem's before_action and rescue_from used to be skipped
+    # silently then (nothing registered them later), so `enforce: true` ran
+    # the action on bad input and a lazy rule raised an unrescued
+    # InvalidParameters. They are now registered at the first `permit_params`.
+    describe "on a bare ActionController::Metal controller, whatever the include order" do
+      # `order` lists the modules to include; :permittable marks where.
+      def build_metal(order, &body)
+        modules = { callbacks: AbstractController::Callbacks, rescue: ActionController::Rescue,
+                    permittable: Permittable }
+        Class.new(ActionController::Metal).tap do |klass|
+          # One at a time, in Rails' own order: `include a, b` puts a in front.
+          [AbstractController::Rendering, ActionController::Rendering, ActionController::Renderers::All,
+           ActionController::Head, ActionController::StrongParameters].each { |mod| klass.include mod }
+          klass.define_singleton_method(:controller_path) { "metal_order" }
+          order.each { |name| klass.include modules.fetch(name) }
+          klass.class_eval(&body) if body
+        end
+      end
+
+      # Rescue stays after Callbacks, as in ActionController::Base: a module
+      # included later runs first, and a rescue_from only covers the
+      # callbacks of a controller whose Rescue wraps them.
+      [%i[permittable callbacks rescue], %i[callbacks permittable rescue],
+       %i[callbacks rescue permittable]].each do |order|
+        context "with the includes in the order #{order.join(', ')}" do
+          it "rejects a bad request to an enforce: true rule before the action runs" do
+            controller = build_metal(order) do
+              permit_params(:create, enforce: true) { required :name, :string }
+              def create = head(:accepted)
+            end
+            result = IntegrationHarness.dispatch(controller, :create, method: "POST", json: {})
+            expect(result.status).to eq(422)
+            expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "name", "code" => "missing" }])
+          end
+
+          it "reports a violation of a monitor-mode rule and runs the action" do
+            controller = build_metal(order) do
+              permit_params(:create, mode: :monitor) { required :name, :string }
+              def create = head(:accepted)
+            end
+            events = recording_notifications do
+              expect(IntegrationHarness.dispatch(controller, :create, method: "POST", json: {}).status).to eq(202)
+            end
+            expect(events.size).to eq(1)
+          end
+
+          it "rescues a lazy rule's InvalidParameters into the envelope" do
+            controller = build_metal(order) do
+              permit_params(:create) { required :name, :string }
+              def create
+                permitted_params
+                head(:accepted)
+              end
+            end
+            expect(IntegrationHarness.dispatch(controller, :create, method: "POST", json: {}).status).to eq(422)
+          end
+
+          it "registers the check once" do
+            controller = build_metal(order) do
+              permit_params(:create, enforce: true) { required :name, :string }
+              permit_params(:update, enforce: true) { required :name, :string }
+            end
+            expect(controller._process_action_callbacks.map(&:filter).count(:enforce_params_contract)).to eq(1)
+            expect(controller.rescue_handlers.count { |klass, _| klass == "Permittable::InvalidParameters" }).to eq(1)
+          end
+        end
+      end
+
+      # The README documents `skip_before_action :enforce_params_contract`;
+      # healing must not bring back a callback the app took out.
+      it "does not bring back a check the app skipped, when it was registered at the include" do
+        controller = build_metal(%i[callbacks rescue permittable]) do
+          skip_before_action :enforce_params_contract
+          permit_params(:create, enforce: true) { required :name, :string }
+          def create = head(:accepted)
+        end
+        expect(IntegrationHarness.dispatch(controller, :create, method: "POST", json: {}).status).to eq(202)
+      end
+
+      it "does not bring back a check the app skipped, when it was registered at a later permit_params" do
+        controller = build_metal(%i[permittable callbacks rescue]) do
+          permit_params(:create, enforce: true) { required :name, :string }
+          skip_before_action :enforce_params_contract
+          permit_params(:update, enforce: true) { required :name, :string }
+          def create = head(:accepted)
+        end
+        expect(IntegrationHarness.dispatch(controller, :create, method: "POST", json: {}).status).to eq(202)
+      end
+
+      it "does not register the check again in a subclass of a controller that has it" do
+        base = build_metal(%i[permittable callbacks rescue]) do
+          permit_params(:create, enforce: true) { required :name, :string }
+        end
+        subclass = Class.new(base) do
+          skip_before_action :enforce_params_contract
+          permit_params(:update, enforce: true) { required :name, :string }
+          def create = head(:accepted)
+        end
+        expect(IntegrationHarness.dispatch(subclass, :create, method: "POST", json: {}).status).to eq(202)
+      end
+
+      it "registers the check in a subclass that is the first to include the callbacks" do
+        base = build_metal(%i[permittable]) { permit_params(:create) { required :name, :string } }
+        subclass = Class.new(base) do
+          include AbstractController::Callbacks
+          include ActionController::Rescue
+          permit_params(:update, enforce: true) { required :name, :string }
+          def update = head(:accepted)
+        end
+        expect(IntegrationHarness.dispatch(subclass, :update, method: "PATCH", json: {}).status).to eq(422)
+      end
+
+      describe "when the controller cannot run the rule" do
+        it "raises at class load for an enforce: true rule without AbstractController::Callbacks" do
+          expect do
+            build_metal(%i[permittable rescue]) { permit_params(:create, enforce: true) { required :name, :string } }
+          end.to raise_error(ArgumentError, /include AbstractController::Callbacks/)
+        end
+
+        it "raises at class load for a monitor-mode rule without AbstractController::Callbacks" do
+          expect do
+            build_metal(%i[permittable rescue]) { permit_params(:create, mode: :monitor) { required :name, :string } }
+          end.to raise_error(ArgumentError, /include AbstractController::Callbacks/)
+        end
+
+        it "raises at class load for an enforce: true rule without ActionController::Rescue" do
+          expect do
+            build_metal(%i[callbacks permittable]) { permit_params(:create, enforce: true) { required :name, :string } }
+          end.to raise_error(ArgumentError, /include ActionController::Rescue/)
+        end
+
+        it "lets a lazy rule, which the action can rescue itself, and a monitor rule without Rescue load" do
+          expect do
+            build_metal(%i[permittable]) { permit_params(:create) { required :name, :string } }
+            build_metal(%i[callbacks permittable]) { permit_params(:create, mode: :monitor) { required :name, :string } }
+          end.not_to raise_error
+        end
+
+        it "leaves a host that is not a controller as it was" do
+          expect do
+            Class.new do
+              include Permittable
+
+              permit_params(:create, enforce: true) { required :name, :string }
+            end
+          end.not_to raise_error
+        end
+      end
+    end
+
     describe "the envelope's content type" do
       # respond_to sets the response's content type to the negotiated format
       # BEFORE the block runs, and Rails' `render json:` only sets

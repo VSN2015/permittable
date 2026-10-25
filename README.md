@@ -538,6 +538,8 @@ Validation is **lazy by default**: it runs on the first `permitted_params` call,
 
 In [monitor mode](#monitor-mode-roll-out-without-rejecting) the same flow runs, but a violation is reported instead of raised and the request proceeds with the raw params passed through.
 
+A bare `ActionController::Metal` controller has no callbacks and no `rescue_from` until it includes them: `include AbstractController::Callbacks` and then `include ActionController::Rescue` (the order `ActionController::Base` uses, so a rejection also covers the `before_action`), before or after `include Permittable`. An `enforce: true` or `mode: :monitor` rule raises `ArgumentError` at class load when `AbstractController::Callbacks` is missing, and an `enforce: true` rule when `ActionController::Rescue` is; both modules have to be in by the time of `permit_params`. A check registered at that first `permit_params` runs after any callback declared between the include and it (see [Per-request locales](#custom-error-messages-message)).
+
 ### Declaring a contract
 
 ```ruby
