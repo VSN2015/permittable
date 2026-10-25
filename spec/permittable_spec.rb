@@ -4128,6 +4128,18 @@ RSpec.describe Permittable do
       end
     end
 
+    it "says so when an ignored column is no longer in the table, and suggests no migration to re-add it" do
+      m = model
+      m.ignored_columns += ["gone"]
+      expect do
+        permittable_class { permit_params(:create, model: m) { optional :gone, :string } }
+      end.to raise_error(ArgumentError) do |e|
+        expect(e.message).to match(/'gone' is in Model's ignored_columns but the table has no such column \(table: permit_users\)/)
+        expect(e.message).to match(/Remove it from ignored_columns and the field from the contract, or declare the field virtual: true/)
+        expect(e.message).not_to match(/does not exist in the database|generate migration|the model ignores that column/)
+      end
+    end
+
     it "accepts an ignored column declared virtual: true" do
       m = model
       m.ignored_columns += ["age"]

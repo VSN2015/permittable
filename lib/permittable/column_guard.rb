@@ -214,10 +214,27 @@ module Permittable
       klass.respond_to?(:ignored_columns) && klass.ignored_columns.map(&:to_s).include?(field.to_s)
     end
 
+    # The column may have been dropped since it was ignored, with its name
+    # left in ignored_columns; the table itself says which. That case needs
+    # different advice: removing the name would only lead to a migration
+    # that re-adds a column the app no longer wants.
     def ignored_column_message(label, klass, field)
-      "#{label}: '#{field}' is in #{model_expr(klass)}'s ignored_columns (table: #{klass.table_name}), " \
-        "so the model ignores that column and assigning it raises ActiveModel::UnknownAttributeError. " \
-        "Remove it from ignored_columns, or declare the field virtual: true if the app handles it itself."
+      subject = "#{label}: '#{field}' is in #{model_expr(klass)}'s ignored_columns"
+      if column_in_table?(klass, field)
+        "#{subject} (table: #{klass.table_name}), so the model ignores that column " \
+          "and assigning it raises ActiveModel::UnknownAttributeError. " \
+          "Remove it from ignored_columns, or declare the field virtual: true if the app handles it itself."
+      else
+        "#{subject} but the table has no such column (table: #{klass.table_name}). " \
+          "Remove it from ignored_columns and the field from the contract, " \
+          "or declare the field virtual: true if the app handles it itself."
+      end
+    end
+
+    # Unlike `column_names`, the connection's own column list includes the
+    # columns the model ignores.
+    def column_in_table?(klass, field)
+      klass.connection_pool.with_connection { |connection| connection.column_exists?(klass.table_name, field) }
     end
 
     def column_migration_hint(klass, field, types)
