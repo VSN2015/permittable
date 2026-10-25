@@ -2453,6 +2453,22 @@ RSpec.describe Permittable do
         .to raise_error(ArgumentError, /:default for field :a is nil but the field is not nullable/)
     end
 
+    it "stores a default that reads as absent as the explicit nil a request sending it gets" do
+      decl = proc do
+        permit_params(:create) do
+          optional :nickname, :string, nullable: true, default: ""
+          optional :bio, :string, nullable: true, normalize: :strip, default: "   "
+          optional :slug, :string, default: ""
+        end
+      end
+      sent = { nickname: "", bio: "   " }
+      expect(permit({}, &decl).fetch("nickname")).to be_nil
+      expect(permit({}, &decl).fetch("bio")).to be_nil
+      expect(permit(sent, &decl).values_at("nickname", "bio")).to eq([nil, nil])
+      # not nullable: a request sending "" is absent too, so it gets the default "" as before
+      expect(permit({}, &decl).fetch("slug")).to eq("")
+    end
+
     it "nulls a whole nested block, distinctly from an empty hash" do
       decl = proc do
         permit_params(:create) do
