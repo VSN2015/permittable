@@ -864,7 +864,8 @@ RSpec.describe Permittable do
     it "reads a midnight-UTC Time, DateTime or TimeWithZone before 1582 as the day it names, like the String" do
       string = permit({ on: "1500-01-01" }, &decl)[:on]
       [Time.utc(1500, 1, 1), DateTime.new(1500, 1, 1, 0, 0, 0, 0, Date::GREGORIAN), DateTime.new(1500, 1, 1),
-       Time.utc(1500, 1, 1).in_time_zone("Tokyo"), "1500-01-01T00:00:00Z"].each do |value|
+       DateTime.parse("1500-01-01T00:00:00Z"), Time.utc(1500, 1, 1).in_time_zone("Tokyo"),
+       "1500-01-01T00:00:00Z"].each do |value|
         read = permit({ on: value }, &decl)[:on]
         expect(read.iso8601).to eq("1500-01-01"), "for #{value.inspect}"
         expect(read).to eq(string).and(be_an_instance_of(Date)), "for #{value.inspect}"

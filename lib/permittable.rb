@@ -1056,9 +1056,19 @@ module Permittable
     # "1582-10-10" is none, so it is nil here and every caller gives its usual
     # error. :datetime is proleptic Gregorian and does accept those days; the
     # two differ there by design, :date being the String path's calendar.
+    #
+    # A DateTime is read by its own civil day, not through #to_time: stdlib's
+    # converts by day number, so outside Rails (ActiveSupport converts by
+    # component) a DateTime before 1582 landed 9 days late.
     def date_of_instant(instant)
-      utc = instant.to_time.getutc
-      return unless utc == utc.beginning_of_day && Date.valid_date?(utc.year, utc.month, utc.day)
+      if instant.is_a?(DateTime)
+        utc = instant.new_offset(0)
+        return unless utc.hour.zero? && utc.minute.zero? && utc.second.zero? && utc.sec_fraction.zero?
+      else
+        utc = instant.to_time.getutc
+        return unless utc == utc.beginning_of_day
+      end
+      return unless Date.valid_date?(utc.year, utc.month, utc.day)
 
       Date.new(utc.year, utc.month, utc.day)
     end
