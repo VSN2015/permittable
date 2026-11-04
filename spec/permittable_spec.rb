@@ -4905,7 +4905,7 @@ RSpec.describe Permittable do
 
               private
 
-              def render_error(message:, code:, status:)
+              def render_error(code:, **)
                 self.status = 418
                 self.response_body = "custom #{code}"
               end
