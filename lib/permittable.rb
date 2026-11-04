@@ -1018,11 +1018,17 @@ module Permittable
         date ? [:ok, date] : [:error, "invalid_type"]
       when Date then [:ok, value]
       when String
-        return cast_date_instant(value) if ISO_DATE_AT_OFFSET.match?(value) || ISO_DATE_T.match?(value)
+        # A bare ISO date ("2026-09-05", the common case) carries no zone, T
+        # or offset, so it skips every check for one.
+        plain = PLAIN_ISO_DATE.match?(value)
+        return cast_date_instant(value) if !plain && (ISO_DATE_AT_OFFSET.match?(value) || ISO_DATE_T.match?(value))
 
         found = Date._parse(value)
         return [:error, "invalid_type"] unless complete_date?(found)
-        return cast_date_instant(value) if names_an_instant?(found) || offset_misread?(value, found)
+        return cast_date_instant(value, found) if names_an_instant?(found)
+        # No time found, but an offset may have been dropped ("5/9/2026
+        # -0500"), which :datetime refuses too.
+        return [:error, "invalid_type"] if !plain && offset_misread?(value, found)
 
         # Built from the components rather than re-running Date.parse, which
         # would parse the same string a second time — and Date.parse is the
@@ -1056,8 +1062,12 @@ module Permittable
     # The Date is built from the components, like a date-only String's,
     # because Time#to_date reads the proleptic Gregorian day in the Julian
     # calendar before 1582 ("1500-01-01T00:00:00Z" became 1499-12-23).
-    def cast_date_instant(value)
-      status, instant = cast_datetime(value)
+    #
+    # `found` is the String's Date._parse, when the caller has it and has
+    # ruled out the ISO forms cast_datetime reads without one; :datetime's
+    # reading of it is then the same, with one parse fewer.
+    def cast_date_instant(value, found = nil)
+      status, instant = found ? cast_parsed_datetime(value, found) : cast_datetime(value)
       return [:error, "invalid_type"] unless status == :ok && instant == instant.beginning_of_day
 
       [:ok, Date.new(instant.year, instant.month, instant.day)]
@@ -1109,13 +1119,20 @@ module Permittable
         elsif ISO_DATE_T.match?(value) then return [:error, "invalid_type"]
         end
 
-        found = Date._parse(value)
-        return [:error, "invalid_type"] unless complete_date?(found) && honoured_zone?(found)
-        return [:error, "invalid_type"] if offset_misread?(value, found)
-
-        [:ok, DateTime.parse(value, true, Date::GREGORIAN).to_time.utc]
+        cast_parsed_datetime(value, Date._parse(value))
       else [:error, "invalid_type"]
       end
+    rescue ArgumentError, RangeError
+      [:error, "invalid_type"]
+    end
+
+    # cast_datetime's reading of a String once Date._parse has `found` its
+    # parts, shared with cast_date_instant so a :date need not parse twice.
+    def cast_parsed_datetime(value, found)
+      return [:error, "invalid_type"] unless complete_date?(found) && honoured_zone?(found)
+      return [:error, "invalid_type"] if offset_misread?(value, found)
+
+      [:ok, DateTime.parse(value, true, Date::GREGORIAN).to_time.utc]
     rescue ArgumentError, RangeError
       [:error, "invalid_type"]
     end
@@ -1148,10 +1165,13 @@ module Permittable
     # than read as some instant the client did not write.
     ISO_DATE_T = /\A\s*\d{4}(-?)\d{2}\1\d{2}[Tt](?!\s*\d)/
 
+    # An ISO date and nothing else, which none of the above can match.
+    PLAIN_ISO_DATE = /\A\s*\d{4}-?\d{2}-?\d{2}\s*\z/
+
     # A signed number at the end of a String, and whether a space sets it
     # apart from what comes before ("5/9/2026 -0500" but not "2026-09-05").
     SIGNED_TAIL = /(\s)?[+-]\d+(?::\d+)*\s*\z/
-    private_constant :ISO_DATE_AT_OFFSET, :ISO_DATE_T, :SIGNED_TAIL
+    private_constant :ISO_DATE_AT_OFFSET, :ISO_DATE_T, :PLAIN_ISO_DATE, :SIGNED_TAIL
 
     # The captures of ISO_DATE_AT_OFFSET as the instant they name, held to
     # the rule any other offset is (honoured_zone?): "+24:00" and "-99:00"
