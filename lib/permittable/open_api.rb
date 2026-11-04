@@ -173,11 +173,21 @@ module Permittable
     # flat body cannot say, a container's own `required`, bounds, `nullable`,
     # `desc:` and `validate:` marker, rides in `x-permittable-form-groups`,
     # keyed by the container's bracket name.
+    #
+    # Under `unknown: :error` the flat body refuses every other name, which
+    # covers each nesting level at once (`user[address][bogus]` is no listed
+    # name). It must then also list what the server still accepts: a
+    # nullable container's null (`user[docs]=""`), the keys of a :json
+    # field (`user[extra][any]`), and, for a `root:` rule, any part outside
+    # the root, which the runtime never reads.
     def form_schema(json_schema, rule)
-      form = { properties: {}, patterns: {}, required: [], groups: {} }
-      flatten_form(json_schema, [], true, form, skip_group: rule[:root] && rule[:root].to_s)
+      root = rule[:root] && rule[:root].to_s
+      form = { properties: {}, patterns: {}, required: [], groups: {}, strict: rule[:unknown] == :error }
+      flatten_form(json_schema, [], true, form, skip_group: root)
+      form[:patterns]["^(?!#{form_escape(root)}(?:\\[|$))"] = {} if form[:strict] && root
       schema = { "type" => "object", "properties" => form[:properties] }
       schema["patternProperties"] = form[:patterns] unless form[:patterns].empty?
+      schema["additionalProperties"] = false if form[:strict]
       schema["required"] = form[:required] unless form[:required].empty?
       schema["x-permittable-form-groups"] = form[:groups] unless form[:groups].empty?
       schema["x-permittable-finalize"] = true if rule[:finalize]
@@ -206,8 +216,18 @@ module Permittable
           schema, required = form_list(schema, path, required, form)
           path += [""]
         end
+        form[:patterns]["#{form_pattern(path).delete_suffix('$')}\\["] = {} if form[:strict] && form_opaque?(schema)
         form_leaf!(schema, path, required, form)
       end
+    end
+
+    def form_opaque?(schema)
+      Array(schema["type"]).include?("object") && !schema.key?("properties")
+    end
+
+    # The part a nullable container's null is sent as: an empty string.
+    def form_null!(path, form)
+      form_leaf!({ "const" => "" }, path, false, form) if form[:strict]
     end
 
     # A nullable array's null is an empty part named without the `[]`
@@ -220,6 +240,7 @@ module Permittable
       return [schema, required] unless types.include?("null")
 
       form[:groups][form_name(path.map { |k| k == :index ? "" : k })] = { "required" => required, "nullable" => true }
+      form_null!(path, form)
       types -= ["null"]
       [schema.merge("type" => types.one? ? types.first : types), false]
     end
@@ -240,17 +261,24 @@ module Permittable
 
     def form_pattern(path)
       body = path.each_with_index.map do |key, i|
-        text = key == :index ? '\\d+' : key.to_s.gsub(JsonSchema::EcmaPattern::SYNTAX_ESCAPE) { |c| "\\#{c}" }
+        text = key == :index ? '\\d+' : form_escape(key)
         i.zero? ? text : "\\[#{text}\\]"
       end
       "^#{body.join}$"
+    end
+
+    def form_escape(key)
+      key.to_s.gsub(JsonSchema::EcmaPattern::SYNTAX_ESCAPE) { |c| "\\#{c}" }
     end
 
     def form_group!(schema, path, required, form, skip_group)
       return if path.empty? || path == [skip_group] || path.last == :index
 
       group = { "required" => required }
-      group["nullable"] = true if Array(schema["type"]).include?("null")
+      if Array(schema["type"]).include?("null")
+        group["nullable"] = true
+        form_null!(path, form)
+      end
       GROUP_KEYS.each { |key| group[key] = schema[key] if schema.key?(key) }
       form[:groups][form_name(path.map { |k| k == :index ? "" : k })] = group
     end

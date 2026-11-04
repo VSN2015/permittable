@@ -311,7 +311,10 @@ RSpec.describe Permittable::OpenAPI do
           "avatar[address][city]" => { "type" => "string", "minLength" => 1 },
           "avatar[address][scan]" => file,
           "avatar[meta][pin]" => { "type" => "string", "minLength" => 1 },
-          "avatar[spare][]" => { "type" => "array", "items" => file }
+          "avatar[spare][]" => { "type" => "array", "items" => file },
+          # under unknown: :error a nullable container's null part is listed too
+          "avatar[meta]" => { "const" => "" },
+          "avatar[spare]" => { "const" => "" }
         )
         # a required leaf is required only while every parent on its way is
         expect(schema["required"]).to eq(["avatar[name]", "avatar[image]"])
@@ -321,6 +324,8 @@ RSpec.describe Permittable::OpenAPI do
         patterns = multipart_schema(paths["/avatars"]["post"])["patternProperties"]
         file = { "type" => "string", "contentMediaType" => "application/octet-stream" }
         expect(patterns).to eq(
+          # unknown: :error refuses unlisted names, so a part outside the root, which the runtime ignores, is let through
+          '^(?!avatar(?:\[|$))' => {},
           '^avatar\[items\]\[\d+\]\[photo\]$' => file,
           '^avatar\[items\]\[\d+\]\[label\]$' => { "type" => "string" },
           '^avatar\[items\]\[\d+\]\[marks\]\[\]$' => { "type" => "array", "items" => { "type" => "string" } }
@@ -401,6 +406,63 @@ RSpec.describe Permittable::OpenAPI do
         end
       end
 
+      context "with unknown: :error" do
+        let(:strict) do
+          IntegrationHarness.build_controller do
+            include Permittable
+
+            def self.controller_path = "strict"
+            permit_params :create, root: :avatar, unknown: :error do
+              required :doc, :file
+              array :docs, of: :file, nullable: true
+              optional :meta, nullable: true do
+                optional :pin, :string
+              end
+              array :items do
+                optional :photo, :file
+              end
+              optional :extra, :json
+            end
+            permit_params(:update, unknown: :error) { required :scan, :file }
+            def create = permitted_params && head(:ok)
+            def update = permitted_params && head(:ok)
+          end
+        end
+
+        let(:strict_paths) { upload_document(strict) { resources :strict, only: %i[create update] }["paths"] }
+
+        # What a validator applies to a part name: listed, matched, or let through.
+        def part_allowed?(schema, name)
+          schema["properties"].key?(name) || schema["additionalProperties"] != false ||
+            schema.fetch("patternProperties", {}).keys.any? { |pattern| Regexp.new(pattern).match?(name) }
+        end
+
+        it "refuses an undeclared part at every level, as the server does, and allows every part it accepts" do
+          schema = multipart_schema(strict_paths["/strict"]["post"])
+          expect(schema["additionalProperties"]).to be(false)
+          accepted = ["avatar[doc]", "avatar[docs][]", "avatar[docs]", "avatar[meta]", "avatar[meta][pin]",
+                      "avatar[items][3][photo]", "avatar[extra][any]", "authenticity_token"]
+          refused = ["avatar[bogus]", "avatar[meta][bogus]", "avatar[items][0][bogus]"]
+          expect(accepted.reject { |name| part_allowed?(schema, name) }).to eq([])
+          expect(refused.select { |name| part_allowed?(schema, name) }).to eq([])
+
+          ok = [["avatar[doc]", "x", "d.txt"], ["avatar[docs]", ""], ["avatar[meta]", ""],
+                ["avatar[items][3][photo]", "p", "p.txt"], ["avatar[extra][any]", "1"], ["authenticity_token", "t"]]
+          expect(IntegrationHarness.dispatch(strict, :create, method: "POST", multipart: ok).status).to eq(200)
+          refused.each do |name|
+            result = IntegrationHarness.dispatch(strict, :create, method: "POST", multipart: ok - [["avatar[meta]", ""]] + [[name, "v"]])
+            expect([name, result.status]).to eq([name, 422])
+          end
+        end
+
+        it "refuses an undeclared part of a rootless rule and keeps its path variable allowed" do
+          schema = multipart_schema(strict_paths["/strict/{id}"]["patch"])
+          expect(schema).to include("additionalProperties" => false)
+          expect(schema["properties"]).to include("id" => {}, "scan" => anything)
+          expect(part_allowed?(schema, "bogus")).to be(false)
+        end
+      end
+
       it "names a rootless rule's parts by their bare names, and an array of files docs[]" do
         patch = paths["/avatars/{id}"]["patch"]
         expect(multipart_schema(patch)["properties"].keys).to eq(["docs[]", "cover"])
@@ -416,12 +478,14 @@ RSpec.describe Permittable::OpenAPI do
 
       it "describes a body the server accepts: a request built from the exported part names" do
         schema = multipart_schema(paths["/avatars"]["post"])
-        parts = schema["properties"].flat_map do |name, leaf|
+        # a nullable container's null part ({"const"=>""}) and the outside-root
+        # pattern are alternatives to a full body, not parts of one
+        parts = schema["properties"].reject { |_, leaf| leaf.key?("const") }.flat_map do |name, leaf|
           file = (leaf["items"] || leaf).key?("contentMediaType")
           Array.new(leaf["type"] == "array" ? 2 : 1) { |i| [name, file ? "hi" : "text", (file ? "f#{i}.txt" : nil)] }
         end
         # two elements, the second without its optional photo, named from the patterns
-        schema["patternProperties"].each_key do |pattern|
+        schema["patternProperties"].each_key.grep_v(/\A\^\(\?!/) do |pattern|
           template = pattern[1..-2].delete("\\")
           file = schema["patternProperties"][pattern]["contentMediaType"]
           [0, 1].each do |i|
