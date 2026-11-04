@@ -2189,10 +2189,11 @@ module Permittable
       return if method_defined?(:render) || private_method_defined?(:render)
       return if Permittable.error_format != :problem && permittable_delegates_render_error?
 
+      hint = " or define render_error before permit_params" unless Permittable.error_format == :problem
       raise ArgumentError,
             "#{LABEL}: permit_params on #{name || inspect}, an ActionController::Metal controller, cannot render " \
             "a rejection: include ActionController::Rendering and ActionController::Renderers::All " \
-            "(after AbstractController::Rendering)#{' or define render_error before permit_params' unless Permittable.error_format == :problem}"
+            "(after AbstractController::Rendering)#{hint}"
     end
 
     def permittable_delegates_render_error?

@@ -4861,7 +4861,7 @@ RSpec.describe Permittable do
           it "loads with a public render_error to delegate to" do
             expect do
               build_metal(order, rendering: false) do
-                def render_error(message:, code:, status:) = nil
+                def render_error(message:, code:, status:) = [message, code, status]
 
                 permit_params(:create, enforce: true) { required :name, :string }
               end
@@ -4871,7 +4871,7 @@ RSpec.describe Permittable do
           it "loads with a private render_error shaped like the documented contract" do
             expect do
               build_metal(order, rendering: false) do
-                def render_error(message:, code:, status:) = nil
+                def render_error(message:, code:, status:) = [message, code, status]
                 private :render_error
 
                 permit_params(:create, enforce: true) { required :name, :string }
@@ -4882,7 +4882,7 @@ RSpec.describe Permittable do
           it "raises for a private render_error the envelope would not call" do
             expect do
               build_metal(order, rendering: false) do
-                def render_error(message, status) = nil
+                def render_error(_message, _status) = nil
                 private :render_error
 
                 permit_params(:create, enforce: true) { required :name, :string }
@@ -4894,7 +4894,7 @@ RSpec.describe Permittable do
             Permittable.error_format = :problem
             expect do
               build_metal(order, rendering: false) do
-                def render_error(message:, code:, status:) = nil
+                def render_error(message:, code:, status:) = [message, code, status]
 
                 permit_params(:create, enforce: true) { required :name, :string }
               end
