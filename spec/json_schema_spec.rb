@@ -74,6 +74,18 @@ RSpec.describe Permittable::JsonSchema do
       expect(prop["maxLength"]).to eq(10)
     end
 
+    # OpenAPI 3.1 dropped `format: binary`; a file is a string with a media type.
+    it "describes a :file as a string with a contentMediaType, no minLength (a 0-byte upload is accepted), alone and as an array element" do
+      schema = schema_for do
+        required :avatar, :file
+        array :docs, of: :file, length: 0..3
+      end
+      expect(schema["properties"]["avatar"]).to eq("type" => "string", "contentMediaType" => "application/octet-stream")
+      expect(schema["properties"]["docs"]).to eq("type" => "array", "minItems" => 0, "maxItems" => 3,
+                                                 "items" => { "type" => "string",
+                                                              "contentMediaType" => "application/octet-stream" })
+    end
+
     # "" is absent for EVERY type, so a required :decimal/:date/:datetime
     # rejects it as missing. They are strings on the wire, and `format` is
     # only an annotation (and "decimal" is no format a validator knows), so

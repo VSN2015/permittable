@@ -67,7 +67,12 @@ module Permittable
       decimal: { "type" => %w[string number], "format" => "decimal" },
       boolean: { "type" => "boolean" },
       date: { "type" => "string", "format" => "date" },
-      datetime: { "type" => "string", "format" => "date-time" }
+      datetime: { "type" => "string", "format" => "date-time" },
+      # OpenAPI 3.1 / JSON Schema 2020-12 describe a file as a string with a
+      # contentMediaType (`format: binary` is the 3.0 spelling, which 3.1
+      # dropped). It rides in a multipart/form-data body, see
+      # OpenApi.body_media_type.
+      file: { "type" => "string", "contentMediaType" => "application/octet-stream" }
     }.freeze
 
     # Request-body schema for one rule from `permittable_contracts` /
@@ -359,7 +364,8 @@ module Permittable
     # takes. A nullable :string keeps the floor it has always had (stricter
     # than the server, the safe direction); the other types start without.
     def blank_floor?(field)
-      field[:required] && (field[:type] == :string || !field[:nullable])
+      # A :file is no string at the wire: a 0-byte upload is accepted.
+      field[:required] && field[:type] != :file && (field[:type] == :string || !field[:nullable])
     end
 
     def apply_pattern!(schema, regexp)
