@@ -1015,6 +1015,8 @@ If this parameter is not backed by a column, declare it with virtual: true.
 
 The error carries a ready-to-paste migration command, typed from your own field declaration.
 
+A field naming a column the model lists in `ignored_columns` raises too, but says so (remove it from `ignored_columns`, or declare it `virtual: true`) rather than suggesting a migration.
+
 #### Checking types too (opt-in)
 
 A dropped column fails the deploy; a **retyped** one doesn't, unless you ask:
