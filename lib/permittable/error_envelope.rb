@@ -61,10 +61,27 @@ module Permittable
         # with html listed first). Without it this JSON body goes out as HTML.
         # A JSON type the response already carries (a registered
         # application/vnd.api+json, say) is the host's choice and is kept.
-        options = { json: { success: false, error: error }, status: status }
-        options[:content_type] = "application/json" unless json_media_type?(response_media_type(controller))
-        controller.render(**options)
+        type = json_media_type?(response_media_type(controller)) ? nil : "application/json"
+        render_json(controller, { success: false, error: error }, status: status, content_type: type)
       end
+    end
+
+    # `render json:`, or — for a bare ActionController::Metal that never
+    # included ActionController::Rendering, and so has no `render` — the same
+    # response written through Metal's own status=, content_type= and
+    # response_body=. `render json:` calls `to_json` on a Hash, so the bytes
+    # are the same. A controller with `render` always takes the first path.
+    def render_json(controller, payload, status:, content_type: nil)
+      if !controller.respond_to?(:render) && controller.respond_to?(:response_body=)
+        controller.status = status
+        controller.content_type = content_type if content_type
+        controller.response_body = [payload.to_json]
+        return
+      end
+
+      options = { json: payload, status: status }
+      options[:content_type] = content_type if content_type
+      controller.render(**options)
     end
 
     # The media type (no parameters) the response already carries, or nil when
@@ -160,7 +177,7 @@ module Permittable
       instance = request_path(controller)
       problem[:instance] = instance if instance
       problem[:errors] = details if details && !details.empty?
-      controller.render(json: problem, status: status, content_type: PROBLEM_MEDIA_TYPE)
+      render_json(controller, problem, status: status, content_type: PROBLEM_MEDIA_TYPE)
     end
 
     # RFC 9457: an absent `type` means "about:blank", so that is the honest

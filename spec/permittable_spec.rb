@@ -4837,83 +4837,88 @@ RSpec.describe Permittable do
           end.not_to raise_error
         end
 
-        # The gem's rescue_from handler renders the rejection, and a Metal
-        # controller without ActionController::Rendering has no `render`: every
-        # rejection was a NoMethodError out of the handler, a 500.
-        describe "that cannot render a rejection" do
+        # A Metal controller without ActionController::Rendering has no
+        # `render`: the gem writes the response through Metal's own
+        # status=, content_type= and response_body= instead, and the bytes
+        # are those `render json:` would have sent.
+        describe "without the rendering modules" do
           let(:order) { %i[callbacks rescue permittable] }
-          let(:rendering_modules) { /ActionController::Rendering and ActionController::Renderers::All/ }
+
+          def dispatch_create(controller, json: {})
+            result = IntegrationHarness.dispatch(controller, :create, method: "POST", json: json)
+            [result.status, result.header("Content-Type"), result.body]
+          end
 
           after { Permittable.error_format = :envelope }
 
-          it "raises at class load for an enforce: true rule" do
-            expect do
-              build_metal(order, rendering: false) { permit_params(:create, enforce: true) { required :name, :string } }
-            end.to raise_error(ArgumentError, rendering_modules)
-          end
-
-          it "raises at class load for a lazy rule, which the same handler renders" do
-            expect do
-              build_metal(order, rendering: false) { permit_params(:create) { required :name, :string } }
-            end.to raise_error(ArgumentError, rendering_modules)
-          end
-
-          it "loads with a public render_error to delegate to" do
-            expect do
-              build_metal(order, rendering: false) do
-                def render_error(message:, code:, status:) = [message, code, status]
-
-                permit_params(:create, enforce: true) { required :name, :string }
+          { "enforce: true" => { enforce: true }, "lazy" => {} }.each do |label, options|
+            it "answers a #{label} rule's 422 with the envelope the rendering controller sends" do
+              build = lambda do |rendering|
+                build_metal(order, rendering: rendering) do
+                  permit_params(:create, **options) { required :name, :string }
+                  def create
+                    permitted_params
+                    head(:accepted)
+                  end
+                end
               end
-            end.not_to raise_error
+              status, type, body = dispatch_create(build.call(false))
+              expect(dispatch_create(build.call(true))).to eq([status, type, body])
+              expect(status).to eq(422)
+              expect(type).to start_with("application/json")
+              expect(JSON.parse(body)).to include("success" => false)
+              expect(JSON.parse(body)["error"]).to include("code" => "invalid_parameters",
+                                                           "details" => [{ "param" => "name", "code" => "missing" }])
+            end
           end
 
-          it "loads with a private render_error shaped like the documented contract" do
-            expect do
-              build_metal(order, rendering: false) do
-                def render_error(message:, code:, status:) = [message, code, status]
-                private :render_error
-
-                permit_params(:create, enforce: true) { required :name, :string }
-              end
-            end.not_to raise_error
-          end
-
-          it "raises for a private render_error the envelope would not call" do
-            expect do
-              build_metal(order, rendering: false) do
-                def render_error(_message, _status) = nil
-                private :render_error
-
-                permit_params(:create, enforce: true) { required :name, :string }
-              end
-            end.to raise_error(ArgumentError, rendering_modules)
-          end
-
-          it "raises under error_format :problem even with a render_error, which :problem does not use" do
-            Permittable.error_format = :problem
-            expect do
-              build_metal(order, rendering: false) do
-                def render_error(message:, code:, status:) = [message, code, status]
-
-                permit_params(:create, enforce: true) { required :name, :string }
-              end
-            end.to raise_error(ArgumentError, rendering_modules)
-          end
-
-          it "loads a monitor-mode rule, which never renders, and a controller with no rescue_from handler" do
-            expect do
-              build_metal(order, rendering: false) { permit_params(:create, mode: :monitor) { required :name, :string } }
-              build_metal(%i[callbacks permittable], rendering: false) { permit_params(:create) { required :name, :string } }
-            end.not_to raise_error
-          end
-
-          it "still answers with the 422 envelope when the rendering modules are there" do
-            controller = build_metal(order) do
-              permit_params(:create, enforce: true) { required :name, :string }
+          it "answers a missing root with 400" do
+            controller = build_metal(order, rendering: false) do
+              permit_params(:create, enforce: true, root: :user) { required :name, :string }
               def create = head(:accepted)
             end
-            expect(IntegrationHarness.dispatch(controller, :create, method: "POST", json: {}).status).to eq(422)
+            status, type, body = dispatch_create(controller)
+            expect(status).to eq(400)
+            expect(type).to start_with("application/json")
+            expect(JSON.parse(body)["error"]["code"]).to eq("invalid_parameters")
+          end
+
+          it "answers under error_format :problem with the problem document the rendering controller sends" do
+            Permittable.error_format = :problem
+            build = lambda do |rendering|
+              build_metal(order, rendering: rendering) do
+                permit_params(:create, enforce: true) { required :name, :string }
+                def create = head(:accepted)
+              end
+            end
+            status, type, body = dispatch_create(build.call(false))
+            expect(dispatch_create(build.call(true))).to eq([status, type, body])
+            expect(status).to eq(422)
+            expect(type).to start_with("application/problem+json")
+            expect(JSON.parse(body)).to include("title" => "Invalid parameters", "status" => 422)
+          end
+
+          it "delegates to a private render_error defined below permit_params" do
+            controller = build_metal(order, rendering: false) do
+              permit_params(:create, enforce: true) { required :name, :string }
+              def create = head(:accepted)
+
+              private
+
+              def render_error(message:, code:, status:)
+                self.status = 418
+                self.response_body = "custom #{code}"
+              end
+            end
+            expect(dispatch_create(controller)).to include(418, "custom invalid_parameters")
+          end
+
+          it "still lets a monitor-mode rule run the action" do
+            controller = build_metal(order, rendering: false) do
+              permit_params(:create, mode: :monitor) { required :name, :string }
+              def create = head(:accepted)
+            end
+            expect(IntegrationHarness.dispatch(controller, :create, method: "POST", json: {}).status).to eq(202)
           end
         end
 
