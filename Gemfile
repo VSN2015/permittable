@@ -21,7 +21,7 @@ gem "json", "< 3"
 gem "railties", ">= 6.1", "< 9"
 gem "rspec", "~> 3.12"
 gem "simplecov", "~> 1.2"
-gem "sqlite3", "~> 2.10.0"
+gem "sqlite3", "~> 2.10.1"
 
 group :development, :test do
   gem 'rubocop', '~> 1.92', require: false
