@@ -716,7 +716,7 @@ What you give up is the shape. What you keep:
 | `max_depth:` | Caps **container nesting**, counting arrays as a level: `{"a": 1}` is 1, `{"a": {"b": 1}}` and `{"a": [1, 2]}` are 2, `{"a": [{"b": 1}]}` is 3. Violation code `depth` |
 | `validate:` / `transform:` | See the whole hash, so any check you can write in Ruby still applies |
 | `model:` | The field maps onto a column like a scalar does, so the [drift guard](#the-schema-drift-guard) still catches a dropped `metadata` column |
-| `sensitive:` / `nullable:` / `message:` / `desc:` / `default:` / `example:` | Behave as on any other field (`default:`/`example:` must be a hash, and are checked against the field's own bounds at class load) |
+| `sensitive:` / `nullable:` / `message:` / `desc:` / `default:` / `example:` | Behave as on any other field (`default:`/`example:` must be a hash holding no NaN or Infinity, and are checked against the field's own bounds at class load) |
 
 Bounding it matters more than it looks: an unbounded `jsonb` column is where clients put megabytes and 200-level-deep objects. `max_depth:` and `length:` are how a contract says "opaque, but not unlimited" — which is strictly more than `permit(metadata: {})` can say.
 
