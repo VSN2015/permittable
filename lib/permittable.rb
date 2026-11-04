@@ -2159,6 +2159,7 @@ module Permittable
       missing << "AbstractController::Callbacks" if (rule[:enforce] || monitored) && !respond_to?(:before_action)
       missing << "ActionController::Rescue" if rule[:enforce] && !monitored && !respond_to?(:rescue_from)
       if missing.empty?
+        permittable_ensure_renderable!(rule)
         return unless rule[:enforce] && !monitored && permittable_rescue_inside_callbacks?
 
         raise ArgumentError,
@@ -2172,6 +2173,33 @@ module Permittable
             "#{LABEL}: permit_params on #{name || inspect}, an ActionController::Metal controller, cannot run " \
             "this #{monitored ? 'monitor-mode' : 'enforce: true'} rule: include #{missing.join(' and ')} " \
             "before permit_params (ActionController::Rescue after AbstractController::Callbacks, as ActionController::Base does)"
+    end
+
+    # The rescue_from handler renders every rejection, so once it is
+    # registered a Metal controller needs something to render with: `render`
+    # (ActionController::Rendering and Renderers::All), or, for the default
+    # envelope, a `render_error` the envelope would delegate to (public, or
+    # private and shaped like the documented keyword contract; the :problem
+    # format never delegates). Without either, each rejection was a
+    # NoMethodError out of the handler. Any rule that is not explicitly in
+    # monitor mode can reach the handler, a lazy one included. Checked when
+    # the rule is declared, so a `render_error` goes above `permit_params`.
+    def permittable_ensure_renderable!(rule)
+      return if rule[:mode] == :monitor || !respond_to?(:rescue_from)
+      return if method_defined?(:render) || private_method_defined?(:render)
+      return if Permittable.error_format != :problem && permittable_delegates_render_error?
+
+      raise ArgumentError,
+            "#{LABEL}: permit_params on #{name || inspect}, an ActionController::Metal controller, cannot render " \
+            "a rejection: include ActionController::Rendering and ActionController::Renderers::All " \
+            "(after AbstractController::Rendering)#{' or define render_error before permit_params' unless Permittable.error_format == :problem}"
+    end
+
+    def permittable_delegates_render_error?
+      return true if method_defined?(:render_error)
+      return false unless private_method_defined?(:render_error)
+
+      ErrorEnvelope.keyword_contract?(instance_method(:render_error).parameters)
     end
 
     # A module included later sits earlier in the ancestors and so runs

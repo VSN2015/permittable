@@ -4688,13 +4688,17 @@ RSpec.describe Permittable do
     # InvalidParameters. They are now registered at the first `permit_params`.
     describe "on a bare ActionController::Metal controller, whatever the include order" do
       # `order` lists the modules to include; :permittable marks where.
-      def build_metal(order, &body)
+      def build_metal(order, rendering: true, &body)
         modules = { callbacks: AbstractController::Callbacks, rescue: ActionController::Rescue,
                     permittable: Permittable }
         Class.new(ActionController::Metal).tap do |klass|
           # One at a time, in Rails' own order: `include a, b` puts a in front.
-          [AbstractController::Rendering, ActionController::Rendering, ActionController::Renderers::All,
-           ActionController::Head, ActionController::StrongParameters].each { |mod| klass.include mod }
+          stack = [ActionController::Head, ActionController::StrongParameters]
+          if rendering
+            stack = [AbstractController::Rendering, ActionController::Rendering,
+                     ActionController::Renderers::All] + stack
+          end
+          stack.each { |mod| klass.include mod }
           klass.define_singleton_method(:controller_path) { "metal_order" }
           order.each { |name| klass.include modules.fetch(name) }
           klass.class_eval(&body) if body
@@ -4831,6 +4835,86 @@ RSpec.describe Permittable do
               permit_params(:update) { required :name, :string }
             end
           end.not_to raise_error
+        end
+
+        # The gem's rescue_from handler renders the rejection, and a Metal
+        # controller without ActionController::Rendering has no `render`: every
+        # rejection was a NoMethodError out of the handler, a 500.
+        describe "that cannot render a rejection" do
+          let(:order) { %i[callbacks rescue permittable] }
+          let(:rendering_modules) { /ActionController::Rendering and ActionController::Renderers::All/ }
+
+          after { Permittable.error_format = :envelope }
+
+          it "raises at class load for an enforce: true rule" do
+            expect do
+              build_metal(order, rendering: false) { permit_params(:create, enforce: true) { required :name, :string } }
+            end.to raise_error(ArgumentError, rendering_modules)
+          end
+
+          it "raises at class load for a lazy rule, which the same handler renders" do
+            expect do
+              build_metal(order, rendering: false) { permit_params(:create) { required :name, :string } }
+            end.to raise_error(ArgumentError, rendering_modules)
+          end
+
+          it "loads with a public render_error to delegate to" do
+            expect do
+              build_metal(order, rendering: false) do
+                def render_error(message:, code:, status:) = nil
+
+                permit_params(:create, enforce: true) { required :name, :string }
+              end
+            end.not_to raise_error
+          end
+
+          it "loads with a private render_error shaped like the documented contract" do
+            expect do
+              build_metal(order, rendering: false) do
+                def render_error(message:, code:, status:) = nil
+                private :render_error
+
+                permit_params(:create, enforce: true) { required :name, :string }
+              end
+            end.not_to raise_error
+          end
+
+          it "raises for a private render_error the envelope would not call" do
+            expect do
+              build_metal(order, rendering: false) do
+                def render_error(message, status) = nil
+                private :render_error
+
+                permit_params(:create, enforce: true) { required :name, :string }
+              end
+            end.to raise_error(ArgumentError, rendering_modules)
+          end
+
+          it "raises under error_format :problem even with a render_error, which :problem does not use" do
+            Permittable.error_format = :problem
+            expect do
+              build_metal(order, rendering: false) do
+                def render_error(message:, code:, status:) = nil
+
+                permit_params(:create, enforce: true) { required :name, :string }
+              end
+            end.to raise_error(ArgumentError, rendering_modules)
+          end
+
+          it "loads a monitor-mode rule, which never renders, and a controller with no rescue_from handler" do
+            expect do
+              build_metal(order, rendering: false) { permit_params(:create, mode: :monitor) { required :name, :string } }
+              build_metal(%i[callbacks permittable], rendering: false) { permit_params(:create) { required :name, :string } }
+            end.not_to raise_error
+          end
+
+          it "still answers with the 422 envelope when the rendering modules are there" do
+            controller = build_metal(order) do
+              permit_params(:create, enforce: true) { required :name, :string }
+              def create = head(:accepted)
+            end
+            expect(IntegrationHarness.dispatch(controller, :create, method: "POST", json: {}).status).to eq(422)
+          end
         end
 
         it "lets a lazy rule, which the action can rescue itself, and a monitor rule without Rescue load" do
