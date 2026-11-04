@@ -773,6 +773,12 @@ Exported [OpenAPI](#exporting-openapi-docs-that-cannot-drift) tells the truth ab
 
 Every failure raises `Permittable::InvalidParameters`, carrying `details` (an array of `{ param:, code: }`, plus a `message:` when the field [declares one](#custom-error-messages-message)) and a `status`. On a real controller it is auto-rescued into the error envelope shown at the [top of this README](#permittable).
 
+Rails searches `rescue_from` handlers from the last declared to the first, so a catch-all such as `rescue_from StandardError` declared *after* `include Permittable` answers an invalid request first, and the client gets that handler's response instead of the 422 or 400. Either declare the catch-all before the include, or re-declare the gem's handler after it:
+
+```ruby
+rescue_from Permittable::InvalidParameters, with: :render_invalid_parameters
+```
+
 | Code | Raised when |
 |---|---|
 | `missing` | A required field is absent, or the `root:` key is absent (that one is a **400**) |
