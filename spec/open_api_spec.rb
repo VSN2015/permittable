@@ -461,6 +461,17 @@ RSpec.describe Permittable::OpenAPI do
           expect(schema["properties"]).to include("id" => {}, "scan" => anything)
           expect(part_allowed?(schema, "bogus")).to be(false)
         end
+
+        it "lets a rootless rule's body carry the form keys the runtime exempts, as a browser form sends them" do
+          schema = multipart_schema(strict_paths["/strict/{id}"]["patch"])
+          scan = [["scan", "x", "s.txt"]]
+          Permittable::FORM_KEYS.each do |key|
+            result = IntegrationHarness.dispatch(strict, :update, method: "PATCH", multipart: scan + [[key, "v"]])
+            expect([key, part_allowed?(schema, key), result.status]).to eq([key, true, 200])
+          end
+          expect(IntegrationHarness.dispatch(strict, :update, method: "PATCH", multipart: scan + [%w[bogus v]]).status).to eq(422)
+          expect(part_allowed?(schema, "xauthenticity_token")).to be(false)
+        end
       end
 
       it "names a rootless rule's parts by their bare names, and an array of files docs[]" do

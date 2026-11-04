@@ -179,12 +179,17 @@ module Permittable
     # name). It must then also list what the server still accepts: a
     # nullable container's null (`user[docs]=""`), the keys of a :json
     # field (`user[extra][any]`), and, for a `root:` rule, any part outside
-    # the root, which the runtime never reads.
+    # the root, which the runtime never reads; a rootless rule instead gets
+    # the form keys (FORM_KEYS) the runtime exempts at the top level.
     def form_schema(json_schema, rule)
       root = rule[:root] && rule[:root].to_s
       form = { properties: {}, patterns: {}, required: [], groups: {}, strict: rule[:unknown] == :error }
       flatten_form(json_schema, [], true, form, skip_group: root)
-      form[:patterns]["^(?!#{form_escape(root)}(?:\\[|$))"] = {} if form[:strict] && root
+      if form[:strict] && root
+        form[:patterns]["^(?!#{form_escape(root)}(?:\\[|$))"] = {}
+      elsif form[:strict]
+        form[:patterns]["^(?:#{Permittable::FORM_KEYS.map { |key| form_escape(key) }.join('|')})$"] = {}
+      end
       schema = { "type" => "object", "properties" => form[:properties] }
       schema["patternProperties"] = form[:patterns] unless form[:patterns].empty?
       schema["additionalProperties"] = false if form[:strict]
