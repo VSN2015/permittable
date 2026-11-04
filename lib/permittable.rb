@@ -1241,9 +1241,32 @@ module Permittable
       return instant_as_date(member) if type == :date && (member.is_a?(Time) || member.is_a?(DateTime))
 
       status, value = cast(type, member)
-      return [status, value] unless status == :ok && type == :datetime && !member.is_a?(String) && !whole_nanoseconds?(value)
+      return [status, value] unless status == :ok && finer_than_nanosecond?(type, member, value)
 
       [:error, "finer than a nanosecond, so it never equals a request; round it, e.g. with .round(9)"]
+    end
+
+    # Whether `raw`, authored as a Time-like `in:` member of a :datetime
+    # field and cast to `cast_value`, holds more than the nine digits the
+    # export prints. A String `in:` member is exempt: it is cast exactly as a
+    # request sending it is, and published as written (see
+    # published_in_member), so whatever precision it spells is reachable.
+    def finer_than_nanosecond?(type, raw, cast_value)
+      type == :datetime && !raw.is_a?(String) && !whole_nanoseconds?(cast_value)
+    end
+
+    # An authored `default:` or `example:` is held to the same rule as an
+    # `in:` member: the exported schema prints it to nine digits, so a value
+    # finer than that was published as a different instant than the action
+    # got for an omitted field, and a client sending the published default
+    # was not sending the default. Unlike an `in:` member, a String is NOT
+    # exempt here: a default or example is stored as the cast Time and
+    # exported from that, never as written, so "...00.1234567891Z" printed
+    # as .123456789Z. `outcome` is the cast's [status, value].
+    def refuse_finer_than_nanosecond(type, outcome)
+      return outcome unless outcome.first == :ok && type == :datetime && !whole_nanoseconds?(outcome.last)
+
+      [:error, "finer than a nanosecond, so the export publishes a different instant; round it, e.g. with .round(9)"]
     end
 
     # A request's fraction of a second is a finite decimal, and the export
@@ -1885,7 +1908,9 @@ module Permittable
       # proc cannot rewrite the host's own literal.
       authored = field[opt].is_a?(String) ? field[opt].dup : field[opt]
       value = Coercion.apply_normalize(field[:normalize], authored)
-      status, result = Coercion.check_scalar(live_in?(field) ? field.except(:in) : field, value)
+      status, result = Coercion.refuse_finer_than_nanosecond(
+        field[:type], Coercion.check_scalar(live_in?(field) ? field.except(:in) : field, value)
+      )
       raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{result})" unless status == :ok
 
       field[opt] = freeze_authored(opt == :default && field[:transform] ? field[opt] : result)
@@ -2758,7 +2783,7 @@ module Permittable
     case field[:kind]
     when :scalar
       # Already normalized by permittable_normalized, before the absence rule.
-      permittable_check_whole(field, Coercion.check_scalar(field, value), full, result, violations: violations)
+      permittable_check_whole(field, permittable_check_scalar(field, value), full, result, violations: violations)
     when :json
       permittable_check_whole(field, permittable_check_json(field, value), full, result, violations: violations)
     when :nested
@@ -2883,7 +2908,18 @@ module Permittable
     field[:transform] ? field[:transform].call(value) : value
   end
 
-  # A second seam, for the same reader: the array-level `validate:` to run.
+  # More seams, for the same reader: how a scalar field's value, and an
+  # array element, are cast. A request's are cast as they come; an authored
+  # default: or example: is also held to the nine digits the export prints.
+  def permittable_check_scalar(field, value)
+    Coercion.check_scalar(field, value)
+  end
+
+  def permittable_cast_element(field, element)
+    Coercion.cast(field[:of], element)
+  end
+
+  # A third seam, for the same reader: the array-level `validate:` to run.
   def permittable_array_validator(field)
     field[:validate]
   end
@@ -2898,7 +2934,7 @@ module Permittable
                                     path: path, unknown: unknown, top_level: false, violations: violations)
     end
 
-    status, out = Coercion.cast(field[:of], permittable_own(element))
+    status, out = permittable_cast_element(field, permittable_own(element))
     return out if status == :ok
 
     violations << permittable_violation(field, path, out)
