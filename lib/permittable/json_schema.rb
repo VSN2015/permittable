@@ -36,6 +36,10 @@ module Permittable
   #   * a `:json` field's `max_depth:` — `x-permittable-max-depth`;
   #   * a Range of non-numbers (`in: "a".."m"`) — `x-permittable-range`;
   #   * a `validate:` proc — `x-permittable-custom-validation`;
+  #   * an :integer, :float or :decimal (its number branch) with no finite
+  #     bound on both sides from `in:` — `x-permittable-finite`: a validator
+  #     that admits non-finite numbers reads `1e400` as Infinity and accepts
+  #     it, which the server refuses;
   #   * a `finalize` block, whose `violate!` cross-field checks no field's
   #     schema can carry — `x-permittable-finalize` on the rule's object;
   #   * a `sensitive:` field's `in:` and `format:`, withheld because they
@@ -144,6 +148,7 @@ module Permittable
       apply_format_name!(schema, field)
       withheld = withholds_constraints?(field)
       apply_in!(schema, field) unless withheld
+      label_finite!(schema) if NUMERIC_TYPES.include?(field[:type])
       apply_string_bounds!(schema, field)
       apply_pattern!(schema, field[:format]) unless withheld
       schema["x-permittable-custom-validation"] = true if withheld
@@ -200,7 +205,34 @@ module Permittable
       # SCALAR_SCHEMAS.
       schema["items"] =
         field[:fields] ? object(field[:fields], unknown: unknown) : SCALAR_SCHEMAS.fetch(field[:of]).deep_dup
+      label_finite!(schema["items"]) if !field[:fields] && NUMERIC_TYPES.include?(field[:of])
       schema
+    end
+
+    # A JSON number literal has no size limit, so `type: integer`/`number`
+    # admits `1e400`, which Rails parses to Infinity and the cast refuses as
+    # invalid_type. Ajv with default options refuses it too, but one that does
+    # not enforce finite numbers (`strict: false`, `strictNumbers: false`)
+    # admits it: the schema is looser there. Bounding the field at
+    # +-Float::MAX would close the gap, but a 309-digit `minimum`/`maximum`
+    # breaks code generators (a Java `@Max(...)` that does not compile, an
+    # overflowing Go constant), so the divergence is labelled instead, like
+    # every other looser one. A field already bounded on both sides by `in:`
+    # (a list, or a Range with both ends) is finite for any validator, so it
+    # carries no label. A `sensitive:` field whose `in:` is withheld is
+    # labelled as though it had none, so the label says nothing about it.
+    # A bound beyond a double's range (`0..10**400`) does not count as one: it
+    # is published exactly, but a JS validator parses it as Infinity, so
+    # `1e400` still passes.
+    def label_finite!(schema)
+      return if schema.key?("enum")
+      return if finite_bound?(schema, "minimum") && (finite_bound?(schema, "maximum") || finite_bound?(schema, "exclusiveMaximum"))
+
+      schema["x-permittable-finite"] = true
+    end
+
+    def finite_bound?(schema, keyword)
+      schema.key?(keyword) && schema[keyword].to_f.finite?
     end
 
     # A list is stored cast by the field's type, so its enum is what the

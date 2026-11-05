@@ -35,10 +35,17 @@ module TinyJsonSchema
     value.is_a?(Numeric)
   end
 
+  # An integer is an Integer, or the Infinity a parser makes of a literal
+  # such as 1e400: the JSON text denotes an integer, and a validator that
+  # does not enforce finite numbers (for example Ajv with
+  # `strictNumbers: false`, which `strict: false` implies) takes
+  # `type: integer` to admit it, so only a bound can refuse it.
+  # Read by type alone it would be refused here and the gap with a missing
+  # bound would go unseen.
   def type_ok?(type, value)
     case type
     when "string" then value.is_a?(String)
-    when "integer" then value.is_a?(Integer)
+    when "integer" then value.is_a?(Integer) || (value.is_a?(Float) && value.infinite?)
     when "number" then number?(value)
     when "boolean" then [true, false].include?(value)
     when "object" then value.is_a?(Hash)

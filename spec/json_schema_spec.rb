@@ -35,9 +35,10 @@ RSpec.describe Permittable::JsonSchema do
         optional :at,  :datetime
       end["properties"]
       expect(props["s"]).to eq("type" => "string")
-      expect(props["i"]).to eq("type" => "integer")
-      expect(props["f"]).to eq("type" => "number")
-      expect(props["d"]).to eq("type" => %w[string number], "format" => "decimal")
+      finite = { "x-permittable-finite" => true }
+      expect(props["i"]).to eq({ "type" => "integer" }.merge(finite))
+      expect(props["f"]).to eq({ "type" => "number" }.merge(finite))
+      expect(props["d"]).to eq({ "type" => %w[string number], "format" => "decimal" }.merge(finite))
       expect(props["b"]).to eq("type" => "boolean")
       expect(props["day"]).to eq("type" => "string", "format" => "date")
       expect(props["at"]).to eq("type" => "string", "format" => "date-time")
@@ -102,6 +103,81 @@ RSpec.describe Permittable::JsonSchema do
 
       expect(prop["type"]).to eq(%w[string number null])
       expect(prop).not_to have_key("minLength")
+    end
+  end
+
+  describe "x-permittable-finite" do
+    let(:finite) { { "x-permittable-finite" => true } }
+
+    it "labels a number a validator that admits Infinity would accept, and adds no minimum/maximum" do
+      %i[integer float decimal].each do |type|
+        schema = property("x") { optional :x, type }
+        expect(schema).to include(finite)
+        expect(schema.keys & %w[minimum maximum]).to be_empty
+      end
+      expect(property("x") { array :x, of: :integer })
+        .to eq("type" => "array", "items" => { "type" => "integer" }.merge(finite))
+      expect(property("x") { array :x, of: :float })
+        .to eq("type" => "array", "items" => { "type" => "number" }.merge(finite))
+      expect(property("x") { array :x, of: :decimal })
+        .to eq("type" => "array", "items" => { "type" => %w[string number], "format" => "decimal" }.merge(finite))
+      expect(property("x") { optional :x, :float, nullable: true }).to include(finite)
+    end
+
+    it "labels the items of a numeric array, not the array itself" do
+      schema = property("x") { array :x, of: :integer }
+      expect(schema.keys).not_to include("x-permittable-finite")
+      expect(schema["items"]).to include(finite)
+      expect(property("x") { array :x, of: :integer, nullable: true }["items"]).to include(finite)
+    end
+
+    it "labels a field bounded on one side only, and leaves one bounded on both sides or listed" do
+      expect(property("x") { optional :x, :integer, in: 0.. }).to eq({ "type" => "integer", "minimum" => 0 }.merge(finite))
+      expect(property("x") { optional :x, :float, in: ...1.5 })
+        .to eq({ "type" => "number", "exclusiveMaximum" => 1.5 }.merge(finite))
+      expect(property("x") { optional :x, :integer, in: 1..5 }).to eq("type" => "integer", "minimum" => 1, "maximum" => 5)
+      expect(property("x") { optional :x, :float, in: 0...1.5 })
+        .to eq("type" => "number", "minimum" => 0, "exclusiveMaximum" => 1.5)
+      expect(property("x") { optional :x, :integer, in: [1, 2] }).to eq("type" => "integer", "enum" => [1, 2])
+      expect(property("x") { optional :x, :decimal, in: %w[1.5 2.5] }.keys).not_to include("x-permittable-finite")
+    end
+
+    # A JS validator reads a `maximum` of 10**400 as Infinity, so `1e400`
+    # passes `Infinity <= Infinity` while the server refuses it. The conformance
+    # validator compares in Ruby, where `Float::INFINITY <= 10**400` is false,
+    # so it cannot see this: this spec is the guard.
+    it "labels a Range whose bound is beyond a double's range, which a validator reads as Infinity" do
+      huge = 10**400
+      [
+        [:integer, 0..huge, { "minimum" => 0, "maximum" => huge }],
+        [:integer, 0...huge, { "minimum" => 0, "exclusiveMaximum" => huge }],
+        [:integer, -huge..5, { "minimum" => -huge, "maximum" => 5 }],
+        [:decimal, 0..huge, { "minimum" => 0, "maximum" => huge }]
+      ].each do |type, range, bounds|
+        schema = property("x") { optional :x, type, in: range }
+        expect(schema).to include(bounds).and include(finite)
+      end
+      expect(property("x") { optional :x, :integer, in: -huge..huge }).to include(finite)
+    end
+
+    it "leaves a Range alone whose bounds are large but within a double's range" do
+      big = 10**300
+      expect(property("x") { optional :x, :integer, in: -big..big })
+        .to eq("type" => "integer", "minimum" => -big, "maximum" => big)
+    end
+
+    it "never labels a string, date or boolean" do
+      %i[string boolean date datetime].each do |type|
+        expect(property("x") { optional :x, type }.keys).not_to include("x-permittable-finite")
+      end
+    end
+
+    it "labels a sensitive numeric field whether or not its in: is withheld, so the label says nothing about it" do
+      plain = property("x") { optional :x, :integer, sensitive: true }
+      bounded = property("x") { optional :x, :integer, in: 1000..9999, sensitive: true }
+      expect(plain).to include(finite)
+      expect(bounded).to include(finite).and include("x-permittable-custom-validation" => true)
+      expect(bounded.keys).not_to include("minimum", "maximum")
     end
   end
 
@@ -716,7 +792,7 @@ RSpec.describe Permittable::JsonSchema do
     it "adds null to a nullable array's type without touching its items" do
       schema = property("tags") { array :tags, of: :integer, nullable: true }
       expect(schema["type"]).to eq(%w[array null])
-      expect(schema["items"]).to eq("type" => "integer")
+      expect(schema["items"]).to eq("type" => "integer", "x-permittable-finite" => true)
     end
 
     it "lists null in an enum, which is instance-wide rather than type-scoped" do
