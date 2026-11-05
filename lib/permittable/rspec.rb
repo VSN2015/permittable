@@ -453,7 +453,11 @@ module Permittable
           # proc cannot rewrite the spec's own literal (the same reason
           # validate_authored_value! copies before normalizing).
           own = expected.is_a?(String) ? expected.dup : expected
-          status, value = Coercion.cast(field[:type], Coercion.apply_normalize(field[:normalize], own))
+          normalized = Coercion.apply_normalize(field[:normalize], own)
+          # Absent on a nullable field is the nil a contract stores for it.
+          return nil if field[:nullable] && Coercion.absent_value?(normalized)
+
+          status, value = Coercion.cast(field[:type], normalized)
           status == :ok ? value : expected
         when :array
           return expected unless expected.is_a?(Array)
