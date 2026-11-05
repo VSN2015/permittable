@@ -416,6 +416,55 @@ RSpec.describe Permittable do
       expect { permittable_class { permit_params(:create) { optional :at, :datetime, in: [Time.now] } } }.not_to raise_error
     end
 
+    # The same holds for a default: and an example:. The export prints the
+    # Rational third as .333333333, so a client sending the published default
+    # got a different instant than the action got for an omitted field.
+    it "refuses a :datetime default: or example: finer than a nanosecond, at any depth" do
+      third = Time.utc(2026, 1, 1, 0, 0, Rational(1, 3))
+      declarations = {
+        "scalar default" => proc { optional :at, :datetime, default: third },
+        "scalar example" => proc { optional :at, :datetime, example: third },
+        "array default" => proc { array :ats, of: :datetime, default: [Time.utc(2026, 1, 1), third] },
+        "array example" => proc { array :ats, of: :datetime, example: [third] },
+        "array of hashes default" => proc {
+          array :events, default: [{ at: third }] do
+            required :at, :datetime
+          end
+        },
+        "array of hashes example" => proc {
+          array :events, example: [{ at: Time.at(1.1).utc }] do
+            required :at, :datetime
+          end
+        },
+        "String default" => proc { optional :at, :datetime, default: "2026-01-01T00:00:00.1234567891Z" },
+        "String example" => proc { optional :at, :datetime, example: "2026-01-01T00:00:00.1234567891Z" },
+        "String in an array default" => proc { array :ats, of: :datetime, default: ["2026-01-01T00:00:00.1234567891Z"] },
+        "sub-field default" => proc {
+          array :events, default: [{}] do
+            optional :at, :datetime, default: third
+          end
+        }
+      }
+      declarations.each do |label, declaration|
+        expect { permittable_class { permit_params(:create, &declaration) } }
+          .to raise_error(ArgumentError, /violates its own contract.*finer than a nanosecond.*\.round\(9\)/), label
+      end
+    end
+
+    it "still accepts a :datetime default: or example: to the nanosecond, a 9-digit String, and the clock" do
+      exact = Time.at(1, 100_000_000, :nsec).utc
+      decl = proc do
+        permit_params(:create) do
+          optional :at, :datetime, default: exact, example: Time.at(1.1).utc.round(9)
+          optional :now, :datetime, default: Time.now, example: Time.now
+          optional :str, :datetime, default: "2026-01-01T00:00:00.123456789Z", example: "2026-01-01T00:00:00.5Z"
+          array :ats, of: :datetime, default: [exact], example: [Time.utc(2026, 1, 1)]
+        end
+      end
+      expect(permit({}, &decl)[:at]).to eq(exact)
+      expect(permit({}, &decl)[:ats]).to eq([exact])
+    end
+
     # A String member is cast exactly as a request sending that string is, and
     # published as written, so any precision it spells is reachable.
     it "still accepts a String :datetime :in member with more than nine fractional digits" do
@@ -886,6 +935,47 @@ RSpec.describe Permittable do
         expect(violations_for({ on: value }, &decl).details)
           .to eq([{ param: "on", code: "invalid_type" }]), "for #{value.inspect}"
       end
+    end
+
+    # Time#to_date keeps the instant's day NUMBER and labels it in the Julian
+    # calendar before the 1582 reform, so Time.utc(1500, 1, 1) became
+    # 1499-12-23 — while the string "1500-01-01" has always been that very
+    # day (and :datetime reads it back by component). The instant is read
+    # by its UTC components, as the String is, so both paths agree.
+    it "reads a midnight-UTC Time, DateTime or TimeWithZone before 1582 as the day it names, like the String" do
+      string = permit({ on: "1500-01-01" }, &decl)[:on]
+      [Time.utc(1500, 1, 1), DateTime.new(1500, 1, 1, 0, 0, 0, 0, Date::GREGORIAN), DateTime.new(1500, 1, 1),
+       DateTime.parse("1500-01-01T00:00:00Z"), Time.utc(1500, 1, 1).in_time_zone("Tokyo"),
+       "1500-01-01T00:00:00Z"].each do |value|
+        read = permit({ on: value }, &decl)[:on]
+        expect(read.iso8601).to eq("1500-01-01"), "for #{value.inspect}"
+        expect(read).to eq(string).and(be_an_instance_of(Date)), "for #{value.inspect}"
+        expect(read.start).to eq(string.start), "for #{value.inspect}"
+      end
+      expect(permit({ on: Time.utc(1500, 1, 1) }, &decl)[:on]).to eq(Date.new(1500, 1, 1))
+      # A modern date, as the control.
+      expect(permit({ on: Time.utc(2026, 9, 5) }, &decl)[:on]).to eq(Date.new(2026, 9, 5))
+    end
+
+    it "matches a pre-1582 Time in: member and a pre-1582 Time default: against the date a request sends" do
+      field = proc { permit_params(:create) { optional :on, :date, in: [Time.utc(1500, 1, 1)], default: Time.utc(1500, 1, 1) } }
+      expect(permit({ on: "1500-01-01" }, &field)[:on]).to eq(Date.new(1500, 1, 1))
+      expect(permit({}, &field)[:on].iso8601).to eq("1500-01-01")
+      expect(permittable_class(&field).permit_rule_for(:create)[:fields].first[:in].map(&:iso8601)).to eq(["1500-01-01"])
+    end
+
+    # 1582-10-05..14 never existed in the Date calendar the String path uses
+    # (the reform skipped them), so an instant on one of those days is not a
+    # date: a request gets invalid_type and an in: member or default: the
+    # usual class-load error naming the field, not a bare Date::Error.
+    it "refuses a midnight-UTC Time on a day the 1582 reform skipped, like the String, naming the field" do
+      gap = Time.utc(1582, 10, 10)
+      expect(violations_for({ on: gap }, &decl).details).to eq([{ param: "on", code: "invalid_type" }])
+      expect(violations_for({ on: "1582-10-10" }, &decl).details).to eq([{ param: "on", code: "invalid_type" }])
+      expect { permittable_class { permit_params(:create) { optional :on, :date, in: [gap] } } }
+        .to raise_error(ArgumentError, /:in for field :on contains .*, which is not a valid :date/)
+      expect { permittable_class { permit_params(:create) { optional :on, :date, default: gap } } }
+        .to raise_error(ArgumentError, /:default for field :on violates its own contract \(invalid_type\)/)
     end
 
     # The disagreements that reading caused: a noon DateTime default: was
@@ -2281,6 +2371,28 @@ RSpec.describe Permittable do
       expect(controller(klass, params: { items: sent }).permitted_params[:items]).to eq([{ "tags" => %w[a b] }])
     end
 
+    it "stores and publishes an example: written with date parts as the date it spells, not as an absent sub-field's default" do
+      parts = { "on(1i)" => "2026", "on(2i)" => "10", "on(3i)" => "17" }
+      time_parts = parts.merge("at(1i)" => "2026", "at(2i)" => "10", "at(3i)" => "17", "at(4i)" => "9", "at(5i)" => "30")
+      klass = permittable_class do
+        permit_params(:create) do
+          array :items, example: [parts] do
+            optional :on, :date, default: Date.new(2000, 1, 1)
+          end
+          array :stamps, example: [time_parts] do
+            optional :at, :datetime, default: "2000-01-01T00:00:00Z"
+          end
+          array :nested, example: [{ "meta" => parts }] do
+            optional(:meta) { optional :on, :date, default: Date.new(2000, 1, 1) }
+          end
+        end
+      end
+      examples = Permittable::JsonSchema.rule(klass.permit_rule_for("create"))["properties"].transform_values { |s| s["examples"] }
+      expect(examples["items"]).to eq([[{ "on" => "2026-10-17" }]])
+      expect(examples["stamps"].first.first["at"]).to start_with("2026-10-17T09:30:00")
+      expect(examples["nested"]).to eq([[{ "meta" => { "on" => "2026-10-17" } }]])
+    end
+
     it "runs no sub-field transform: over an example: at class load when no container validate: consumes it" do
       boom = ->(_) { raise "no database at class load" }
       sent = [{ "id" => "1", "meta" => { "tag" => "t" }, "rows" => [{ "n" => "2" }] }]
@@ -2893,6 +3005,36 @@ RSpec.describe Permittable do
           .to raise_error(ArgumentError, /:default for :m must be a Hash/)
         expect { permittable_class { permit_params(:create) { optional :m, :json, max_depth: 1, example: { "a" => { "b" => 1 } } } } }
           .to raise_error(ArgumentError, /:example for field :m violates its own contract \(depth\)/)
+      end
+
+      holds_non_finite = ->(at) { "holds NaN or Infinity at #{Regexp.escape(at)}, which JSON cannot carry" }
+
+      # JSON has no NaN or Infinity: the exported default/example would make
+      # JSON.generate raise when the document is written, long after the load.
+      it "refuses an authored default:/example: holding a NaN or infinite Float, at any depth, at class load" do
+        [Float::NAN, Float::INFINITY, -Float::INFINITY].each do |bad|
+          { { "x" => bad } => "x", { "x" => [1, { "y" => bad }] } => "x[1].y" }.each do |value, at|
+            %i[default example].each do |opt|
+              expect { permittable_class { permit_params(:create) { optional :m, :json, opt => value } } }
+                .to raise_error(ArgumentError, /:#{opt} for field :m violates its own contract \(#{holds_non_finite.call(at)}\)/)
+            end
+          end
+        end
+      end
+
+      it "refuses a non-finite Float in a :json value inside an array's default:/example: too" do
+        %i[default example].each do |opt|
+          expect do
+            permittable_class { permit_params(:create) { array(:items, opt => [{ "m" => { "x" => Float::NAN } }]) { optional :m, :json } } }
+          end.to raise_error(ArgumentError,
+                             /:#{opt} for array :items violates its own contract: items\[0\]\.m \(#{holds_non_finite.call('x')}\)/)
+        end
+      end
+
+      it "still reads a request's hash as it always did, finite or not: only the authored value is held to JSON" do
+        decl = proc { permit_params(:create) { optional :m, :json } }
+        expect(permit({ m: { "x" => 1.5 } }, &decl)[:m]).to eq("x" => 1.5)
+        expect(permit({ m: { "x" => Float::NAN } }, &decl)[:m]["x"]).to be_nan
       end
 
       it "reads an authored default:/example: as a request's hash is read: indifferent, and a copy" do
@@ -4146,6 +4288,38 @@ RSpec.describe Permittable do
         expect(e.message).to match(%r{bin/rails generate migration AddNicknameToPermitUsers nickname:string})
         expect(e.message).to match(/declare it with virtual: true/)
       end
+    end
+
+    it "says the model ignores a column that is in the database, and suggests no migration" do
+      m = model
+      m.ignored_columns += ["age"]
+      expect do
+        permittable_class { permit_params(:create, model: m) { optional :age, :integer } }
+      end.to raise_error(ArgumentError) do |e|
+        expect(e.message).to match(/'age' is in Model's ignored_columns \(table: permit_users\), so the model ignores that column/)
+        expect(e.message).to match(/Remove it from ignored_columns, or declare the field virtual: true/)
+        expect(e.message).not_to match(/does not exist in the database|generate migration/)
+      end
+    end
+
+    it "says so when an ignored column is no longer in the table, and suggests no migration to re-add it" do
+      m = model
+      m.ignored_columns += ["gone"]
+      expect do
+        permittable_class { permit_params(:create, model: m) { optional :gone, :string } }
+      end.to raise_error(ArgumentError) do |e|
+        expect(e.message).to match(/'gone' is in Model's ignored_columns but the table has no such column \(table: permit_users\)/)
+        expect(e.message).to match(/Remove it from ignored_columns and the field from the contract, or declare the field virtual: true/)
+        expect(e.message).not_to match(/does not exist in the database|generate migration|the model ignores that column/)
+      end
+    end
+
+    it "accepts an ignored column declared virtual: true" do
+      m = model
+      m.ignored_columns += ["age"]
+      expect do
+        permittable_class { permit_params(:create, model: m) { optional :age, :integer, virtual: true } }
+      end.not_to raise_error
     end
 
     it "skips virtual fields and (implicitly) nested/array fields" do

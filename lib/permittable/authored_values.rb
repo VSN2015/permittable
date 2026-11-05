@@ -103,6 +103,16 @@ module Permittable
       found
     end
 
+    # An authored :datetime Time must survive the export's nine digits, at
+    # any depth, as a scalar `default:` or `example:` must (see Coercion).
+    def permittable_check_scalar(field, value)
+      Coercion.refuse_finer_than_nanosecond(field[:type], super)
+    end
+
+    def permittable_cast_element(field, element)
+      Coercion.refuse_finer_than_nanosecond(field[:of], super)
+    end
+
     # Nor does it run an array-level validate:, which expects the transformed
     # sub-fields a request hands it. The validating read has already run it
     # on exactly those, so the stored read, which would hand it the
@@ -114,11 +124,13 @@ module Permittable
     # What a client sends has no defaults filled in: an omitted sub-field
     # stays omitted, at any depth, so the published example does not show a
     # value (`cents: 0`) that no client sends. The walker fills them in; drop
-    # exactly what it filled, by the walker's own absence rule.
+    # exactly what it filled, by the walker's own absence rule, judged on the
+    # hash the walker walked: one with the date parts read into their field.
     def permittable_check_hash(fields, hash, **)
       result = super
       return result unless @as_sent
 
+      hash = permittable_read_date_parts(fields, hash)
       fields.each do |field|
         key = field[:name].to_s
         next unless field.key?(:default)
@@ -128,6 +140,30 @@ module Permittable
         result.delete(key)
       end
       result
+    end
+
+    # An authored hash is exported as a schema `default`/`example`, and JSON
+    # has no NaN or Infinity: JSON.generate raises on them when the document
+    # is written, long after the class loaded. A request cannot carry one
+    # (JSON has none; a form sends Strings), so only the authored value is
+    # held to it, here, and not permittable_check_json for every request.
+    def permittable_check_json(field, value)
+      status, read = super
+      return [status, read] unless status == :ok
+
+      at = non_finite_path(value, "")
+      return [:error, "holds NaN or Infinity at #{at}, which JSON cannot carry"] if at
+
+      [status, read]
+    end
+
+    # Where the first NaN or infinite Float sits, as `a.b[1].c`, or nil.
+    def non_finite_path(value, path)
+      case value
+      when Float then path unless value.finite?
+      when Hash then value.each_pair.lazy.filter_map { |k, v| non_finite_path(v, path.empty? ? k.to_s : "#{path}.#{k}") }.first
+      when Array then value.each_with_index.lazy.filter_map { |v, i| non_finite_path(v, "#{path}[#{i}]") }.first
+      end
     end
 
     def permittable_violation(_field, param, code)

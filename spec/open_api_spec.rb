@@ -176,6 +176,92 @@ RSpec.describe Permittable::OpenAPI do
       expect(operations).not_to have_key("permitted_params")
       expect(operations).not_to have_key("enforce_params_contract")
     end
+
+    # Rails reads a controller's internal methods off its nearest abstract
+    # class. For one built on Metal that is Metal itself, which has none of
+    # the modules the controller includes, so `render`, `head`, `locale=`
+    # and the readers its callbacks and renderers define all counted as actions.
+    it "leaves the framework's own methods out of a catch-all's expansion on a Metal controller, and keeps the app's",
+       :integration do
+      stats = Module.new do
+        def stats = nil
+      end
+      klass = Class.new(ActionController::Metal) do
+        include AbstractController::Rendering
+        include ActionController::Rendering
+        include ActionController::Renderers::All
+        include ActionController::Head
+        include AbstractController::Callbacks
+        include ActionController::Rescue
+        include ActionController::StrongParameters
+        include Permittable
+        include stats
+
+        permit_params(enforce: true) { required :host, :string }
+
+        def create = head(:created)
+      end
+      expect(klass.action_methods).to include("render", "head", "locale=", "__callbacks")
+      expect(described_class.operations_for(klass).keys).to eq(%w[create stats])
+    end
+
+    # A framework controller's own action, such as Rails::HealthController#show,
+    # is defined in a Rails gem too, but it is an action of the app's subclass.
+    # Rails::WelcomeController is in every Rails this gem supports.
+    it "keeps an action inherited from a framework controller, which is defined in a Rails gem", :integration do
+      require "logger"
+      require "rails"
+      require "rails/application_controller"
+      require "rails/welcome_controller"
+      klass = Class.new(Rails::WelcomeController) do
+        include Permittable
+
+        permit_params { optional :q, :string }
+      end
+      expect(klass.instance_method(:index).owner).to eq(Rails::WelcomeController)
+      expect(described_class.operations_for(klass).keys).to eq(%w[index])
+    end
+
+    # The same rule must not keep what an app's own parent class gets from
+    # the framework modules it includes: a class_attribute reader is owned by
+    # that class, but it is defined in ActiveSupport, not in the class's file.
+    it "still leaves out the class attributes a parent that includes the framework modules defines", :integration do
+      parent = Class.new(ActionController::Metal) do
+        include AbstractController::Callbacks
+        include ActionController::Renderers::All
+        include ActionController::Rescue
+        include ActionController::Rendering
+      end
+      klass = Class.new(parent) do
+        include Permittable
+
+        permit_params { optional :q, :string }
+
+        def create = nil
+        def own = nil
+      end
+      expect(klass.action_methods).to include("__callbacks", "_renderers", "rescue_handlers")
+      expect(described_class.operations_for(klass).keys).to eq(%w[create own])
+    end
+
+    # Ruby reports a method's source_location as a realpath, and Bundler's
+    # full_gem_path for a git or path gem is only expanded, so a symlinked
+    # install path never matched and the filter did nothing.
+    describe ".framework_roots" do
+      after { described_class.instance_variable_set(:@framework_roots, nil) }
+
+      it "resolves a symlinked gem path to the real one, the way source_location reports it" do
+        Dir.mktmpdir do |dir|
+          real = File.join(File.realpath(dir), "real")
+          Dir.mkdir(real)
+          link = File.join(dir, "link")
+          File.symlink(real, link)
+          described_class.instance_variable_set(:@framework_roots, nil)
+          allow(Gem).to receive(:loaded_specs).and_return("actionpack" => double(full_gem_path: link))
+          expect(described_class.framework_roots).to eq([File.join(real, "")])
+        end
+      end
+    end
   end
 
   describe ".document" do

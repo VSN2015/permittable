@@ -386,6 +386,45 @@ RSpec.describe Permittable::Contract do
       expect(out).to eq("1500-01-01 10:00:00 UTC")
     end
 
+    it "reads a midnight-UTC Time or DateTime on a :date before 1582 as the day it names, whatever the host has loaded" do
+      # Time#to_date labels the instant's day number in the Julian calendar
+      # before the reform, so Time.utc(1500, 1, 1) was 1499-12-23, while the
+      # String "1500-01-01" has always been that day. Stdlib and
+      # ActiveSupport differ in how they get there; a clean process sees
+      # the stdlib half.
+      script = <<~RUBY
+        require "permittable"
+        contract = Permittable::Contract.define { required :on, :date }
+        puts contract.call!(on: Time.utc(1500, 1, 1))[:on].iso8601
+        puts contract.call!(on: DateTime.new(1500, 1, 1, 0, 0, 0, 0, Date::GREGORIAN))[:on].iso8601
+        puts contract.call!(on: "1500-01-01")[:on].iso8601
+      RUBY
+      lib = File.expand_path("../lib", __dir__)
+      out, err, status = Open3.capture3(RbConfig.ruby, "-I", lib, "-e", script)
+      expect(status).to be_success, err
+      expect(out.split).to eq(%w[1500-01-01] * 3)
+    end
+
+    it "reads a midnight-UTC DateTime on a :date before 1582 by its own day, whatever the host has loaded" do
+      # Stdlib's DateTime#to_time converts by day number, so a DateTime read
+      # through it landed 9 days late (1500-01-01 became 1500-01-10) unless
+      # ActiveSupport's component-wise to_time was loaded. The DateTime's own
+      # civil day is read instead; only a clean process sees the stdlib half.
+      script = <<~RUBY
+        require "permittable"
+        contract = Permittable::Contract.define { required :on, :date; optional :at, :date, default: DateTime.new(1500, 1, 1) }
+        puts contract.call!(on: DateTime.new(1500, 1, 1))[:on].iso8601
+        puts contract.call!(on: DateTime.parse("1500-01-01T00:00:00Z"))[:on].iso8601
+        puts contract.call!(on: DateTime.new(1500, 1, 1, 0, 0, 0, 0, Date::GREGORIAN))[:on].iso8601
+        puts contract.call!(on: DateTime.new(2026, 9, 5))[:on].iso8601
+        puts contract.call!(on: "2026-09-05")[:at].iso8601
+      RUBY
+      lib = File.expand_path("../lib", __dir__)
+      out, err, status = Open3.capture3(RbConfig.ruby, "-I", lib, "-e", script)
+      expect(status).to be_success, err
+      expect(out.split).to eq(%w[1500-01-01 1500-01-01 1500-01-01 2026-09-05 1500-01-01])
+    end
+
     it "reads a :date String with a time or zone as an instant, whatever the host has loaded" do
       # The instant is read through the :datetime cast, and DateTime#to_time
       # differs between stdlib and ActiveSupport, so check it in a clean process.
