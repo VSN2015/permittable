@@ -1046,9 +1046,31 @@ module Permittable
     # with a time of day always got. Shared by cast_date and
     # instant_as_date, so a value and an in: member cannot be read
     # differently; and always a plain Date, never the DateTime it came as.
+    #
+    # Built from the UTC components, as a String is (cast_date), not with
+    # Time#to_date: that keeps the instant's day NUMBER and labels it in the
+    # Julian calendar before the 1582 reform, so Time.utc(1500, 1, 1) came
+    # out as 1499-12-23 while "1500-01-01" was 1500-01-01.
+    #
+    # A day the 1582 reform skipped (1582-10-05..14) is no Date, as the String
+    # "1582-10-10" is none, so it is nil here and every caller gives its usual
+    # error. :datetime is proleptic Gregorian and does accept those days; the
+    # two differ there by design, :date being the String path's calendar.
+    #
+    # A DateTime is read by its own civil day, not through #to_time: stdlib's
+    # converts by day number, so outside Rails (ActiveSupport converts by
+    # component) a DateTime before 1582 landed 9 days late.
     def date_of_instant(instant)
-      utc = instant.to_time.getutc
-      utc.to_date if utc == utc.beginning_of_day
+      if instant.is_a?(DateTime)
+        utc = instant.new_offset(0)
+        return unless utc.hour.zero? && utc.minute.zero? && utc.second.zero? && utc.sec_fraction.zero?
+      else
+        utc = instant.to_time.getutc
+        return unless utc == utc.beginning_of_day
+      end
+      return unless Date.valid_date?(utc.year, utc.month, utc.day)
+
+      Date.new(utc.year, utc.month, utc.day)
     end
 
     # A zoneless String parses as UTC regardless of the host timezone
@@ -1241,9 +1263,32 @@ module Permittable
       return instant_as_date(member) if type == :date && (member.is_a?(Time) || member.is_a?(DateTime))
 
       status, value = cast(type, member)
-      return [status, value] unless status == :ok && type == :datetime && !member.is_a?(String) && !whole_nanoseconds?(value)
+      return [status, value] unless status == :ok && finer_than_nanosecond?(type, member, value)
 
       [:error, "finer than a nanosecond, so it never equals a request; round it, e.g. with .round(9)"]
+    end
+
+    # Whether `raw`, authored as a Time-like `in:` member of a :datetime
+    # field and cast to `cast_value`, holds more than the nine digits the
+    # export prints. A String `in:` member is exempt: it is cast exactly as a
+    # request sending it is, and published as written (see
+    # published_in_member), so whatever precision it spells is reachable.
+    def finer_than_nanosecond?(type, raw, cast_value)
+      type == :datetime && !raw.is_a?(String) && !whole_nanoseconds?(cast_value)
+    end
+
+    # An authored `default:` or `example:` is held to the same rule as an
+    # `in:` member: the exported schema prints it to nine digits, so a value
+    # finer than that was published as a different instant than the action
+    # got for an omitted field, and a client sending the published default
+    # was not sending the default. Unlike an `in:` member, a String is NOT
+    # exempt here: a default or example is stored as the cast Time and
+    # exported from that, never as written, so "...00.1234567891Z" printed
+    # as .123456789Z. `outcome` is the cast's [status, value].
+    def refuse_finer_than_nanosecond(type, outcome)
+      return outcome unless outcome.first == :ok && type == :datetime && !whole_nanoseconds?(outcome.last)
+
+      [:error, "finer than a nanosecond, so the export publishes a different instant; round it, e.g. with .round(9)"]
     end
 
     # A request's fraction of a second is a finite decimal, and the export
@@ -1267,7 +1312,7 @@ module Permittable
     # class-load error a reason where a request gets `invalid_type`.
     def instant_as_date(member)
       date = date_of_instant(member)
-      date ? [:ok, date] : [:error, "not midnight UTC, so it never equals a date"]
+      date ? [:ok, date] : [:error, "not midnight UTC of an existing day, so it never equals a date"]
     end
 
     # What an exported enum lists for one member: the cast value, re-encoded
@@ -1892,7 +1937,9 @@ module Permittable
       status, result = if field[:nullable] && Coercion.absent_value?(value)
                          [:ok, nil]
                        else
-                         Coercion.check_scalar(live_in?(field) ? field.except(:in) : field, value)
+                         Coercion.refuse_finer_than_nanosecond(
+                           field[:type], Coercion.check_scalar(live_in?(field) ? field.except(:in) : field, value)
+                         )
                        end
       raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{result})" unless status == :ok
 
@@ -2766,7 +2813,7 @@ module Permittable
     case field[:kind]
     when :scalar
       # Already normalized by permittable_normalized, before the absence rule.
-      permittable_check_whole(field, Coercion.check_scalar(field, value), full, result, violations: violations)
+      permittable_check_whole(field, permittable_check_scalar(field, value), full, result, violations: violations)
     when :json
       permittable_check_whole(field, permittable_check_json(field, value), full, result, violations: violations)
     when :nested
@@ -2891,7 +2938,18 @@ module Permittable
     field[:transform] ? field[:transform].call(value) : value
   end
 
-  # A second seam, for the same reader: the array-level `validate:` to run.
+  # More seams, for the same reader: how a scalar field's value, and an
+  # array element, are cast. A request's are cast as they come; an authored
+  # default: or example: is also held to the nine digits the export prints.
+  def permittable_check_scalar(field, value)
+    Coercion.check_scalar(field, value)
+  end
+
+  def permittable_cast_element(field, element)
+    Coercion.cast(field[:of], element)
+  end
+
+  # A third seam, for the same reader: the array-level `validate:` to run.
   def permittable_array_validator(field)
     field[:validate]
   end
@@ -2906,7 +2964,7 @@ module Permittable
                                     path: path, unknown: unknown, top_level: false, violations: violations)
     end
 
-    status, out = Coercion.cast(field[:of], permittable_own(element))
+    status, out = permittable_cast_element(field, permittable_own(element))
     return out if status == :ok
 
     violations << permittable_violation(field, path, out)
