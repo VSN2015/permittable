@@ -91,6 +91,54 @@ module Permittable
       @concern_methods ||= Permittable.public_instance_methods(false).map(&:to_s).freeze
     end
 
+    # Gems whose public methods are the framework's own: the ones a controller
+    # gets from the modules Rails mixes in (Rendering, Head, Callbacks, ViewPaths,
+    # Rescuable, ...) and from the class attributes those define on it.
+    FRAMEWORK_GEMS = %w[actionpack actionview activesupport activemodel railties].freeze
+
+    # Rails reads a controller's internal methods off its nearest abstract
+    # class: ActionController::Base includes all of those modules, so they are
+    # internal on a Base or API controller, but ActionController::Metal includes
+    # none, so on one built directly on it every public method of an included
+    # module is an action_methods entry. A method is the framework's when it
+    # is defined in one of its gems, by whichever module or class_attribute
+    # put it on the controller; a method the app defines, in the class or in a
+    # concern of its own, stays an action. So does one a superclass declares in
+    # its own file, even a framework controller's (Rails::HealthController#show):
+    # a method defined elsewhere in a gem, such as the class_attribute readers
+    # an app's parent class gets from the modules it includes, is not one.
+    def framework_method?(controller, action)
+      return false unless controller.respond_to?(:instance_method)
+
+      method = controller.instance_method(action)
+      file = method.source_location&.first
+      return false if file.nil? || framework_roots.none? { |root| file.start_with?(root) }
+
+      !declared_by_superclass?(method, controller, file)
+    rescue NameError
+      false
+    end
+
+    # Whether `method` is written in the file that defines its owner, a class
+    # other than the controller itself. An anonymous owner has no such file.
+    def declared_by_superclass?(method, controller, file)
+      owner = method.owner
+      owner.is_a?(Class) && owner != controller && !owner.name.nil? &&
+        Object.const_source_location(owner.name)&.first == file
+    end
+
+    # Resolved lazily, like concern_methods: the gems load after this file.
+    # Real paths, which is what source_location reports: a gem's own path is
+    # only expanded, so one reached through a symlink would never match.
+    def framework_roots
+      @framework_roots ||= FRAMEWORK_GEMS.filter_map do |name|
+        path = Gem.loaded_specs[name]&.full_gem_path or next
+        File.join(File.realpath(path), "")
+      rescue SystemCallError
+        File.join(path, "")
+      end.freeze
+    end
+
     # Shared `components` for any document referencing Permittable responses.
     #
     # Unlike a rule's monitor mode — which the exporter reads only from the
@@ -176,7 +224,8 @@ module Permittable
       return explicit unless contracts.any? { |rule| rule[:actions].empty? }
       return explicit + ["*"] unless controller.respond_to?(:action_methods)
 
-      explicit + (controller.action_methods.map(&:to_s).sort - explicit - concern_methods)
+      actions = controller.action_methods.map(&:to_s).sort - explicit - concern_methods
+      explicit + actions.reject { |action| framework_method?(controller, action) }
     end
 
     def operation_for(controller, action)

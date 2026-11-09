@@ -716,7 +716,7 @@ What you give up is the shape. What you keep:
 | `max_depth:` | Caps **container nesting**, counting arrays as a level: `{"a": 1}` is 1, `{"a": {"b": 1}}` and `{"a": [1, 2]}` are 2, `{"a": [{"b": 1}]}` is 3. Violation code `depth` |
 | `validate:` / `transform:` | See the whole hash, so any check you can write in Ruby still applies |
 | `model:` | The field maps onto a column like a scalar does, so the [drift guard](#the-schema-drift-guard) still catches a dropped `metadata` column |
-| `sensitive:` / `nullable:` / `message:` / `desc:` / `default:` / `example:` | Behave as on any other field (`default:`/`example:` must be a hash, and are checked against the field's own bounds at class load) |
+| `sensitive:` / `nullable:` / `message:` / `desc:` / `default:` / `example:` | Behave as on any other field (`default:`/`example:` must be a hash holding no NaN or Infinity, and are checked against the field's own bounds at class load) |
 
 Bounding it matters more than it looks: an unbounded `jsonb` column is where clients put megabytes and 200-level-deep objects. `max_depth:` and `length:` are how a contract says "opaque, but not unlimited" — which is strictly more than `permit(metadata: {})` can say.
 
@@ -772,6 +772,12 @@ Exported [OpenAPI](#exporting-openapi-docs-that-cannot-drift) tells the truth ab
 ### Violations and error responses
 
 Every failure raises `Permittable::InvalidParameters`, carrying `details` (an array of `{ param:, code: }`, plus a `message:` when the field [declares one](#custom-error-messages-message)) and a `status`. On a real controller it is auto-rescued into the error envelope shown at the [top of this README](#permittable).
+
+Rails searches `rescue_from` handlers from the last declared to the first, so a catch-all such as `rescue_from StandardError` declared *after* `include Permittable` answers an invalid request first, and the client gets that handler's response instead of the 422 or 400. Either declare the catch-all before the include, or re-declare the gem's handler after it:
+
+```ruby
+rescue_from Permittable::InvalidParameters, with: :render_invalid_parameters
+```
 
 | Code | Raised when |
 |---|---|
@@ -1014,6 +1020,8 @@ If this parameter is not backed by a column, declare it with virtual: true.
 ```
 
 The error carries a ready-to-paste migration command, typed from your own field declaration.
+
+A field naming a column the model lists in `ignored_columns` raises too, but says so (remove it from `ignored_columns`, or declare it `virtual: true`) rather than suggesting a migration.
 
 #### Checking types too (opt-in)
 
@@ -1592,7 +1600,7 @@ A bad contract is a programmer error, so it fails when the class loads — never
 - `length:` that isn't a non-negative `Integer` or a `Range`, or a `Range` with a negative or fractional end (`..-1`, `-2..3`, `1.5..3.5`; a whole-number Float such as `1..10.0` is fine; leave an end off, or use `Float::INFINITY`, for no bound); an `in:` that is a `String` (`String#include?` would match any substring — `in: "free pro"` accepted `"e"`), or that is neither a `Range` nor answers `include?`
 - An `in:` member the field's own type can't cast (`in: %w[1 two]` on an `:integer`, `nil` on a field that isn't `nullable:`, or a `Time` on a `:date` field that isn't exactly midnight UTC), or an `in:` `Range` whose endpoints a value of the field's type can't be compared with (`in: "1".."5"` on an `:integer`) — either would reject every request as `inclusion`
 - A bound **no value could satisfy**: a reversed or empty `Range` (`in: 65..18`, `length: 5..2`, `length: 3...3`), an empty `in:` set, or a `length:` of 0 on a `required` field (where `""` already violates as `missing`)
-- A `Time` `in:` member on a `:datetime` field finer than a nanosecond (`Time.at(1.1)`, a third of a second): a request's fraction is a finite decimal and the export prints nine digits, so no request could equal it
+- A `Time` `in:` member, `default:` or `example:` on a `:datetime` field finer than a nanosecond (`Time.at(1.1)`, a third of a second): a request's fraction is a finite decimal and the export prints nine digits, so no request could equal the member, and a published default or example would be a different instant
 - `validate:` or `transform:` that isn't callable
 - A `default:` or `example:` that violates its own field's contract, or an array `default:`/`example:` whose elements violate `of:` — or, for an array declared with a **block**, an element that isn't a hash the block would accept
 - A `default: nil` or `example: nil` on a field that isn't `nullable:`
