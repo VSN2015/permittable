@@ -367,6 +367,24 @@ RSpec.describe Permittable::Contract do
       )
     end
 
+    it "reads an ISO date with an offset but no time of day as midnight at it, whatever the host has loaded" do
+      script = <<~RUBY
+        require "permittable"
+        contract = Permittable::Contract.define { required :at, :datetime }
+        ["2026-09-05 -05:00", "2026-09-05 +05:00", "2026-09-05-05:00", "2026-09-05 -0500", "20260905Z",
+         "2026-09-05+00:00", "2026-09-05 05:00 -05:00", "Sep 5 2026 -05:00", "5/9/2026 -0500", "2026-09-05T"].each do |at|
+          print contract.call(at: at).then { |r| r.valid? ? r.params[:at].utc.strftime("%F %T") : "refused" }, "|"
+        end
+      RUBY
+      lib = File.expand_path("../lib", __dir__)
+      out, err, status = Open3.capture3(RbConfig.ruby, "-I", lib, "-e", script)
+      expect(status).to be_success, err
+      expect(out.split("|")).to eq(
+        ["2026-09-05 05:00:00", "2026-09-04 19:00:00", "2026-09-05 05:00:00", "2026-09-05 05:00:00",
+         "2026-09-05 00:00:00", "2026-09-05 00:00:00", "2026-09-05 10:00:00", "refused", "refused", "refused"]
+      )
+    end
+
     it "reads a :datetime before 1582 as the day it names, whatever the host has loaded" do
       # ISO 8601 dates are proleptic Gregorian, like Time. DateTime.parse
       # defaults to the 1582 Italian reform and reads an earlier date as
