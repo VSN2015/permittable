@@ -1020,6 +1020,7 @@ module Permittable
       when String
         found = Date._parse(value)
         return [:error, "invalid_type"] unless complete_date?(found)
+        return cast_date_instant(value) if names_an_instant?(found)
 
         # Built from the components rather than re-running Date.parse, which
         # would parse the same string a second time — and Date.parse is the
@@ -1036,6 +1037,28 @@ module Permittable
     # it actually FOUND rather than the filled-in result.
     def complete_date?(found)
       found.key?(:year) && found.key?(:mon) && found.key?(:mday)
+    end
+
+    # A time of day or a zone, as opposed to a bare calendar date.
+    def names_an_instant?(found)
+      %i[hour min sec sec_fraction zone offset].any? { |part| found.key?(part) }
+    end
+
+    # A String that carries a time or a zone is the instant it names, read
+    # exactly as :datetime reads it (a zoneless one as UTC, an impossible
+    # time or an offset Ruby cannot honour refused) and then as a Time is
+    # read: a date only at midnight UTC. Keeping just the calendar day
+    # accepted "T25:00:00Z" and "+24:00", and turned "T23:30:00-05:00",
+    # which is the next day in UTC, into the day before.
+    #
+    # The Date is built from the components, like a date-only String's,
+    # because Time#to_date reads the proleptic Gregorian day in the Julian
+    # calendar before 1582 ("1500-01-01T00:00:00Z" became 1499-12-23).
+    def cast_date_instant(value)
+      status, instant = cast_datetime(value)
+      return [:error, "invalid_type"] unless status == :ok && instant == instant.beginning_of_day
+
+      [:ok, Date.new(instant.year, instant.month, instant.day)]
     end
 
     # The date a Time or DateTime IS, or nil: its UTC date when it is
