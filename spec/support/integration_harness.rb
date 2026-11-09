@@ -33,14 +33,19 @@ module IntegrationHarness
   # `:input` set Rack::MockRequest ignores `:params`, and `json:` would
   # overwrite `raw_json:`, so a pair used to send one body and silently drop
   # the other. Put form-style fields in `query:` alongside a JSON body.
+  # `multipart:` sends a multipart/form-data body built from `[name, value]`
+  # or `[name, value, filename]` parts (a part with a filename is an upload,
+  # which Rack::MockRequest's own builder cannot nest in an array), so an
+  # upload reaches the controller exactly as the browser's multipart parser
+  # hands it over.
   # `accept:` sets the request's Accept header, for specs about content
   # negotiation (respond_to picks a format from it).
   # `instance:` dispatches on that controller object instead of a fresh one
   # per request, to pin down state that must not survive from one request to
   # the next.
   def dispatch(controller_class, action, method: "GET", query: "", params: nil, json: nil, raw_json: nil,
-               path_params: nil, instance: nil, accept: nil)
-    bodies = { params: params, json: json, raw_json: raw_json }.compact
+               path_params: nil, instance: nil, accept: nil, multipart: nil)
+    bodies = { params: params, json: json, raw_json: raw_json, multipart: multipart }.compact
     if bodies.size > 1
       raise ArgumentError, "IntegrationHarness.dispatch sends one request body, " \
                            "got #{bodies.keys.map { |k| "#{k}:" }.join(' and ')}"
@@ -52,6 +57,10 @@ module IntegrationHarness
     if raw_json
       opts[:input] = raw_json
       opts["CONTENT_TYPE"] = "application/json"
+    end
+    if multipart
+      opts[:input] = multipart_body(multipart)
+      opts["CONTENT_TYPE"] = "multipart/form-data; boundary=#{MULTIPART_BOUNDARY}"
     end
     env = Rack::MockRequest.env_for("/?#{query}", **opts)
     # Without a logger, ActionDispatch logs a body it fails to parse to $stderr.
@@ -69,6 +78,17 @@ module IntegrationHarness
     chunks = body.enum_for(:each).to_a
     body.close if body.respond_to?(:close)
     Result.new(status, headers, chunks.join)
+  end
+
+  MULTIPART_BOUNDARY = "PermittableBoundary".freeze
+
+  def multipart_body(parts)
+    body = parts.map do |name, value, filename|
+      disposition = %(form-data; name="#{name}") + (filename ? %(; filename="#{filename}") : "")
+      type = filename ? "Content-Type: text/plain\r\n" : ""
+      "--#{MULTIPART_BOUNDARY}\r\nContent-Disposition: #{disposition}\r\n#{type}\r\n#{value}\r\n"
+    end
+    "#{body.join}--#{MULTIPART_BOUNDARY}--\r\n"
   end
 
   # Anonymous ActionController::Base subclass with a stable controller_path
