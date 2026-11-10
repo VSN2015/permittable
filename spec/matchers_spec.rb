@@ -1112,19 +1112,152 @@ RSpec.describe "Permittable RSpec matchers" do
           }
       end
 
-      # Permittable.filter_parameter_registry= only asks for #to_proc.
-      it "survives a swapped-in registry that has no #include?" do
+      # Permittable.filter_parameter_registry= only asks for #to_proc. A
+      # registry that cannot say whether a name is in it still redacts: by
+      # #names when it has them, by what its proc masks when it has neither.
+      def with_registry(registry)
         account # declares its sensitive: fields while the real registry is installed
         original = Permittable.filter_parameter_registry
-        bare = Class.new do
-          def to_proc = ->(_key, _value) {}
-        end.new
-        Permittable.filter_parameter_registry = bare
-        message = failure_of { expect(account).to reject_params(payload).for_action(:create) }
-        expect(message).to include("a@b.co")
-        expect(accept_params(payload).for_action(:create).returning(email: "x").description).to include("returning")
+        Permittable.filter_parameter_registry = registry
+        yield
       ensure
         Permittable.filter_parameter_registry = original
+      end
+
+      it "redacts by #names when a swapped-in registry has no #include?" do
+        named = Class.new do
+          def names = %w[SSN pin]
+          def to_proc = ->(_key, _value) {}
+        end.new
+        with_registry(named) do
+          message = failure_of { expect(account).to reject_params(payload).for_action(:create) }
+          expect(message).to include("a@b.co", "Hue", "[FILTERED]")
+          expect(message).not_to match(/123-45-6789|4321|987-65-4321/)
+        end
+      end
+
+      it "redacts with the registry's proc when it has neither #include? nor #names" do
+        bare = Class.new do
+          def to_proc = ->(key, value) { value.replace("[FILTERED]") if value.is_a?(String) && key.to_s.include?("ssn") }
+        end.new
+        with_registry(bare) do
+          message = failure_of { expect(account).to reject_params(payload).for_action(:create) }
+          expect(message).to include("a@b.co")
+          expect(message).not_to match(/123-45-6789|987-65-4321/)
+          expect(accept_params(payload).for_action(:create).returning(email: "x").description).to include("returning")
+        end
+      end
+
+      # Rails' own filters can be scoped to the path a request logs: "payment.number"
+      # matches under the root, not on the bare field. The message filters
+      # the way the log does, so the root goes back around the hash first.
+      context "under a root: contract" do
+        let(:payments) do
+          Class.new(FakeController) do
+            include Permittable
+
+            permit_params(:create, root: :payment) do
+              optional :number, :string
+              optional :code, :string
+              optional :city, :string
+            end
+          end
+        end
+        let(:charge) { { payment: { number: "4111111111111111", code: "123", city: "Hue" } } }
+
+        def with_app_filters(*filters, &)
+          stub_const("Rails", double(application: double(config: double(filter_parameters: filters))))
+          yield
+        end
+
+        it "applies a scoped string filter" do
+          with_app_filters("payment.number") do
+            message = failure_of { expect(payments).to reject_params(charge).for_action(:create) }
+            expect(message).to include("Hue", "123")
+            expect(message).not_to include("4111111111111111")
+          end
+        end
+
+        it "applies a scoped regexp filter" do
+          with_app_filters(/\Apayment\.code\z/) do
+            message = failure_of { expect(payments).to reject_params(charge).for_action(:create) }
+            expect(message).to include("4111111111111111", "Hue")
+            expect(message).not_to include('"123"')
+          end
+        end
+
+        it "applies to a standalone Contract with a root: too" do
+          contract = Permittable::Contract.define(root: :payment) { optional :number, :string }
+          with_app_filters("payment.number") do
+            message = failure_of { expect(contract).to reject_params(payment: { number: "4111111111111111" }) }
+            expect(message).not_to include("4111111111111111")
+          end
+        end
+
+        it "applies to the returning hash in the negated-qualifier refusal" do
+          with_app_filters("payment.number") do
+            matcher = accept_params(charge).for_action(:create).returning(number: "4111111111111111", city: "Hue")
+            expect { matcher.does_not_match?(payments) }.to raise_error(ArgumentError) { |e|
+              expect(e.message).to include("Hue")
+              expect(e.message).not_to include("4111111111111111")
+            }
+          end
+        end
+
+        it "applies to the returning hash in the description once the rule is resolved" do
+          with_app_filters("payment.number") do
+            matcher = accept_params(charge).for_action(:create).returning(number: "4111111111111111")
+            matcher.matches?(payments)
+            expect(matcher.description).not_to include("4111111111111111")
+          end
+        end
+      end
+
+      it "redacts inside an ActionController::Parameters returning, top level or nested" do
+        account # registers its sensitive: names
+        top = ActionController::Parameters.new(email: "x", ssn: "000-11-2222")
+        nested = { email: "x", profile: ActionController::Parameters.new(ssn: "000-33-4444", city: "Hue") }
+        [top, nested].each do |returning|
+          description = accept_params(payload).for_action(:create).returning(returning).description
+          expect(description).to include("[FILTERED]")
+          expect(description).not_to match(/000-11-2222|000-33-4444/)
+        end
+      end
+
+      # The note names where two redacted hashes differ. It stops at the
+      # redaction boundary: a name or an index below a masked key is as
+      # secret as the value.
+      it "does not walk below a redacted key when it names where the hashes differ" do
+        vault = Class.new(FakeController) do
+          include Permittable
+
+          permit_params(:create) do
+            optional :credentials, :json, sensitive: true
+            optional :city, :string
+          end
+        end
+        actual = { credentials: { sk_live_AAAA: "x", secret: [1, 2, 3, 4] }, city: "Hue" }
+        expected = { credentials: { sk_live_AAAA: "y", secret: [1, 2, 3, 5] }, city: "Hue" }
+        message = failure_of { expect(vault).to accept_params(actual).for_action(:create).returning(expected) }
+        expect(message).to include("differs at: credentials")
+        expect(message).not_to match(/sk_live_AAAA|secret|\[3\]/)
+      end
+
+      it "names a path below an app-filtered key by the key alone" do
+        stub_const("Rails", double(application: double(config: double(filter_parameters: [:token]))))
+        keyed = Class.new(FakeController) do
+          include Permittable
+
+          permit_params(:create) do
+            optional(:auth) { optional :token, :json }
+          end
+        end
+        message = failure_of do
+          expect(keyed).to accept_params(auth: { token: { sk_live_BBBB: "x" } }).for_action(:create)
+                                                                                .returning(auth: { token: { sk_live_BBBB: "y" } })
+        end
+        expect(message).to include("differs at: auth.token")
+        expect(message).not_to include("sk_live_BBBB")
       end
 
       # ActiveSupport before 7 does not load ActiveSupport::ParameterFilter

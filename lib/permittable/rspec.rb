@@ -634,7 +634,7 @@ module Permittable
       # `not_to ...returning(x)` would pass both on a rejection and on an
       # acceptance returning anything else.
       def does_not_match?(subject) # rubocop:disable Naming/PredicatePrefix -- the RSpec protocol name
-        raise ArgumentError, negated_qualifier_message if @returning || !@expected_violations.empty?
+        raise ArgumentError, negated_qualifier_message(subject) if @returning || !@expected_violations.empty?
 
         rule = locate(subject)
         return false unless rule
@@ -685,12 +685,24 @@ module Permittable
       # first so a matcher object reused across examples (or re-chained
       # with another for_action) never reports a previous run's problem.
       def locate(subject)
-        @problem = @violations = @result = nil
+        @problem = @violations = @result = @root = nil
         @subject = resolve_subject(subject)
-        resolve_rule
+        rule = resolve_rule
+        @root = rule[:root] if rule
+        rule
       end
 
-      def negated_qualifier_message
+      def negated_qualifier_message(subject = nil)
+        # Raised before the rule is located, so the root a scoped filter
+        # needs is looked up here, best effort: a subject or an ambiguity
+        # that locate would refuse is not this message's to report, and
+        # leaves the filter unscoped (the shallow one) rather than masking
+        # the qualifier error.
+        begin
+          locate(subject) if subject
+        rescue ArgumentError
+          @root = nil
+        end
         call = @expect_accepted ? "accept_params" : "reject_params"
         qualifiers = []
         qualifiers << "returning #{printable(@returning)}" if @returning
@@ -887,35 +899,73 @@ module Permittable
       # application is booted. Only the printed copy is filtered; the matching
       # itself reads the real values.
       def printable(hash)
-        filtered = redact_sensitive(hash)
-        filter = app_parameter_filter
-        (filter ? filter.filter(filtered) : filtered).inspect
+        redacted(hash).inspect
       end
 
-      # A registry only has to answer #to_proc (Permittable.filter_parameter_registry=),
-      # so the name pass runs only when it can also say whether a name is in it.
+      # The redacted structure itself, which differs_note walks beside the
+      # real one. A rule with a root: has its hash put back under that root
+      # for the app's filter, as a request logs it, so a scoped filter
+      # ("payment.number", /\Apayment\.code\z/) matches; the registry pass
+      # runs on the hash alone, as it does at runtime.
+      def redacted(hash)
+        inner = redact_sensitive(hash)
+        filter = parameter_filter
+        return inner unless filter
+        return filter.filter(inner) unless @root
+
+        key = @root.to_s
+        filter.filter(key => inner)[key]
+      end
+
+      # The registry's names, by whatever it can answer: #include?, else its
+      # #names matched the way the registry matches (case-insensitive
+      # substring). One with neither is left to its #to_proc in
+      # parameter_filter. A masked value is replaced whole, a Hash included.
+      # An ActionController::Parameters is unwrapped, so its nested values
+      # are reached too.
       def redact_sensitive(value)
+        value = value.to_unsafe_h if value.respond_to?(:to_unsafe_h)
         return value.map { |item| redact_sensitive(item) } if value.is_a?(Array)
         return value unless value.is_a?(Hash)
 
         registry = Permittable.filter_parameter_registry
-        return value unless registry.respond_to?(:include?)
-
-        value.to_h { |key, item| [key, registry.include?(key) ? Permittable::FilterParameterRegistry::FILTERED : redact_sensitive(item)] }
+        value.to_h do |key, item|
+          [key, sensitive_name?(registry, key) ? Permittable::FilterParameterRegistry::FILTERED : redact_sensitive(item)]
+        end
       end
 
-      # ActiveSupport::ParameterFilter is not loaded by `require "active_support"`
-      # before 7.0, and a Rails 6.1 app without ActionDispatch::Request has
-      # not loaded it either; it has been requirable since 6.0.
-      def app_parameter_filter
-        return unless defined?(Rails) && Rails.respond_to?(:application) && Rails.application
+      def sensitive_name?(registry, key)
+        if registry.respond_to?(:include?)
+          registry.include?(key)
+        elsif registry.respond_to?(:names)
+          name = key.to_s.downcase
+          registry.names.any? { |sensitive| name.include?(sensitive.to_s.downcase) }
+        else
+          false
+        end
+      end
+
+      # Rails' ParameterFilter over the app's config.filter_parameters, plus
+      # the registry's own #to_proc when it can answer neither #include? nor
+      # #names (a proc masks only Strings, but it is all such a registry
+      # offers). ActiveSupport::ParameterFilter is not loaded by
+      # `require "active_support"` before 7.0, and a Rails 6.1 app without
+      # ActionDispatch::Request has not loaded it either; it has been
+      # requirable since 6.0.
+      def parameter_filter
+        filters = []
+        app = defined?(Rails) && Rails.respond_to?(:application) && Rails.application
+        filters.concat(Array(app.config.filter_parameters)) if app
+        registry = Permittable.filter_parameter_registry
+        filters << registry.to_proc unless registry.respond_to?(:include?) || registry.respond_to?(:names)
+        return if filters.empty?
 
         begin
           require "active_support/parameter_filter"
         rescue LoadError
           return
         end
-        ActiveSupport::ParameterFilter.new(Rails.application.config.filter_parameters)
+        ActiveSupport::ParameterFilter.new(filters)
       end
 
       # The registry matches by substring, like Rails (`pin` also redacts
@@ -928,16 +978,25 @@ module Permittable
         actual = @result.to_h
         return "" if expected == actual || printable(expected) != printable(actual)
 
-        "; differs at: #{differing_paths(expected, actual).join(', ')}"
+        paths = differing_paths(expected, actual, redacted(expected), redacted(actual))
+        "; differs at: #{paths.join(', ')}"
       end
 
-      def differing_paths(expected, actual, prefix = nil)
-        if expected.is_a?(Hash) && actual.is_a?(Hash)
+      # Walks the real hashes beside their redacted copies and stops at the
+      # redaction boundary: a node the copy shows as masked is named by its
+      # path alone when the real values differ, and not entered, since a key
+      # or an index below it is as secret as its value.
+      def differing_paths(expected, actual, expected_masked, actual_masked, prefix = nil)
+        filtered = Permittable::FilterParameterRegistry::FILTERED
+        masked = expected_masked == filtered || actual_masked == filtered
+        if !masked && expected.is_a?(Hash) && actual.is_a?(Hash)
           (expected.keys | actual.keys).flat_map do |key|
-            differing_paths(expected[key], actual[key], [prefix, key].compact.join("."))
+            differing_paths(expected[key], actual[key], expected_masked[key], actual_masked[key], [prefix, key].compact.join("."))
           end
-        elsif expected.is_a?(Array) && actual.is_a?(Array) && expected.length == actual.length
-          expected.each_index.flat_map { |index| differing_paths(expected[index], actual[index], "#{prefix}[#{index}]") }
+        elsif !masked && expected.is_a?(Array) && actual.is_a?(Array) && expected.length == actual.length
+          expected.each_index.flat_map do |i|
+            differing_paths(expected[i], actual[i], expected_masked[i], actual_masked[i], "#{prefix}[#{i}]")
+          end
         else
           expected == actual ? [] : [prefix]
         end
