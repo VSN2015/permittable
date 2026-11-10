@@ -1258,7 +1258,7 @@ module Permittable
 
     # An era word at the start of such a tail: the parser reads it with the
     # date ("Sep 5 2026 BC" is the year -2025), so it is not what follows.
-    ERA_WORD = /\A(?:ad|ce|bce|bc)(?:\s+|\z)/i
+    ERA_WORD = /\A(?:a\.?\s?d\.?|c\.?\s?e\.?|b\.?\s?c\.?(?:\s?e\.?)?)(?:\s+|\z)/i
 
     # What ends a date the way git, `date` and Time#to_s write it, with the
     # offset after the year: "Sat Sep 5 10:00:00 2026", "Sep 5 10:00 2026".
@@ -1312,6 +1312,11 @@ module Permittable
 
         zone = Date._parse("00:00 #{text}")
         return unless zone.key?(:zone) # a day name
+        # A single letter is a military zone, which is no zone here: alone it
+        # is nothing ("2026-09-05 a", "A."), but the rest of an initial-led
+        # name Ruby did not know ("W. Europe") is dropped, so it is refused
+        # like any other word it does not know.
+        return text.match?(/\A[[:alpha:]]\.?\z/) ? nil : [:error, "invalid_type"] if zone[:zone].length == 1
         # The hour the tail made the parser lose ("2026-09-05 10 EST").
         return [:error, "invalid_type"] unless same_time?(rest, found)
 

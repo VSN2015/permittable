@@ -1128,6 +1128,27 @@ RSpec.describe Permittable do
       end
     end
 
+    # A dotted era ("A.D.") or initial ("A.") is not the military zone Ruby
+    # reads it as (A is +01:00), and a single letter is never a zone here.
+    it "reads a dotted era or a lone initial after a date as no zone" do
+      ["2026-09-05 A.D.", "2026-09-05 a.d.", "2026-09-05 A. D.", "2026-09-05 C.E.", "2026-09-05 A.", "2026-09-05 a."].each do |value|
+        expect(permit({ at: value }, &decl)[:at]).to eq(Time.utc(2026, 9, 5)), value
+        expect(permit({ on: value }, &decl)[:on]).to eq(Date.new(2026, 9, 5)), value
+      end
+      expect(permit({ at: "2026-09-05 A.D. EST" }, &decl)[:at]).to eq(Time.utc(2026, 9, 5, 5))
+    end
+
+    # "W. Europe" is the military zone W to Ruby, which is no zone here, and
+    # the rest of it would be dropped; like any unknown word after a date it
+    # is refused. The whole name is a zone Ruby knows.
+    it "refuses an initial-led word that is not a zone name, and keeps the Windows names" do
+      ["2026-09-05 W. Europe", "2026-09-05 A. foo"].each do |value|
+        expect(violations_for({ at: value }, &decl).details).to eq([{ param: "at", code: "invalid_type" }]), value
+        expect(violations_for({ on: value }, &decl).details).to eq([{ param: "on", code: "invalid_type" }]), value
+      end
+      expect(permit({ at: "2026-09-05 W. Europe Standard Time" }, &decl)[:at]).to eq(Time.utc(2026, 9, 4, 23))
+    end
+
     # Any word after a complete date that is not a day name or an era is
     # taken for a zone, and one Ruby does not know is not honoured.
     it "refuses an unknown word after a date" do
