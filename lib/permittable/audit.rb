@@ -175,11 +175,34 @@ module Permittable
     # themselves are Metal descendants too; they are the framework's abstract
     # bases, which no route names, and the old lists never held them.
     # Anonymous classes cannot be routed to, so only named ones are kept.
-    def rails_controllers
+    #
+    # `descendants` only holds classes that have been loaded, and a framework
+    # controller is autoloaded: Rails::HealthController behind `/up` is a
+    # registered constant until something touches it, so it had no row. Pass
+    # the route descriptors and every controller a route names is loaded and
+    # added — it is the route's own controller. One that does not resolve to a
+    # controller class is left out rather than raised on; the audit's table
+    # has no row for a class that does not exist.
+    def rails_controllers(routes = [])
       return [] unless defined?(::ActionController::Metal)
 
       frameworks = %w[ActionController::Base ActionController::API]
-      ::ActionController::Metal.descendants.uniq.select { |controller| controller.name && !frameworks.include?(controller.name) }
+      loaded = ::ActionController::Metal.descendants + routed_controllers(routes)
+      loaded.uniq.select { |controller| controller.name && !frameworks.include?(controller.name) }
+    end
+
+    # The controller classes the routes' `controller:` keys name, constantized
+    # (loading an autoloaded one). A key that names no constant, or one that is
+    # not an ActionController::Metal class, yields nothing.
+    def routed_controllers(routes)
+      routes.map { |route| route[:controller].to_s }.reject(&:empty?).uniq.filter_map do |key|
+        found = begin
+          ActiveSupport::Inflector.safe_constantize("#{ActiveSupport::Inflector.camelize(key)}Controller")
+        rescue NameError, LoadError
+          nil
+        end
+        found if found.is_a?(Class) && found < ::ActionController::Metal
+      end
     end
 
     # The root a controller's source must be inside to be audited:

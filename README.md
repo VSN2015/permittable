@@ -1267,7 +1267,7 @@ No Rails required for the core: `Permittable::Generator.draft(model: User)`, `.f
 
 A controller declaring `permit_params :create` looks adopted. If it also answers `PATCH`, that action is validating **nothing** — and until now nothing in the gem said so. [`permittable:generate`](#generating-draft-contracts-permittablegenerate) only notices controllers with no contract at all, and the [OpenAPI export](#exporting-openapi-docs-that-cannot-drift) documents what exists rather than what is missing.
 
-The audit crosses the contract registry with the **route set**, so a half-covered controller is as visible as an uncovered one. It reads every controller a route can reach: `ActionController::Base` and `::API` subclasses, and bare `ActionController::Metal` ones such as a lean webhook endpoint. The export and the generator read the same list.
+The audit crosses the contract registry with the **route set**, so a half-covered controller is as visible as an uncovered one. It reads every controller a route can reach: `ActionController::Base` and `::API` subclasses, and bare `ActionController::Metal` ones such as a lean webhook endpoint. It also loads any autoloaded controller a route names (`Rails::HealthController` behind `/up`, which nothing has loaded yet), since the route's own controller is part of the app; a route whose controller constant does not exist is skipped, not raised on. A controller from a gem is still [ignored by default](#ignoring-controllers-and-actions). The export and the generator read the same list.
 
 ```sh
 bin/rails permittable:audit             # the table plus a summary

@@ -359,7 +359,8 @@ RSpec.describe Permittable::Audit do
           expect(entry).not_to be_covered
           expect(entry).to be_inert
           expect(described_class.summary([entry])).to include(monitored: 0, uncovered: 1, uncovered_with_body: 1)
-          expect(described_class.format([entry])).to match(/POST\s+\/hook\s+create\s+no contract — contract cannot run: .*Callbacks.* — ACCEPTS A BODY/)
+          expect(described_class.format([entry]))
+            .to match(%r{POST\s+/hook\s+create\s+no contract — contract cannot run: .*Callbacks.* — ACCEPTS A BODY})
         end
 
         it "still covers the same rule while the app-wide mode is enforce" do
@@ -405,6 +406,45 @@ RSpec.describe Permittable::Audit do
         end)
         expect(missing?(unbuildable, "create")).to be(false)
       end
+    end
+  end
+
+  # ActionController::Metal.descendants holds loaded classes only, and a
+  # framework controller (Rails::HealthController behind /up) is autoloaded.
+  describe ".rails_controllers" do
+    # A fresh constant per example: a loaded class stays in `descendants` for
+    # the rest of the process, so a shared one would be found by the next
+    # example whether or not a route named it.
+    let(:constant) { "AuditAutoloaded#{SecureRandom.hex(4)}Controller" }
+    let(:autoloaded_route) { { controller: constant.delete_suffix("Controller").underscore, action: "show", verb: "get", path: "/up" } }
+
+    around do |example|
+      Dir.mktmpdir do |dir|
+        file = File.join(dir, "autoloaded.rb")
+        File.write(file, "class #{constant} < ActionController::Metal; end\n")
+        Object.autoload(constant.to_sym, file)
+        example.run
+      ensure
+        Object.send(:remove_const, constant) if Object.const_defined?(constant, false)
+      end
+    end
+
+    it "leaves out an autoloaded controller no route names, as descendants does" do
+      expect(described_class.rails_controllers.map(&:name)).not_to include(constant)
+    end
+
+    it "loads and includes an autoloaded controller a route names, and gives it a row in the audit" do
+      controllers = described_class.rails_controllers([autoloaded_route])
+      expect(controllers.map(&:name)).to include(constant)
+      expect(described_class.entries(controllers: controllers, routes: [autoloaded_route]).map(&:action)).to eq(["show"])
+    end
+
+    it "does not raise for a route whose controller constant is missing or is not a controller" do
+      routes = [{ controller: "no_such_thing", action: "index" }, { controller: "audit_not_a_controller", action: "index" },
+                { controller: "", action: "index" }, { controller: "rack/utils", action: "index" }]
+      stub_const("AuditNotAControllerController", Class.new)
+      expect { described_class.rails_controllers(routes) }.not_to raise_error
+      expect(described_class.rails_controllers(routes).map(&:name)).not_to include("AuditNotAControllerController")
     end
   end
 
