@@ -1041,9 +1041,13 @@ module Permittable
         found = Date._parse(value)
         return [:error, "invalid_type"] unless complete_date?(found)
         return cast_date_instant(value, found) if names_an_instant?(found)
-        # No time found, but an offset may have been dropped ("5/9/2026
-        # -0500"), which :datetime refuses too.
-        return [:error, "invalid_type"] if !plain && offset_misread?(value, found)
+
+        # No time found, but a zone or offset may have been dropped
+        # ("5/9/2026 -0500", "2026-09-05 EST") or an hour with it
+        # ("2026-09-05T10"), which :datetime refuses or reads the same way.
+        if !plain && (dropped = dropped_tail(value, found))
+          return date_at_midnight(*dropped)
+        end
 
         # Built from the components rather than re-running Date.parse, which
         # would parse the same string a second time — and Date.parse is the
@@ -1082,7 +1086,11 @@ module Permittable
     # ruled out the ISO forms cast_datetime reads without one; :datetime's
     # reading of it is then the same, with one parse fewer.
     def cast_date_instant(value, found = nil)
-      status, instant = found ? cast_parsed_datetime(value, found) : cast_datetime(value)
+      date_at_midnight(*(found ? cast_parsed_datetime(value, found) : cast_datetime(value)))
+    end
+
+    # The Date of an instant read from a String when it is midnight UTC.
+    def date_at_midnight(status, instant)
       return [:error, "invalid_type"] unless status == :ok && instant == instant.beginning_of_day
 
       [:ok, Date.new(instant.year, instant.month, instant.day)]
@@ -1167,7 +1175,9 @@ module Permittable
     # parts, shared with cast_date_instant so a :date need not parse twice.
     def cast_parsed_datetime(value, found)
       return [:error, "invalid_type"] unless complete_date?(found) && honoured_zone?(found)
-      return [:error, "invalid_type"] if offset_misread?(value, found)
+
+      dropped = dropped_tail(value, found)
+      return dropped if dropped
 
       [:ok, DateTime.parse(value, true, Date::GREGORIAN).to_time.utc]
     rescue ArgumentError, RangeError
@@ -1236,23 +1246,65 @@ module Permittable
       (zone.start_with?("-") ? -1 : 1) * ((hours * 3600) + (minutes * 60))
     end
 
-    # Whether a date's trailing offset was taken for its time of day
-    # ("Sep 5 2026 -05:00" reports 05:00, "2026-09-05 UTC-05:00" too) or
-    # dropped without a trace ("5/9/2026 -0500", "2026-09-05 +5"), outside
-    # the ISO form midnight_at_offset reads. The tail is the culprit when the
-    # parser found no zone and the String without it names the same date and
-    # no time. Only a String that ends in a signed number and either got an
-    # hour or has a space before the number is parsed again, so a plain
-    # "2026-09-05" is not.
-    def offset_misread?(value, found)
-      return false if found.key?(:zone)
+    # An ISO date, then a "T": what follows is an ISO time, so a parse that
+    # found no hour ("2026-09-05T10", "T1030", "T10Z") dropped it.
+    ISO_DATE_T_START = /\A\s*\d{4}(-?)\d{2}\1\d{2}[Tt]/
 
-      tail = SIGNED_TAIL.match(value) or return false
-      return false unless tail[1] || found.key?(:hour)
+    # Trailing words, set apart by a space: a zone name ("EST", "Eastern
+    # Standard Time") or a day name. The first word has two letters or more,
+    # as a lone letter is a military zone or the ISO "T".
+    ZONE_NAME_TAIL = /(?<=\s)[[:alpha:]]{2}[[:alpha:].]*(?:\s+[[:alpha:].]+)*\z/
+    ERA_AD = /\A(?:ad|ce)\z/i
+    private_constant :ISO_DATE_T_START, :ZONE_NAME_TAIL, :ERA_AD
 
-      rest = Date._parse(tail.pre_match)
-      complete_date?(rest) && !rest.key?(:hour) &&
-        rest.values_at(:year, :mon, :mday) == found.values_at(:year, :mon, :mday)
+    # What Date._parse did with the END of a date or date-time String when it
+    # dropped or misplaced it, as nil when it did neither, or the result
+    # ([:ok, instant] or [:error, "invalid_type"]) the String must be given:
+    #
+    # - an hour after an ISO "T" it did not find ("2026-09-05T10");
+    # - a trailing offset taken for a time of day ("Sep 5 2026 -05:00",
+    #   "2026-09-05 10 -05:00", "2026-09-05 UTC-05:00") or dropped without a
+    #   trace ("5/9/2026 -0500", "Sat Sep 5 10:00:00 2026 -0500"), outside the
+    #   ISO form midnight_at_offset reads;
+    # - a trailing zone NAME, which it reads only next to a time of day:
+    #   "2026-09-05 EST" is midnight at -05:00 and "Sat Sep 5 10:00:00 2026
+    #   EST" 10:00 there, and a name it does not know is refused like any
+    #   other zone (honoured_zone?).
+    #
+    # The tail is the culprit when the parser found no zone and the String
+    # without it names the same date (and time). Only a String that ends in a
+    # signed number or a word is parsed again, so a plain "2026-09-05" is not.
+    def dropped_tail(value, found)
+      return [:error, "invalid_type"] if !found.key?(:hour) && ISO_DATE_T_START.match?(value)
+      return if found.key?(:zone)
+
+      if (tail = SIGNED_TAIL.match(value))
+        return unless tail[1] || found.key?(:hour)
+
+        rest = Date._parse(tail.pre_match)
+        [:error, "invalid_type"] if same_date?(rest, found)
+      elsif (tail = ZONE_NAME_TAIL.match(value))
+        rest = Date._parse(tail.pre_match)
+        return unless same_date?(rest, found)
+
+        zone = Date._parse("00:00 #{tail[0]}")
+        # Not a zone: a day name, or the era "AD" that changes nothing ("BC"
+        # is a zone as far as the parser can tell, and is refused as one).
+        return if !zone.key?(:zone) || ERA_AD.match?(tail[0])
+        # The hour the tail made the parser lose ("2026-09-05 10 EST").
+        return [:error, "invalid_type"] unless TIME_PARTS.all? { |part| rest[part] == found[part] }
+
+        return [:error, "invalid_type"] unless honoured_zone?(zone)
+
+        [:ok, DateTime.parse(tail.pre_match, true, Date::GREGORIAN).to_time.utc - zone[:offset]]
+      end
+    end
+
+    TIME_PARTS = %i[hour min sec sec_fraction].freeze
+    private_constant :TIME_PARTS
+
+    def same_date?(rest, found)
+      complete_date?(rest) && rest.values_at(:year, :mon, :mday) == found.values_at(:year, :mon, :mday)
     end
 
     # Presets only make sense on String input; a non-String value (JSON
