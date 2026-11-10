@@ -1545,7 +1545,7 @@ A `format:` regexp that does not translate to ECMA-262 is looser in the same way
 | `:date` / `:datetime` | `string` + `format: date` / `date-time` |
 | `:file` | `string` + `contentMediaType: application/octet-stream` (the 3.1 spelling; `format: binary` is 3.0's). An operation whose contract has a `:file` field gets a `multipart/form-data` request body instead of `application/json` |
 | `:decimal` | `type: ["string", "number"]` + `format: decimal` (string is the precision-safe encoding) |
-| `in:` list / numeric Range | `enum` of the cast members (a `:date`/`:datetime` member written as a String is published as written) / `minimum` + `maximum` (exclusive ends honoured). An `in:` object that only answers `include?` is flagged `x-permittable-custom-validation` |
+| `in:` list / numeric Range | `enum` of the cast members (a `:datetime` member written as a String is published as written; a `:date` member, however written, as `YYYY-MM-DD`) / `minimum` + `maximum` (exclusive ends honoured). An `in:` object that only answers `include?` is flagged `x-permittable-custom-validation` |
 | `length:` | `minLength`/`maxLength` on strings, `minItems`/`maxItems` on arrays |
 | `format:` | `pattern`, valid under the `u` flag Ajv compiles with: `\A`/`\z` become `^`/`$`, `\s` and `.` are spelled out as the classes they are in Ruby (ECMA-262's `\s` also matches NBSP and U+2028; its `.` also stops at `\r`), and redundant escapes like `\-` and `\#` are written bare |
 | `default:` / `desc:` / `example:` | `default` / `description` / `examples` |

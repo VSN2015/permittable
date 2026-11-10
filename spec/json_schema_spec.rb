@@ -158,19 +158,34 @@ RSpec.describe Permittable::JsonSchema do
     # written with fractional seconds exported as the whole second, which
     # the server then refused. A String member is therefore published as
     # written, and every published member must be one the server accepts.
-    it "exports a String-authored :date/:datetime member as written, and the server accepts each one" do
+    it "exports a String-authored :datetime member as written, and the server accepts each one" do
       contract = Permittable::Contract.define do
-        optional :at,  :datetime, in: ["2026-09-05T10:00:00.25Z", "2026-09-05T15:00:00+05:00", Time.utc(2026, 1, 1)]
-        optional :day, :date,     in: ["Sep 5, 2026", Date.new(2026, 9, 6)]
+        optional :at, :datetime, in: ["2026-09-05T10:00:00.25Z", "2026-09-05T15:00:00+05:00", Time.utc(2026, 1, 1),
+                                      "2026-09-05T10:00:00.1234567891Z"]
       end
       props = described_class.rule(contract.permittable_contracts.first)["properties"]
-      expect(props["at"]["enum"]).to eq(["2026-09-05T10:00:00.25Z", "2026-09-05T15:00:00+05:00", "2026-01-01T00:00:00Z"])
-      expect(props["day"]["enum"]).to eq(["Sep 5, 2026", "2026-09-06"])
-      props.each do |name, schema|
-        schema["enum"].each do |member|
-          expect(contract.call(name => member).violations).to be_empty, "#{name}: #{member.inspect} was refused"
-        end
+      expect(props["at"]["enum"]).to eq(["2026-09-05T10:00:00.25Z", "2026-09-05T15:00:00+05:00", "2026-01-01T00:00:00Z",
+                                         "2026-09-05T10:00:00.1234567891Z"])
+      props["at"]["enum"].each do |member|
+        expect(contract.call(at: member).violations).to be_empty, "at: #{member.inspect} was refused"
       end
+    end
+
+    # A :date String member the server reads in any form (Date.parse's, or an
+    # instant at midnight UTC) is a Date once cast, and the Date is what a
+    # request is compared against. Published as written it was an enum value
+    # that fails the field's own `format: date`.
+    it "exports a String-authored :date member as the YYYY-MM-DD the server compares against" do
+      contract = Permittable::Contract.define do
+        optional :day, :date, in: ["Sep 5, 2026", "2026-09-05T00:00:00Z", Date.new(2026, 9, 6), "Sep 6, 2026", "2026-09-07"]
+      end
+      day = described_class.rule(contract.permittable_contracts.first)["properties"]["day"]
+      expect(day["enum"]).to eq(%w[2026-09-05 2026-09-06 2026-09-07])
+      day["enum"].each do |member|
+        expect(member).to match(/\A\d{4}-\d{2}-\d{2}\z/)
+        expect(contract.call(day: member).violations).to be_empty, "day: #{member.inspect} was refused"
+      end
+      %w[2026-09-04 2026-09-08].each { |other| expect(contract.call(day: other).violations).not_to be_empty }
     end
 
     # A Time/DateTime/TimeWithZone member is re-encoded, so it must keep the
@@ -558,12 +573,11 @@ RSpec.describe Permittable::JsonSchema do
       money = property("totals") { optional :totals, :json, default: { "net" => BigDecimal("2.5") } }
       expect(money["default"]).to eq("net" => "2.5")
 
-      # A finite BigDecimal inside :json stays a string (above); a non-finite
-      # one must not crash the export by becoming Float::INFINITY along the
-      # way — :json contents are opaque and pass through untyped.
-      infinite = property("totals") { optional :totals, :json, default: { "cap" => BigDecimal("Infinity") } }
-      expect(infinite["default"]).to eq("cap" => "Infinity")
-      expect { JSON.generate(infinite) }.not_to raise_error
+      # A non-finite BigDecimal is not a JSON number (the export used to print
+      # it as the String "Infinity"), so an authored one is refused at class
+      # load like a non-finite Float, and never reaches the export to crash it.
+      expect { property("totals") { optional :totals, :json, default: { "cap" => BigDecimal("Infinity") } } }
+        .to raise_error(ArgumentError, /holds NaN or Infinity at cap/)
     end
 
     it "re-encodes authored Date/Time/BigDecimal values as JSON scalars" do

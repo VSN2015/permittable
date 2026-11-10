@@ -223,7 +223,7 @@ module Permittable
         # applies here too — a :decimal in: member is otherwise always
         # exported as a string, so a numerically-exported default: is no
         # longer a member of its own enum's exported list. in_published (a
-        # :date/:datetime member kept in its authored String form, see
+        # :datetime member kept in its authored String form, see
         # Coercion.published_in_member) takes precedence over the cast
         # members when both apply.
         schema["enum"] = (field[:in_published] || allowed).map { |v| json_value(v, decimal: :number) }
