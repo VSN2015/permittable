@@ -1087,11 +1087,69 @@ RSpec.describe Permittable do
     # read as the offset's own, and the T of an ISO date-time with only an
     # hour ("2026-09-05T10") loses the hour.
     it "refuses a zone, offset or hour the parser dropped or misplaced" do
-      ["2026-09-05 XYZ", "2026-09-05 10 -05:00", "Sat Sep  5 10:00:00 2026 -0500", "12:00 2026-09-05 -05:00",
+      ["2026-09-05 XYZ", "2026-09-05 10 -05:00", "12:00 2026-09-05 -05:00", "Sat Sep  5 10:00:00 2026 UTC-05:00",
        "2026-09-05T10", "2026-09-05T10Z", "2026-09-05T1030", "2026-09-05T10-05:00", "2026-09-05T10 EST",
        "2026-09-05 10 EST", "Sat Sep  5 10:00:00 2026 XYZ"].each do |value|
         expect(violations_for({ at: value }, &decl).details).to eq([{ param: "at", code: "invalid_type" }]), value
       end
+    end
+
+    # git log, `date` and Time#to_s write the offset AFTER the year, where
+    # Date._parse drops it; the time of day beside it is the client's own, so
+    # the offset is read back (and is refused where a misread hour shows the
+    # parser took the offset for the time).
+    it "reads the offset after the year of git's and ctime's date format" do
+      {
+        "Sat Sep 5 10:00:00 2026 +0000" => Time.utc(2026, 9, 5, 10), "Sat Sep 5 10:00:00 2026 -0500" => Time.utc(2026, 9, 5, 15),
+        "Sep 5 10:00:00 2026 +0000" => Time.utc(2026, 9, 5, 10), "Sat Sep 5 10:00 2026 +0000" => Time.utc(2026, 9, 5, 10),
+        "Sat Sep  5 10:00:00 2026 +05:30" => Time.utc(2026, 9, 5, 4, 30)
+      }.each do |value, instant|
+        expect(permit({ at: value }, &decl)[:at]).to eq(instant), value
+      end
+      ["Sat Sep 5 00:00:00 2026 +0000", "Sat Sep 5 00:00:00 2026 -0000", "Sat Sep 5 00:00:00 2026 +00:00"].each do |value|
+        expect(permit({ on: value }, &decl)[:on]).to be_an_instance_of(Date).and(eq(Date.new(2026, 9, 5))), value
+      end
+      ["Sat Sep 5 00:00:00 2026 -0500", "Sat Sep 5 10:00:00 2026 +0000", "Sat Sep 5 10:00:00 2026 +24:00"].each do |value|
+        expect(violations_for({ on: value }, &decl).details).to eq([{ param: "on", code: "invalid_type" }]), value
+      end
+      expect(violations_for({ at: "Sat Sep 5 10:00:00 2026 +24:00" }, &decl).details)
+        .to eq([{ param: "at", code: "invalid_type" }])
+    end
+
+    # An era word does not hide the zone behind it, and a zone name may start
+    # with an initial (Windows names do).
+    it "reads a zone name after an era word, and one that starts with an initial" do
+      {
+        "2026-09-05 BC EST" => Time.utc(-2025, 9, 5, 5), "5 Sep 2026 BC EST" => Time.utc(-2025, 9, 5, 5),
+        "2026-09-05 BC" => Time.utc(-2025, 9, 5), "2026-09-05 AD EST" => Time.utc(2026, 9, 5, 5),
+        "2026-09-05 W. Europe Standard Time" => Time.utc(2026, 9, 4, 23)
+      }.each do |value, instant|
+        expect(permit({ at: value }, &decl)[:at]).to eq(instant), value
+      end
+    end
+
+    # Any word after a complete date that is not a day name or an era is
+    # taken for a zone, and one Ruby does not know is not honoured.
+    it "refuses an unknown word after a date" do
+      ["2026-09-05 foo", "2026-09-05 noon", "2026-09-05 BC foo", "2026-09-05 W. Nowhere Standard Time"].each do |value|
+        expect(violations_for({ at: value }, &decl).details).to eq([{ param: "at", code: "invalid_type" }]), value
+        expect(violations_for({ on: value }, &decl).details).to eq([{ param: "on", code: "invalid_type" }]), value
+      end
+    end
+
+    it "holds an in: member and a default: written with a zone name to the same reading" do
+      listed = proc { permit_params(:create) { optional :at, :datetime, in: ["2026-09-05 EST"] } }
+      expect(permit({ at: Time.utc(2026, 9, 5, 5) }, &listed)[:at]).to eq(Time.utc(2026, 9, 5, 5))
+      expect(permit({}) { permit_params(:create) { optional :at, :datetime, default: "2026-09-05 EST" } }[:at])
+        .to eq(Time.utc(2026, 9, 5, 5))
+      expect { permittable_class { permit_params(:create) { optional :on, :date, in: ["2026-09-05 EST"] } } }
+        .to raise_error(ArgumentError, /:in for field :on contains "2026-09-05 EST", which is not a valid :date/)
+      expect { permittable_class { permit_params(:create) { optional :on, :date, default: "2026-09-05 EST" } } }
+        .to raise_error(ArgumentError, /:default for field :on violates its own contract \(invalid_type\)/)
+      expect { permittable_class { permit_params(:create) { optional :at, :datetime, in: ["2026-09-05T10"] } } }
+        .to raise_error(ArgumentError, /:in for field :at contains "2026-09-05T10"/)
+      expect(permit({}) { permit_params(:create) { optional :on, :date, default: "2026-09-05 UTC" } }[:on])
+        .to eq(Date.new(2026, 9, 5))
     end
 
     it "applies the same readings to :date, which holds only midnight UTC" do

@@ -1251,11 +1251,19 @@ module Permittable
     ISO_DATE_T_START = /\A\s*\d{4}(-?)\d{2}\1\d{2}[Tt]/
 
     # Trailing words, set apart by a space: a zone name ("EST", "Eastern
-    # Standard Time") or a day name. The first word has two letters or more,
-    # as a lone letter is a military zone or the ISO "T".
-    ZONE_NAME_TAIL = /(?<=\s)[[:alpha:]]{2}[[:alpha:].]*(?:\s+[[:alpha:].]+)*\z/
-    ERA_AD = /\A(?:ad|ce)\z/i
-    private_constant :ISO_DATE_T_START, :ZONE_NAME_TAIL, :ERA_AD
+    # Standard Time", "W. Europe Standard Time") or a day or era word. The
+    # first word has two letters or more, or one and a ".", as a lone letter
+    # is a military zone or the ISO "T".
+    ZONE_NAME_TAIL = /(?<=\s)[[:alpha:]](?:\.|[[:alpha:]]+)[[:alpha:].]*(?:\s+[[:alpha:].]+)*\z/
+
+    # An era word at the start of such a tail: the parser reads it with the
+    # date ("Sep 5 2026 BC" is the year -2025), so it is not what follows.
+    ERA_WORD = /\A(?:ad|ce|bce|bc)(?:\s+|\z)/i
+
+    # What ends a date the way git, `date` and Time#to_s write it, with the
+    # offset after the year: "Sat Sep 5 10:00:00 2026", "Sep 5 10:00 2026".
+    TIME_THEN_YEAR = /\d:\d{2}(?::\d{2}(?:[.,]\d+)?)?\s+\d{4}\s*\z/
+    private_constant :ZONE_NAME_TAIL, :ERA_WORD, :TIME_THEN_YEAR
 
     # What Date._parse did with the END of a date or date-time String when it
     # dropped or misplaced it, as nil when it did neither, or the result
@@ -1264,12 +1272,16 @@ module Permittable
     # - an hour after an ISO "T" it did not find ("2026-09-05T10");
     # - a trailing offset taken for a time of day ("Sep 5 2026 -05:00",
     #   "2026-09-05 10 -05:00", "2026-09-05 UTC-05:00") or dropped without a
-    #   trace ("5/9/2026 -0500", "Sat Sep 5 10:00:00 2026 -0500"), outside the
-    #   ISO form midnight_at_offset reads;
+    #   trace ("5/9/2026 -0500", "12:00 2026-09-05 -05:00"), outside the ISO
+    #   form midnight_at_offset reads. An offset after "10:00:00 2026" is the
+    #   exception: that is git's and ctime's format, which puts it after the
+    #   year, so it is read, like a zone name;
     # - a trailing zone NAME, which it reads only next to a time of day:
     #   "2026-09-05 EST" is midnight at -05:00 and "Sat Sep 5 10:00:00 2026
-    #   EST" 10:00 there, and a name it does not know is refused like any
-    #   other zone (honoured_zone?).
+    #   EST" 10:00 there. A name it does not know is refused like any other
+    #   zone (honoured_zone?), and so is ANY other word after a complete date
+    #   ("2026-09-05 noon"), since all it can be is a zone. A day name and an
+    #   era word are what the parser reads as part of the date, not a zone.
     #
     # The tail is the culprit when the parser found no zone and the String
     # without it names the same date (and time). Only a String that ends in a
@@ -1282,22 +1294,42 @@ module Permittable
         return unless tail[1] || found.key?(:hour)
 
         rest = Date._parse(tail.pre_match)
-        [:error, "invalid_type"] if same_date?(rest, found)
-      elsif (tail = ZONE_NAME_TAIL.match(value))
-        rest = Date._parse(tail.pre_match)
         return unless same_date?(rest, found)
 
-        zone = Date._parse("00:00 #{tail[0]}")
-        # Not a zone: a day name, or the era "AD" that changes nothing ("BC"
-        # is a zone as far as the parser can tell, and is refused as one).
-        return if !zone.key?(:zone) || ERA_AD.match?(tail[0])
+        git_style = tail[1] && found.key?(:hour) && TIME_THEN_YEAR.match?(tail.pre_match) && same_time?(rest, found)
+        git_style ? instant_in_zone(tail.pre_match, tail[0].strip) : [:error, "invalid_type"]
+      elsif (tail = ZONE_NAME_TAIL.match(value))
+        pre = tail.pre_match
+        text = tail[0]
+        if (era = ERA_WORD.match(text))
+          pre += era[0]
+          text = era.post_match
+        end
+        return if text.empty?
+
+        rest = Date._parse(pre)
+        return unless same_date?(rest, found)
+
+        zone = Date._parse("00:00 #{text}")
+        return unless zone.key?(:zone) # a day name
         # The hour the tail made the parser lose ("2026-09-05 10 EST").
-        return [:error, "invalid_type"] unless TIME_PARTS.all? { |part| rest[part] == found[part] }
+        return [:error, "invalid_type"] unless same_time?(rest, found)
 
-        return [:error, "invalid_type"] unless honoured_zone?(zone)
-
-        [:ok, DateTime.parse(tail.pre_match, true, Date::GREGORIAN).to_time.utc - zone[:offset]]
+        instant_in_zone(pre, text)
       end
+    end
+
+    # The wall clock `date` names, as it is read in the zone `text` names:
+    # [:ok, instant], or an error when Ruby cannot honour the zone.
+    def instant_in_zone(date, text)
+      zone = Date._parse("00:00 #{text}")
+      return [:error, "invalid_type"] unless zone.key?(:zone) && honoured_zone?(zone)
+
+      [:ok, DateTime.parse(date, true, Date::GREGORIAN).to_time.utc - zone[:offset]]
+    end
+
+    def same_time?(rest, found)
+      TIME_PARTS.all? { |part| rest[part] == found[part] }
     end
 
     TIME_PARTS = %i[hour min sec sec_fraction].freeze
