@@ -1204,6 +1204,29 @@ RSpec.describe "Permittable RSpec matchers" do
           end
         end
 
+        # The root itself is a filtered name: the whole hash is masked, and the
+        # only path left to name is the root.
+        it "names the root when the filter masks the whole hash" do
+          secrets = Class.new(FakeController) do
+            include Permittable
+
+            permit_params(:create, root: :password) { optional :value, :string }
+          end
+          with_app_filters(:password) do
+            message = failure_of do
+              expect(secrets).to accept_params(password: { value: "a" }).for_action(:create).returning(value: "b")
+            end
+            expect(message).to include("differs at: password")
+            expect(message).not_to match(/differs at: *\z/)
+            expect(message).not_to match(/"[ab]"/)
+          end
+        end
+
+        it "lets the qualifier error win for a subject that cannot answer respond_to?" do
+          matcher = accept_params(charge).for_action(:create).returning(number: "4111111111111111")
+          expect { matcher.does_not_match?(BasicObject.new) }.to raise_error(ArgumentError, /cannot take qualifiers/)
+        end
+
         it "applies to the returning hash in the description once the rule is resolved" do
           with_app_filters("payment.number") do
             matcher = accept_params(charge).for_action(:create).returning(number: "4111111111111111")

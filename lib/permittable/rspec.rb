@@ -695,12 +695,12 @@ module Permittable
       def negated_qualifier_message(subject = nil)
         # Raised before the rule is located, so the root a scoped filter
         # needs is looked up here, best effort: a subject or an ambiguity
-        # that locate would refuse is not this message's to report, and
-        # leaves the filter unscoped (the shallow one) rather than masking
-        # the qualifier error.
+        # that locate would refuse (a BasicObject answers no respond_to?) is not
+        # this message's to report, and leaves the filter unscoped (the
+        # shallow one) rather than masking the qualifier error.
         begin
           locate(subject) if subject
-        rescue ArgumentError
+        rescue StandardError
           @root = nil
         end
         call = @expect_accepted ? "accept_params" : "reject_params"
@@ -978,8 +978,9 @@ module Permittable
         actual = @result.to_h
         return "" if expected == actual || printable(expected) != printable(actual)
 
-        paths = differing_paths(expected, actual, redacted(expected), redacted(actual))
-        "; differs at: #{paths.join(', ')}"
+        # A filter on the root itself masks the whole hash, leaving the root as the one path.
+        paths = differing_paths(expected, actual, redacted(expected), redacted(actual)).map { |path| path || @root.to_s }
+        paths.empty? ? "" : "; differs at: #{paths.join(', ')}"
       end
 
       # Walks the real hashes beside their redacted copies and stops at the
