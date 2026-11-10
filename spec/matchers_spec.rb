@@ -933,6 +933,45 @@ RSpec.describe "Permittable RSpec matchers" do
           .to raise_error(/ActionDispatch::Http::Utils.*ActionDispatch::Request::Utils/)
       end
 
+      # A bare ActionDispatch module (a stand-in, or a gem that namespaces under
+      # it) is not actionpack's request code: nothing there to normalize with,
+      # nothing renamed, so the payload goes through as given.
+      it "does not mistake a bare ActionDispatch module for missing request code" do
+        hide_const("ActionDispatch::Request")
+        hide_const("ActionDispatch::Http::Utils")
+        expect(defined?(ActionDispatch::Request)).to be_nil
+        expect(tagged).to accept_params(tags: %w[a b]).for_action(:create).returning("tags" => %w[a b])
+        expect(tagged).to reject_params(tags: ["a", nil]).for_action(:create).with_violation("tags[1]", :invalid_type)
+      end
+
+      # A real request carries every scalar as a String; a spec writes
+      # `status: :active`. The contract reads what the request would deliver.
+      it "reads a Symbol value as the String a request carries" do
+        statused = Class.new(FakeController) do
+          include Permittable
+
+          permit_params(:create) do
+            optional :status, :string, in: %w[active]
+            array :kinds, of: :string
+            optional :meta, :json
+          end
+        end
+        expect(statused).to accept_params(status: :active, kinds: %i[a b], meta: { list: [:x] })
+          .for_action(:create).returning("status" => "active", "kinds" => %w[a b], "meta" => { "list" => ["x"] })
+        expect(statused).to reject_params(status: :gone).for_action(:create).with_violation("status", :inclusion)
+      end
+
+      it "does not mutate a Symbol value in the payload it was given" do
+        payload = { tags: %w[a b], json: { k: :v } }
+        expect(tagged).to accept_params(payload).for_action(:create)
+        expect(payload).to eq(tags: %w[a b], json: { k: :v })
+      end
+
+      it "leaves a Symbol value to a standalone Contract, which gets the payload as given" do
+        contract = Permittable::Contract.define { optional :status, :string, in: %w[active] }
+        expect(contract).to reject_params(status: :active).with_violation("status", :invalid_type)
+      end
+
       it "drops the null before the contract sees it, as a request does" do
         expect(tagged).to accept_params(tags: ["a", "b", nil]).for_action(:create).returning("tags" => %w[a b])
         expect(tagged).to reject_params(tags: ["a", nil]).for_action(:create).with_violation("tags", :length)

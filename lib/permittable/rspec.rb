@@ -788,7 +788,8 @@ module Permittable
       # payload belongs to the spec. The copy stringifies Symbol keys, which
       # the normalizer's HashWithIndifferentAccess does anyway but only after
       # it has read a Symbol :tempfile key as an upload, a key a request
-      # (String keys only) never has. A Parameters payload is unwrapped first
+      # (String keys only) never has, and Symbol values (see copy_payload).
+      # A Parameters payload is unwrapped first
       # so it is normalized like the Hash it wraps.
       def request_params
         utils = request_utils
@@ -799,25 +800,29 @@ module Permittable
       end
 
       # Rails main moved the class from ActionDispatch::Request::Utils to
-      # ActionDispatch::Http::Utils. nil only when ActionDispatch is not
-      # loaded at all (a non-Rails stand-in controller); once it is, a rename
-      # this does not know raises instead of silently skipping the
-      # normalization, which would bring the false greens back.
+      # ActionDispatch::Http::Utils. nil when actionpack's request code is not
+      # loaded (a non-Rails stand-in controller, or a bare ActionDispatch module
+      # that something else namespaced): there is nothing to normalize with, and
+      # nothing was renamed. Once ActionDispatch::Request exists, a rename this
+      # does not know raises instead of silently skipping the normalization,
+      # which would bring the false greens back.
       def request_utils
-        return unless defined?(ActionDispatch)
-
         if defined?(ActionDispatch::Http::Utils) then ActionDispatch::Http::Utils
         elsif defined?(ActionDispatch::Request::Utils) then ActionDispatch::Request::Utils
-        else
+        elsif defined?(ActionDispatch::Request)
           raise "Permittable's matchers cannot find Rails' parameter normalizer: neither " \
                 "ActionDispatch::Http::Utils nor ActionDispatch::Request::Utils is defined"
         end
       end
 
+      # Symbol keys become Strings, and so do Symbol values: a request carries
+      # every scalar as a String (or a JSON number, boolean or null), never a
+      # Symbol, so `status: :active` is the "active" the contract would read.
       def copy_payload(value)
         case value
         when Hash then value.to_h { |key, item| [key.is_a?(Symbol) ? key.to_s : key, copy_payload(item)] }
         when Array then value.map { |item| copy_payload(item) }
+        when Symbol then value.to_s
         else value
         end
       end
