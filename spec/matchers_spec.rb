@@ -1023,6 +1023,53 @@ RSpec.describe "Permittable RSpec matchers" do
       end
     end
 
+    # The failure message is printed into CI logs. The payload values it
+    # echoes (the returned params, the expected `returning` hash) are redacted
+    # by the same names that redact a request log.
+    context "when a failure message would echo a sensitive value" do
+      let(:account) do
+        Class.new(FakeController) do
+          include Permittable
+
+          permit_params(:create) do
+            required :email, :string
+            optional :ssn, :string, sensitive: true
+            optional :pin, :integer, sensitive: true
+            optional :profile do
+              optional :ssn, :string, sensitive: true
+              optional :city, :string
+            end
+          end
+        end
+      end
+      let(:payload) { { email: "a@b.co", ssn: "123-45-6789", pin: 4321, profile: { ssn: "987-65-4321", city: "Hue" } } }
+
+      it "redacts them in the message for an accepted payload that was not meant to be" do
+        message = failure_of { expect(account).to reject_params(payload).for_action(:create) }
+        expect(message).to include("a@b.co", "Hue", "[FILTERED]")
+        expect(message).not_to match(/123-45-6789|4321|987-65-4321/)
+      end
+
+      it "redacts a sensitive value in the expected `returning` hash it describes" do
+        message = failure_of { expect(account).to accept_params(payload).for_action(:create).returning(email: "x", ssn: "000-11-2222") }
+        expect(message).to include("[FILTERED]")
+        expect(message).not_to match(/123-45-6789|000-11-2222|4321|987-65-4321/)
+      end
+
+      it "redacts a name that only the app's config.filter_parameters knows" do
+        stub_const("Rails", double(application: double(config: double(filter_parameters: [:email]))))
+        message = failure_of { expect(account).to reject_params(payload).for_action(:create) }
+        expect(message).not_to include("a@b.co")
+        expect(message).to include("Hue")
+      end
+
+      it "leaves the matching itself untouched: the real values are still compared" do
+        expect(account).to accept_params(payload).for_action(:create)
+                                                 .returning("email" => "a@b.co", "ssn" => "123-45-6789", "pin" => 4321,
+                                                            "profile" => { "ssn" => "987-65-4321", "city" => "Hue" })
+      end
+    end
+
     # Documented in the README: the matchers run without a request, so there is
     # no route to read path parameters from. A real PATCH /widgets/7 carries
     # id in the URL and is accepted; the matcher is given only the payload.

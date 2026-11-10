@@ -649,9 +649,11 @@ module Permittable
         if @expect_accepted
           return "expected #{subject_name} to #{description}, but it rejected them: #{summary(@violations)}" unless @violations.empty?
 
-          "expected #{subject_name} to #{description}, but it accepted them but returned #{@result.to_h.inspect}"
+          "expected #{subject_name} to #{description}, but it accepted them but returned #{printable(@result.to_h)}"
         else
-          return "expected #{subject_name} to #{description}, but it accepted them, returning #{@result.to_h.inspect}" if @violations.empty?
+          if @violations.empty?
+            return "expected #{subject_name} to #{description}, but it accepted them, returning #{printable(@result.to_h)}"
+          end
 
           "expected #{subject_name} to #{description}, but the violations were: #{summary(@violations)}"
         end
@@ -668,7 +670,7 @@ module Permittable
         label = @expect_accepted ? "accept those params" : "reject those params"
         label += action_label
         label += " with #{summary(@expected_violations)}" unless @expected_violations.empty?
-        label += " returning #{@returning.inspect}" if @returning
+        label += " returning #{printable(@returning)}" if @returning
         label
       end
 
@@ -690,7 +692,7 @@ module Permittable
       def negated_qualifier_message
         call = @expect_accepted ? "accept_params" : "reject_params"
         qualifiers = []
-        qualifiers << "returning #{@returning.inspect}" if @returning
+        qualifiers << "returning #{printable(@returning)}" if @returning
         qualifiers << "with_violation #{summary(@expected_violations)}" unless @expected_violations.empty?
         "#{LABEL}: `not_to #{call}(...)` cannot take qualifiers (here: #{qualifiers.join(', ')}) — " \
           "negating one is ambiguous, since it would pass both when the params are " \
@@ -877,6 +879,32 @@ module Permittable
         return subject.class if subject.class.respond_to?(:permit_rule_for)
 
         raise ArgumentError, "#{LABEL}: the subject of accept_params/reject_params must include Permittable (got #{subject.inspect})"
+      end
+
+      # A hash echoed into a failure message, which lands in CI logs, goes out
+      # redacted the way a request log is: by the names `sensitive:` fields
+      # registered, and by the app's config.filter_parameters when a Rails
+      # application is booted. Only the printed copy is filtered; the matching
+      # itself reads the real values.
+      def printable(hash)
+        filtered = redact_sensitive(hash)
+        filter = app_parameter_filter
+        (filter ? filter.filter(filtered) : filtered).inspect
+      end
+
+      def redact_sensitive(value)
+        return value.map { |item| redact_sensitive(item) } if value.is_a?(Array)
+        return value unless value.is_a?(Hash)
+
+        registry = Permittable.filter_parameter_registry
+        value.to_h { |key, item| [key, registry.include?(key) ? Permittable::FilterParameterRegistry::FILTERED : redact_sensitive(item)] }
+      end
+
+      def app_parameter_filter
+        return unless defined?(Rails) && Rails.respond_to?(:application) && Rails.application
+        return unless defined?(ActiveSupport::ParameterFilter)
+
+        ActiveSupport::ParameterFilter.new(Rails.application.config.filter_parameters)
       end
 
       def summary(violations)
