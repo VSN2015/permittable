@@ -52,11 +52,7 @@ module Permittable
         unless klass.column_names.include?(column)
           raise ArgumentError, ignored_column_message(label, klass, column) if ignored_column?(klass, column)
 
-          raise ArgumentError, store_column_message(label, klass, field) if stored_attribute?(klass, field)
-
-          raise ArgumentError,
-                "#{label}: '#{field}' does not exist in the database (table: #{klass.table_name})." \
-                "#{column_migration_hint(klass, field, types)}"
+          raise ArgumentError, missing_column_message(label, klass, field, column, types)
         end
 
         ensure_column_type!(label, klass, field, types, allowed, transformed: transformed) if check_types
@@ -67,55 +63,82 @@ module Permittable
     # `alias_attribute :title, :name` makes `title` an attribute assignment
     # accepts, backed by `name`'s column, so the existence check, the
     # ignored_columns check and the type check all look at the target. Aliases
-    # may chain, and the walk is bounded so a cycle cannot hang a class body.
-    # A duck-typed model without `attribute_aliases` has none.
+    # may chain; the walk stops at a name it has seen, so a cycle cannot hang a
+    # class body. A duck-typed model without `attribute_aliases` (or whose
+    # reader returns nil) has none.
     def resolve_alias(klass, field)
       name = field.to_s
-      aliases = klass.respond_to?(:attribute_aliases) ? klass.attribute_aliases : {}
-      aliases.size.times do
-        target = aliases[name]
-        break unless target
+      aliases = attribute_aliases_of(klass)
+      seen = [name]
+      while (target = aliases[name])
+        break if seen.include?(target.to_s)
 
         name = target.to_s
+        seen << name
       end
       name
     end
 
-    # The column a field is stored in: its alias target's, or for a store
-    # accessor (`store_accessor :settings, :theme`) the column of its store,
-    # `settings`. The field is then a key inside that column, not a column of
-    # its own, so the column's type says nothing about it (see
-    # ensure_column_type!). The guard accepts it for the reason it accepts an
-    # alias or an enum: assignment takes it and the data lands in a column.
-    # `virtual: true` stays the opt-out for what no column holds. That is also
-    # why the store column itself must exist.
-    def backing_column(klass, field)
-      name = resolve_alias(klass, field)
-      stored_attribute_store(klass, name)&.to_s || name
+    def attribute_aliases_of(klass)
+      klass.respond_to?(:attribute_aliases) ? Hash(klass.attribute_aliases) : {}
     end
 
-    # The store (the column holding the hash) a `store_accessor` key lives
+    # The column a field is stored in: its alias target's, or for a store
+    # accessor (`store_accessor :settings, :theme`) the column of its store,
+    # `settings`, itself resolved when the store is an alias. The field is then
+    # a key inside that column, not a column of its own, so the column's type
+    # says nothing about it (see ensure_column_type!). The guard accepts it for
+    # the reason it accepts an alias or an enum: assignment takes it and the
+    # data lands in a column. `virtual: true` stays the opt-out for what no
+    # column holds. That is also why the store column itself must exist.
+    def backing_column(klass, field)
+      name = resolve_alias(klass, field)
+      store = stored_attribute_store(klass, name)
+      store ? resolve_alias(klass, store) : name
+    end
+
+    # The store (the column holding the hash) a `store_accessor` field lives
     # in, nil when `name` is a plain attribute. A real column of the same name
     # wins: it is the attribute Rails reads. A duck-typed model without
     # `stored_attributes` has none.
+    #
+    # `stored_attributes` lists the raw keys (`{settings: [:theme]}`), but the
+    # accessor is named by `prefix:`/`suffix:` too (`settings_theme`), so the
+    # name is accepted only when the model really defines its writer, which
+    # is what assignment calls. The store is then the one whose key the name
+    # is built from, an exact match first.
     def stored_attribute_store(klass, name)
-      return unless klass.respond_to?(:stored_attributes) && !klass.column_names.include?(name)
+      return unless klass.respond_to?(:stored_attributes) && klass.respond_to?(:_store_accessors_module)
+      return if klass.column_names.include?(name) || !klass._store_accessors_module.method_defined?("#{name}=")
 
-      klass.stored_attributes.find { |_store, keys| keys.map(&:to_s).include?(name) }&.first
+      pairs = Hash(klass.stored_attributes).flat_map { |store, keys| keys.map { |key| [store, key.to_s] } }
+      pairs.select { |_store, key| name.include?(key) }
+           .min_by { |store, key| [name == key ? 0 : 1, name.include?(store.to_s) ? 0 : 1] }&.first
     end
 
-    def stored_attribute?(klass, field)
-      !stored_attribute_store(klass, resolve_alias(klass, field)).nil?
+    def missing_column_message(label, klass, field, column, types)
+      store = stored_attribute_store(klass, resolve_alias(klass, field))
+      return store_column_message(label, klass, field, store, column) if store
+
+      if column == field.to_s
+        return "#{label}: '#{field}' does not exist in the database (table: #{klass.table_name})." \
+               "#{column_migration_hint(klass, field, types)}"
+      end
+
+      # An alias: the migration must add the column the alias points at,
+      # not one named for the alias, which would still leave this check failing.
+      "#{label}: '#{field}' is an alias of '#{column}', which does not exist in the database " \
+        "(table: #{klass.table_name})." \
+        "#{column_migration_hint(klass, column, types.is_a?(Hash) ? types[field.to_sym] : types)}"
     end
 
     # The store column is gone (dropped, or never migrated), so the accessor
     # reads and writes nothing. That is the column the migration is for, not
     # a column named after the accessor, which would shadow it.
-    def store_column_message(label, klass, field)
-      store = backing_column(klass, field)
+    def store_column_message(label, klass, field, store, column)
       "#{label}: '#{field}' is a store_accessor of :#{store} on #{model_expr(klass)}, " \
-        "but the table has no '#{store}' column (table: #{klass.table_name}). " \
-        "Add the '#{store}' column that holds it, or declare the field virtual: true if the app handles it itself."
+        "but the table has no '#{column}' column (table: #{klass.table_name}). " \
+        "Add the '#{column}' column that holds it, or declare the field virtual: true if the app handles it itself."
     end
 
     # The type half of the drift guard, opt-in via Permittable
@@ -132,12 +155,16 @@ module Permittable
       ensure_not_array_column!(label, klass, field, declared, column)
 
       wanted = TYPE_GROUPS[declared.to_sym]
-      enum = enum_attribute?(klass, target)
+      # An enum is keyed by the name it was declared on, which may be the
+      # alias (`enum :phase` over `alias_attribute :phase, :status`) or the
+      # target it points at.
+      enum_name = [field.to_s, target].find { |name| enum_attribute?(klass, name) }
+      enum = !enum_name.nil?
       # Checked before the column's type, which an enum's contract does not
       # depend on: see ensure_enum_contract!.
       if enum && wanted == :text
-        return ensure_enum_contract!(label, klass, target, declared, allowed && allowed[field.to_sym],
-                                     transformed: Array(transformed).include?(field.to_sym))
+        return ensure_enum_contract!(label, klass, enum_name, declared, allowed && allowed[field.to_sym],
+                                     transformed: Array(transformed).include?(field.to_sym), shown: field.to_s)
       end
 
       # `column.type` is nil for a SQL type the adapter does not recognise
@@ -153,7 +180,8 @@ module Permittable
       # On an enum, `virtual: true` would be the wrong advice: it switches
       # off the existence check too, and the field IS backed by this column.
       fix = if enum
-              "'#{field}' is an enum on #{model_expr(klass)}: declare it :string, in: #{enum_keys_expr(klass, target)}."
+              "#{enum_subject(enum_name, field)} is an enum on #{model_expr(klass)}: " \
+                "declare it :string, in: #{enum_keys_expr(klass, enum_name)}."
             else
               "Change the contract to match the column, migrate the column to match the contract, " \
                 "or declare the field virtual: true if it is not backed by this column."
@@ -211,7 +239,7 @@ module Permittable
     # over a string column) is left compared against the column by choice:
     # an enum's mapping says exactly which strings are valid, an attribute
     # override says nothing a contract could be checked against.
-    def ensure_enum_contract!(label, klass, field, declared, listed, transformed: false)
+    def ensure_enum_contract!(label, klass, field, declared, listed, transformed: false, shown: field)
       problem =
         if listed.nil?
           "declared :#{declared} without an in:"
@@ -228,9 +256,17 @@ module Permittable
         end
 
       raise ArgumentError,
-            "#{label}: '#{field}' is an enum on #{model_expr(klass)}, #{problem} (table: #{klass.table_name}). " \
+            "#{label}: #{enum_subject(field, shown)} is an enum on #{model_expr(klass)}, #{problem} (table: #{klass.table_name}). " \
             "A value outside the enum would pass the contract and then raise on assignment. " \
             "Declare it with in: #{enum_keys_expr(klass, field)}."
+    end
+
+    # The field as an enum error names it: `'phase'`, or `'state' (an alias of
+    # 'status')` when the enum is declared on the alias's target.
+    def enum_subject(enum_name, shown)
+      return "'#{shown}'" if enum_name.to_s == shown.to_s
+
+      "'#{shown}' (an alias of '#{enum_name}')"
     end
 
     def enum_values(klass, field)
