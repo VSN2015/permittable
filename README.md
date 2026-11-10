@@ -1041,6 +1041,8 @@ The error carries a ready-to-paste migration command, typed from your own field 
 
 A field naming a column the model lists in `ignored_columns` raises too, but says so (remove it from `ignored_columns`, or declare it `virtual: true`) rather than suggesting a migration.
 
+An attribute assignment accepts without a column of its own is checked against the column behind it. A field named for an `alias_attribute` (`alias_attribute :title, :name`) is checked as its target `name`, type included. A field named for a `store_accessor` (`store_accessor :settings, :theme`) passes when the store's column (`settings`) exists, since the value lives inside that column; it has no type of its own to compare, and a missing store column is reported by the store's name rather than as a missing `theme` column. Only a name no column, alias or store accessor backs still needs `virtual: true`.
+
 #### Checking types too (opt-in)
 
 A dropped column fails the deploy; a **retyped** one doesn't, unless you ask:

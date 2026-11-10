@@ -48,8 +48,11 @@ module Permittable
       return false unless schema_reachable?(klass)
 
       fields.flatten.compact.each do |field|
-        unless klass.column_names.include?(field.to_s)
-          raise ArgumentError, ignored_column_message(label, klass, field) if ignored_column?(klass, field)
+        column = backing_column(klass, field)
+        unless klass.column_names.include?(column)
+          raise ArgumentError, ignored_column_message(label, klass, column) if ignored_column?(klass, column)
+
+          raise ArgumentError, store_column_message(label, klass, field) if stored_attribute?(klass, field)
 
           raise ArgumentError,
                 "#{label}: '#{field}' does not exist in the database (table: #{klass.table_name})." \
@@ -61,6 +64,60 @@ module Permittable
       true
     end
 
+    # `alias_attribute :title, :name` makes `title` an attribute assignment
+    # accepts, backed by `name`'s column, so the existence check, the
+    # ignored_columns check and the type check all look at the target. Aliases
+    # may chain, and the walk is bounded so a cycle cannot hang a class body.
+    # A duck-typed model without `attribute_aliases` has none.
+    def resolve_alias(klass, field)
+      name = field.to_s
+      aliases = klass.respond_to?(:attribute_aliases) ? klass.attribute_aliases : {}
+      aliases.size.times do
+        target = aliases[name]
+        break unless target
+
+        name = target.to_s
+      end
+      name
+    end
+
+    # The column a field is stored in: its alias target's, or for a store
+    # accessor (`store_accessor :settings, :theme`) the column of its store,
+    # `settings`. The field is then a key inside that column, not a column of
+    # its own, so the column's type says nothing about it (see
+    # ensure_column_type!). The guard accepts it for the reason it accepts an
+    # alias or an enum: assignment takes it and the data lands in a column.
+    # `virtual: true` stays the opt-out for what no column holds. That is also
+    # why the store column itself must exist.
+    def backing_column(klass, field)
+      name = resolve_alias(klass, field)
+      stored_attribute_store(klass, name)&.to_s || name
+    end
+
+    # The store (the column holding the hash) a `store_accessor` key lives
+    # in, nil when `name` is a plain attribute. A real column of the same name
+    # wins: it is the attribute Rails reads. A duck-typed model without
+    # `stored_attributes` has none.
+    def stored_attribute_store(klass, name)
+      return unless klass.respond_to?(:stored_attributes) && !klass.column_names.include?(name)
+
+      klass.stored_attributes.find { |_store, keys| keys.map(&:to_s).include?(name) }&.first
+    end
+
+    def stored_attribute?(klass, field)
+      !stored_attribute_store(klass, resolve_alias(klass, field)).nil?
+    end
+
+    # The store column is gone (dropped, or never migrated), so the accessor
+    # reads and writes nothing. That is the column the migration is for, not
+    # a column named after the accessor, which would shadow it.
+    def store_column_message(label, klass, field)
+      store = backing_column(klass, field)
+      "#{label}: '#{field}' is a store_accessor of :#{store} on #{model_expr(klass)}, " \
+        "but the table has no '#{store}' column (table: #{klass.table_name}). " \
+        "Add the '#{store}' column that holds it, or declare the field virtual: true if the app handles it itself."
+    end
+
     # The type half of the drift guard, opt-in via Permittable
     # .check_column_types. It compares GROUPS rather than exact types (see
     # TYPE_GROUPS) and stays silent unless both sides are known, so it can
@@ -68,17 +125,18 @@ module Permittable
     # :datetime after the column became a string, say.
     def ensure_column_type!(label, klass, field, types, allowed = nil, transformed: nil)
       declared = types.is_a?(Hash) ? types[field.to_sym] : types
-      column = klass.columns_hash[field.to_s]
+      target = resolve_alias(klass, field)
+      column = klass.columns_hash[target]
       return unless declared && column
 
       ensure_not_array_column!(label, klass, field, declared, column)
 
       wanted = TYPE_GROUPS[declared.to_sym]
-      enum = enum_attribute?(klass, field)
+      enum = enum_attribute?(klass, target)
       # Checked before the column's type, which an enum's contract does not
       # depend on: see ensure_enum_contract!.
       if enum && wanted == :text
-        return ensure_enum_contract!(label, klass, field, declared, allowed && allowed[field.to_sym],
+        return ensure_enum_contract!(label, klass, target, declared, allowed && allowed[field.to_sym],
                                      transformed: Array(transformed).include?(field.to_sym))
       end
 
@@ -95,7 +153,7 @@ module Permittable
       # On an enum, `virtual: true` would be the wrong advice: it switches
       # off the existence check too, and the field IS backed by this column.
       fix = if enum
-              "'#{field}' is an enum on #{model_expr(klass)}: declare it :string, in: #{enum_keys_expr(klass, field)}."
+              "'#{field}' is an enum on #{model_expr(klass)}: declare it :string, in: #{enum_keys_expr(klass, target)}."
             else
               "Change the contract to match the column, migrate the column to match the contract, " \
                 "or declare the field virtual: true if it is not backed by this column."

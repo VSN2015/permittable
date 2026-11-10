@@ -4763,6 +4763,64 @@ RSpec.describe Permittable do
           end
         end
 
+        describe "attributes assignment accepts without a column of their own" do
+          let(:aliased) do
+            Class.new(TestModel) do
+              self.table_name = "typed_things"
+              alias_attribute :label, :title
+              alias_attribute :headline, :label
+              alias_attribute :ghost_alias, :ghost
+              alias_attribute :state, :status
+              enum :status, { pending: 0, shipped: 1 }
+            end
+          end
+
+          let(:stored) do
+            Class.new(TestModel) do
+              self.table_name = "typed_things"
+              store_accessor :payload, :theme
+              store_accessor :lost_store, :mode
+            end
+          end
+
+          it "resolves an alias_attribute to its target column, one that chains included" do
+            expect(&declaring(aliased) { optional :label, :string }).not_to raise_error
+            expect(&declaring(aliased) { optional :headline, :string }).not_to raise_error
+          end
+
+          it "holds an alias to the type of its target column" do
+            expect(&declaring(aliased) { optional :label, :integer })
+              .to raise_error(ArgumentError, /'label' is declared :integer but the column is :string/)
+          end
+
+          it "holds an alias of an enum to the enum contract" do
+            expect(&declaring(aliased) { optional :state, :string })
+              .to raise_error(ArgumentError, /'status' is an enum.*in: .*\.statuses\.keys/m)
+            expect(&declaring(aliased) { optional :state, :string, in: %w[pending shipped] }).not_to raise_error
+          end
+
+          it "still reports an alias whose target is no column as missing" do
+            expect(&declaring(aliased) { optional :ghost_alias, :string }).to raise_error(ArgumentError, /does not exist/)
+          end
+
+          it "accepts a store_accessor, which lives in its store's column, without a type to compare" do
+            expect(&declaring(stored) { optional :theme, :string }).not_to raise_error
+            expect(&declaring(stored) { optional :theme, :integer }).not_to raise_error
+          end
+
+          it "names the missing store column, not a column for the accessor, when the store is gone" do
+            expect(&declaring(stored) { optional :mode, :string }).to raise_error(ArgumentError) do |e|
+              expect(e.message).to match(/'mode' is a store_accessor of :lost_store/)
+              expect(e.message).to match(/no 'lost_store' column.*virtual: true/m)
+              expect(e.message).not_to match(/generate migration AddModeTo/)
+            end
+          end
+
+          it "still reports a name that is neither a column, an alias nor a store key" do
+            expect(&declaring(stored) { optional :nope, :string }).to raise_error(ArgumentError, /'nope' does not exist/)
+          end
+        end
+
         it "still skips virtual fields and a missing column still reports as missing" do
           expect(&declaring(typed) { optional :title, :integer, virtual: true }).not_to raise_error
           expect(&declaring(typed) { optional :nope, :integer }).to raise_error(ArgumentError, /does not exist/)
