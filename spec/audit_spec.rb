@@ -327,6 +327,65 @@ RSpec.describe Permittable::Audit do
         expect([missing?(api, "index"), missing?(api, "create")]).to eq([false, true])
       end
 
+      # A bare Metal controller without AbstractController::Callbacks has no
+      # before_action, so a monitor-mode rule never emits. permit_params only
+      # sees Permittable.mode as it is at class load; an initializer may set
+      # it afterwards, so the audit judges by the mode as it is now.
+      context "with a Metal controller that cannot run a before_action" do
+        def metal_hook(**options)
+          stub_const("AuditMetalHookController", Class.new(ActionController::Metal) do
+            include ActionController::Head
+            include ActionController::StrongParameters
+            include Permittable
+
+            def self.controller_path = "audit_metal_hook"
+            permit_params(:create, **options) { required :name, :string }
+            def create = head(:accepted)
+          end)
+        end
+
+        let(:hook_route) { { controller: "audit_metal_hook", action: "create", verb: "post", path: "/hook" } }
+
+        def audited(controller)
+          described_class.entries(controllers: [controller], routes: [hook_route]).first
+        end
+
+        after { Permittable.mode = :enforce }
+
+        it "reports an app-wide monitor mode set after the class loaded as not covered" do
+          controller = metal_hook
+          Permittable.mode = :monitor
+          entry = audited(controller)
+          expect(entry).not_to be_covered
+          expect(entry).to be_inert
+          expect(described_class.summary([entry])).to include(monitored: 0, uncovered: 1, uncovered_with_body: 1)
+          expect(described_class.format([entry])).to match(/POST\s+\/hook\s+create\s+no contract — contract cannot run: .*Callbacks.* — ACCEPTS A BODY/)
+        end
+
+        it "still covers the same rule while the app-wide mode is enforce" do
+          expect(audited(metal_hook)).to be_covered
+        end
+
+        it "still covers a rule that declares mode: :enforce under an app-wide monitor mode" do
+          controller = metal_hook(mode: :enforce)
+          Permittable.mode = :monitor
+          expect(audited(controller)).to have_attributes(covered?: true, mode: :enforce)
+        end
+
+        it "leaves a Metal controller that has the callbacks covered" do
+          stub_const("AuditMetalCallbacksController", Class.new(ActionController::Metal) do
+            include AbstractController::Callbacks
+            include ActionController::Head
+            include Permittable
+
+            def self.controller_path = "audit_metal_hook"
+            permit_params(:create) { required :name, :string }
+          end)
+          Permittable.mode = :monitor
+          expect(audited(AuditMetalCallbacksController)).to have_attributes(covered?: true, mode: :monitor)
+        end
+      end
+
       # A via: :all route is five entries for one action; Rails need only be
       # asked once.
       it "asks Rails's resolver once per action, not once per verb" do

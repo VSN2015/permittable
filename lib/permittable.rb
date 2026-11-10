@@ -2351,10 +2351,13 @@ module Permittable
     # rescue_from until the app includes them, and a rule that needs one of
     # them would otherwise load and then not run: raise at class load, naming
     # the module. Other hosts (a plain class, a duck) are left as they are.
+    # The mode is the effective one, the rule's own or else Permittable.mode as
+    # it is NOW: an app-wide :monitor set after this class loads is not seen
+    # here, which is why Audit marks such an action as not covered.
     def permittable_ensure_runnable!(rule)
       return unless defined?(::ActionController::Metal) && self < ::ActionController::Metal
 
-      monitored = rule[:mode] == :monitor
+      monitored = (rule[:mode] || Permittable.mode) == :monitor
       missing = []
       missing << "AbstractController::Callbacks" if (rule[:enforce] || monitored) && !respond_to?(:before_action)
       missing << "ActionController::Rescue" if rule[:enforce] && !monitored && !respond_to?(:rescue_from)
