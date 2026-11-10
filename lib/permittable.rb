@@ -1901,6 +1901,12 @@ module Permittable
       status, read = AuthoredValues.read_json(field, field[opt])
       raise ArgumentError, "#{LABEL}: :#{opt} for field :#{field[:name]} violates its own contract (#{read})" unless status == :ok
 
+      # A request sending "" for a nullable :json field is the explicit null
+      # the walker reads it as, so a blank authored value is that nil, as a
+      # nullable scalar's is (see validate_authored_value!).
+      return field[opt] = nil if field[:nullable] && Coercion.absent_value?(field[opt])
+
+
       field[opt] = freeze_authored(opt == :example ? ActiveSupport::HashWithIndifferentAccess.new(field[opt]) : read)
     end
 

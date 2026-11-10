@@ -3099,6 +3099,72 @@ RSpec.describe Permittable do
         end
       end
 
+      # json_value exports a BigDecimal as its text, so a NaN or infinite one
+      # printed as the String "NaN": not a JSON number, and not what a request
+      # carrying one would hold.
+      it "refuses an authored default:/example: holding a NaN or infinite BigDecimal, like a Float" do
+        [BigDecimal("NaN"), BigDecimal("Infinity"), BigDecimal("-Infinity")].each do |bad|
+          { { "x" => bad } => "x", { "x" => [1, { "y" => bad }] } => "x[1].y" }.each do |value, at|
+            %i[default example].each do |opt|
+              expect { permittable_class { permit_params(:create) { optional :m, :json, opt => value } } }
+                .to raise_error(ArgumentError, /:#{opt} for field :m violates its own contract \(#{holds_non_finite.call(at)}\)/)
+            end
+          end
+        end
+      end
+
+      it "still accepts a finite BigDecimal in an authored :json default:/example:" do
+        expect { permittable_class { permit_params(:create) { optional :m, :json, default: { "x" => BigDecimal("1.5") } } } }
+          .not_to raise_error
+      end
+
+      # The export prints a Time to nine digits, so a :json value finer than a
+      # nanosecond was published as a different instant: refused like the same
+      # Time on a :datetime field (and, as there, not a String that merely
+      # spells one, which is just text in a :json value).
+      it "refuses a Time finer than a nanosecond in an authored :json default:/example:, at any depth" do
+        holds_time = ->(at) { "holds a Time at #{Regexp.escape(at)} finer than a nanosecond.*round\\(9\\)" }
+        third = Time.utc(2026, 1, 1, 0, 0, Rational(1, 3))
+        [third, Time.at(1.1).utc, DateTime.new(2026, 1, 1, 0, 0, Rational(1, 3)), third.in_time_zone("Tokyo")].each do |bad|
+          { { "at" => bad } => "at", { "a" => [1, { "b" => bad }] } => "a[1].b" }.each do |value, at|
+            %i[default example].each do |opt|
+              expect { permittable_class { permit_params(:create) { optional :m, :json, opt => value } } }
+                .to raise_error(ArgumentError, /:#{opt} for field :m violates its own contract \(#{holds_time.call(at)}/)
+            end
+          end
+        end
+      end
+
+      it "still accepts a Time to the nanosecond, and a long fraction written as a String, in an authored :json value" do
+        exact = Time.at(1, 100_000_000, :nsec).utc
+        expect do
+          permittable_class do
+            permit_params(:create) do
+              optional :m, :json, default: { "at" => exact, "now" => Time.now, "s" => "2026-01-01T00:00:00.1234567891Z" },
+                                  example: { "at" => Time.utc(2026, 1, 1) }
+            end
+          end
+        end.not_to raise_error
+      end
+
+      # A request sending "" for a nullable :json field is an explicit null, so
+      # a blank default: reads as that nil, as a nullable scalar's does.
+      it "reads a blank default:/example: on a nullable :json field as the nil a request gets" do
+        klass = permittable_class { permit_params(:create) { optional :m, :json, nullable: true, default: "", example: "" } }
+        expect(controller(klass).permitted_params).to eq("m" => nil)
+        expect(controller(klass, params: { m: "" }).permitted_params).to eq("m" => nil)
+        props = Permittable::JsonSchema.rule(klass.permit_rule_for("create"))["properties"]["m"]
+        expect(props).to include("default" => nil)
+        expect(props["examples"]).to eq([nil])
+      end
+
+      it "still refuses a blank default:/example: on a :json field that is not nullable, saying it must be a Hash" do
+        %i[default example].each do |opt|
+          expect { permittable_class { permit_params(:create) { optional :m, :json, opt => "" } } }
+            .to raise_error(ArgumentError, /:#{opt} for :m must be a Hash/)
+        end
+      end
+
       it "still reads a request's hash as it always did, finite or not: only the authored value is held to JSON" do
         decl = proc { permit_params(:create) { optional :m, :json } }
         expect(permit({ m: { "x" => 1.5 } }, &decl)[:m]).to eq("x" => 1.5)

@@ -143,27 +143,39 @@ module Permittable
     end
 
     # An authored hash is exported as a schema `default`/`example`, and JSON
-    # has no NaN or Infinity: JSON.generate raises on them when the document
-    # is written, long after the class loaded. A request cannot carry one
-    # (JSON has none; a form sends Strings), so only the authored value is
-    # held to it, here, and not permittable_check_json for every request.
+    # has no NaN or Infinity: JSON.generate raises on a Float's when the
+    # document is written, long after the class loaded, and a BigDecimal's was
+    # exported as the String "NaN". Nor does the export keep a Time finer than
+    # a nanosecond: it prints nine digits, a different instant (a :datetime
+    # field's own default is refused for the same reason). A request cannot
+    # carry any of these (JSON has none; a form sends Strings), so only the
+    # authored value is held to it, here, and not permittable_check_json for
+    # every request.
     def permittable_check_json(field, value)
       status, read = super
       return [status, read] unless status == :ok
 
-      at = non_finite_path(value, "")
-      return [:error, "holds NaN or Infinity at #{at}, which JSON cannot carry"] if at
+      problem = unexportable_json(value, "")
+      return [:error, problem] if problem
 
       [status, read]
     end
 
-    # Where the first NaN or infinite Float sits, as `a.b[1].c`, or nil.
-    def non_finite_path(value, path)
+    # Why the first value that would not survive the export is refused, and
+    # where it sits (`a.b[1].c`), or nil.
+    def unexportable_json(value, path)
       case value
-      when Float then path unless value.finite?
-      when Hash then value.each_pair.lazy.filter_map { |k, v| non_finite_path(v, path.empty? ? k.to_s : "#{path}.#{k}") }.first
-      when Array then value.each_with_index.lazy.filter_map { |v, i| non_finite_path(v, "#{path}[#{i}]") }.first
+      when Float, BigDecimal then "holds NaN or Infinity at #{path}, which JSON cannot carry" unless value.finite?
+      when Time, DateTime then unexportable_time(value, path)
+      when Hash then value.each_pair.lazy.filter_map { |k, v| unexportable_json(v, path.empty? ? k.to_s : "#{path}.#{k}") }.first
+      when Array then value.each_with_index.lazy.filter_map { |v, i| unexportable_json(v, "#{path}[#{i}]") }.first
       end
+    end
+
+    def unexportable_time(time, path)
+      return if Coercion.whole_nanoseconds?(time)
+
+      "holds a Time at #{path} finer than a nanosecond, so the export publishes a different instant; round it, e.g. with .round(9)"
     end
 
     def permittable_violation(_field, param, code)
