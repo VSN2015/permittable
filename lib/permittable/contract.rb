@@ -140,7 +140,10 @@ module Permittable
     end
 
     # The request-body schema for this contract — JSON Schema draft 2020-12,
-    # identical to what the OpenAPI exporter emits for a controller rule.
+    # what the OpenAPI exporter emits for a controller rule, less what only an
+    # HTTP request carries (the form keys a rootless `unknown: :error` body
+    # lists, the route's path parameters, a multipart body's flat part names):
+    # a contract exempts none of those.
     def json_schema
       JsonSchema.rule(rule)
     end
