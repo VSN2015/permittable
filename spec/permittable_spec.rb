@@ -4936,6 +4936,29 @@ RSpec.describe Permittable do
               expect(&declaring(parent) { optional :scratch, :string }).to raise_error(ArgumentError, /'scratch' does not exist/)
             end
 
+            it "still accepts a store accessor the model overrides, in the model, a subclass or a prepended module" do
+              own = Class.new(parent) do
+                def theme=(value)
+                  super(value.to_s)
+                end
+              end
+              child = Class.new(own) do
+                def theme=(value)
+                  super(value.to_s.strip)
+                end
+              end
+              wrapper = Module.new do
+                def theme=(value)
+                  super(value.to_s)
+                end
+              end
+              prepended = Class.new(parent) { prepend wrapper }
+              [own, child, prepended].each do |model|
+                expect(model.new(theme: 1).payload).to eq("theme" => "1")
+                expect(&declaring(model) { optional :theme, :string }).not_to raise_error
+              end
+            end
+
             it "picks the store whose key is the longest match when stores share a key" do
               both = Class.new(TestModel) do
                 self.table_name = "typed_things"

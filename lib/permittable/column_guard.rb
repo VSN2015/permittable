@@ -123,10 +123,14 @@ module Permittable
     end
 
     def store_accessor_writer?(klass, writer)
-      return false unless klass.method_defined?(writer)
-
-      modules = klass.ancestors.filter_map { |ancestor| ancestor.instance_variable_get(:@_store_accessors_module) }
-      modules.include?(klass.instance_method(writer).owner)
+      # Any store module defining it will do: the first writer found may be the
+      # model's own override (`def theme=(v); super; end`, a subclass's, a
+      # prepended or later-included module), which calls through to it.
+      klass.method_defined?(writer) &&
+        klass.ancestors.any? do |ancestor|
+          store_module = ancestor.instance_variable_get(:@_store_accessors_module)
+          store_module&.method_defined?(writer)
+        end
     end
 
     def missing_column_message(label, klass, field, column, types)
