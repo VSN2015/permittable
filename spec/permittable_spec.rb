@@ -4900,6 +4900,54 @@ RSpec.describe Permittable do
             end
           end
 
+          describe "a store_accessor reached through inheritance" do
+            let(:parent) do
+              Class.new(TestModel) do
+                self.table_name = "typed_things"
+                store_accessor :payload, :theme
+                attr_accessor :scratch
+              end
+            end
+
+            it "accepts an accessor a parent model declared, on a subclass that declares none" do
+              child = Class.new(parent)
+              expect(&declaring(child) { optional :theme, :string }).not_to raise_error
+            end
+
+            it "accepts the inherited accessor and the subclass's own side by side" do
+              child = Class.new(parent) { store_accessor :payload, :mode }
+              expect(&declaring(child) do
+                optional :theme, :string
+                optional :mode, :string
+              end).not_to raise_error
+            end
+
+            it "accepts an inherited prefixed accessor under its assigned name only" do
+              base = Class.new(TestModel) do
+                self.table_name = "typed_things"
+                store_accessor :payload, :tone, prefix: true
+              end
+              child = Class.new(base)
+              expect(&declaring(child) { optional :payload_tone, :string }).not_to raise_error
+              expect(&declaring(child) { optional :tone, :string }).to raise_error(ArgumentError, /'tone' does not exist/)
+            end
+
+            it "does not take an ordinary writer for a store accessor" do
+              expect(&declaring(parent) { optional :scratch, :string }).to raise_error(ArgumentError, /'scratch' does not exist/)
+            end
+
+            it "picks the store whose key is the longest match when stores share a key" do
+              both = Class.new(TestModel) do
+                self.table_name = "typed_things"
+                store_accessor :payload, :name, prefix: :pay
+                store_accessor :lost_store, :first_name, prefix: :lost
+              end
+              expect(&declaring(both) { optional :pay_name, :string }).not_to raise_error
+              expect(&declaring(both) { optional :lost_first_name, :string })
+                .to raise_error(ArgumentError, /'lost_first_name' is a store_accessor of :lost_store/)
+            end
+          end
+
           it "finds the store column behind an alias, and names the column the migration is for" do
             on_alias = Class.new(TestModel) do
               self.table_name = "typed_things"

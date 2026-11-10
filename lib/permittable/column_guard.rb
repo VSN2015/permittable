@@ -104,16 +104,29 @@ module Permittable
     #
     # `stored_attributes` lists the raw keys (`{settings: [:theme]}`), but the
     # accessor is named by `prefix:`/`suffix:` too (`settings_theme`), so the
-    # name is accepted only when the model really defines its writer, which
-    # is what assignment calls. The store is then the one whose key the name
-    # is built from, an exact match first.
+    # name is accepted only when a store module of the model, or of an
+    # ancestor, really defines its writer, which is what assignment calls.
+    # Rails keeps a module per class (`_store_accessors_module`), so a
+    # subclass's own is empty and the ancestors' are read directly rather than
+    # created. A writer from anywhere else is an ordinary attribute, not a
+    # store key. The store is then the one whose key the name is built from,
+    # the longest key first and one whose name the accessor mentions next.
+    # Rails does not record which prefix built which accessor, so two stores
+    # sharing a key are ambiguous, and the guess may check the other's column.
     def stored_attribute_store(klass, name)
-      return unless klass.respond_to?(:stored_attributes) && klass.respond_to?(:_store_accessors_module)
-      return if klass.column_names.include?(name) || !klass._store_accessors_module.method_defined?("#{name}=")
+      return unless klass.respond_to?(:stored_attributes)
+      return if klass.column_names.include?(name) || !store_accessor_writer?(klass, "#{name}=")
 
       pairs = Hash(klass.stored_attributes).flat_map { |store, keys| keys.map { |key| [store, key.to_s] } }
       pairs.select { |_store, key| name.include?(key) }
-           .min_by { |store, key| [name == key ? 0 : 1, name.include?(store.to_s) ? 0 : 1] }&.first
+           .min_by { |store, key| [-key.length, name.include?(store.to_s) ? 0 : 1] }&.first
+    end
+
+    def store_accessor_writer?(klass, writer)
+      return false unless klass.method_defined?(writer)
+
+      modules = klass.ancestors.filter_map { |ancestor| ancestor.instance_variable_get(:@_store_accessors_module) }
+      modules.include?(klass.instance_method(writer).owner)
     end
 
     def missing_column_message(label, klass, field, column, types)
