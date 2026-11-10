@@ -4765,13 +4765,19 @@ RSpec.describe Permittable do
 
         describe "attributes assignment accepts without a column of their own" do
           let(:aliased) do
+            mapping = { pending: 0, shipped: 1 }
             Class.new(TestModel) do
               self.table_name = "typed_things"
               alias_attribute :label, :title
               alias_attribute :headline, :label
               alias_attribute :ghost_alias, :ghost
               alias_attribute :state, :status
-              enum :status, { pending: 0, shipped: 1 }
+              # `enum` is spelled positionally from Rails 7.0 and by keyword before it.
+              if ActiveRecord.version >= Gem::Version.new("7.0")
+                enum :status, mapping
+              else
+                enum status: mapping
+              end
             end
           end
 
