@@ -125,20 +125,23 @@ module Permittable
       end
     end
 
-    # Whether `rule` is declared on `controller` but can never run there: a
-    # bare ActionController::Metal controller without AbstractController::
-    # Callbacks has no before_action, so a rule that validates from one — an
-    # `enforce: true` rule, or one in monitor mode, by its own mode: or the
-    # app-wide Permittable.mode — emits and rejects nothing. permit_params
-    # raises for this at class load, but only knows the app-wide mode as it is
-    # then; an initializer that sets it later is seen here, where the mode is
-    # the effective one. Such an action is audited as uncovered rather than
-    # as the monitored one it claims to be.
+    # Whether `rule` is declared on `controller` but can never run there: the
+    # gem never registered its before_action on it — a bare ActionController::
+    # Metal controller without AbstractController::Callbacks at its
+    # `permit_params`, which asks the flag the gem sets when it registers the
+    # callback (a callbacks module included afterwards does not undo that) —
+    # while the rule validates from that callback: an `enforce: true` rule, or
+    # one in monitor mode by its own mode: or the app-wide Permittable.mode.
+    # permit_params raises for this at class load, but reads only the rule's own
+    # mode, since the app-wide one is often set after the class loads; the
+    # effective mode is judged here. Such an action is audited as uncovered
+    # rather than as the monitored one it claims to be.
     def inert?(controller, rule)
       return false unless rule && defined?(::ActionController::Metal) && controller.is_a?(Class) &&
                           controller < ::ActionController::Metal
 
-      (rule[:enforce] || (rule[:mode] || Permittable.mode) == :monitor) && !controller.respond_to?(:before_action)
+      (rule[:enforce] || (rule[:mode] || Permittable.mode) == :monitor) &&
+        !(controller.respond_to?(:permittable_callback_registered) && controller.permittable_callback_registered)
     end
 
     # Why `controller` — or one of its actions — is left out of the audit and
@@ -180,9 +183,8 @@ module Permittable
     # controller is autoloaded: Rails::HealthController behind `/up` is a
     # registered constant until something touches it, so it had no row. Pass
     # the route descriptors and every controller a route names is loaded and
-    # added — it is the route's own controller. One that does not resolve to a
-    # controller class is left out rather than raised on; the audit's table
-    # has no row for a class that does not exist.
+    # added — it is the route's own controller. A constant that does not exist,
+    # or is not a controller class, is left out rather than raised on.
     def rails_controllers(routes = [])
       return [] unless defined?(::ActionController::Metal)
 
@@ -192,15 +194,14 @@ module Permittable
     end
 
     # The controller classes the routes' `controller:` keys name, constantized
-    # (loading an autoloaded one). A key that names no constant, or one that is
-    # not an ActionController::Metal class, yields nothing.
+    # (loading an autoloaded one). `safe_constantize` answers nil for a missing
+    # constant and raises on anything else — an error inside the controller's
+    # own file is the app's to see, so nothing more is rescued here. A key that
+    # names no constant, or one that is not an ActionController::Metal class,
+    # yields nothing.
     def routed_controllers(routes)
       routes.map { |route| route[:controller].to_s }.reject(&:empty?).uniq.filter_map do |key|
-        found = begin
-          ActiveSupport::Inflector.safe_constantize("#{ActiveSupport::Inflector.camelize(key)}Controller")
-        rescue NameError, LoadError
-          nil
-        end
+        found = ActiveSupport::Inflector.safe_constantize("#{ActiveSupport::Inflector.camelize(key)}Controller")
         found if found.is_a?(Class) && found < ::ActionController::Metal
       end
     end

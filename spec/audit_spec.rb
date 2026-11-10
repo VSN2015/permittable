@@ -363,6 +363,29 @@ RSpec.describe Permittable::Audit do
             .to match(%r{POST\s+/hook\s+create\s+no contract — contract cannot run: .*Callbacks.* — ACCEPTS A BODY})
         end
 
+        it "loads, and audits as not covered, a rule with no mode when the app-wide monitor mode was set before it loaded" do
+          Permittable.mode = :monitor
+          controller = metal_hook
+          expect(audited(controller)).to have_attributes(covered?: false, inert?: true)
+        end
+
+        # The gem registers its before_action at `permit_params`, so callbacks
+        # included after it leave the rule without one.
+        it "reports as not covered a rule declared before AbstractController::Callbacks was included" do
+          controller = stub_const("AuditMetalLateController", Class.new(ActionController::Metal) do
+            include ActionController::Head
+            include ActionController::StrongParameters
+            include Permittable
+
+            def self.controller_path = "audit_metal_hook"
+            permit_params(:create) { required :name, :string }
+            include AbstractController::Callbacks
+          end)
+          expect(controller).to respond_to(:before_action)
+          Permittable.mode = :monitor
+          expect(audited(controller)).to have_attributes(covered?: false, inert?: true)
+        end
+
         it "still covers the same rule while the app-wide mode is enforce" do
           expect(audited(metal_hook)).to be_covered
         end

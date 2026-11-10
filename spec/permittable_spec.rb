@@ -5205,10 +5205,26 @@ RSpec.describe Permittable do
             Permittable.mode = :enforce
           end
 
-          it "raises at class load for a rule with no mode of its own, without AbstractController::Callbacks" do
+          # Permittable.mode is usually set by an initializer, so the class-load
+          # check reads only the rule's own mode: an app must still boot. The
+          # audit reports the action as not covered (see Audit.inert?).
+          it "still loads a rule with no mode of its own, without AbstractController::Callbacks" do
             expect do
               build_metal(%i[permittable rescue]) { permit_params(:create) { required :name, :string } }
-            end.to raise_error(ArgumentError, /cannot run this monitor-mode rule: include AbstractController::Callbacks/)
+            end.not_to raise_error
+          end
+
+          # The effective mode may only add a requirement, never remove one.
+          it "still raises for an enforce: true rule with no mode: when Rescue is missing" do
+            expect do
+              build_metal(%i[callbacks permittable]) { permit_params(:create, enforce: true) { required :name, :string } }
+            end.to raise_error(ArgumentError, /include ActionController::Rescue/)
+          end
+
+          it "still raises for a rule's own mode: :monitor without AbstractController::Callbacks" do
+            expect do
+              build_metal(%i[permittable rescue]) { permit_params(:create, mode: :monitor) { required :name, :string } }
+            end.to raise_error(ArgumentError, /include AbstractController::Callbacks/)
           end
 
           it "does not raise for a rule that declares mode: :enforce, which runs from the action" do
