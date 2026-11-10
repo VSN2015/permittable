@@ -3158,6 +3158,19 @@ RSpec.describe Permittable do
         expect(props["examples"]).to eq([nil])
       end
 
+      it "reads a blank default: on a nullable :json sub-field of an array of hashes as nil, as a request does" do
+        klass = permittable_class do
+          permit_params(:create) do
+            array :rows, default: [{ "id" => 1 }] do
+              required :id, :integer
+              optional :meta, :json, nullable: true, default: ""
+            end
+          end
+        end
+        expect(controller(klass).permitted_params[:rows]).to eq([{ "id" => 1, "meta" => nil }])
+        expect(controller(klass, params: { rows: [{ id: 1, meta: "" }] }).permitted_params[:rows]).to eq([{ "id" => 1, "meta" => nil }])
+      end
+
       it "still refuses a blank default:/example: on a :json field that is not nullable, saying it must be a Hash" do
         %i[default example].each do |opt|
           expect { permittable_class { permit_params(:create) { optional :m, :json, opt => "" } } }

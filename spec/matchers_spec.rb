@@ -112,6 +112,18 @@ RSpec.describe "Permittable RSpec matchers" do
     expect(blank).to permit_param(:bio).with_default("  ")
   end
 
+  it "reads a blank with_default on a nullable :json field as the nil the contract stores" do
+    blank = Class.new(FakeController) do
+      include Permittable
+
+      permit_params(:create) { optional :prefs, :json, nullable: true, default: "" }
+    end
+
+    expect(blank).to permit_param(:prefs).with_default("")
+    expect(blank).to permit_param(:prefs).with_default(nil)
+    expect(failure_of { expect(blank).to permit_param(:prefs).with_default(theme: "dark") }).to include("expected default:")
+  end
+
   it "reads a :json with_default as the contract reads its default:, with String or Symbol keys" do
     opaque = Class.new(FakeController) do
       include Permittable

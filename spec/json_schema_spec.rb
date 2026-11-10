@@ -171,6 +171,15 @@ RSpec.describe Permittable::JsonSchema do
       end
     end
 
+    # Date#iso8601 spells a year past 9999 its own way ("10000-01-01", or with
+    # a sign on other Rubies); whichever it is, the server reads it back.
+    it "publishes a :date member past year 9999 in a spelling the server reads back as the same Date" do
+      contract = Permittable::Contract.define { optional :day, :date, in: ["Jan 1, 10000"] }
+      member = described_class.rule(contract.permittable_contracts.first)["properties"]["day"]["enum"].first
+      expect(Permittable::Coercion.cast(:date, member)).to eq([:ok, Date.new(10_000, 1, 1)])
+      expect(contract.call(day: member).violations).to be_empty
+    end
+
     # A :date String member the server reads in any form (Date.parse's, or an
     # instant at midnight UTC) is a Date once cast, and the Date is what a
     # request is compared against. Published as written it was an enum value
