@@ -1,3 +1,5 @@
+require "open3"
+require "rbconfig"
 require "permittable/rspec"
 
 RSpec.describe "Permittable RSpec matchers" do
@@ -944,6 +946,17 @@ RSpec.describe "Permittable RSpec matchers" do
         expect(tagged).to reject_params(tags: ["a", nil]).for_action(:create).with_violation("tags[1]", :invalid_type)
       end
 
+      it "still reads a Symbol value as a String when there is no normalizer to run" do
+        hide_const("ActionDispatch::Request")
+        hide_const("ActionDispatch::Http::Utils")
+        stringy = Class.new(FakeController) do
+          include Permittable
+
+          permit_params(:create) { optional :status, :string, in: %w[active] }
+        end
+        expect(stringy).to accept_params(status: :active).for_action(:create).returning("status" => "active")
+      end
+
       # A real request carries every scalar as a String; a spec writes
       # `status: :active`. The contract reads what the request would deliver.
       it "reads a Symbol value as the String a request carries" do
@@ -1061,6 +1074,88 @@ RSpec.describe "Permittable RSpec matchers" do
         message = failure_of { expect(account).to reject_params(payload).for_action(:create) }
         expect(message).not_to include("a@b.co")
         expect(message).to include("Hue")
+      end
+
+      # The registry matches by substring, like Rails: `pin` redacts `shipping`.
+      # Two values that differ only under redacted names print identically, so
+      # the message names where they differ, never what they are.
+      it "names the paths that differ when redaction makes the expected and actual look identical" do
+        shipped = Class.new(FakeController) do
+          include Permittable
+
+          permit_params(:create) do
+            optional :pin, :string, sensitive: true
+            optional :shipping, :string
+            optional :city, :string
+          end
+        end
+        message = failure_of do
+          expect(shipped).to accept_params(pin: "1", shipping: "x", city: "Hue").for_action(:create)
+                                                                                .returning(pin: "2", shipping: "y", city: "Hue")
+        end
+        expect(message).to include("differs at: pin, shipping")
+        expect(message).not_to match(/"[12xy]"/)
+      end
+
+      it "does not add a differs-at note when the printed values already differ" do
+        message = failure_of do
+          expect(account).to accept_params(payload).for_action(:create).returning(email: "other@b.co", ssn: "x")
+        end
+        expect(message).not_to include("differs at")
+      end
+
+      it "redacts the `returning` hash named by the negated-qualifier refusal" do
+        expect { expect(account).not_to accept_params(payload).for_action(:create).returning(email: "x", ssn: "000-11-2222") }
+          .to raise_error(ArgumentError) { |e|
+            expect(e.message).to include("[FILTERED]")
+            expect(e.message).not_to include("000-11-2222")
+          }
+      end
+
+      # Permittable.filter_parameter_registry= only asks for #to_proc.
+      it "survives a swapped-in registry that has no #include?" do
+        account # declares its sensitive: fields while the real registry is installed
+        original = Permittable.filter_parameter_registry
+        bare = Class.new do
+          def to_proc = ->(_key, _value) {}
+        end.new
+        Permittable.filter_parameter_registry = bare
+        message = failure_of { expect(account).to reject_params(payload).for_action(:create) }
+        expect(message).to include("a@b.co")
+        expect(accept_params(payload).for_action(:create).returning(email: "x").description).to include("returning")
+      ensure
+        Permittable.filter_parameter_registry = original
+      end
+
+      # ActiveSupport before 7 does not load ActiveSupport::ParameterFilter
+      # until something asks (Rails 6.1 with no ActionDispatch::Request loaded),
+      # so there is no constant to find. Newer versions load it with
+      # active_support, where this passes either way.
+      it "loads ActiveSupport::ParameterFilter itself when the app's filter_parameters need it" do
+        script = <<~RUBY
+          require "logger"
+          require "active_support"
+          require "active_support/core_ext/hash"
+          require "active_support/core_ext/string"
+          require "active_support/core_ext/module"
+          require "permittable"
+          require "permittable/rspec"
+          module Rails
+            def self.application = Struct.new(:config).new(Struct.new(:filter_parameters).new([:email]))
+          end
+          klass = Class.new do
+            include Permittable
+            def self.permit_rule_for(*) = permittable_contracts.first
+            permit_params(:create) { optional :email, :string }
+          end
+          matcher = Object.new.extend(Permittable::Matchers).reject_params(email: "a@b.co").for_action(:create)
+          matcher.matches?(klass)
+          print matcher.failure_message
+        RUBY
+        out, err, status = Open3.capture3(RbConfig.ruby, "-I", File.expand_path("../lib", __dir__), "-e", script)
+        expect(status).to be_success, err
+        expect(out).to include("[FILTERED]")
+        expect(out).not_to include("a@b.co")
       end
 
       it "leaves the matching itself untouched: the real values are still compared" do

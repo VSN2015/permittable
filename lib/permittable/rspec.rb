@@ -649,7 +649,8 @@ module Permittable
         if @expect_accepted
           return "expected #{subject_name} to #{description}, but it rejected them: #{summary(@violations)}" unless @violations.empty?
 
-          "expected #{subject_name} to #{description}, but it accepted them but returned #{printable(@result.to_h)}"
+          "expected #{subject_name} to #{description}, but it accepted them but returned " \
+            "#{printable(@result.to_h)}#{differs_note}"
         else
           if @violations.empty?
             return "expected #{subject_name} to #{description}, but it accepted them, returning #{printable(@result.to_h)}"
@@ -791,14 +792,13 @@ module Permittable
       # the normalizer's HashWithIndifferentAccess does anyway but only after
       # it has read a Symbol :tempfile key as an upload, a key a request
       # (String keys only) never has, and Symbol values (see copy_payload).
-      # A Parameters payload is unwrapped first
-      # so it is normalized like the Hash it wraps.
+      # A Parameters payload is unwrapped first so it is normalized like the
+      # Hash it wraps. Without actionpack's request code only the normalizer
+      # is skipped; the copy (and its Symbol stringifying) still happens.
       def request_params
+        payload = copy_payload(@params.respond_to?(:to_unsafe_h) ? @params.to_unsafe_h : @params)
         utils = request_utils
-        return @params unless utils
-
-        payload = @params.respond_to?(:to_unsafe_h) ? @params.to_unsafe_h : @params
-        utils.normalize_encode_params(copy_payload(payload))
+        utils ? utils.normalize_encode_params(payload) : payload
       end
 
       # Rails main moved the class from ActionDispatch::Request::Utils to
@@ -892,19 +892,55 @@ module Permittable
         (filter ? filter.filter(filtered) : filtered).inspect
       end
 
+      # A registry only has to answer #to_proc (Permittable.filter_parameter_registry=),
+      # so the name pass runs only when it can also say whether a name is in it.
       def redact_sensitive(value)
         return value.map { |item| redact_sensitive(item) } if value.is_a?(Array)
         return value unless value.is_a?(Hash)
 
         registry = Permittable.filter_parameter_registry
+        return value unless registry.respond_to?(:include?)
+
         value.to_h { |key, item| [key, registry.include?(key) ? Permittable::FilterParameterRegistry::FILTERED : redact_sensitive(item)] }
       end
 
+      # ActiveSupport::ParameterFilter is not loaded by `require "active_support"`
+      # before 7.0, and a Rails 6.1 app without ActionDispatch::Request has
+      # not loaded it either; it has been requirable since 6.0.
       def app_parameter_filter
         return unless defined?(Rails) && Rails.respond_to?(:application) && Rails.application
-        return unless defined?(ActiveSupport::ParameterFilter)
 
+        begin
+          require "active_support/parameter_filter"
+        rescue LoadError
+          return
+        end
         ActiveSupport::ParameterFilter.new(Rails.application.config.filter_parameters)
+      end
+
+      # The registry matches by substring, like Rails (`pin` also redacts
+      # `shipping`), so an expected and an actual hash that differ only under
+      # redacted names print the same. Say where they differ, by name only.
+      def differs_note
+        return "" unless @returning
+
+        expected = ActiveSupport::HashWithIndifferentAccess.new(@returning).to_h
+        actual = @result.to_h
+        return "" if expected == actual || printable(expected) != printable(actual)
+
+        "; differs at: #{differing_paths(expected, actual).join(', ')}"
+      end
+
+      def differing_paths(expected, actual, prefix = nil)
+        if expected.is_a?(Hash) && actual.is_a?(Hash)
+          (expected.keys | actual.keys).flat_map do |key|
+            differing_paths(expected[key], actual[key], [prefix, key].compact.join("."))
+          end
+        elsif expected.is_a?(Array) && actual.is_a?(Array) && expected.length == actual.length
+          expected.each_index.flat_map { |index| differing_paths(expected[index], actual[index], "#{prefix}[#{index}]") }
+        else
+          expected == actual ? [] : [prefix]
+        end
       end
 
       def summary(violations)
