@@ -104,11 +104,9 @@ module Permittable
     #
     # `stored_attributes` lists the raw keys (`{settings: [:theme]}`), but the
     # accessor is named by `prefix:`/`suffix:` too (`settings_theme`), so the
-    # name is accepted only when a store module of the model, or of an
-    # ancestor, really defines its writer, which is what assignment calls.
-    # Rails keeps a module per class (`_store_accessors_module`), so a
-    # subclass's own is empty and the ancestors' are read directly rather than
-    # created. A writer from anywhere else is an ordinary attribute, not a
+    # name is accepted only when the model really has a store accessor's writer
+    # under it, which is what assignment calls (see store_accessor_writer?). A
+    # writer from anywhere else is an ordinary attribute, not a
     # store key. The store is then the one whose key the name is built from,
     # the longest key first and one whose name the accessor mentions next.
     # Rails does not record which prefix built which accessor, so two stores
@@ -122,15 +120,27 @@ module Permittable
            .min_by { |store, key| [-key.length, name.include?(store.to_s) ? 0 : 1] }&.first
     end
 
+    # Whether `writer` is a store accessor's, whatever the model has layered on
+    # it. The accessor is defined by active_record/store.rb itself, so the
+    # method chain is walked through `super` (an override in the model, a
+    # subclass, a prepended or later-included module calls through to it) until
+    # a method defined in that file turns up. That holds across Rails versions:
+    # the module holding the accessors is `_store_accessors_module` on 6.1
+    # through 8.1 and a `GeneratedStoreMethods` constant on main, which a
+    # lookup of either would miss. An ordinary writer (`attr_accessor`, an
+    # attribute-API or column writer) is defined elsewhere.
+    STORE_SOURCE = %r{/active_record/store\.rb\z}
+
     def store_accessor_writer?(klass, writer)
-      # Any store module defining it will do: the first writer found may be the
-      # model's own override (`def theme=(v); super; end`, a subclass's, a
-      # prepended or later-included module), which calls through to it.
-      klass.method_defined?(writer) &&
-        klass.ancestors.any? do |ancestor|
-          store_module = ancestor.instance_variable_get(:@_store_accessors_module)
-          store_module&.method_defined?(writer)
-        end
+      return false unless klass.method_defined?(writer)
+
+      method = klass.instance_method(writer)
+      while method
+        return true if method.source_location&.first.to_s.match?(STORE_SOURCE)
+
+        method = method.super_method
+      end
+      false
     end
 
     def missing_column_message(label, klass, field, column, types)
