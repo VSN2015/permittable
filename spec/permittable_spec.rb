@@ -4965,6 +4965,233 @@ RSpec.describe Permittable do
           end
         end
 
+        describe "attributes assignment accepts without a column of their own" do
+          # `enum` is spelled positionally from Rails 7.0 and by keyword before it.
+          def self.spell_enum(klass, name, mapping)
+            if ActiveRecord.version >= Gem::Version.new("7.0")
+              klass.enum name, mapping
+            else
+              klass.enum name => mapping
+            end
+          end
+
+          let(:aliased) do
+            group = self.class
+            mapping = { pending: 0, shipped: 1 }
+            Class.new(TestModel) do
+              self.table_name = "typed_things"
+              alias_attribute :label, :title
+              alias_attribute :headline, :label
+              alias_attribute :ghost_alias, :ghost
+              alias_attribute :state, :status
+              group.spell_enum(self, :status, mapping)
+            end
+          end
+
+          let(:stored) do
+            Class.new(TestModel) do
+              self.table_name = "typed_things"
+              store_accessor :payload, :theme
+              store_accessor :lost_store, :mode
+            end
+          end
+
+          it "resolves an alias_attribute to its target column, one that chains included" do
+            expect(&declaring(aliased) { optional :label, :string }).not_to raise_error
+            expect(&declaring(aliased) { optional :headline, :string }).not_to raise_error
+          end
+
+          it "holds an alias to the type of its target column" do
+            expect(&declaring(aliased) { optional :label, :integer })
+              .to raise_error(ArgumentError, /'label' is declared :integer but the column is :string/)
+          end
+
+          it "holds an alias of an enum to the enum contract" do
+            expect(&declaring(aliased) { optional :state, :string })
+              .to raise_error(ArgumentError, /'state' \(an alias of 'status'\) is an enum.*in: .*\.statuses\.keys/m)
+            expect(&declaring(aliased) { optional :state, :string, in: %w[pending shipped] }).not_to raise_error
+          end
+
+          it "still reports an alias whose target is no column as missing" do
+            expect(&declaring(aliased) { optional :ghost_alias, :string }).to raise_error(ArgumentError, /does not exist/)
+          end
+
+          it "accepts a store_accessor, which lives in its store's column, without a type to compare" do
+            expect(&declaring(stored) { optional :theme, :string }).not_to raise_error
+            expect(&declaring(stored) { optional :theme, :integer }).not_to raise_error
+          end
+
+          it "names the missing store column, not a column for the accessor, when the store is gone" do
+            expect(&declaring(stored) { optional :mode, :string }).to raise_error(ArgumentError) do |e|
+              expect(e.message).to match(/'mode' is a store_accessor of :lost_store/)
+              expect(e.message).to match(/no 'lost_store' column.*virtual: true/m)
+              expect(e.message).not_to match(/generate migration AddModeTo/)
+            end
+          end
+
+          it "names the target, and builds the migration for it, when an alias points at no column" do
+            expect(&declaring(aliased) { optional :ghost_alias, :string }).to raise_error(ArgumentError) do |e|
+              expect(e.message).to match(/'ghost_alias' is an alias of 'ghost', which does not exist in the database/)
+              expect(e.message).to include("generate migration AddGhostToTypedThings ghost:string")
+              expect(e.message).not_to match(/AddGhostAlias/)
+            end
+          end
+
+          it "does not hang or raise on a cycle of aliases, and names where the walk ended" do
+            cyclic = Class.new(TestModel) do
+              self.table_name = "typed_things"
+              self.attribute_aliases = { "a" => "b", "b" => "a" }
+            end
+            expect(&declaring(cyclic) { optional :a, :string }).to raise_error(ArgumentError, /'a' is an alias of 'b'/)
+          end
+
+          it "treats a duck-typed model whose attribute_aliases is nil as having none" do
+            duck = Class.new do
+              define_singleton_method(:table_name) { "ducks" }
+              define_singleton_method(:table_exists?) { true }
+              define_singleton_method(:column_names) { %w[count] }
+              define_singleton_method(:columns_hash) { { "count" => Struct.new(:type).new(:integer) } }
+              define_singleton_method(:attribute_aliases) { nil }
+              define_singleton_method(:stored_attributes) { nil }
+            end
+            expect(&declaring(duck) { optional :count, :integer }).not_to raise_error
+            expect(&declaring(duck) { optional :nope, :integer }).to raise_error(ArgumentError, /'nope' does not exist/)
+          end
+
+          it "finds an enum declared on the alias name itself, and names the field it was declared for" do
+            on_alias = Class.new(TestModel) do
+              self.table_name = "typed_things"
+              alias_attribute :phase, :status
+            end
+            group = self.class
+            group.spell_enum(on_alias, :phase, { pending: 0, shipped: 1 })
+            stub_const("PhaseThing", on_alias)
+            expect(&declaring(on_alias) { optional :phase, :string })
+              .to raise_error(ArgumentError, /'phase' is an enum on PhaseThing.*in: PhaseThing\.phases\.keys/m)
+            expect(&declaring(on_alias) { optional :phase, :string, in: %w[pending shipped] }).not_to raise_error
+          end
+
+          it "says an enum on the target is reached through an alias" do
+            stub_const("AliasedThing", aliased)
+            expect(&declaring(aliased) { optional :state, :string }).to raise_error(ArgumentError) do |e|
+              expect(e.message).to match(/'state' \(an alias of 'status'\) is an enum on AliasedThing/)
+              expect(e.message).to include("in: AliasedThing.statuses.keys")
+            end
+          end
+
+          describe "a store_accessor with prefix: or suffix:" do
+            let(:prefixed) do
+              Class.new(TestModel) do
+                self.table_name = "typed_things"
+                store_accessor :payload, :theme, prefix: true
+                store_accessor :payload, :mode, suffix: :cfg
+                store_accessor :payload, :tone, prefix: :ui
+              end
+            end
+
+            it "accepts the name assignment takes, and refuses the bare key it does not" do
+              expect(prefixed.new(payload_theme: "x").payload).to eq("theme" => "x")
+              expect { prefixed.new(theme: "x") }.to raise_error(ActiveModel::UnknownAttributeError)
+              %i[payload_theme mode_cfg ui_tone].each do |name|
+                expect(&declaring(prefixed) { optional name, :string }).not_to raise_error
+              end
+              %i[theme mode tone].each do |name|
+                expect(&declaring(prefixed) { optional name, :string })
+                  .to raise_error(ArgumentError, /'#{name}' does not exist in the database/)
+              end
+            end
+          end
+
+          describe "a store_accessor reached through inheritance" do
+            let(:parent) do
+              Class.new(TestModel) do
+                self.table_name = "typed_things"
+                store_accessor :payload, :theme
+                attr_accessor :scratch
+              end
+            end
+
+            it "accepts an accessor a parent model declared, on a subclass that declares none" do
+              child = Class.new(parent)
+              expect(&declaring(child) { optional :theme, :string }).not_to raise_error
+            end
+
+            it "accepts the inherited accessor and the subclass's own side by side" do
+              child = Class.new(parent) { store_accessor :payload, :mode }
+              expect(&declaring(child) do
+                optional :theme, :string
+                optional :mode, :string
+              end).not_to raise_error
+            end
+
+            it "accepts an inherited prefixed accessor under its assigned name only" do
+              base = Class.new(TestModel) do
+                self.table_name = "typed_things"
+                store_accessor :payload, :tone, prefix: true
+              end
+              child = Class.new(base)
+              expect(&declaring(child) { optional :payload_tone, :string }).not_to raise_error
+              expect(&declaring(child) { optional :tone, :string }).to raise_error(ArgumentError, /'tone' does not exist/)
+            end
+
+            it "does not take an ordinary writer for a store accessor" do
+              expect(&declaring(parent) { optional :scratch, :string }).to raise_error(ArgumentError, /'scratch' does not exist/)
+            end
+
+            it "still accepts a store accessor the model overrides, in the model, a subclass or a prepended module" do
+              own = Class.new(parent) do
+                def theme=(value)
+                  super(value.to_s)
+                end
+              end
+              child = Class.new(own) do
+                def theme=(value)
+                  super(value.to_s.strip)
+                end
+              end
+              wrapper = Module.new do
+                def theme=(value)
+                  super(value.to_s)
+                end
+              end
+              prepended = Class.new(parent) { prepend wrapper }
+              [own, child, prepended].each do |model|
+                expect(model.new(theme: 1).payload).to eq("theme" => "1")
+                expect(&declaring(model) { optional :theme, :string }).not_to raise_error
+              end
+            end
+
+            it "picks the store whose key is the longest match when stores share a key" do
+              both = Class.new(TestModel) do
+                self.table_name = "typed_things"
+                store_accessor :payload, :name, prefix: :pay
+                store_accessor :lost_store, :first_name, prefix: :lost
+              end
+              expect(&declaring(both) { optional :pay_name, :string }).not_to raise_error
+              expect(&declaring(both) { optional :lost_first_name, :string })
+                .to raise_error(ArgumentError, /'lost_first_name' is a store_accessor of :lost_store/)
+            end
+          end
+
+          it "finds the store column behind an alias, and names the column the migration is for" do
+            on_alias = Class.new(TestModel) do
+              self.table_name = "typed_things"
+              alias_attribute :prefs, :payload
+              alias_attribute :lost, :lost_raw
+              store_accessor :prefs, :color
+              store_accessor :lost, :hue
+            end
+            expect(&declaring(on_alias) { optional :color, :string }).not_to raise_error
+            expect(&declaring(on_alias) { optional :hue, :string }).to raise_error(ArgumentError) do |e|
+              expect(e.message).to match(/'hue' is a store_accessor of :lost on .*no 'lost_raw' column/m)
+            end
+          end
+
+          it "still reports a name that is neither a column, an alias nor a store key" do
+            expect(&declaring(stored) { optional :nope, :string }).to raise_error(ArgumentError, /'nope' does not exist/)
+          end
+        end
+
         it "still skips virtual fields and a missing column still reports as missing" do
           expect(&declaring(typed) { optional :title, :integer, virtual: true }).not_to raise_error
           expect(&declaring(typed) { optional :nope, :integer }).to raise_error(ArgumentError, /does not exist/)

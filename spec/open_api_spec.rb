@@ -266,6 +266,9 @@ RSpec.describe Permittable::OpenAPI do
   end
 
   describe ".document" do
+    # The form keys a rootless `unknown: :error` JSON body lists as free properties.
+    let(:form_keys) { Permittable::FORM_KEYS.to_h { |key| [key, {}] } }
+
     it "places routed operations under paths and everything else under x-permittable-controllers" do
       klass = controller_class do
         permit_params(:create, root: :user) { required :name, :string }
@@ -678,12 +681,84 @@ RSpec.describe Permittable::OpenAPI do
 
         expect(patch["requestBody"]["required"]).to be(true)
         expect(patch["requestBody"]["content"]["application/json"]["schema"]).to eq(
-          "type" => "object", "properties" => { "name" => { "type" => "string", "minLength" => 1 }, "id" => {} },
+          "type" => "object",
+          "properties" => { "name" => { "type" => "string", "minLength" => 1 } }.merge(form_keys).merge("id" => {}),
           "required" => ["name"], "additionalProperties" => false
         )
         ok = IntegrationHarness.dispatch(controller, :update, method: "PATCH", path_params: { id: "7" },
                                                               json: { id: 7, name: "x" })
         expect([ok.status, JSON.parse(ok.body)]).to eq([200, { "id" => 7, "name" => "x" }])
+      end
+
+      # The runtime exempts Rails' form keys at the top of a rootless
+      # contract, so a JSON body carrying them (a form's fields sent as JSON, a
+      # client echoing a record back) is a 200 under unknown: :error.
+      context "with the form keys under unknown: :error" do
+        def strict_form_controller(root: nil, &fields)
+          IntegrationHarness.build_controller do
+            include Permittable
+
+            def self.controller_path = "widgets"
+            permit_params(:create, root: root, unknown: :error, &fields)
+            def create = render(json: permitted_params)
+          end
+        end
+
+        def body_schema(controller)
+          paths = widgets_document(controller) { resources :widgets, only: :create }["paths"]
+          paths["/widgets"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+        end
+
+        let(:keys) { form_keys.keys }
+        let(:rootless) { strict_form_controller { required :name, :string } }
+
+        it "lets a rootless rule's JSON body carry them as free optional properties, as the runtime accepts them" do
+          schema = body_schema(rootless)
+          expect(schema["additionalProperties"]).to be(false)
+          expect(schema["required"]).to eq(["name"])
+          keys.each do |key|
+            expect([key, schema["properties"][key]]).to eq([key, {}])
+            body = { "name" => "x", key => "v" }
+            expect([key, TinyJsonSchema.valid?(schema, body)]).to eq([key, true])
+            expect([key, IntegrationHarness.dispatch(rootless, :create, method: "POST", json: body).status]).to eq([key, 200])
+          end
+        end
+
+        it "still refuses any other undeclared key, as the server does" do
+          schema = body_schema(rootless)
+          body = { "name" => "x", "bogus" => "v" }
+          expect(TinyJsonSchema.valid?(schema, body)).to be(false)
+          expect(IntegrationHarness.dispatch(rootless, :create, method: "POST", json: body).status).to eq(422)
+        end
+
+        it "keeps a form key the contract declares as that field" do
+          schema = body_schema(strict_form_controller { optional :commit, :integer })
+          expect(schema["properties"]["commit"]).to eq("type" => "integer")
+          expect(schema["properties"].keys).to eq(["commit"] + (keys - ["commit"]))
+        end
+
+        it "leaves a root: rule's body alone, its form keys being outside the root" do
+          schema = body_schema(strict_form_controller(root: :widget) { required :name, :string })
+          expect(schema["properties"].keys).to eq(["widget"])
+          expect(schema["properties"]["widget"]["properties"].keys).to eq(["name"])
+          expect(schema).not_to have_key("additionalProperties")
+        end
+
+        it "adds nothing without unknown: :error" do
+          lenient = IntegrationHarness.build_controller do
+            include Permittable
+
+            def self.controller_path = "widgets"
+            permit_params(:create) { required :name, :string }
+            def create = head(:ok)
+          end
+          expect(body_schema(lenient)["properties"].keys).to eq(["name"])
+        end
+
+        it "does not change the contract's own JSON Schema, which describes no HTTP body" do
+          contract = Permittable::Contract.new(unknown: :error) { required :name, :string }
+          expect(contract.json_schema["properties"].keys).to eq(["name"])
+        end
       end
 
       it "keeps a template variable the contract does not declare as a free property under unknown: :error" do
@@ -699,11 +774,12 @@ RSpec.describe Permittable::OpenAPI do
         end["paths"]
 
         in_body = ->(path, verb) { paths[path][verb]["requestBody"]["content"]["application/json"]["schema"] }
-        expect(in_body.call("/widgets/{id}", "patch")["properties"].keys).to eq(%w[name id])
-        expect(in_body.call("/{locale}/widgets/{id}", "patch")["properties"].keys).to eq(%w[name locale id])
-        expect(in_body.call("/widgets", "post")["properties"].keys).to eq(%w[name])
+        expect(in_body.call("/widgets/{id}", "patch")["properties"].keys).to eq(%w[name] + form_keys.keys + %w[id])
+        expect(in_body.call("/{locale}/widgets/{id}", "patch")["properties"].keys)
+          .to eq(%w[name] + form_keys.keys + %w[locale id])
+        expect(in_body.call("/widgets", "post")["properties"].keys).to eq(%w[name] + form_keys.keys)
         expect(in_body.call("/{locale}/widgets", "post")["properties"]).to eq(
-          "name" => { "type" => "string" }, "locale" => {}
+          { "name" => { "type" => "string" } }.merge(form_keys).merge("locale" => {})
         )
         expect(in_body.call("/widgets/{id}", "patch")["additionalProperties"]).to be(false)
         # What the runtime does with such a body, a stray key still being flagged.
@@ -879,11 +955,13 @@ RSpec.describe Permittable::OpenAPI do
         end["paths"]["/w/special"]
 
         expect(body_schema(paths["patch"])).to eq(
-          "type" => "object", "properties" => { "name" => { "type" => "string" }, "id" => {} },
+          "type" => "object",
+          "properties" => { "name" => { "type" => "string" } }.merge(form_keys).merge("id" => {}),
           "additionalProperties" => false
         )
         expect(body_schema(paths["delete"])).to eq(
-          "type" => "object", "properties" => { "name" => { "type" => "string" }, "kind" => {} },
+          "type" => "object",
+          "properties" => { "name" => { "type" => "string" } }.merge(form_keys).merge("kind" => {}),
           "additionalProperties" => false
         )
         ok = IntegrationHarness.dispatch(controller, :update, method: "PATCH", path_params: { id: "5" },
@@ -898,7 +976,8 @@ RSpec.describe Permittable::OpenAPI do
 
         bare = paths["/o"]["patch"]
         expect(bare).not_to have_key("parameters")
-        expect(body_schema(bare)["properties"]).to eq("name" => { "type" => "string" }, "id" => {})
+        expect(body_schema(bare)["properties"])
+          .to eq({ "name" => { "type" => "string" } }.merge(form_keys).merge("id" => {}))
         expect(body_schema(bare)).not_to have_key("required")
         expect(paths["/o/{id}"]["patch"]["parameters"].map { |p| p["name"] }).to eq(%w[id])
         expect(paths["/o/{id}"]["patch"]["parameters"].first["schema"]).to include("type" => "integer")

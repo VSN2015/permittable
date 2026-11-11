@@ -204,10 +204,25 @@ module Permittable
       media_type = body_media_type(rule)
       schema = JsonSchema.rule(rule)
       schema = form_schema(schema, rule) if media_type == "multipart/form-data"
+      allow_form_keys!(schema) if media_type != "multipart/form-data" && rule[:unknown] == :error && !rule[:root]
       {
         "required" => !!(rule[:root] || rule[:fields].any? { |f| f[:required] }),
         "content" => { media_type => { "schema" => schema } }
       }
+    end
+
+    # Under `unknown: :error` the runtime still exempts Rails' form keys
+    # (FORM_KEYS) at the top of a rootless contract, so a JSON body carrying
+    # `authenticity_token` or `_method` (a form's fields sent as JSON, a record
+    # echoed back) is accepted, and the body schema must not forbid it. They
+    # stay in as free, never-required properties, as the multipart body lists
+    # them (see form_schema). A name the contract declares keeps its own
+    # schema. A `root:` rule needs none of this: the keys sit outside the root,
+    # in a wrapper that is permissive already. The plain JsonSchema.rule and
+    # Contract#json_schema describe the contract, not an HTTP body, and a
+    # standalone Contract exempts no form key, so they do not list them.
+    def allow_form_keys!(schema)
+      Permittable::FORM_KEYS.each { |key| schema["properties"][key] ||= {} }
     end
 
     # A multipart body is not one JSON object: each part is a form field, and
