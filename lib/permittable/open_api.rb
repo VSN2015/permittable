@@ -1044,13 +1044,15 @@ module Permittable
     # The names a route fills from its `defaults:` (`scope`, `resources` and
     # `mount` take them too), as strings. The router puts them into
     # path_parameters beside the URL's own, so the client cannot set them;
-    # `controller`, `action` and `format` are the router's own keys and
-    # are left out, as the runtime leaves them out of `unknown:`. A
+    # `controller` and `action` are the router's own keys and are left
+    # out, as the runtime leaves them out of `unknown:`. `format` is left in:
+    # a `defaults: { format: ... }` lands in path_parameters like any other
+    # default, so a contract field of that name is filled by it. A
     # hand-built route that cannot say fills nothing.
     def route_defaults(route)
       return [] unless route.respond_to?(:defaults)
 
-      route.defaults.keys.map(&:to_s) - %w[controller action format]
+      route.defaults.keys.map(&:to_s) - %w[controller action]
     end
 
     # The Prefix of each variant of a mount's path under each of `prefixes`,
