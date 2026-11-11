@@ -863,15 +863,17 @@ RSpec.describe Permittable do
     # the next day in UTC) came back as the day before.
     #
     # Date._parse drops a zone that has no time beside it ("2026-09-05 EST"
-    # reports the date alone), so that stays the plain date it always was.
+    # reports the date alone); dropped_tail reads it back, so that is midnight
+    # at -05:00 and, like "2026-09-05 00:00 EST", no date.
     it "reads a String with a time or zone as an instant, a date only at midnight UTC" do
       ["2026-09-05T00:00:00", "2026-09-05T00:00:00Z", "2026-09-05T00:00:00.000+00:00", "2026-09-05 00:00 UTC",
-       "2026-09-05T05:00:00+05:00", "2026-09-04T19:00:00-05:00", "2026-09-05 UTC", "2026-09-05 EST"].each do |value|
+       "2026-09-05T05:00:00+05:00", "2026-09-04T19:00:00-05:00", "2026-09-05 UTC"].each do |value|
         expect(permit({ on: value }, &decl)[:on])
           .to be_an_instance_of(Date).and(eq(Date.new(2026, 9, 5))), "for #{value}"
       end
       ["2026-09-05T10:00:00Z", "2026-09-05T10:00:00", "2026-09-05T00:00:00-05:00", "2026-09-05T00:00:00.5Z",
        "2026-09-05T23:30:00-05:00", "2026-09-05T00:00:01Z", "2026-09-05 00:00 EST", "2026-09-05T00:00:00+05:00",
+       "2026-09-05 EST",
        "2026-09-05T25:00:00Z", "2026-09-05T99:99:99Z", "2026-09-05T10:00:00+24:00", "2026-09-05T00:00:00XYZ"].each do |value|
         expect(violations_for({ on: value }, &decl).details)
           .to eq([{ param: "on", code: "invalid_type" }]), "for #{value}"
@@ -1061,13 +1063,134 @@ RSpec.describe Permittable do
       end
     end
 
+    # Date._parse reads a zone only next to a time of day, so a zone NAME
+    # after a date ("2026-09-05 EST") or after a year that follows the time
+    # ("Sat Sep  5 10:00:00 2026 EST") is dropped, and so is an offset after
+    # the year; the string was read as the wall clock in UTC, hours away from
+    # the instant it names. A name Ruby knows is honoured, the rest refused.
+    it "reads a zone name after a date, with or without a time, as the instant it names" do
+      {
+        "2026-09-05 EST" => Time.utc(2026, 9, 5, 5), "2026-09-05 PST" => Time.utc(2026, 9, 5, 8),
+        "2026-09-05 est" => Time.utc(2026, 9, 5, 5), "Sep 5 2026 EST" => Time.utc(2026, 9, 5, 5),
+        "2026-09-05 UTC" => Time.utc(2026, 9, 5), "2026-09-05 GMT" => Time.utc(2026, 9, 5),
+        "2026-09-05 EST DST" => Time.utc(2026, 9, 5, 4),
+        "2026-09-05 Eastern Standard Time" => Time.utc(2026, 9, 5, 5),
+        "Sat Sep  5 10:00:00 2026 EST" => Time.utc(2026, 9, 5, 15),
+        "Sat 2026-09-05 EST" => Time.utc(2026, 9, 5, 5)
+      }.each do |value, instant|
+        expect(permit({ at: value }, &decl)[:at]).to eq(instant), value
+      end
+    end
+
+    # An offset or an hour the parser dropped or misplaced is as much a
+    # different instant as a dropped zone: the bare hour before an offset is
+    # read as the offset's own, and the T of an ISO date-time with only an
+    # hour ("2026-09-05T10") loses the hour.
+    it "refuses a zone, offset or hour the parser dropped or misplaced" do
+      ["2026-09-05 XYZ", "2026-09-05 10 -05:00", "12:00 2026-09-05 -05:00", "Sat Sep  5 10:00:00 2026 UTC-05:00",
+       "2026-09-05T10", "2026-09-05T10Z", "2026-09-05T1030", "2026-09-05T10-05:00", "2026-09-05T10 EST",
+       "2026-09-05 10 EST", "Sat Sep  5 10:00:00 2026 XYZ"].each do |value|
+        expect(violations_for({ at: value }, &decl).details).to eq([{ param: "at", code: "invalid_type" }]), value
+      end
+    end
+
+    # git log, `date` and Time#to_s write the offset AFTER the year, where
+    # Date._parse drops it; the time of day beside it is the client's own, so
+    # the offset is read back (and is refused where a misread hour shows the
+    # parser took the offset for the time).
+    it "reads the offset after the year of git's and ctime's date format" do
+      {
+        "Sat Sep 5 10:00:00 2026 +0000" => Time.utc(2026, 9, 5, 10), "Sat Sep 5 10:00:00 2026 -0500" => Time.utc(2026, 9, 5, 15),
+        "Sep 5 10:00:00 2026 +0000" => Time.utc(2026, 9, 5, 10), "Sat Sep 5 10:00 2026 +0000" => Time.utc(2026, 9, 5, 10),
+        "Sat Sep  5 10:00:00 2026 +05:30" => Time.utc(2026, 9, 5, 4, 30)
+      }.each do |value, instant|
+        expect(permit({ at: value }, &decl)[:at]).to eq(instant), value
+      end
+      ["Sat Sep 5 00:00:00 2026 +0000", "Sat Sep 5 00:00:00 2026 -0000", "Sat Sep 5 00:00:00 2026 +00:00"].each do |value|
+        expect(permit({ on: value }, &decl)[:on]).to be_an_instance_of(Date).and(eq(Date.new(2026, 9, 5))), value
+      end
+      ["Sat Sep 5 00:00:00 2026 -0500", "Sat Sep 5 10:00:00 2026 +0000", "Sat Sep 5 10:00:00 2026 +24:00"].each do |value|
+        expect(violations_for({ on: value }, &decl).details).to eq([{ param: "on", code: "invalid_type" }]), value
+      end
+      expect(violations_for({ at: "Sat Sep 5 10:00:00 2026 +24:00" }, &decl).details)
+        .to eq([{ param: "at", code: "invalid_type" }])
+    end
+
+    # An era word does not hide the zone behind it, and a zone name may start
+    # with an initial (Windows names do).
+    it "reads a zone name after an era word, and one that starts with an initial" do
+      {
+        "2026-09-05 BC EST" => Time.utc(-2025, 9, 5, 5), "5 Sep 2026 BC EST" => Time.utc(-2025, 9, 5, 5),
+        "2026-09-05 BC" => Time.utc(-2025, 9, 5), "2026-09-05 AD EST" => Time.utc(2026, 9, 5, 5),
+        "2026-09-05 W. Europe Standard Time" => Time.utc(2026, 9, 4, 23)
+      }.each do |value, instant|
+        expect(permit({ at: value }, &decl)[:at]).to eq(instant), value
+      end
+    end
+
+    # A dotted era ("A.D.") or initial ("A.") is not the military zone Ruby
+    # reads it as (A is +01:00), and a single letter is never a zone here.
+    it "reads a dotted era or a lone initial after a date as no zone" do
+      ["2026-09-05 A.D.", "2026-09-05 a.d.", "2026-09-05 A. D.", "2026-09-05 C.E.", "2026-09-05 A.", "2026-09-05 a."].each do |value|
+        expect(permit({ at: value }, &decl)[:at]).to eq(Time.utc(2026, 9, 5)), value
+        expect(permit({ on: value }, &decl)[:on]).to eq(Date.new(2026, 9, 5)), value
+      end
+      expect(permit({ at: "2026-09-05 A.D. EST" }, &decl)[:at]).to eq(Time.utc(2026, 9, 5, 5))
+    end
+
+    # "W. Europe" is the military zone W to Ruby, which is no zone here, and
+    # the rest of it would be dropped; like any unknown word after a date it
+    # is refused. The whole name is a zone Ruby knows.
+    it "refuses an initial-led word that is not a zone name, and keeps the Windows names" do
+      ["2026-09-05 W. Europe", "2026-09-05 A. foo"].each do |value|
+        expect(violations_for({ at: value }, &decl).details).to eq([{ param: "at", code: "invalid_type" }]), value
+        expect(violations_for({ on: value }, &decl).details).to eq([{ param: "on", code: "invalid_type" }]), value
+      end
+      expect(permit({ at: "2026-09-05 W. Europe Standard Time" }, &decl)[:at]).to eq(Time.utc(2026, 9, 4, 23))
+    end
+
+    # Any word after a complete date that is not a day name or an era is
+    # taken for a zone, and one Ruby does not know is not honoured.
+    it "refuses an unknown word after a date" do
+      ["2026-09-05 foo", "2026-09-05 noon", "2026-09-05 BC foo", "2026-09-05 W. Nowhere Standard Time"].each do |value|
+        expect(violations_for({ at: value }, &decl).details).to eq([{ param: "at", code: "invalid_type" }]), value
+        expect(violations_for({ on: value }, &decl).details).to eq([{ param: "on", code: "invalid_type" }]), value
+      end
+    end
+
+    it "holds an in: member and a default: written with a zone name to the same reading" do
+      listed = proc { permit_params(:create) { optional :at, :datetime, in: ["2026-09-05 EST"] } }
+      expect(permit({ at: Time.utc(2026, 9, 5, 5) }, &listed)[:at]).to eq(Time.utc(2026, 9, 5, 5))
+      expect(permit({}) { permit_params(:create) { optional :at, :datetime, default: "2026-09-05 EST" } }[:at])
+        .to eq(Time.utc(2026, 9, 5, 5))
+      expect { permittable_class { permit_params(:create) { optional :on, :date, in: ["2026-09-05 EST"] } } }
+        .to raise_error(ArgumentError, /:in for field :on contains "2026-09-05 EST", which is not a valid :date/)
+      expect { permittable_class { permit_params(:create) { optional :on, :date, default: "2026-09-05 EST" } } }
+        .to raise_error(ArgumentError, /:default for field :on violates its own contract \(invalid_type\)/)
+      expect { permittable_class { permit_params(:create) { optional :at, :datetime, in: ["2026-09-05T10"] } } }
+        .to raise_error(ArgumentError, /:in for field :at contains "2026-09-05T10"/)
+      expect(permit({}) { permit_params(:create) { optional :on, :date, default: "2026-09-05 UTC" } }[:on])
+        .to eq(Date.new(2026, 9, 5))
+    end
+
+    it "applies the same readings to :date, which holds only midnight UTC" do
+      ["2026-09-05 UTC", "2026-09-05 GMT", "2026-09-05 Sat", "Sep 5 2026 Saturday"].each do |value|
+        expect(permit({ on: value }, &decl)[:on]).to be_an_instance_of(Date).and(eq(Date.new(2026, 9, 5))), value
+      end
+      ["2026-09-05 EST", "2026-09-05 PST", "2026-09-05 XYZ", "2026-09-05 10 -05:00", "Sat Sep  5 10:00:00 2026 -0500",
+       "12:00 2026-09-05 -05:00", "2026-09-05T10", "2026-09-05T10Z", "Sat Sep  5 10:00:00 2026 EST"].each do |value|
+        expect(violations_for({ on: value }, &decl).details).to eq([{ param: "on", code: "invalid_type" }]), value
+      end
+    end
+
     it "still reads a time with its offset, a date alone, and a letter after a date as no zone" do
       expect(permit({ at: "2026-09-05 05:00 -05:00" }, &decl)[:at]).to eq(Time.utc(2026, 9, 5, 10))
       expect(permit({ at: "2026-09-05T05:00-05:00" }, &decl)[:at]).to eq(Time.utc(2026, 9, 5, 10))
       expect(permit({ at: "2026-09-05 10:00 -5" }, &decl)[:at]).to eq(Time.utc(2026, 9, 5, 15))
       expect(permit({ at: "Sat, 05 Sep 2026 05:00:00 -0500" }, &decl)[:at]).to eq(Time.utc(2026, 9, 5, 10))
       expect(permit({ at: "2026-09-05 10:00 PM" }, &decl)[:at]).to eq(Time.utc(2026, 9, 5, 22))
-      ["2026-09-05", "20260905", "2026-9-5", "05-Sep-2026", "2026 Sep 5th", "2026-09-05 a", "2026-09-05 Z"].each do |value|
+      ["2026-09-05", "20260905", "2026-9-5", "05-Sep-2026", "2026 Sep 5th", "2026-09-05 a", "2026-09-05 Z",
+       "2026-09-05 Sat", "Sep 5 2026 AD"].each do |value|
         expect(permit({ at: value }, &decl)[:at]).to eq(Time.utc(2026, 9, 5)), value
       end
     end
