@@ -1335,11 +1335,14 @@ module Permittable
     # A signed offset after a zone name ("GMT+5", "UTC+0530") is that zone to
     # Ruby when it reads it next to a time, so the String is midnight at it.
     # A name it does not read whole ("EST+5") or honour ("UTC+99") is refused.
-    # The hour a lost tail hid ("2026-09-05 10 GMT+5") is refused, as before it.
+    # What comes before the zone is held to the rules of any date String: no
+    # hour a lost tail hid ("2026-09-05 10 AD GMT+5"), no second zone, and the
+    # offset is hours ("+5", "+05") or hhmm with minutes a minute ("+0530").
     def glued_zone(word, offset, found)
       zone = "#{word[0].strip}#{offset}"
-      return [:error, "invalid_type"] unless same_time?(Date._parse(word.pre_match), found)
-      return [:error, "invalid_type"] unless Date._parse("00:00 #{zone}")[:zone] == zone
+      pre = Date._parse(word.pre_match)
+      return [:error, "invalid_type"] unless offset.match?(GLUED_OFFSET) && Date._parse("00:00 #{zone}")[:zone] == zone
+      return [:error, "invalid_type"] unless same_time?(pre, found) && !pre.key?(:zone) && dropped_tail(word.pre_match, pre).nil?
 
       instant_in_zone(word.pre_match, zone)
     end
@@ -1358,7 +1361,8 @@ module Permittable
     end
 
     TIME_PARTS = %i[hour min sec sec_fraction].freeze
-    private_constant :TIME_PARTS
+    GLUED_OFFSET = /\A[+-](?:\d{1,2}|\d{2}[0-5]\d)\z/
+    private_constant :TIME_PARTS, :GLUED_OFFSET
 
     def same_date?(rest, found)
       complete_date?(rest) && rest.values_at(:year, :mon, :mday) == found.values_at(:year, :mon, :mday)

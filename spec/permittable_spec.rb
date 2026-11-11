@@ -1167,8 +1167,11 @@ RSpec.describe Permittable do
       ["2026-09-05 GMT+5", "2026-09-05 UTC+0530", "2026-09-05 UTC+99", "2026-09-05 EST+5", "2026-09-05 Z+5"].each do |value|
         expect(violations_for({ on: value }, &decl).details).to eq([{ param: "on", code: "invalid_type" }]), value
       end
-      ["2026-09-05 UTC+99", "2026-09-05 EST+5", "2026-09-05 Z+5"].each do |value|
+      ["2026-09-05 UTC+99", "2026-09-05 EST+5", "2026-09-05 Z+5", "2026-09-05 UTC+0560", "2026-09-05 UTC+1234567",
+       "2026-09-05 10 AD GMT+5", "2026-09-05 10 a GMT+5", "2026-09-05 10 A.D. UTC+0530", "2026-09-05 10 EST GMT+5",
+       "2026-09-05 EST GMT+5", "2026-09-05 10 AD GMT+0"].each do |value|
         expect(violations_for({ at: value }, &decl).details).to eq([{ param: "at", code: "invalid_type" }]), value
+        expect(violations_for({ on: value }, &decl).details).to eq([{ param: "on", code: "invalid_type" }]), value
       end
     end
 
