@@ -1138,6 +1138,40 @@ RSpec.describe Permittable do
       expect(permit({ at: "2026-09-05 A.D. EST" }, &decl)[:at]).to eq(Time.utc(2026, 9, 5, 5))
     end
 
+    # An hour before an era word or a lone initial is lost by the parser
+    # ("2026-09-05 10 A.D." reports the date alone), so it is refused as
+    # "2026-09-05 10 EST" is, not read as midnight.
+    it "refuses an hour that precedes an era word or a lone initial" do
+      ["2026-09-05 10 A.D.", "2026-09-05 10 A.", "2026-09-05 10 W.", "2026-09-05 10 a", "2026-09-05 10 AD",
+       "2026-09-05 10 CE", "2026-09-05 10 C.E.", "2026-09-05 10 AD EST", "2026-09-05 10 A.D. EST",
+       "Sep 5 2026 10 A.", "Sep 5 2026 10 A.D.", "2026-09-05 10 Z", "2026-09-05 10 GMT+5"].each do |value|
+        expect(violations_for({ at: value }, &decl).details).to eq([{ param: "at", code: "invalid_type" }]), value
+        expect(violations_for({ on: value }, &decl).details).to eq([{ param: "on", code: "invalid_type" }]), value
+      end
+    end
+
+    # An offset written straight after a zone name and no time ("GMT+5") is
+    # read by Ruby next to a time of day only; here it is midnight at that
+    # offset, or refused when Ruby does not honour it.
+    it "reads an offset glued to a zone name after a date as midnight at that offset" do
+      {
+        "2026-09-05 GMT+5" => Time.utc(2026, 9, 4, 19), "2026-09-05 GMT-5" => Time.utc(2026, 9, 5, 5),
+        "2026-09-05 UTC+0530" => Time.utc(2026, 9, 4, 18, 30), "Sep 5 2026 UTC+5" => Time.utc(2026, 9, 4, 19),
+        "2026-09-05 UTC+0" => Time.utc(2026, 9, 5), "2026-09-05 GMT-0" => Time.utc(2026, 9, 5)
+      }.each do |value, instant|
+        expect(permit({ at: value }, &decl)[:at]).to eq(instant), value
+      end
+      ["2026-09-05 UTC+0", "2026-09-05 GMT-0"].each do |value|
+        expect(permit({ on: value }, &decl)[:on]).to eq(Date.new(2026, 9, 5)), value
+      end
+      ["2026-09-05 GMT+5", "2026-09-05 UTC+0530", "2026-09-05 UTC+99", "2026-09-05 EST+5", "2026-09-05 Z+5"].each do |value|
+        expect(violations_for({ on: value }, &decl).details).to eq([{ param: "on", code: "invalid_type" }]), value
+      end
+      ["2026-09-05 UTC+99", "2026-09-05 EST+5", "2026-09-05 Z+5"].each do |value|
+        expect(violations_for({ at: value }, &decl).details).to eq([{ param: "at", code: "invalid_type" }]), value
+      end
+    end
+
     # "W. Europe" is the military zone W to Ruby, which is no zone here, and
     # the rest of it would be dropped; like any unknown word after a date it
     # is refused. The whole name is a zone Ruby knows.
