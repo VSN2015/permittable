@@ -1535,13 +1535,17 @@ module Permittable
     end
 
     # What an exported enum lists for one member: the cast value, re-encoded
-    # as JSON — except a :date/:datetime member authored as a String, which
-    # is published AS WRITTEN. Re-encoding a cast Time prints whole seconds,
-    # so "2026-09-05T10:00:00.25Z" was published as "…10:00:00Z", a value
-    # the server refuses. The authored String went through the very cast a
-    # request does, so the server accepts it by construction.
+    # as JSON — except a :datetime member authored as a String, which is
+    # published AS WRITTEN. Re-encoding a cast Time prints whole seconds, so
+    # "2026-09-05T10:00:00.25Z" was published as "…10:00:00Z", a value the
+    # server refuses. The authored String went through the very cast a request
+    # does, so the server accepts it by construction. A :date member is
+    # re-encoded: a Date has no digits to lose, and the String as written
+    # ("Sep 6, 2026", "2026-09-05T00:00:00Z") is a date the server reads but
+    # not one `format: date` accepts, so it is published as the YYYY-MM-DD
+    # the server compares against.
     def published_in_member(type, member, value)
-      member.is_a?(String) && %i[date datetime].include?(type) ? member : value
+      member.is_a?(String) && type == :datetime ? member : value
     end
 
     # Range#include? walks discrete ranges; cover? is the O(1) bounds check
@@ -1888,7 +1892,7 @@ module Permittable
     end
 
     # `published` is stored only where it differs from the cast members (a
-    # String-authored :date/:datetime member), so it is read as an override.
+    # String-authored :datetime member), so it is read as an override.
     def cast_in_members!(field, members)
       status, cast, published = Coercion.cast_in_members(field[:type], members, nullable: field[:nullable])
       unless status == :ok
@@ -1985,6 +1989,12 @@ module Permittable
     def validate_json_authored_value!(field, opt)
       return unless field.key?(opt)
       return if authored_nil!(field, opt)
+
+      # A request sending "" for a nullable :json field is the explicit null
+      # the walker reads it as, so a blank authored value is that nil, as a
+      # nullable scalar's is (see validate_authored_value!).
+      return field[opt] = nil if field[:nullable] && Coercion.absent_value?(field[opt])
+
       raise ArgumentError, "#{LABEL}: :#{opt} for :#{field[:name]} must be a Hash" unless field[opt].is_a?(Hash)
 
       status, read = AuthoredValues.read_json(field, field[opt])

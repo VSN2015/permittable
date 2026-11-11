@@ -469,6 +469,8 @@ module Permittable
       end
 
       def cast_json_default(field, expected)
+        # Absent on a nullable field is the nil a contract stores for it.
+        return nil if field[:nullable] && Coercion.absent_value?(expected)
         return expected unless expected.is_a?(Hash)
 
         status, value = AuthoredValues.read_json(field, expected)
