@@ -5397,6 +5397,51 @@ RSpec.describe Permittable do
           end.to raise_error(ArgumentError, /include AbstractController::Callbacks/)
         end
 
+        # The rule's own mode wins, but a rule that declares none follows the
+        # app-wide default, so it needs the callback just the same.
+        context "with the app-wide Permittable.mode = :monitor" do
+          around do |example|
+            Permittable.mode = :monitor
+            example.run
+          ensure
+            Permittable.mode = :enforce
+          end
+
+          # Permittable.mode is usually set by an initializer, so the class-load
+          # check reads only the rule's own mode: an app must still boot. The
+          # audit reports the action as not covered (see Audit.inert?).
+          it "still loads a rule with no mode of its own, without AbstractController::Callbacks" do
+            expect do
+              build_metal(%i[permittable rescue]) { permit_params(:create) { required :name, :string } }
+            end.not_to raise_error
+          end
+
+          # The effective mode may only add a requirement, never remove one.
+          it "still raises for an enforce: true rule with no mode: when Rescue is missing" do
+            expect do
+              build_metal(%i[callbacks permittable]) { permit_params(:create, enforce: true) { required :name, :string } }
+            end.to raise_error(ArgumentError, /include ActionController::Rescue/)
+          end
+
+          it "still raises for a rule's own mode: :monitor without AbstractController::Callbacks" do
+            expect do
+              build_metal(%i[permittable rescue]) { permit_params(:create, mode: :monitor) { required :name, :string } }
+            end.to raise_error(ArgumentError, /include AbstractController::Callbacks/)
+          end
+
+          it "does not raise for a rule that declares mode: :enforce, which runs from the action" do
+            expect do
+              build_metal(%i[permittable rescue]) { permit_params(:create, mode: :enforce) { required :name, :string } }
+            end.not_to raise_error
+          end
+
+          it "does not raise once the controller has the callbacks" do
+            expect do
+              build_metal(%i[callbacks rescue permittable]) { permit_params(:create) { required :name, :string } }
+            end.not_to raise_error
+          end
+        end
+
         it "raises at class load for an enforce: true rule without ActionController::Rescue" do
           expect do
             build_metal(%i[callbacks permittable]) { permit_params(:create, enforce: true) { required :name, :string } }

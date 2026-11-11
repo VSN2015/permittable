@@ -327,6 +327,89 @@ RSpec.describe Permittable::Audit do
         expect([missing?(api, "index"), missing?(api, "create")]).to eq([false, true])
       end
 
+      # A bare Metal controller without AbstractController::Callbacks has no
+      # before_action, so a monitor-mode rule never emits. permit_params only
+      # sees Permittable.mode as it is at class load; an initializer may set
+      # it afterwards, so the audit judges by the mode as it is now.
+      context "with a Metal controller that cannot run a before_action" do
+        def metal_hook(**options)
+          stub_const("AuditMetalHookController", Class.new(ActionController::Metal) do
+            include ActionController::Head
+            include ActionController::StrongParameters
+            include Permittable
+
+            def self.controller_path = "audit_metal_hook"
+            permit_params(:create, **options) { required :name, :string }
+            def create = head(:accepted)
+          end)
+        end
+
+        let(:hook_route) { { controller: "audit_metal_hook", action: "create", verb: "post", path: "/hook" } }
+
+        def audited(controller)
+          described_class.entries(controllers: [controller], routes: [hook_route]).first
+        end
+
+        after { Permittable.mode = :enforce }
+
+        it "reports an app-wide monitor mode set after the class loaded as not covered" do
+          controller = metal_hook
+          Permittable.mode = :monitor
+          entry = audited(controller)
+          expect(entry).not_to be_covered
+          expect(entry).to be_inert
+          expect(described_class.summary([entry])).to include(monitored: 0, uncovered: 1, uncovered_with_body: 1)
+          expect(described_class.format([entry]))
+            .to match(%r{POST\s+/hook\s+create\s+no contract — contract cannot run: .*Callbacks.* — ACCEPTS A BODY})
+        end
+
+        it "loads, and audits as not covered, a rule with no mode when the app-wide monitor mode was set before it loaded" do
+          Permittable.mode = :monitor
+          controller = metal_hook
+          expect(audited(controller)).to have_attributes(covered?: false, inert?: true)
+        end
+
+        # The gem registers its before_action at `permit_params`, so callbacks
+        # included after it leave the rule without one.
+        it "reports as not covered a rule declared before AbstractController::Callbacks was included" do
+          controller = stub_const("AuditMetalLateController", Class.new(ActionController::Metal) do
+            include ActionController::Head
+            include ActionController::StrongParameters
+            include Permittable
+
+            def self.controller_path = "audit_metal_hook"
+            permit_params(:create) { required :name, :string }
+            include AbstractController::Callbacks
+          end)
+          expect(controller).to respond_to(:before_action)
+          Permittable.mode = :monitor
+          expect(audited(controller)).to have_attributes(covered?: false, inert?: true)
+        end
+
+        it "still covers the same rule while the app-wide mode is enforce" do
+          expect(audited(metal_hook)).to be_covered
+        end
+
+        it "still covers a rule that declares mode: :enforce under an app-wide monitor mode" do
+          controller = metal_hook(mode: :enforce)
+          Permittable.mode = :monitor
+          expect(audited(controller)).to have_attributes(covered?: true, mode: :enforce)
+        end
+
+        it "leaves a Metal controller that has the callbacks covered" do
+          stub_const("AuditMetalCallbacksController", Class.new(ActionController::Metal) do
+            include AbstractController::Callbacks
+            include ActionController::Head
+            include Permittable
+
+            def self.controller_path = "audit_metal_hook"
+            permit_params(:create) { required :name, :string }
+          end)
+          Permittable.mode = :monitor
+          expect(audited(AuditMetalCallbacksController)).to have_attributes(covered?: true, mode: :monitor)
+        end
+      end
+
       # A via: :all route is five entries for one action; Rails need only be
       # asked once.
       it "asks Rails's resolver once per action, not once per verb" do
@@ -346,6 +429,45 @@ RSpec.describe Permittable::Audit do
         end)
         expect(missing?(unbuildable, "create")).to be(false)
       end
+    end
+  end
+
+  # ActionController::Metal.descendants holds loaded classes only, and a
+  # framework controller (Rails::HealthController behind /up) is autoloaded.
+  describe ".rails_controllers" do
+    # A fresh constant per example: a loaded class stays in `descendants` for
+    # the rest of the process, so a shared one would be found by the next
+    # example whether or not a route named it.
+    let(:constant) { "AuditAutoloaded#{SecureRandom.hex(4)}Controller" }
+    let(:autoloaded_route) { { controller: constant.delete_suffix("Controller").underscore, action: "show", verb: "get", path: "/up" } }
+
+    around do |example|
+      Dir.mktmpdir do |dir|
+        file = File.join(dir, "autoloaded.rb")
+        File.write(file, "class #{constant} < ActionController::Metal; end\n")
+        Object.autoload(constant.to_sym, file)
+        example.run
+      ensure
+        Object.send(:remove_const, constant) if Object.const_defined?(constant, false)
+      end
+    end
+
+    it "leaves out an autoloaded controller no route names, as descendants does" do
+      expect(described_class.rails_controllers.map(&:name)).not_to include(constant)
+    end
+
+    it "loads and includes an autoloaded controller a route names, and gives it a row in the audit" do
+      controllers = described_class.rails_controllers([autoloaded_route])
+      expect(controllers.map(&:name)).to include(constant)
+      expect(described_class.entries(controllers: controllers, routes: [autoloaded_route]).map(&:action)).to eq(["show"])
+    end
+
+    it "does not raise for a route whose controller constant is missing or is not a controller" do
+      routes = [{ controller: "no_such_thing", action: "index" }, { controller: "audit_not_a_controller", action: "index" },
+                { controller: "", action: "index" }, { controller: "rack/utils", action: "index" }]
+      stub_const("AuditNotAControllerController", Class.new)
+      expect { described_class.rails_controllers(routes) }.not_to raise_error
+      expect(described_class.rails_controllers(routes).map(&:name)).not_to include("AuditNotAControllerController")
     end
   end
 

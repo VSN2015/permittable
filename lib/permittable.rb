@@ -2450,6 +2450,11 @@ module Permittable
     # rescue_from until the app includes them, and a rule that needs one of
     # them would otherwise load and then not run: raise at class load, naming
     # the module. Other hosts (a plain class, a duck) are left as they are.
+    # Only the rule's OWN declared mode is read, never Permittable.mode: that
+    # is usually set by an initializer, and an app must not stop booting over
+    # it. The effective mode can only add a requirement, so an action it makes
+    # monitored without a before_action is left to Audit.inert?, which reports
+    # it as not covered.
     def permittable_ensure_runnable!(rule)
       return unless defined?(::ActionController::Metal) && self < ::ActionController::Metal
 

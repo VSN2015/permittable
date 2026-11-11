@@ -48,11 +48,13 @@ module Permittable
     # never included the concern, which is exactly the case worth finding).
     #
     # `missing_action` marks a route to an action the controller does not
-    # define — see Audit.missing_action?. `route` identifies the route the
+    # define — see Audit.missing_action?. `inert` marks one whose rule exists
+    # but cannot run, so `rule` is nil and the action is uncovered — see
+    # Audit.inert?. `route` identifies the route the
     # path came from (nil for a hand-built descriptor, which is then its own
     # route); see `summary`. `ignored` is why the entry is left out of the
     # counts — a key of IGNORE_REASONS — or nil when it is audited.
-    Entry = Struct.new(:controller, :action, :verb, :path, :rule, :missing_action, :route, :ignored,
+    Entry = Struct.new(:controller, :action, :verb, :path, :rule, :missing_action, :route, :ignored, :inert,
                        keyword_init: true) do
       def covered?
         !rule.nil?
@@ -64,6 +66,10 @@ module Permittable
 
       def ignored?
         !ignored.nil?
+      end
+
+      def inert?
+        inert == true
       end
 
       # The mode this action would actually run in, rule-level declaration
@@ -111,10 +117,31 @@ module Permittable
       outside = :outside_root if outside_root?(controller, root)
       routes.select { |route| route[:controller].to_s == key }.map do |route|
         action = route[:action].to_s
+        rule = rule_for(controller, action)
+        inert = inert?(controller, rule)
         Entry.new(controller: key, action: action, verb: route[:verb], path: route[:path],
-                  rule: rule_for(controller, action), missing_action: missing[action],
-                  route: route[:route], ignored: configured_ignore(key, action, ignore) || outside)
+                  rule: (rule unless inert), missing_action: missing[action], route: route[:route],
+                  ignored: configured_ignore(key, action, ignore) || outside, inert: inert)
       end
+    end
+
+    # Whether `rule` is declared on `controller` but can never run there: the
+    # gem never registered its before_action on it — a bare ActionController::
+    # Metal controller without AbstractController::Callbacks at its
+    # `permit_params`, which asks the flag the gem sets when it registers the
+    # callback (a callbacks module included afterwards does not undo that) —
+    # while the rule validates from that callback: an `enforce: true` rule, or
+    # one in monitor mode by its own mode: or the app-wide Permittable.mode.
+    # permit_params raises for this at class load, but reads only the rule's own
+    # mode, since the app-wide one is often set after the class loads; the
+    # effective mode is judged here. Such an action is audited as uncovered
+    # rather than as the monitored one it claims to be.
+    def inert?(controller, rule)
+      return false unless rule && defined?(::ActionController::Metal) && controller.is_a?(Class) &&
+                          controller < ::ActionController::Metal
+
+      (rule[:enforce] || (rule[:mode] || Permittable.mode) == :monitor) &&
+        !(controller.respond_to?(:permittable_callback_registered) && controller.permittable_callback_registered)
     end
 
     # Why `controller` — or one of its actions — is left out of the audit and
@@ -151,11 +178,32 @@ module Permittable
     # themselves are Metal descendants too; they are the framework's abstract
     # bases, which no route names, and the old lists never held them.
     # Anonymous classes cannot be routed to, so only named ones are kept.
-    def rails_controllers
+    #
+    # `descendants` only holds classes that have been loaded, and a framework
+    # controller is autoloaded: Rails::HealthController behind `/up` is a
+    # registered constant until something touches it, so it had no row. Pass
+    # the route descriptors and every controller a route names is loaded and
+    # added — it is the route's own controller. A constant that does not exist,
+    # or is not a controller class, is left out rather than raised on.
+    def rails_controllers(routes = [])
       return [] unless defined?(::ActionController::Metal)
 
       frameworks = %w[ActionController::Base ActionController::API]
-      ::ActionController::Metal.descendants.uniq.select { |controller| controller.name && !frameworks.include?(controller.name) }
+      loaded = ::ActionController::Metal.descendants + routed_controllers(routes)
+      loaded.uniq.select { |controller| controller.name && !frameworks.include?(controller.name) }
+    end
+
+    # The controller classes the routes' `controller:` keys name, constantized
+    # (loading an autoloaded one). `safe_constantize` answers nil for a missing
+    # constant and raises on anything else — an error inside the controller's
+    # own file is the app's to see, so nothing more is rescued here. A key that
+    # names no constant, or one that is not an ActionController::Metal class,
+    # yields nothing.
+    def routed_controllers(routes)
+      routes.map { |route| route[:controller].to_s }.reject(&:empty?).uniq.filter_map do |key|
+        found = ActiveSupport::Inflector.safe_constantize("#{ActiveSupport::Inflector.camelize(key)}Controller")
+        found if found.is_a?(Class) && found < ::ActionController::Metal
+      end
     end
 
     # The root a controller's source must be inside to be audited:
@@ -434,7 +482,16 @@ module Permittable
     end
 
     def uncovered_note(entry)
-      not_found_note(entry) || ("ACCEPTS A BODY" if entry.body?)
+      not_found_note(entry) || inert_note(entry) || ("ACCEPTS A BODY" if entry.body?)
+    end
+
+    # Says why a declared contract is not counted, and keeps the body warning
+    # a gate reader needs.
+    def inert_note(entry)
+      return unless entry.inert?
+
+      ["contract cannot run: controller lacks AbstractController::Callbacks (no before_action)",
+       ("ACCEPTS A BODY" if entry.body?)].compact.join(" — ")
     end
 
     # The one wording for a route Rails would 404, covered or not.

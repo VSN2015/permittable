@@ -136,6 +136,9 @@ RSpec.describe "permittable:audit and permittable:generate with an ignore list",
       post "uploads", to: "gem_uploads#create"
       post "hooks", to: "hooks#receive"
       post "pings", to: "pings#create"
+      # Rails::HealthController (7.1+), an autoloaded framework controller no
+      # eager load touches: `/up` is routed to it and it is not loaded yet.
+      get "up", to: "rails/health#show" if defined?(Rails::HealthController)
       match "*path", to: "application#not_found", via: :all
     end
     Rails.application.load_tasks
@@ -158,6 +161,7 @@ RSpec.describe "permittable:audit and permittable:generate with an ignore list",
     end
 
     results = {}
+    results["health_autoloaded"] = !Rails.autoload?(:HealthController).nil? if defined?(Rails::HealthController)
     Permittable.audit_ignore = %w[application#not_found widget hooks]
     results["ignored"] = run_task("permittable:audit", "strict")
 
@@ -173,6 +177,9 @@ RSpec.describe "permittable:audit and permittable:generate with an ignore list",
 
     Permittable.audit_ignore_outside_root = false
     results["generate_all"] = run_task("permittable:generate")
+
+    # Auditing gem controllers too, since the health controller is one.
+    results["audit_gems"] = run_task("permittable:audit")
 
     results["generate_sessions"] = run_task("permittable:generate", "SessionsController")
     results["generate_webhooks"] = run_task("permittable:generate", "WebhooksController")
@@ -226,6 +233,15 @@ RSpec.describe "permittable:audit and permittable:generate with an ignore list",
       expect(metal["out"]).to match(%r{^pings\n  POST +/pings +create +enforce})
       expect(metal["aborted"]).to be(true)
       expect(metal["err"]).to include("1 routed action accepts a request body with no contract covering it")
+    end
+
+    # Rails::HealthController is autoloaded, so it is not among the Metal
+    # descendants until something loads it: routed, it still has a row.
+    it "audits an autoloaded framework controller a route names" do
+      skip "Rails::HealthController needs Rails 7.1+" unless results.key?("health_autoloaded")
+
+      expect(results["health_autoloaded"]).to be(true)
+      expect(results["audit_gems"]["out"]).to match(%r{^rails/health\n  GET +/up +show +no contract})
     end
 
     it "still fails on the catch-all once it is not ignored" do

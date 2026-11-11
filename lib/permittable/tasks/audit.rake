@@ -13,9 +13,10 @@ namespace :permittable do
 
     # Every controller, not just the ones including Permittable — a controller
     # that never included it is unguarded, which is exactly the finding. Bare
-    # ActionController::Metal ones included; see Audit.rails_controllers.
-    controllers = Permittable::Audit.rails_controllers
+    # ActionController::Metal ones included, and autoloaded framework ones
+    # (Rails::HealthController) the routes name; see Audit.rails_controllers.
     routes = Permittable::OpenAPI.rails_routes(Rails.application)
+    controllers = Permittable::Audit.rails_controllers(routes)
 
     entries = Permittable::Audit.entries(controllers: controllers, routes: routes)
     stale = Permittable::Audit.stale(controllers: controllers, routes: routes)
