@@ -266,8 +266,9 @@ RSpec.describe Permittable::OpenAPI do
   end
 
   describe ".document" do
-    # The form keys a rootless `unknown: :error` JSON body lists as free properties.
-    let(:form_keys) { Permittable::FORM_KEYS.to_h { |key| [key, {}] } }
+    # The keys a rootless `unknown: :error` JSON body lists as free properties:
+    # the routing keys and form keys the runtime exempts.
+    let(:form_keys) { Permittable::UNCHECKED_TOP_LEVEL_KEYS.to_h { |key| [key, {}] } }
 
     it "places routed operations under paths and everything else under x-permittable-controllers" do
       klass = controller_class do
@@ -704,9 +705,21 @@ RSpec.describe Permittable::OpenAPI do
           end
         end
 
-        def body_schema(controller)
+        def body_schema(controller, media_type = "application/json")
           paths = widgets_document(controller) { resources :widgets, only: :create }["paths"]
-          paths["/widgets"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+          paths["/widgets"]["post"]["requestBody"]["content"][media_type]["schema"]
+        end
+
+        def renamed_token_controller(&fields)
+          IntegrationHarness.build_controller do
+            self.request_forgery_protection_token = :csrf_token
+
+            include Permittable
+
+            def self.controller_path = "widgets"
+            permit_params(:create, unknown: :error, &fields)
+            def create = render(json: permitted_params)
+          end
         end
 
         let(:keys) { form_keys.keys }
@@ -722,6 +735,30 @@ RSpec.describe Permittable::OpenAPI do
             expect([key, TinyJsonSchema.valid?(schema, body)]).to eq([key, true])
             expect([key, IntegrationHarness.dispatch(rootless, :create, method: "POST", json: body).status]).to eq([key, 200])
           end
+        end
+
+        it "lets a rootless rule's JSON body carry the routing keys and a renamed CSRF token, as the runtime accepts them" do
+          renamed = renamed_token_controller { required :name, :string }
+          schema = body_schema(renamed)
+          (Permittable::ROUTING_KEYS + %w[csrf_token]).each do |key|
+            body = { "name" => "x", key => "v" }
+            expect([key, schema["properties"][key]]).to eq([key, {}])
+            expect([key, TinyJsonSchema.valid?(schema, body)]).to eq([key, true])
+            expect([key, IntegrationHarness.dispatch(renamed, :create, method: "POST", json: body).status]).to eq([key, 200])
+          end
+          expect(schema["properties"].keys).to eq(%w[name] + Permittable::UNCHECKED_TOP_LEVEL_KEYS + %w[csrf_token])
+        end
+
+        it "lets a rootless rule's multipart body carry them too" do
+          renamed = renamed_token_controller { required :scan, :file }
+          schema = body_schema(renamed, "multipart/form-data")
+          scan = [["scan", "x", "s.txt"]]
+          (Permittable::ROUTING_KEYS + %w[csrf_token]).each do |key|
+            allowed = schema["patternProperties"].keys.any? { |pattern| Regexp.new(pattern).match?(key) }
+            result = IntegrationHarness.dispatch(renamed, :create, method: "POST", multipart: scan + [[key, "v"]])
+            expect([key, allowed, result.status]).to eq([key, true, 200])
+          end
+          expect(schema["patternProperties"].keys.any? { |pattern| Regexp.new(pattern).match?("bogus") }).to be(false)
         end
 
         it "still refuses any other undeclared key, as the server does" do

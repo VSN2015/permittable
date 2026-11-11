@@ -197,32 +197,44 @@ module Permittable
     # required field (missing).
     def request_body_for(controller, action)
       rule = controller.permit_rule_for(action)
-      rule && rule_request_body(rule)
+      rule && rule_request_body(rule, controller)
     end
 
-    def rule_request_body(rule)
+    def rule_request_body(rule, controller)
       media_type = body_media_type(rule)
       schema = JsonSchema.rule(rule)
-      schema = form_schema(schema, rule) if media_type == "multipart/form-data"
-      allow_form_keys!(schema) if media_type != "multipart/form-data" && rule[:unknown] == :error && !rule[:root]
+      exempt = exempt_keys(controller)
+      schema = form_schema(schema, rule, exempt) if media_type == "multipart/form-data"
+      allow_form_keys!(schema, exempt) if media_type != "multipart/form-data" && rule[:unknown] == :error && !rule[:root]
       {
         "required" => !!(rule[:root] || rule[:fields].any? { |f| f[:required] }),
         "content" => { media_type => { "schema" => schema } }
       }
     end
 
-    # Under `unknown: :error` the runtime still exempts Rails' form keys
-    # (FORM_KEYS) at the top of a rootless contract, so a JSON body carrying
-    # `authenticity_token` or `_method` (a form's fields sent as JSON, a record
-    # echoed back) is accepted, and the body schema must not forbid it. They
+    # The top-level keys the runtime exempts under `unknown: :error`: the
+    # constant list it subtracts (UNCHECKED_TOP_LEVEL_KEYS) plus the CSRF
+    # parameter the controller renamed, which it reads off the controller too
+    # (permittable_configured_csrf_key). Per-instance overrides and an image
+    # submit's x/y pair cannot be known here.
+    def exempt_keys(controller)
+      token = controller.request_forgery_protection_token if controller.respond_to?(:request_forgery_protection_token)
+      (Permittable::UNCHECKED_TOP_LEVEL_KEYS + [token&.to_s]).compact.uniq
+    end
+
+    # Under `unknown: :error` the runtime still exempts Rails' routing and form
+    # keys (`exempt`, see exempt_keys) at the top of a rootless contract, so a
+    # JSON body carrying `authenticity_token`, `format` or `_method` (a form's
+    # fields sent as JSON, a record echoed back) is accepted, and the body
+    # schema must not forbid it. They
     # stay in as free, never-required properties, as the multipart body lists
     # them (see form_schema). A name the contract declares keeps its own
     # schema. A `root:` rule needs none of this: the keys sit outside the root,
     # in a wrapper that is permissive already. The plain JsonSchema.rule and
     # Contract#json_schema describe the contract, not an HTTP body, and a
     # standalone Contract exempts no form key, so they do not list them.
-    def allow_form_keys!(schema)
-      Permittable::FORM_KEYS.each { |key| schema["properties"][key] ||= {} }
+    def allow_form_keys!(schema, exempt)
+      exempt.each { |key| schema["properties"][key] ||= {} }
     end
 
     # A multipart body is not one JSON object: each part is a form field, and
@@ -243,15 +255,15 @@ module Permittable
     # nullable container's null (`user[docs]=""`), the keys of a :json
     # field (`user[extra][any]`), and, for a `root:` rule, any part outside
     # the root, which the runtime never reads; a rootless rule instead gets
-    # the form keys (FORM_KEYS) the runtime exempts at the top level.
-    def form_schema(json_schema, rule)
+    # the keys (`exempt`, see exempt_keys) the runtime exempts at the top level.
+    def form_schema(json_schema, rule, exempt)
       root = rule[:root] && rule[:root].to_s
       form = { properties: {}, patterns: {}, required: [], groups: {}, strict: rule[:unknown] == :error }
       flatten_form(json_schema, [], true, form, skip_group: root)
       if form[:strict] && root
         form[:patterns]["^(?!#{form_escape(root)}(?:\\[|$))"] = {}
       elsif form[:strict]
-        form[:patterns]["^(?:#{Permittable::FORM_KEYS.map { |key| form_escape(key) }.join('|')})$"] = {}
+        form[:patterns]["^(?:#{exempt.map { |key| form_escape(key) }.join('|')})$"] = {}
       end
       schema = { "type" => "object", "properties" => form[:properties] }
       schema["patternProperties"] = form[:patterns] unless form[:patterns].empty?
@@ -401,7 +413,7 @@ module Permittable
       # dup: the stored desc is frozen, and a caller editing the generated
       # document in place must neither raise nor reach the contract.
       operation["description"] = rule[:desc].dup if rule[:desc]
-      operation["requestBody"] = rule_request_body(rule)
+      operation["requestBody"] = rule_request_body(rule, controller)
       operation["responses"] = responses_for(rule)
       # The docs must not promise a 422 the server doesn't yet send. Only
       # the rule's own declaration is contract data — the app-wide
@@ -588,7 +600,7 @@ module Permittable
         else
           free.each do |path, verb, template, defaults|
             holder = (paths[path] ||= {})
-            placed = with_path_parameters(operation, path, controller.permit_rule_for(action), template || path, defaults)
+            placed = with_path_parameters(operation, path, controller.permit_rule_for(action), controller, [template || path, defaults])
             holder[verb] = template ? placed.merge("x-permittable-path" => template) : placed
             slots << OperationSlot.new(holder, verb, verb, operation["operationId"], owner, path)
           end
@@ -707,6 +719,9 @@ module Permittable
     # otherwise: a rootless contract field named like one is that parameter's
     # schema (path_fields), and leaves the body schema.
     #
+    # `route` is `[own, defaults]`; `controller` supplies the keys the body
+    # exempts (see exempt_keys).
+    #
     # `own` is the route's own spelling of the template, which differs
     # from `path` when collapse_shapes placed the route under another
     # route's spelling: the same shape, so the names pair up by position.
@@ -717,7 +732,8 @@ module Permittable
     # not carry them and they are no path parameter. A name the path
     # templates is that parameter instead: `get "o(/:id)", defaults:
     # { id: 5 }` is a parameter on `/o/{id}` and a default only on `/o`.
-    def with_path_parameters(operation, path, rule, own = path, defaults = [])
+    def with_path_parameters(operation, path, rule, controller, route)
+      own, defaults = route
       # A name the path templates twice (a mount and an engine route both
       # name `:id`) is declared once: OpenAPI forbids two parameters with
       # one name and location.
@@ -736,7 +752,7 @@ module Permittable
       operation.each_with_object({}) do |(key, value), out|
         if key == "requestBody"
           out["parameters"] = parameters unless parameters.empty?
-          value = body_without(rule, fields.values + default_fields(rule, supplied), own_names + supplied)
+          value = body_without(rule, controller, fields.values + default_fields(rule, supplied), own_names + supplied)
         end
         out[key] = value unless value.nil?
       end
@@ -797,11 +813,11 @@ module Permittable
     # nothing in the body can make the request wrong. A name the route's
     # `defaults:` fill is treated the same. A rooted contract
     # needs none of this: its wrapper object is permissive already.
-    def body_without(rule, moved, templated)
+    def body_without(rule, controller, moved, templated)
       rest = rule[:fields] - moved
       return if rest.empty? && !moved.empty?
 
-      body = rule_request_body(moved.empty? ? rule : rule.merge(fields: rest))
+      body = rule_request_body(moved.empty? ? rule : rule.merge(fields: rest), controller)
       return body unless rule[:unknown] == :error && !rule[:root]
 
       properties = body["content"].values.first["schema"]["properties"]
