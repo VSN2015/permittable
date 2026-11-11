@@ -636,7 +636,7 @@ module Permittable
       # `not_to ...returning(x)` would pass both on a rejection and on an
       # acceptance returning anything else.
       def does_not_match?(subject) # rubocop:disable Naming/PredicatePrefix -- the RSpec protocol name
-        raise ArgumentError, negated_qualifier_message if @returning || !@expected_violations.empty?
+        raise ArgumentError, negated_qualifier_message(subject) if @returning || !@expected_violations.empty?
 
         rule = locate(subject)
         return false unless rule
@@ -651,9 +651,12 @@ module Permittable
         if @expect_accepted
           return "expected #{subject_name} to #{description}, but it rejected them: #{summary(@violations)}" unless @violations.empty?
 
-          "expected #{subject_name} to #{description}, but it accepted them but returned #{@result.to_h.inspect}"
+          "expected #{subject_name} to #{description}, but it accepted them but returned " \
+            "#{printable(@result.to_h)}#{differs_note}"
         else
-          return "expected #{subject_name} to #{description}, but it accepted them, returning #{@result.to_h.inspect}" if @violations.empty?
+          if @violations.empty?
+            return "expected #{subject_name} to #{description}, but it accepted them, returning #{printable(@result.to_h)}"
+          end
 
           "expected #{subject_name} to #{description}, but the violations were: #{summary(@violations)}"
         end
@@ -670,7 +673,7 @@ module Permittable
         label = @expect_accepted ? "accept those params" : "reject those params"
         label += action_label
         label += " with #{summary(@expected_violations)}" unless @expected_violations.empty?
-        label += " returning #{@returning.inspect}" if @returning
+        label += " returning #{printable(@returning)}" if @returning
         label
       end
 
@@ -684,15 +687,27 @@ module Permittable
       # first so a matcher object reused across examples (or re-chained
       # with another for_action) never reports a previous run's problem.
       def locate(subject)
-        @problem = @violations = @result = nil
+        @problem = @violations = @result = @root = nil
         @subject = resolve_subject(subject)
-        resolve_rule
+        rule = resolve_rule
+        @root = rule[:root] if rule
+        rule
       end
 
-      def negated_qualifier_message
+      def negated_qualifier_message(subject = nil)
+        # Raised before the rule is located, so the root a scoped filter
+        # needs is looked up here, best effort: a subject or an ambiguity
+        # that locate would refuse (a BasicObject answers no respond_to?) is not
+        # this message's to report, and leaves the filter unscoped (the
+        # shallow one) rather than masking the qualifier error.
+        begin
+          locate(subject) if subject
+        rescue StandardError
+          @root = nil
+        end
         call = @expect_accepted ? "accept_params" : "reject_params"
         qualifiers = []
-        qualifiers << "returning #{@returning.inspect}" if @returning
+        qualifiers << "returning #{printable(@returning)}" if @returning
         qualifiers << "with_violation #{summary(@expected_violations)}" unless @expected_violations.empty?
         "#{LABEL}: `not_to #{call}(...)` cannot take qualifiers (here: #{qualifiers.join(', ')}) — " \
           "negating one is ambiguous, since it would pass both when the params are " \
@@ -790,36 +805,40 @@ module Permittable
       # payload belongs to the spec. The copy stringifies Symbol keys, which
       # the normalizer's HashWithIndifferentAccess does anyway but only after
       # it has read a Symbol :tempfile key as an upload, a key a request
-      # (String keys only) never has. A Parameters payload is unwrapped first
-      # so it is normalized like the Hash it wraps.
+      # (String keys only) never has, and Symbol values (see copy_payload).
+      # A Parameters payload is unwrapped first so it is normalized like the
+      # Hash it wraps. Without actionpack's request code only the normalizer
+      # is skipped; the copy (and its Symbol stringifying) still happens.
       def request_params
+        payload = copy_payload(@params.respond_to?(:to_unsafe_h) ? @params.to_unsafe_h : @params)
         utils = request_utils
-        return @params unless utils
-
-        payload = @params.respond_to?(:to_unsafe_h) ? @params.to_unsafe_h : @params
-        utils.normalize_encode_params(copy_payload(payload))
+        utils ? utils.normalize_encode_params(payload) : payload
       end
 
       # Rails main moved the class from ActionDispatch::Request::Utils to
-      # ActionDispatch::Http::Utils. nil only when ActionDispatch is not
-      # loaded at all (a non-Rails stand-in controller); once it is, a rename
-      # this does not know raises instead of silently skipping the
-      # normalization, which would bring the false greens back.
+      # ActionDispatch::Http::Utils. nil when actionpack's request code is not
+      # loaded (a non-Rails stand-in controller, or a bare ActionDispatch module
+      # that something else namespaced): there is nothing to normalize with, and
+      # nothing was renamed. Once ActionDispatch::Request exists, a rename this
+      # does not know raises instead of silently skipping the normalization,
+      # which would bring the false greens back.
       def request_utils
-        return unless defined?(ActionDispatch)
-
         if defined?(ActionDispatch::Http::Utils) then ActionDispatch::Http::Utils
         elsif defined?(ActionDispatch::Request::Utils) then ActionDispatch::Request::Utils
-        else
+        elsif defined?(ActionDispatch::Request)
           raise "Permittable's matchers cannot find Rails' parameter normalizer: neither " \
                 "ActionDispatch::Http::Utils nor ActionDispatch::Request::Utils is defined"
         end
       end
 
+      # Symbol keys become Strings, and so do Symbol values: a request carries
+      # every scalar as a String (or a JSON number, boolean or null), never a
+      # Symbol, so `status: :active` is the "active" the contract would read.
       def copy_payload(value)
         case value
         when Hash then value.to_h { |key, item| [key.is_a?(Symbol) ? key.to_s : key, copy_payload(item)] }
         when Array then value.map { |item| copy_payload(item) }
+        when Symbol then value.to_s
         else value
         end
       end
@@ -874,6 +893,116 @@ module Permittable
         return subject.class if subject.class.respond_to?(:permit_rule_for)
 
         raise ArgumentError, "#{LABEL}: the subject of accept_params/reject_params must include Permittable (got #{subject.inspect})"
+      end
+
+      # A hash echoed into a failure message, which lands in CI logs, goes out
+      # redacted the way a request log is: by the names `sensitive:` fields
+      # registered, and by the app's config.filter_parameters when a Rails
+      # application is booted. Only the printed copy is filtered; the matching
+      # itself reads the real values.
+      def printable(hash)
+        redacted(hash).inspect
+      end
+
+      # The redacted structure itself, which differs_note walks beside the
+      # real one. A rule with a root: has its hash put back under that root
+      # for the app's filter, as a request logs it, so a scoped filter
+      # ("payment.number", /\Apayment\.code\z/) matches; the registry pass
+      # runs on the hash alone, as it does at runtime.
+      def redacted(hash)
+        inner = redact_sensitive(hash)
+        filter = parameter_filter
+        return inner unless filter
+        return filter.filter(inner) unless @root
+
+        key = @root.to_s
+        filter.filter(key => inner)[key]
+      end
+
+      # The registry's names, by whatever it can answer: #include?, else its
+      # #names matched the way the registry matches (case-insensitive
+      # substring). One with neither is left to its #to_proc in
+      # parameter_filter. A masked value is replaced whole, a Hash included.
+      # An ActionController::Parameters is unwrapped, so its nested values
+      # are reached too.
+      def redact_sensitive(value)
+        value = value.to_unsafe_h if value.respond_to?(:to_unsafe_h)
+        return value.map { |item| redact_sensitive(item) } if value.is_a?(Array)
+        return value unless value.is_a?(Hash)
+
+        registry = Permittable.filter_parameter_registry
+        value.to_h do |key, item|
+          [key, sensitive_name?(registry, key) ? Permittable::FilterParameterRegistry::FILTERED : redact_sensitive(item)]
+        end
+      end
+
+      def sensitive_name?(registry, key)
+        if registry.respond_to?(:include?)
+          registry.include?(key)
+        elsif registry.respond_to?(:names)
+          name = key.to_s.downcase
+          registry.names.any? { |sensitive| name.include?(sensitive.to_s.downcase) }
+        else
+          false
+        end
+      end
+
+      # Rails' ParameterFilter over the app's config.filter_parameters, plus
+      # the registry's own #to_proc when it can answer neither #include? nor
+      # #names (a proc masks only Strings, but it is all such a registry
+      # offers). ActiveSupport::ParameterFilter is not loaded by
+      # `require "active_support"` before 7.0, and a Rails 6.1 app without
+      # ActionDispatch::Request has not loaded it either; it has been
+      # requirable since 6.0.
+      def parameter_filter
+        filters = []
+        app = defined?(Rails) && Rails.respond_to?(:application) && Rails.application
+        filters.concat(Array(app.config.filter_parameters)) if app
+        registry = Permittable.filter_parameter_registry
+        filters << registry.to_proc unless registry.respond_to?(:include?) || registry.respond_to?(:names)
+        return if filters.empty?
+
+        begin
+          require "active_support/parameter_filter"
+        rescue LoadError
+          return
+        end
+        ActiveSupport::ParameterFilter.new(filters)
+      end
+
+      # The registry matches by substring, like Rails (`pin` also redacts
+      # `shipping`), so an expected and an actual hash that differ only under
+      # redacted names print the same. Say where they differ, by name only.
+      def differs_note
+        return "" unless @returning
+
+        expected = ActiveSupport::HashWithIndifferentAccess.new(@returning).to_h
+        actual = @result.to_h
+        return "" if expected == actual || printable(expected) != printable(actual)
+
+        # A filter on the root itself masks the whole hash, leaving the root as the one path.
+        paths = differing_paths(expected, actual, redacted(expected), redacted(actual)).map { |path| path || @root.to_s }
+        paths.empty? ? "" : "; differs at: #{paths.join(', ')}"
+      end
+
+      # Walks the real hashes beside their redacted copies and stops at the
+      # redaction boundary: a node the copy shows as masked is named by its
+      # path alone when the real values differ, and not entered, since a key
+      # or an index below it is as secret as its value.
+      def differing_paths(expected, actual, expected_masked, actual_masked, prefix = nil)
+        filtered = Permittable::FilterParameterRegistry::FILTERED
+        masked = expected_masked == filtered || actual_masked == filtered
+        if !masked && expected.is_a?(Hash) && actual.is_a?(Hash)
+          (expected.keys | actual.keys).flat_map do |key|
+            differing_paths(expected[key], actual[key], expected_masked[key], actual_masked[key], [prefix, key].compact.join("."))
+          end
+        elsif !masked && expected.is_a?(Array) && actual.is_a?(Array) && expected.length == actual.length
+          expected.each_index.flat_map do |i|
+            differing_paths(expected[i], actual[i], expected_masked[i], actual_masked[i], "#{prefix}[#{i}]")
+          end
+        else
+          expected == actual ? [] : [prefix]
+        end
       end
 
       def summary(violations)
