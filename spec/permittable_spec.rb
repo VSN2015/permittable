@@ -1175,6 +1175,21 @@ RSpec.describe Permittable do
       end
     end
 
+    # The head before a glued offset may be any date String, and a zero or
+    # two-digit offset is as valid as "+5".
+    it "does not refuse a valid head or offset in front of a glued zone" do
+      ["Sat, 05 Sep 2026 GMT+5", "5 Sep 2026 AD GMT+5", "2026-09-05 GMT+12", "2026-09-05 GMT+1200"].each do |value|
+        expected = value.include?("+12") ? Time.utc(2026, 9, 4, 12) : Time.utc(2026, 9, 4, 19)
+        expect(permit({ at: value }, &decl)[:at]).to eq(expected), value
+        expect(violations_for({ on: value }, &decl).details).to eq([{ param: "on", code: "invalid_type" }]), value
+      end
+      ["2026-09-05 GMT+0", "2026-09-05 UTC+0000", "2026-09-05 GMT-00"].each do |value|
+        expect(permit({ at: value }, &decl)[:at]).to eq(Time.utc(2026, 9, 5)), value
+        expect(permit({ on: value }, &decl)[:on]).to eq(Date.new(2026, 9, 5)), value
+      end
+      expect(violations_for({ at: "2026-09-05 GMT+120" }, &decl).details).to eq([{ param: "at", code: "invalid_type" }])
+    end
+
     # "W. Europe" is the military zone W to Ruby, which is no zone here, and
     # the rest of it would be dropped; like any unknown word after a date it
     # is refused. The whole name is a zone Ruby knows.
