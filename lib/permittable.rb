@@ -1091,9 +1091,8 @@ module Permittable
 
     # The Date of an instant read from a String when it is midnight UTC.
     def date_at_midnight(status, instant)
-      return [:error, "invalid_type"] unless status == :ok && instant == instant.beginning_of_day
-
-      [:ok, Date.new(instant.year, instant.month, instant.day)]
+      date = date_of_instant(instant) if status == :ok
+      date ? [:ok, date] : [:error, "invalid_type"]
     end
 
     # The date a Time or DateTime IS, or nil: its UTC date when it is
