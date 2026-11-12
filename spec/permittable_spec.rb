@@ -4130,6 +4130,17 @@ RSpec.describe Permittable do
         expect([error.status, c.rendered[:status]]).to eq(%i[unprocessable_entity unprocessable_entity])
       end
 
+      it "renders a status that is neither Symbol, String nor Integer as it was handed over, without raising" do
+        controller_class = Class.new(ActionController::API) do
+          include Permittable
+        end
+        [nil, 422.0].each do |odd|
+          controller_class.send(:define_method, :create) { raise Permittable::InvalidParameters.new("x", status: odd) }
+          result = IntegrationHarness.dispatch(controller_class, :create, method: "POST")
+          expect([odd, result.status]).to eq([odd, odd.nil? ? 200 : 422])
+        end
+      end
+
       it "gives a real controller's 422 response no Rack deprecation warning" do
         controller_class = Class.new(ActionController::API) do
           include Permittable

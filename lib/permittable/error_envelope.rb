@@ -195,6 +195,8 @@ module Permittable
     def status_code(status)
       return status if status.is_a?(Integer)
 
+      return nil unless status.respond_to?(:to_sym)
+
       symbol = status.to_sym
       STATUS_CODES[symbol] ||
         (defined?(Rack::Utils) && Rack::Utils::SYMBOL_TO_STATUS_CODE[symbol])
