@@ -613,6 +613,23 @@ RSpec.describe Permittable::Generator do
       ActiveRecord::Base.connection.drop_table(:gen_documents, if_exists: true)
     end
 
+    it "hints at what the contract cannot say for decimal, routing-key and json columns" do
+      ActiveRecord::Schema.define do
+        create_table(:gen_hints) do |t|
+          t.decimal :price, precision: 8, scale: 2
+          t.string :format
+          t.json :settings
+        end
+      end
+      stub_const("GenHint", Class.new(TestModel) { self.table_name = "gen_hints" })
+      draft = described_class.draft(model: GenHint)
+      expect(draft).to match(/:price, :decimal # .*TODO: decimal\(8,2\): the contract does not bound precision/)
+      expect(draft).to match(/:format, :string # TODO: format collides with a Rails request key under root: false/)
+      expect(draft).to match(/:settings, :json # TODO: settings \(json\): a :json field accepts an object only/)
+    ensure
+      ActiveRecord::Base.connection.drop_table(:gen_hints, if_exists: true)
+    end
+
     it "leaves a TODO comment for columns with no contract type at all" do
       expect(draft).to match(/# TODO: thumbnail \(binary\) has no contract type/)
     end
