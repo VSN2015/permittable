@@ -46,7 +46,9 @@ module Permittable
     # What an entry's `inert` reason reads as in the table.
     INERT_NOTES = {
       no_callbacks: "contract cannot run: controller lacks AbstractController::Callbacks (no before_action)",
-      skipped: "contract cannot run: skip_before_action :enforce_params_contract removed its before_action"
+      skipped: "contract cannot run: skip_before_action :enforce_params_contract removed its before_action",
+      conditional: "contract may not run: skip_before_action :enforce_params_contract is conditional " \
+                   "(if:/unless:) and the audit cannot evaluate the condition"
     }.freeze
 
     # One routed action, paired with the rule a request for it would resolve
@@ -56,7 +58,7 @@ module Permittable
     # `missing_action` marks a route to an action the controller does not
     # define — see Audit.missing_action?. `inert` marks one whose rule exists
     # but cannot run, so `rule` is nil and the action is uncovered: the reason,
-    # :no_callbacks or :skipped — see Audit.inert_reason. `route` identifies the route the
+    # :no_callbacks, :skipped or :conditional — see Audit.inert_reason. `route` identifies the route the
     # path came from (nil for a hand-built descriptor, which is then its own
     # route); see `summary`. `ignored` is why the entry is left out of the
     # counts — a key of IGNORE_REASONS — or nil when it is audited.
@@ -124,38 +126,63 @@ module Permittable
       routes.select { |route| route[:controller].to_s == key }.map do |route|
         action = route[:action].to_s
         rule = rule_for(controller, action)
-        inert = inert_reason(controller, rule)
+        inert = inert_reason(controller, rule, action)
         Entry.new(controller: key, action: action, verb: route[:verb], path: route[:path],
                   rule: (rule unless inert), missing_action: missing[action], route: route[:route],
                   ignored: configured_ignore(key, action, ignore) || outside, inert: inert)
       end
     end
 
-    # Why `rule` is declared on `controller` but can never run there, or nil
-    # when it can: the gem's before_action is not in the controller's callback
-    # chain, while the rule validates from that callback (an `enforce: true`
-    # rule, or one in monitor mode by its own mode: or the app-wide
-    # Permittable.mode). Either :no_callbacks — a bare ActionController::Metal
-    # controller without AbstractController::Callbacks at its `permit_params`,
-    # where the gem never registered it (a callbacks module included afterwards
-    # does not undo that) — or :skipped, for `skip_before_action
-    # :enforce_params_contract`, which removes it from this class's chain and
-    # its subclasses' (permit_params does not register it a second time).
+    # Why `rule` is declared on `controller` but may not run for `action`, or
+    # nil when it does: the gem's before_action is not in the controller's
+    # callback chain, or is skipped for that action, while the rule validates
+    # from that callback (an `enforce: true` rule, or one in monitor mode by
+    # its own mode: or the app-wide Permittable.mode). One of
+    # - :no_callbacks: a bare ActionController::Metal controller without
+    #   AbstractController::Callbacks at its `permit_params`, where the gem
+    #   never registered it (a callbacks module included afterwards does not
+    #   undo that);
+    # - :skipped: `skip_before_action :enforce_params_contract` took it out of
+    #   this class's chain and its subclasses' (permit_params does not register
+    #   it a second time), or its only:/except: name this action;
+    # - :conditional: a skip with if:/unless: that could reach this action,
+    #   whose condition the audit does not evaluate, since that is host code.
     # permit_params raises for the first at class load, but reads only the
     # rule's own mode, since the app-wide one is often set after the class
     # loads; the effective mode is judged here. Such an action is audited as
     # uncovered rather than as the monitored or enforced one it claims to be.
     #
-    # A skip with `only:`, `except:`, `if:` or `unless:` leaves the callback in
-    # the chain behind conditions Rails keeps private, so it is not seen here:
-    # the action stays covered, as it was.
-    def inert_reason(controller, rule)
+    # The conditions of a skip are read from the record Permittable::SkipRecorder
+    # keeps of the `skip_before_action` call, and apply only while the callback
+    # in the chain is the one that call left. A skip made with `skip_callback`
+    # directly, or a `before_action :enforce_params_contract` of the host's own
+    # with conditions, is not seen unless it removed the callback outright.
+    def inert_reason(controller, rule, action)
       return unless rule && (rule[:enforce] || (rule[:mode] || Permittable.mode) == :monitor)
-
       return :no_callbacks if never_registered?(controller)
+      return unless controller.respond_to?(:_process_action_callbacks)
 
-      :skipped if controller.respond_to?(:_process_action_callbacks) &&
-                  controller._process_action_callbacks.none? { |c| c.kind == :before && c.filter == :enforce_params_contract }
+      callback = controller._process_action_callbacks.find { |c| c.kind == :before && c.filter == :enforce_params_contract }
+      callback ? skip_reason(controller, callback, action) : :skipped
+    end
+
+    def skip_reason(controller, callback, action)
+      held = controller.permittable_skips if controller.respond_to?(:permittable_skips)
+      return unless held && held[:callback].equal?(callback)
+
+      effects = held[:skips].map { |skip| skip_effect(skip, action) }
+      effects.include?(:skipped) ? :skipped : effects.compact.first
+    end
+
+    # What one skip does to `action`, as Rails composes it: each skip adds its
+    # only: and except: to the callback as conditions that must all hold, so
+    # the action is skipped when it is in only: or outside except:. An if: or
+    # unless: makes it :conditional wherever only:/except: do not skip it.
+    def skip_effect(skip, action)
+      named = skip[:only]&.include?(action) || (skip[:except] && !skip[:except].include?(action))
+      return :skipped if named || (skip[:only].nil? && skip[:except].nil? && !skip[:conditional])
+
+      :conditional if skip[:conditional]
     end
 
     def never_registered?(controller)

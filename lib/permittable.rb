@@ -642,8 +642,55 @@ module Permittable
     end
   end
 
+  # Remembers what `skip_before_action :enforce_params_contract` took out of
+  # the callback chain, for Audit. A skip with only:/except:/if:/unless: leaves
+  # the callback in the chain behind conditions Rails keeps private, so the
+  # only public place to read them is the call itself. Prepended to the
+  # controller's singleton class when the gem registers its callback, so it
+  # wins whatever the include order of the callbacks module and this one.
+  # It calls super with the arguments it was given and returns what super
+  # returns; it only looks.
+  module SkipRecorder
+    ruby2_keywords def skip_before_action(*args, &)
+      options = args.last.is_a?(Hash) ? args.last : {}
+      return super unless args.any? { |name| name.to_s == "enforce_params_contract" }
+
+      # Rails rebuilds the callback of every class already below this one too,
+      # each with its own new object, so each gets the record.
+      targets = [self] + descendants
+      before = targets.map(&:permittable_hook_callback)
+      result = super
+      targets.zip(before) { |target, was| target.permittable_record_skip(was, options) }
+      result
+    end
+
+    def permittable_hook_callback
+      _process_action_callbacks.find { |callback| callback.kind == :before && callback.filter == :enforce_params_contract }
+    end
+
+    # One state per class, replaced rather than changed, so a subclass's skip
+    # never reaches its parent. It holds the callback now in the chain and
+    # every skip that produced it: a skip is carried forward from the state
+    # only when it was made on that very callback, so a callback declared
+    # again afterwards (a new object) starts clean. only:/except: are kept as
+    # Rails compares them, action names as Strings.
+    def permittable_record_skip(before, options)
+      after = permittable_hook_callback
+      return if before.nil? || before.equal?(after)
+
+      held = permittable_skips
+      skips = held && held[:callback].equal?(before) ? held[:skips] : []
+      skip = { only: (Array(options[:only]).to_set(&:to_s) if options[:only]),
+               except: (Array(options[:except]).to_set(&:to_s) if options[:except]),
+               conditional: options.key?(:if) || options.key?(:unless) }.freeze
+      self.permittable_skips = { callback: after, skips: (skips + [skip]).freeze }.freeze
+    end
+  end
+
   included do
     class_attribute :permittable_contracts, instance_accessor: false, default: []
+    # The skips of enforce_params_contract SkipRecorder saw (see Audit).
+    class_attribute :permittable_skips, instance_accessor: false, default: nil
     # Whether the gem itself ever registered its rescue_from / before_action
     # for this class (a subclass inherits the answer). Asking the callback
     # chain instead would bring back a check the app took out with
@@ -2466,6 +2513,7 @@ module Permittable
       # order: this check runs before any callback declared after the include,
       # so a locale switch that must cover it is a `prepend_around_action`.
       before_action :enforce_params_contract
+      singleton_class.prepend(SkipRecorder) unless singleton_class < SkipRecorder
       self.permittable_callback_registered = true
     end
 
