@@ -652,7 +652,8 @@ module Permittable
   # returns; it only looks.
   module SkipRecorder
     ruby2_keywords def skip_before_action(*args, &)
-      options = args.last.is_a?(Hash) ? args.last : {}
+      # A copy: Rails deletes only:/except: from a positional Hash and adds :if to it.
+      options = args.last.is_a?(Hash) ? args.last.dup : {}
       return super unless args.any? { |name| name.to_s == "enforce_params_contract" }
 
       # Rails rebuilds the callback of every class already below this one too,

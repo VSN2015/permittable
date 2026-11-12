@@ -628,6 +628,34 @@ RSpec.describe Permittable::Audit do
             expect(spared).to have_attributes(covered?: true, mode: :monitor)
           end
 
+          # Rails deletes only:/except: from, and adds :if to, a Hash passed as
+          # the last positional argument, so the record must be read from a copy.
+          it "reads a positional options Hash the way a real request sees it, with only:" do
+            controller = declare(**rule) { skip_before_action :enforce_params_contract, { only: :create } }
+            expect(both(controller)).to eq([[false, 200], [true, 422]])
+          end
+
+          it "reads a positional options Hash the way a real request sees it, with except:" do
+            controller = declare(**rule) { skip_before_action :enforce_params_contract, { except: :create } }
+            expect(both(controller)).to eq([[true, 422], [false, 200]])
+          end
+
+          # The audit applies a record while the callback in the chain is the
+          # very object the skip left there. If Rails ever copies callbacks when
+          # other ones are declared, this fails on that Rails: see SkipRecorder.
+          it "keeps a skip's verdict after unrelated callbacks are declared" do
+            controller = declare(**rule) do
+              skip_before_action :enforce_params_contract, only: :create
+              before_action :other
+              skip_before_action :other2, raise: false
+              prepend_before_action :other
+              around_action ->(_controller, block) { block.call }
+              after_action :other
+              def other = nil
+            end
+            expect(both(controller)).to eq([[false, 200], [true, 422]])
+          end
+
           it "does not change what skip_before_action does for other callbacks, raise: false, or inherited calls" do
             controller = declare(**rule) do
               before_action :other
@@ -675,6 +703,16 @@ RSpec.describe Permittable::Audit do
               %i[create update].each { |name| define_method(name) { render(json: { ok: 1 }) } }
             end
             expect(both(metal)).to eq([[true, 422], [true, 422]])
+          end
+
+          # An ancestor that never included Permittable has no recorder, so its
+          # raise: false skip (nothing to skip on it) is rewritten into the
+          # subclass's callback by Rails, with nothing recorded.
+          it "cannot see a skip made on an ancestor that never included Permittable" do
+            ancestor = Class.new(ActionController::Base)
+            controller = declare(ancestor, **rule)
+            ancestor.skip_before_action :enforce_params_contract, only: :create, raise: false
+            expect(both(controller)).to eq([[true, 200], [true, 422]])
           end
 
           # Not seen: the skip never went through skip_before_action, so there is
