@@ -1,5 +1,16 @@
 <!-- CHANGELOG.md -->
 
+## 0.15.1 (2026-11-12)
+<!-- title: a date String's hour and glued offset read or refused, and the exported body and descriptors list the routing keys, a renamed CSRF token and a route's format default -->
+
+**Patch rather than minor.** Every string this release newly refuses was already misread by 0.15.0: each dropped an hour or an offset, or read midnight UTC by accident. The refused strings are `"2026-09-05 10 A.D."`, `"2026-09-05 10 a"`, `"2026-09-05 10 AD GMT+5"`, offsets that are not read whole or not honoured (`"EST+5"`, `"UTC+99"`, `"GMT+0560"`), and, for a `:date`, `"2026-09-05 GMT+5"`. The export changes are these: `rails_routes` descriptors now name a `format:` default; a contract field `format` leaves the body for such routes; a rootless multipart `unknown: :error` body gains a redundant `"format": {}`; and a rootless JSON `unknown: :error` body lists the routing keys and a renamed CSRF token as free properties.
+
+### Fixed
+- **An hour before an era or a lone letter is refused on a date String.** `"2026-09-05 10 A.D."` and `"2026-09-05 10 a"` lost the hour on 0.15.0 and read as midnight; they are now refused as `invalid_type`, as `"2026-09-05 10 EST"` already was. (#179)
+- **An offset glued to a zone name is read.** `"2026-09-05 GMT+5"` and `"2026-09-05 UTC+0530"` were dropped to midnight UTC on 0.15.0. A `:datetime` now reads them as midnight at that offset (`2026-09-04T19:00Z`, `2026-09-04T18:30Z`); a `:date` refuses them, since the instant is not midnight UTC. (#179)
+- **The rootless `unknown: :error` JSON body lists the routing keys and a renamed CSRF token.** `controller`, `action`, `format` and the controller's `request_forgery_protection_token` are accepted by the runtime but failed the exported schema. They are now free, optional properties. (#180)
+- **A route's `format:` default fills a contract field of that name.** The export left a field called `format` in the body and its `required` list, though the router fills it. `rails_routes` now names `format` in the descriptor's `defaults:`. (#180)
+
 ## 0.15.0 (2026-11-12)
 <!-- title: zone names and hours that Date._parse drops honoured or refused, an export that matches what the server stores, an audit that stops reporting rules that cannot run, matchers that redact what they print, and a column guard that knows aliases and store accessors -->
 
