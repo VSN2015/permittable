@@ -5688,7 +5688,7 @@ RSpec.describe Permittable do
 
           # Permittable.mode is usually set by an initializer, so the class-load
           # check reads only the rule's own mode: an app must still boot. The
-          # audit reports the action as not covered (see Audit.inert?).
+          # audit reports the action as not covered (see Audit.inert_reason).
           it "still loads a rule with no mode of its own, without AbstractController::Callbacks" do
             expect do
               build_metal(%i[permittable rescue]) { permit_params(:create) { required :name, :string } }

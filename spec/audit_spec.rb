@@ -410,6 +410,117 @@ RSpec.describe Permittable::Audit do
         end
       end
 
+      # `skip_before_action :enforce_params_contract` removes the callback an
+      # enforce: true or monitor-mode rule validates from, so the request is
+      # never checked. Every verdict is compared with a REAL request.
+      context "with enforce_params_contract skipped" do
+        let(:skip_route) { { controller: "audit_skip", action: "create", verb: "post", path: "/skip" } }
+
+        # `reads:` makes the action read permitted_params, as a lazy rule needs.
+        def declare(parent = ActionController::Base, reads: false, **rule, &after_rule)
+          Class.new(parent) do
+            include Permittable unless self < Permittable
+
+            def self.controller_path = "audit_skip"
+            permit_params(:create, **rule) { optional :n, :integer } if rule.any?
+            class_eval(&after_rule) if after_rule
+            define_method(:create) { render(json: reads ? permitted_params(:create).to_h : { ok: 1 }) }
+          end
+        end
+
+        def verdict(controller)
+          entry = described_class.entries(controllers: [controller], routes: [skip_route]).first
+          status = IntegrationHarness.dispatch(controller, :create, method: "POST", json: { bogus: 1 }).status
+          [entry, status]
+        end
+
+        def metal_base
+          Class.new(ActionController::Metal) do
+            include AbstractController::Callbacks
+            include ActionController::Rescue
+            include AbstractController::Rendering
+            include ActionController::Rendering
+            include ActionController::Renderers::All
+            include ActionController::StrongParameters
+          end
+        end
+
+        after { Permittable.mode = :enforce }
+
+        it "audits an unskipped enforce: true rule as covered, and the request is rejected (control)" do
+          entry, status = verdict(declare(enforce: true, unknown: :error))
+          expect([entry.covered?, entry.inert?, status]).to eq([true, false, 422])
+        end
+
+        it "audits a skip with no options as uncovered, with the reason and the body warning" do
+          controller = declare(enforce: true, unknown: :error) { skip_before_action :enforce_params_contract }
+          entry, status = verdict(controller)
+          expect([entry.covered?, entry.inert?, status]).to eq([false, true, 200])
+          expect(described_class.summary([entry])).to include(enforced: 0, uncovered: 1, uncovered_with_body: 1)
+          expect(described_class.format([entry]))
+            .to match(%r{POST\s+/skip\s+create\s+no contract — contract cannot run: .*skip_before_action.* — ACCEPTS A BODY})
+        end
+
+        it "audits a skip on a Metal controller with Callbacks as uncovered" do
+          controller = declare(metal_base, enforce: true, unknown: :error) { skip_before_action :enforce_params_contract }
+          entry, status = verdict(controller)
+          expect([entry.covered?, status]).to eq([false, 200])
+        end
+
+        it "audits a monitor-mode rule whose callback is skipped as uncovered, and a lazy rule as still covered" do
+          monitored = declare(mode: :monitor, unknown: :error) { skip_before_action :enforce_params_contract }
+          expect(verdict(monitored).first).to have_attributes(covered?: false, inert?: true)
+
+          lazy = declare(reads: true, unknown: :error) { skip_before_action :enforce_params_contract }
+          entry, status = verdict(lazy)
+          expect([entry.covered?, status]).to eq([true, 422])
+        end
+
+        it "audits a subclass that skips what its parent declared as uncovered, and the parent as covered" do
+          parent = declare(enforce: true, unknown: :error)
+          child = Class.new(parent) { skip_before_action :enforce_params_contract }
+          expect([verdict(parent).first.covered?, verdict(parent).last]).to eq([true, 422])
+          entry, status = verdict(child)
+          expect([entry.covered?, status]).to eq([false, 200])
+        end
+
+        # permit_params registers the callback once per class tree, so a child
+        # declaring a rule under a parent that skipped it does not get it back.
+        it "audits a child's new permit_params under a skipping parent as uncovered" do
+          parent = declare(enforce: true, unknown: :error) { skip_before_action :enforce_params_contract }
+          child = Class.new(parent) do
+            permit_params(:create, enforce: true, unknown: :error) { optional :n, :integer }
+          end
+          entry, status = verdict(child)
+          expect([entry.covered?, status]).to eq([false, 200])
+        end
+
+        it "audits a skip on a Metal child of a Metal parent as uncovered" do
+          parent = declare(metal_base, enforce: true, unknown: :error)
+          child = Class.new(parent) { skip_before_action :enforce_params_contract }
+          entry, status = verdict(child)
+          expect([entry.covered?, status]).to eq([false, 200])
+        end
+
+        it "audits a callback declared again after a skip as covered" do
+          controller = declare(enforce: true, unknown: :error) do
+            skip_before_action :enforce_params_contract
+            before_action :enforce_params_contract
+          end
+          entry, status = verdict(controller)
+          expect([entry.covered?, status]).to eq([true, 422])
+        end
+
+        it "keeps the verdicts of monitor-mode and unknown: :log / :ignore rules when nothing is skipped" do
+          Permittable.mode = :monitor
+          expect(verdict(declare(unknown: :error)).first).to have_attributes(covered?: true, inert?: false, mode: :monitor)
+          Permittable.mode = :enforce
+          %i[log ignore].each do |unknown|
+            expect(verdict(declare(enforce: true, unknown: unknown)).first).to have_attributes(covered?: true, inert?: false)
+          end
+        end
+      end
+
       # A via: :all route is five entries for one action; Rails need only be
       # asked once.
       it "asks Rails's resolver once per action, not once per verb" do
