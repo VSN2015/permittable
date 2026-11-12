@@ -624,7 +624,7 @@ RSpec.describe Permittable::Generator do
       stub_const("GenHint", Class.new(TestModel) { self.table_name = "gen_hints" })
       draft = described_class.draft(model: GenHint)
       expect(draft).to match(/:price, :decimal # .*TODO: decimal\(8,2\): the contract does not bound precision/)
-      expect(draft).to match(/:format, :string # TODO: format collides with a Rails request key under root: false/)
+      expect(draft).to match(/:format, :string # TODO: format is also a Rails request key/)
       expect(draft).to match(/:settings, :json # TODO: settings \(json\): a :json field accepts an object only/)
     ensure
       ActiveRecord::Base.connection.drop_table(:gen_hints, if_exists: true)

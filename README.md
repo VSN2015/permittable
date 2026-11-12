@@ -812,7 +812,7 @@ rescue_from Permittable::InvalidParameters, with: :render_invalid_parameters
 
 Paths are fully qualified: `user.address.zip`, `line_items[1].sku`.
 
-**`details` is complete; `message` is prose.** The `details` array names **every** offender, however many there are — it is the machine-readable channel and nothing is dropped from it. The `message` string is a sentence for a person, and it also lands in your logs and in every exception tracker, so it is bounded: at most ten offenders, each truncated past 120 characters, then a count of the rest (`…, and 49990 more`). Before that bound, a request carrying 50,000 undeclared keys against `unknown: :error` produced a **1 MB** exception message and a 1 MB log line. The 422 body still carries the complete `details`, so it stays proportional to the number of violations; the field bounds are what keep that number down. The check itself lists one violation per undeclared key, so its cost grows with the key count (about 33 s for 200,000 keys); cap the request body size or key count in front of the app.
+**`details` is complete; `message` is prose.** The `details` array names **every** offender, however many there are — it is the machine-readable channel and nothing is dropped from it. The `message` string is a sentence for a person, and it also lands in your logs and in every exception tracker, so it is bounded: at most ten offenders, each truncated past 120 characters, then a count of the rest (`…, and 49990 more`). Before that bound, a request carrying 50,000 undeclared keys against `unknown: :error` produced a **1 MB** exception message and a 1 MB log line. The 422 body still carries the complete `details`, so it stays proportional to the number of violations; the field bounds are what keep that number down. The check itself lists one violation per undeclared key, so its cost grows with the key count (tens of seconds at a few hundred thousand keys, growing linearly); cap the request body size or key count in front of the app.
 
 **Status codes.** A bad root key renders **400** — the request is malformed; the envelope you asked for isn't there, or isn't an object. Field-level violations render **422** — well-formed, semantically wrong. The two root failures are told apart by their code: `missing` when the key really is absent (`{}`, `{"user": null}`, `{"user": ""}`), `invalid_type` when the client sent it with the wrong shape.
 
@@ -1517,13 +1517,16 @@ Output is deterministic (fixed key order, declaration-order properties), so the 
 
 `spec/schema_conformance_spec.rb` holds the "cannot drift" claim to account: it walks canonical JSON payloads through both the contract and its own exported schema and asserts the verdicts agree.
 
-Where they legitimately differ, the spec names the reason and asserts the **direction**, so a new divergence fails the suite instead of shipping quietly. Five cases go the safe way — the **server accepts what its docs reject**, leaving a client that follows the docs merely conservative:
+Where they legitimately differ, the spec names the reason and asserts the **direction**, so a new divergence fails the suite instead of shipping quietly. Three cases go the safe way — the **server accepts what its docs reject**, leaving a client that follows the docs merely conservative:
 
 - **Non-canonical encodings.** Coercion accepts `"30"` for an `:integer` and `1` for a `:string`, because form and query payloads are all strings. The schema documents the canonical JSON encoding only.
 - **`null` as absence.** The runtime reads `{"age": null}` as `{}` ([absence](#absence-defaults-and-partial-updates)); JSON Schema cannot express that, so `type: integer` rejects a null the server would accept and ignore. A [`nullable:`](#explicit-nulls-nullable) field is not this case — there the null is a value, the exported `type` widens to say so, and the two agree.
-- **Rails' `rows[][name]` naming.** The server accepts Rails' unindexed form naming in a multipart body; the export describes only the indexed `rows[0][name]` form.
-- **A `null` or blank array element.** The server drops it (absence, as above), while the schema's `items` refuses it.
 - **Padding that normalizes away.** `normalize:` runs before the checks, so under `normalize: :squish` and `length: 3..10` the server accepts `"  abcdefghij  "` — ten characters once squished — while the docs reject its fourteen.
+
+Two more go the same way but sit outside that spec's JSON-only harness (it has no multipart or Rails-parsing step), so they are documented here and not asserted there:
+
+- **Rails' `rows[][name]` naming.** The server accepts Rails' unindexed form naming in a multipart body; the export describes only the indexed `rows[0][name]` form.
+- **A dropped array element.** Rails' parameter parsing removes a `null` element before the contract runs, and the contract drops a blank one from a non-string array (`""` in an `:integer` array), while the schema's `items` refuses both. A standalone `Contract` still refuses `["a", null]`.
 
 Seven cases go the other way, and are worth knowing before you hand the document to a client. Each rule stays visible on its own field, and the spec asserts that as well as the direction:
 

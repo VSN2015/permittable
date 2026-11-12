@@ -1173,7 +1173,10 @@ module Permittable
         todos << "TODO: decimal(#{column.precision},#{column.scale || 0}): the contract does not bound precision; " \
                  "a Postgres app may 500 on overflow"
       end
-      todos << "TODO: #{column.name} collides with a Rails request key under root: false" if RAILS_REQUEST_KEYS.include?(column.name.to_s)
+      if RAILS_REQUEST_KEYS.include?(column.name.to_s)
+        todos << "TODO: #{column.name} is also a Rails request key — if this contract is rootless (root: false) " \
+                 "the router's value collides with it"
+      end
       if JSON_TYPES.include?(column.type)
         todos << "TODO: #{column.name} (#{column.type}): a :json field accepts an object only, not an array"
       end
