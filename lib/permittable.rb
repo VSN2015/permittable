@@ -1290,6 +1290,8 @@ module Permittable
     # without it names the same date (and time). Only a String that ends in a
     # signed number or a word is parsed again, so a plain "2026-09-05" is not.
     def dropped_tail(value, found)
+      # "at" joins a date to its time, and Ruby reads it as a zone (or drops it) when none follows.
+      return [:error, "invalid_type"] if /\sat\s*\z/i.match?(value)
       return [:error, "invalid_type"] if !found.key?(:hour) && ISO_DATE_T_START.match?(value)
       return if found.key?(:zone)
 
@@ -1383,10 +1385,15 @@ module Permittable
       text = value.gsub(REMARK, " ")
       # A remark the parser read (a "(Sat)") is part of the parse: look at it too.
       text = value if text != value && Date._parse(text) != found
+      # "(GMT+02:00)" after "GMT+0200": a remark that repeats the offset read.
+      text = text.gsub(OFFSET_REMARK) do
+        Date._parse("00:00 GMT#{Regexp.last_match(1)}")[:offset] == found[:offset] ? " " : Regexp.last_match(0)
+      end
       text = text.gsub(%r{[^-+',./:@[:alnum:]\[\]]+}, " ")
       text.scan(PART) do
         part = Regexp.last_match
         next if part[0].match?(part.pre_match.match?(/\d\z/) ? GLUED_NOISE : LONE_WORD)
+        next if part[0].casecmp?("at") && found.key?(:hour) && part.post_match.match?(/\d/) # joins a date to its time
         # "10:30 am", "12 pm" and "22:00 pm" are what the hour already says.
         next if { "am" => found[:hour].to_i < 12, "pm" => found[:hour].to_i >= 12 }[part[0].downcase]
         next if found[:offset] && Date._parse("00:00 #{part[0]}")[:offset] == found[:offset]
@@ -1407,8 +1414,9 @@ module Permittable
     REMARK = %r{\([\p{L}\p{M} .'’-]*\)|(?:\[!?[\w/+=-]+\])+\z|\sm=[+-]\d+(?:\.\d+)?\z}
     PART = /[[:alpha:]]+|[+-]?\d[^[:alpha:]\s]*/
     GLUED_NOISE = /\A(?:t|st|nd|rd|th)\z/i
-    LONE_WORD = /\A(?:[[:alpha:]]|ad|ce|at)\z/i # "at" joins a date to its time
-    private_constant :TIME_PARTS, :GLUED_OFFSET, :ISO_DATE_TIME, :INVISIBLE, :REMARK, :PART, :GLUED_NOISE, :LONE_WORD
+    LONE_WORD = /\A(?:[[:alpha:]]|ad|ce)\z/i
+    OFFSET_REMARK = /\((?:GMT|UTC)([+-]\d{1,2}(?::?\d{2})?)\)/
+    private_constant :TIME_PARTS, :GLUED_OFFSET, :ISO_DATE_TIME, :INVISIBLE, :REMARK, :PART, :GLUED_NOISE, :LONE_WORD, :OFFSET_REMARK
 
     def same_date?(rest, found)
       complete_date?(rest) && rest.values_at(:year, :mon, :mday) == found.values_at(:year, :mon, :mday)

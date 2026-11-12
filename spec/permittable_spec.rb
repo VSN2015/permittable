@@ -1249,7 +1249,9 @@ RSpec.describe Permittable do
        "2026-09-05 10:30\u200b", "2026-09-05T10:30:00Z pm", "2026-01-01 EST xyz", "xyz 2026-01-01 EST",
        "(Sat) 2026-01-15\n2099-12-31", "2026-01-15 (Sat) 2099-12-31", "2026-01-15 <script> (Thu)", "2026-01-15 xyz (Thu)",
        "2026-01-15 10:00 (PST) xyz", "2026-09-05 10:00:00 -0400 PST", "2026-09-05 06:00:00 EDT -0700",
-       "2026-09-05 10:00 EST UTC PST GMT", "2026-09-05 10:00 UTC EST", "2026-09-05T10:00+01:00[Europe/London] xyz"].each do |value|
+       "2026-09-05 10:00 EST UTC PST GMT", "2026-09-05 10:00 UTC EST", "2026-09-05T10:00+01:00[Europe/London] xyz",
+       "Sat Sep 05 2026 10:00:00 GMT+0200 (GMT-05:00)", "Sat Sep 05 2026 10:00:00 GMT+0200 (UTC+3)",
+       "2026-09-05 at", "Sep 5 2026 at", "2026-09-05 10:00 at"].each do |value|
         expect(violations_for({ at: value }, &decl).details).to eq([{ param: "at", code: "invalid_type" }]), value
         expect(violations_for({ on: value }, &decl).details).to eq([{ param: "on", code: "invalid_type" }]), value
       end
@@ -1289,6 +1291,9 @@ RSpec.describe Permittable do
         "2026-09-05 10:00:00 UTC +00:00" => Time.utc(2026, 9, 5, 10), "2026-09-05 10:00:00 +0000 +0000" => Time.utc(2026, 9, 5, 10),
         "2026-09-05 06:00:00 -0400 EDT" => Time.utc(2026, 9, 5, 10), "2026-09-05 22:00 PM" => Time.utc(2026, 9, 5, 22),
         "September 5, 2026 at 10:00 AM" => Time.utc(2026, 9, 5, 10),
+        # Chrome's toString for a zone with no long name: the remark repeats the offset.
+        "Sat Sep 05 2026 10:00:00 GMT+0200 (GMT+02:00)" => Time.utc(2026, 9, 5, 8),
+        "Sat Sep 05 2026 10:00:00 GMT+0200 (UTC+2)" => Time.utc(2026, 9, 5, 8),
         # RFC 9557 zone ids and annotations, which the offset governs, and remarks in any script.
         "2026-09-05T10:00+01:00[Europe/London]" => Time.utc(2026, 9, 5, 9),
         "2026-09-05T06:00-04:00[America/New_York]" => Time.utc(2026, 9, 5, 10),
