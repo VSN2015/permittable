@@ -1091,9 +1091,8 @@ module Permittable
 
     # The Date of an instant read from a String when it is midnight UTC.
     def date_at_midnight(status, instant)
-      return [:error, "invalid_type"] unless status == :ok && instant == instant.beginning_of_day
-
-      [:ok, Date.new(instant.year, instant.month, instant.day)]
+      date = date_of_instant(instant) if status == :ok
+      date ? [:ok, date] : [:error, "invalid_type"]
     end
 
     # The date a Time or DateTime IS, or nil: its UTC date when it is
@@ -1252,9 +1251,9 @@ module Permittable
 
     # Trailing words, set apart by a space: a zone name ("EST", "Eastern
     # Standard Time", "W. Europe Standard Time") or a day or era word. The
-    # first word has two letters or more, or one and a ".", as a lone letter
-    # is a military zone or the ISO "T".
-    ZONE_NAME_TAIL = /(?<=\s)[[:alpha:]](?:\.|[[:alpha:]]+)[[:alpha:].]*(?:\s+[[:alpha:].]+)*\z/
+    # first word may be one letter, which is a military zone or the ISO "T"
+    # and so no zone here, but still stands where an hour was lost.
+    ZONE_NAME_TAIL = /(?<=\s)[[:alpha:]](?:\.|[[:alpha:]]+)?[[:alpha:].]*(?:\s+[[:alpha:].]+)*\z/
 
     # An era word at the start of such a tail: the parser reads it with the
     # date ("Sep 5 2026 BC" is the year -2025), so it is not what follows.
@@ -1291,10 +1290,15 @@ module Permittable
       return if found.key?(:zone)
 
       if (tail = SIGNED_TAIL.match(value))
-        return unless tail[1] || found.key?(:hour)
+        # An offset glued to a zone name with no time ("2026-09-05 GMT+5") is
+        # read below as midnight at that offset; one glued to a date is a
+        # part of it ("2026-09-05" ends in "-05").
+        named = !tail[1] && !found.key?(:hour) && /\s[[:alpha:]]+\z/.match(tail.pre_match)
+        return unless tail[1] || found.key?(:hour) || named
 
         rest = Date._parse(tail.pre_match)
         return unless same_date?(rest, found)
+        return glued_zone(named, tail[0].strip, found) if named
 
         git_style = tail[1] && found.key?(:hour) && TIME_THEN_YEAR.match?(tail.pre_match) && same_time?(rest, found)
         git_style ? instant_in_zone(tail.pre_match, tail[0].strip) : [:error, "invalid_type"]
@@ -1305,23 +1309,41 @@ module Permittable
           pre += era[0]
           text = era.post_match
         end
-        return if text.empty?
+        # The era is part of the date, so the hour a lost one hid is looked
+        # for before it ("2026-09-05 10 A.D.", "2026-09-05 10 AD EST").
+        head = era ? Date._parse(tail.pre_match) : nil
+        return same_time?(head, found) ? nil : [:error, "invalid_type"] if text.empty?
 
         rest = Date._parse(pre)
         return unless same_date?(rest, found)
 
         zone = Date._parse("00:00 #{text}")
         return unless zone.key?(:zone) # a day name
+        # The hour the tail made the parser lose ("2026-09-05 10 EST").
+        return [:error, "invalid_type"] unless same_time?(head || rest, found)
         # A single letter is a military zone, which is no zone here: alone it
         # is nothing ("2026-09-05 a", "A."), but the rest of an initial-led
         # name Ruby did not know ("W. Europe") is dropped, so it is refused
         # like any other word it does not know.
         return text.match?(/\A[[:alpha:]]\.?\z/) ? nil : [:error, "invalid_type"] if zone[:zone].length == 1
-        # The hour the tail made the parser lose ("2026-09-05 10 EST").
-        return [:error, "invalid_type"] unless same_time?(rest, found)
 
         instant_in_zone(pre, text)
       end
+    end
+
+    # A signed offset after a zone name ("GMT+5", "UTC+0530") is that zone to
+    # Ruby when it reads it next to a time, so the String is midnight at it.
+    # A name it does not read whole ("EST+5") or honour ("UTC+99") is refused.
+    # What comes before the zone is held to the rules of any date String: no
+    # hour a lost tail hid ("2026-09-05 10 AD GMT+5"), no second zone, and the
+    # offset is hours ("+5", "+05") or hhmm with minutes a minute ("+0530").
+    def glued_zone(word, offset, found)
+      zone = "#{word[0].strip}#{offset}"
+      pre = Date._parse(word.pre_match)
+      return [:error, "invalid_type"] unless offset.match?(GLUED_OFFSET) && Date._parse("00:00 #{zone}")[:zone] == zone
+      return [:error, "invalid_type"] unless same_time?(pre, found) && !pre.key?(:zone) && dropped_tail(word.pre_match, pre).nil?
+
+      instant_in_zone(word.pre_match, zone)
     end
 
     # The wall clock `date` names, as it is read in the zone `text` names:
@@ -1338,7 +1360,8 @@ module Permittable
     end
 
     TIME_PARTS = %i[hour min sec sec_fraction].freeze
-    private_constant :TIME_PARTS
+    GLUED_OFFSET = /\A[+-](?:\d{1,2}|\d{2}[0-5]\d)\z/
+    private_constant :TIME_PARTS, :GLUED_OFFSET
 
     def same_date?(rest, found)
       complete_date?(rest) && rest.values_at(:year, :mon, :mday) == found.values_at(:year, :mon, :mday)
