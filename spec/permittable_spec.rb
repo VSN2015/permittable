@@ -4065,9 +4065,83 @@ RSpec.describe Permittable do
       rescue described_class::InvalidParameters => e
         c.render_invalid_parameters(e)
       end
-      expect(c.rendered[:status]).to eq(:unprocessable_entity)
+      expect(c.rendered[:status]).to eq(422)
       expect(c.rendered[:json][:error][:code]).to eq("invalid_parameters")
       expect(c.rendered[:json][:error][:details]).to eq([{ param: "name", code: "missing" }])
+    end
+
+    # Rack >= 3.1 deprecates the symbol :unprocessable_entity (it is
+    # :unprocessable_content there) and Rails 7.1 hands it to Rack as is, so
+    # the gem gives `render` the number, which means the same on every Rack.
+    describe "the status it hands to render" do
+      def rendered_for(params, format: :envelope)
+        Permittable.error_format = format
+        c = controller(permittable_class { permit_params(:create, root: :user) { required :name, :string } },
+                       params: params)
+        begin
+          c.permitted_params
+        rescue described_class::InvalidParameters => e
+          c.render_invalid_parameters(e)
+        end
+        c.rendered
+      end
+
+      after { Permittable.error_format = :envelope }
+
+      it "is the Integer 422 for a field violation and 400 for a missing root, in either format" do
+        %i[envelope problem].each do |format|
+          expect(rendered_for({ user: {} }, format: format)[:status]).to eq(422)
+          expect(rendered_for({}, format: format)[:status]).to eq(400)
+        end
+      end
+
+      it "is an Integer on a bare Metal controller, which has no render" do
+        metal = Class.new do
+          include Permittable
+
+          attr_accessor :params, :status, :content_type, :response_body
+
+          permit_params(:create, root: :user) { required :name, :string }
+          def action_name = "create"
+        end.new
+        metal.params = ActiveSupport::HashWithIndifferentAccess.new(user: {})
+        begin
+          metal.permitted_params
+        rescue described_class::InvalidParameters => e
+          metal.render_invalid_parameters(e)
+        end
+        expect(metal.status).to eq(422)
+      end
+
+      it "leaves InvalidParameters#status, and what a host's render_error receives, as the symbol" do
+        klass = permittable_class do
+          permit_params(:create) { required :name, :string }
+          def render_error(message:, status:, code:)
+            render(json: { message: message, code: code }, status: status)
+          end
+        end
+        c = controller(klass, params: {})
+        error = begin
+          c.permitted_params
+        rescue described_class::InvalidParameters => e
+          e
+        end
+        c.render_invalid_parameters(error)
+        expect([error.status, c.rendered[:status]]).to eq(%i[unprocessable_entity unprocessable_entity])
+      end
+
+      it "gives a real controller's 422 response no Rack deprecation warning" do
+        controller_class = Class.new(ActionController::API) do
+          include Permittable
+
+          permit_params(:create, root: :user) { required :name, :string }
+          def create = render(json: permitted_params)
+        end
+        warnings = []
+        allow(Warning).to receive(:warn) { |message, **| warnings << message }
+        result = IntegrationHarness.dispatch(controller_class, :create, method: "POST", json: { user: { zip: 1 } })
+        expect([result.status, warnings.grep(/deprecated/)]).to eq([422, []])
+      end
     end
   end
 

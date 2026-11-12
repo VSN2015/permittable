@@ -72,6 +72,9 @@ module Permittable
     # response_body=. `render json:` calls `to_json` on a Hash, so the bytes
     # are the same. A controller with `render` always takes the first path.
     def render_json(controller, payload, status:, content_type: nil)
+      # The number, not the symbol: Rack >= 3.1 deprecates :unprocessable_entity
+      # (:unprocessable_content there) and Rails 7.1 passes it to Rack as is.
+      status = status_code(status) || status
       if !controller.respond_to?(:render) && controller.respond_to?(:response_body=)
         controller.status = status
         controller.content_type = content_type if content_type
