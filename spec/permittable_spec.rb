@@ -800,6 +800,32 @@ RSpec.describe Permittable do
         .to raise_error(described_class::InvalidParameters)
     end
 
+    # `==` made 1.0, BigDecimal("1"), Rational(1, 1) and Complex(1, 0) equal to
+    # the listed 1, and a JSON `1.0` arrives as a Float: it passed as true.
+    it "refuses a number other than the Integer 1 or 0 for :boolean, however it equals them" do
+      klass = permittable_class { permit_params(:create) { required :flag, :boolean } }
+      [1.0, 0.0, -0.0, BigDecimal("1"), BigDecimal("0"), Rational(1, 1), Complex(1, 0), 2, "1.0", "2"].each do |value|
+        expect { controller(klass, params: { flag: value }).permitted_params }
+          .to raise_error(described_class::InvalidParameters), value.inspect
+      end
+      expect(controller(klass, params: { flag: 1 }).permitted_params[:flag]).to be(true)
+      expect(controller(klass, params: { flag: 0 }).permitted_params[:flag]).to be(false)
+    end
+
+    it "refuses a JSON 1.0 or 0.0 for :boolean on a request" do
+      controller = IntegrationHarness.build_controller do
+        include Permittable
+
+        permit_params(:create, unknown: :error) { optional :flag, :boolean }
+
+        def create = render(json: { flag: permitted_params[:flag] })
+      end
+      { "1.0" => 422, "0.0" => 422, "1" => 200, "0" => 200 }.each do |literal, status|
+        result = IntegrationHarness.dispatch(controller, :create, method: "POST", raw_json: %({"flag": #{literal}}))
+        expect(result.status).to eq(status), literal
+      end
+    end
+
     it "casts float, decimal, date, and datetime" do
       result = permit({ f: "3.14", d: "19.99", day: "2026-08-15", at: "2026-08-15T10:00:00" }) do
         permit_params(:create) do
@@ -1207,6 +1233,58 @@ RSpec.describe Permittable do
       ["2026-09-05 foo", "2026-09-05 noon", "2026-09-05 BC foo", "2026-09-05 W. Nowhere Standard Time"].each do |value|
         expect(violations_for({ at: value }, &decl).details).to eq([{ param: "at", code: "invalid_type" }]), value
         expect(violations_for({ on: value }, &decl).details).to eq([{ param: "on", code: "invalid_type" }]), value
+      end
+    end
+
+    # Date._parse reads what it can find and says nothing of the rest, so text
+    # after (or before, or between) a complete date was dropped and the
+    # String taken as the date alone: "2026-01-15\n2099-12-31" passed an
+    # in: range for January, "2026-01-01 <script>" was a date. A part of the
+    # String it read nothing from is refused, as "2026-01-01 hello" always was.
+    it "refuses text the parser read nothing from, around a date or a date-time" do
+      ["2026-01-01xyz", "2026-01-15\n2099-12-31", "2026-01-01 <script>", "2026-01-01;DROP", "2026-01-01\u200b",
+       "\u200b2026-01-01", "2026-01-01 \u0000", "2026-01-01 2026-02-02", "xyz 2026-01-01", "2026-01-01 (2099-12-31)",
+       "2026-01-01#frag", "2026-01-01 OR 1=1", "Sep 5 2026\u200b", "GMT+5 2026-09-05", "Sep 5 junk 2026",
+       "2026-09-05 10:30 12", "2026-09-05 10:30:00Z xyz", "2026-09-05 10:30:00 +0200 xyz", "Sat, 05 Sep 2026 10:00:00 GMT xyz",
+       "2026-09-05 10:30\u200b", "2026-09-05T10:30:00Z pm", "2026-01-01 EST xyz", "xyz 2026-01-01 EST"].each do |value|
+        expect(violations_for({ at: value }, &decl).details).to eq([{ param: "at", code: "invalid_type" }]), value
+        expect(violations_for({ on: value }, &decl).details).to eq([{ param: "on", code: "invalid_type" }]), value
+      end
+    end
+
+    it "refuses such text on a request, before an in: range can be met with the date it hid" do
+      controller = IntegrationHarness.build_controller do
+        include Permittable
+
+        permit_params :create, unknown: :error do
+          optional :d, :date, in: Date.new(2026, 1, 1)..Date.new(2026, 1, 31)
+        end
+
+        def create = render(json: { d: permitted_params[:d] })
+      end
+      ["2026-01-01xyz", "2026-01-15\n2099-12-31", "2026-01-01 <script>"].each do |value|
+        expect(IntegrationHarness.dispatch(controller, :create, method: "POST", params: { d: value }).status).to eq(422), value
+      end
+      expect(IntegrationHarness.dispatch(controller, :create, method: "POST", params: { d: "2026-01-15" }).status).to eq(200)
+    end
+
+    it "still reads every date String the parser accounts for in full" do
+      {
+        "Sat, 05 Sep 2026 10:00:00 -0500 (CDT)" => Time.utc(2026, 9, 5, 15),
+        "Sat Sep 05 2026 10:00:00 GMT-0500 (Central Daylight Time)" => Time.utc(2026, 9, 5, 15),
+        "2026-09-05 10:00:00.5 +0000 UTC m=+0.000123456" => Time.utc(2026, 9, 5, 10, 0, 0.5),
+        "2026-09-05 10:00:00 -0500 CDT m=+12.5" => Time.utc(2026, 9, 5, 15),
+        "Sat Sep 5 10:00:00 UTC 2026" => Time.utc(2026, 9, 5, 10), "2026-09-05 10:30 am" => Time.utc(2026, 9, 5, 10, 30),
+        "2026-09-05 12pm" => Time.utc(2026, 9, 5, 12), "2026-09-05 10:00 PM" => Time.utc(2026, 9, 5, 22),
+        "1st Jan 2026" => Time.utc(2026, 1, 1), "22nd Jan 2026" => Time.utc(2026, 1, 22),
+        "Saturday, September 5, 2026" => Time.utc(2026, 9, 5),
+        "20260905T100000Z" => Time.utc(2026, 9, 5, 10), "2026-09-05 EST DST" => Time.utc(2026, 9, 5, 4),
+        "2026-09-05," => Time.utc(2026, 9, 5), "2026-09-05\n" => Time.utc(2026, 9, 5), "\t2026-09-05\t" => Time.utc(2026, 9, 5)
+      }.each do |value, instant|
+        expect(permit({ at: value }, &decl)[:at]).to eq(instant), value
+      end
+      ["Sep 5th 2026", "5 Sep 2026 BC", "2026-09-05 CE", "2026-09-05 A. D.", "2026-09-05 Sat", "Sat Sep 05 2026 (UTC)"].each do |value|
+        expect { permit({ on: value }, &decl) }.not_to raise_error, value
       end
     end
 

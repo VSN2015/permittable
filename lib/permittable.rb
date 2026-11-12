@@ -1006,9 +1006,11 @@ module Permittable
       result.exponent.abs > [DECIMAL_DIGIT_ALLOWANCE, source.length].max
     end
 
+    # eql?, not ==: 1.0, BigDecimal("1"), Rational(1, 1) and Complex(1, 0) are
+    # == 1, and a JSON `1.0` arrives as a Float, but only the Integer is listed.
     def cast_boolean(value)
-      return [:ok, true] if TRUE_VALUES.include?(value)
-      return [:ok, false] if FALSE_VALUES.include?(value)
+      return [:ok, true] if TRUE_VALUES.any? { |true_value| true_value.eql?(value) }
+      return [:ok, false] if FALSE_VALUES.any? { |false_value| false_value.eql?(value) }
 
       [:error, "invalid_type"]
     end
@@ -1048,6 +1050,7 @@ module Permittable
         if !plain && (dropped = dropped_tail(value, found))
           return date_at_midnight(*dropped)
         end
+        return [:error, "invalid_type"] if !plain && unread_text?(value, found)
 
         # Built from the components rather than re-running Date.parse, which
         # would parse the same string a second time — and Date.parse is the
@@ -1177,6 +1180,7 @@ module Permittable
 
       dropped = dropped_tail(value, found)
       return dropped if dropped
+      return [:error, "invalid_type"] if unread_text?(value, found)
 
       [:ok, DateTime.parse(value, true, Date::GREGORIAN).to_time.utc]
     rescue ArgumentError, RangeError
@@ -1351,8 +1355,40 @@ module Permittable
     def instant_in_zone(date, text)
       zone = Date._parse("00:00 #{text}")
       return [:error, "invalid_type"] unless zone.key?(:zone) && honoured_zone?(zone)
+      # Ruby reads a zone name and drops what follows it ("EST xyz" is EST).
+      return [:error, "invalid_type"] unless zone[:zone].casecmp?(text.split.join(" "))
+      return [:error, "invalid_type"] if unread_text?(date, Date._parse(date))
 
       [:ok, DateTime.parse(date, true, Date::GREGORIAN).to_time.utc - zone[:offset]]
+    end
+
+    # Text Date._parse read nothing from, which the parse then leaves out of
+    # the result without a word: "2026-01-01xyz", a second date after the
+    # first ("2026-01-15\n2099-12-31"), "<script>", and any control or
+    # zero-width character (the parser takes it for a space). Found by
+    # leaving each word and number out in turn: if the parse is unchanged,
+    # that part of the String meant nothing to it. A part that is meant
+    # to say nothing is let through: the T of an ISO date-time, an ordinal or
+    # era word, an am or pm the hour already says, a lone letter after a date, a zone Ruby knows beside another,
+    # and a remark in brackets ("(Central Daylight Time)") or Go's "m=+0.1".
+    def unread_text?(value, found)
+      return false if ISO_DATE_TIME.match?(value) # all of it is read; skips the parses below
+      return true if value.match?(INVISIBLE)
+
+      text = value.gsub(REMARK, " ")
+      return false if text != value && Date._parse(text) != found
+
+      text = text.gsub(%r{[^-+',./:@[:alnum:]\[\]]+}, " ")
+      text.scan(PART) do
+        part = Regexp.last_match
+        next if part[0].match?(part.pre_match.match?(/\d\z/) ? GLUED_NOISE : LONE_WORD)
+        next if part[0].match?(/\A[[:alpha:]]/) && Date._parse("00:00 #{part[0]}")[:offset]
+        # "10:30 am" and "12 pm" are what the hour already says.
+        next if { "am" => found[:hour].to_i < 12, "pm" => found[:hour] == 12 }[part[0].downcase]
+
+        return true if Date._parse("#{part.pre_match} #{part.post_match}") == found
+      end
+      false
     end
 
     def same_time?(rest, found)
@@ -1361,7 +1397,13 @@ module Permittable
 
     TIME_PARTS = %i[hour min sec sec_fraction].freeze
     GLUED_OFFSET = /\A[+-](?:\d{1,2}|\d{2}[0-5]\d)\z/
-    private_constant :TIME_PARTS, :GLUED_OFFSET
+    ISO_DATE_TIME = /\A\d{4}-?\d\d-?\d\d[Tt ]\d\d:?\d\d(?::?\d\d(?:[.,]\d+)?)?(?:[Zz]| ?[+-]\d\d(?::?\d\d)?)?\z/
+    INVISIBLE = /[\p{Cc}\p{Cf}&&[^\s]]/
+    REMARK = /\([[:alpha:]. ]*\)|\sm=[+-]\d+(?:\.\d+)?\z/
+    PART = /[[:alpha:]]+|[+-]?\d[^[:alpha:]\s]*/
+    GLUED_NOISE = /\A(?:t|st|nd|rd|th)\z/i
+    LONE_WORD = /\A(?:[[:alpha:]]|ad|ce)\z/i
+    private_constant :TIME_PARTS, :GLUED_OFFSET, :ISO_DATE_TIME, :INVISIBLE, :REMARK, :PART, :GLUED_NOISE, :LONE_WORD
 
     def same_date?(rest, found)
       complete_date?(rest) && rest.values_at(:year, :mon, :mday) == found.values_at(:year, :mon, :mday)
