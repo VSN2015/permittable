@@ -1367,24 +1367,29 @@ module Permittable
     # first ("2026-01-15\n2099-12-31"), "<script>", and any control or
     # zero-width character (the parser takes it for a space). Found by
     # leaving each word and number out in turn: if the parse is unchanged,
-    # that part of the String meant nothing to it. A part that is meant
-    # to say nothing is let through: the T of an ISO date-time, an ordinal or
-    # era word, an am or pm the hour already says, a lone letter after a date, a zone Ruby knows beside another,
-    # and a remark in brackets ("(Central Daylight Time)") or Go's "m=+0.1".
+    # that part of the String meant nothing to it.
+    #
+    # A part may stay unread only when it says nothing new: the T of an ISO
+    # date-time, an ordinal or era word, "at", a lone letter after a date, an am
+    # or pm the hour already says, or an offset or zone name that repeats the
+    # one read ("EDT -04:00", "+0000 UTC"; "-0400 PST" disagrees, so is
+    # refused). Remarks are set aside: a bracketed name ("(Central Daylight
+    # Time)", "(heure d'été de l'Est)"), an RFC 9557 zone id
+    # ("[Europe/London]", "[u-ca=japanese]": the offset governs) and Go's "m=+0.1".
     def unread_text?(value, found)
       return false if ISO_DATE_TIME.match?(value) # all of it is read; skips the parses below
       return true if value.match?(INVISIBLE)
 
       text = value.gsub(REMARK, " ")
-      return false if text != value && Date._parse(text) != found
-
+      # A remark the parser read (a "(Sat)") is part of the parse: look at it too.
+      text = value if text != value && Date._parse(text) != found
       text = text.gsub(%r{[^-+',./:@[:alnum:]\[\]]+}, " ")
       text.scan(PART) do
         part = Regexp.last_match
         next if part[0].match?(part.pre_match.match?(/\d\z/) ? GLUED_NOISE : LONE_WORD)
-        next if part[0].match?(/\A[[:alpha:]]/) && Date._parse("00:00 #{part[0]}")[:offset]
-        # "10:30 am" and "12 pm" are what the hour already says.
-        next if { "am" => found[:hour].to_i < 12, "pm" => found[:hour] == 12 }[part[0].downcase]
+        # "10:30 am", "12 pm" and "22:00 pm" are what the hour already says.
+        next if { "am" => found[:hour].to_i < 12, "pm" => found[:hour].to_i >= 12 }[part[0].downcase]
+        next if found[:offset] && Date._parse("00:00 #{part[0]}")[:offset] == found[:offset]
 
         return true if Date._parse("#{part.pre_match} #{part.post_match}") == found
       end
@@ -1399,10 +1404,10 @@ module Permittable
     GLUED_OFFSET = /\A[+-](?:\d{1,2}|\d{2}[0-5]\d)\z/
     ISO_DATE_TIME = /\A\d{4}-?\d\d-?\d\d[Tt ]\d\d:?\d\d(?::?\d\d(?:[.,]\d+)?)?(?:[Zz]| ?[+-]\d\d(?::?\d\d)?)?\z/
     INVISIBLE = /[\p{Cc}\p{Cf}&&[^\s]]/
-    REMARK = /\([[:alpha:]. ]*\)|\sm=[+-]\d+(?:\.\d+)?\z/
+    REMARK = %r{\([\p{L}\p{M} .'’-]*\)|(?:\[!?[\w/+=-]+\])+\z|\sm=[+-]\d+(?:\.\d+)?\z}
     PART = /[[:alpha:]]+|[+-]?\d[^[:alpha:]\s]*/
     GLUED_NOISE = /\A(?:t|st|nd|rd|th)\z/i
-    LONE_WORD = /\A(?:[[:alpha:]]|ad|ce)\z/i
+    LONE_WORD = /\A(?:[[:alpha:]]|ad|ce|at)\z/i # "at" joins a date to its time
     private_constant :TIME_PARTS, :GLUED_OFFSET, :ISO_DATE_TIME, :INVISIBLE, :REMARK, :PART, :GLUED_NOISE, :LONE_WORD
 
     def same_date?(rest, found)

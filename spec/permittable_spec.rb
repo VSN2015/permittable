@@ -1246,7 +1246,10 @@ RSpec.describe Permittable do
        "\u200b2026-01-01", "2026-01-01 \u0000", "2026-01-01 2026-02-02", "xyz 2026-01-01", "2026-01-01 (2099-12-31)",
        "2026-01-01#frag", "2026-01-01 OR 1=1", "Sep 5 2026\u200b", "GMT+5 2026-09-05", "Sep 5 junk 2026",
        "2026-09-05 10:30 12", "2026-09-05 10:30:00Z xyz", "2026-09-05 10:30:00 +0200 xyz", "Sat, 05 Sep 2026 10:00:00 GMT xyz",
-       "2026-09-05 10:30\u200b", "2026-09-05T10:30:00Z pm", "2026-01-01 EST xyz", "xyz 2026-01-01 EST"].each do |value|
+       "2026-09-05 10:30\u200b", "2026-09-05T10:30:00Z pm", "2026-01-01 EST xyz", "xyz 2026-01-01 EST",
+       "(Sat) 2026-01-15\n2099-12-31", "2026-01-15 (Sat) 2099-12-31", "2026-01-15 <script> (Thu)", "2026-01-15 xyz (Thu)",
+       "2026-01-15 10:00 (PST) xyz", "2026-09-05 10:00:00 -0400 PST", "2026-09-05 06:00:00 EDT -0700",
+       "2026-09-05 10:00 EST UTC PST GMT", "2026-09-05 10:00 UTC EST", "2026-09-05T10:00+01:00[Europe/London] xyz"].each do |value|
         expect(violations_for({ at: value }, &decl).details).to eq([{ param: "at", code: "invalid_type" }]), value
         expect(violations_for({ on: value }, &decl).details).to eq([{ param: "on", code: "invalid_type" }]), value
       end
@@ -1279,7 +1282,20 @@ RSpec.describe Permittable do
         "1st Jan 2026" => Time.utc(2026, 1, 1), "22nd Jan 2026" => Time.utc(2026, 1, 22),
         "Saturday, September 5, 2026" => Time.utc(2026, 9, 5),
         "20260905T100000Z" => Time.utc(2026, 9, 5, 10), "2026-09-05 EST DST" => Time.utc(2026, 9, 5, 4),
-        "2026-09-05," => Time.utc(2026, 9, 5), "2026-09-05\n" => Time.utc(2026, 9, 5), "\t2026-09-05\t" => Time.utc(2026, 9, 5)
+        "2026-09-05," => Time.utc(2026, 9, 5), "2026-09-05\n" => Time.utc(2026, 9, 5), "\t2026-09-05\t" => Time.utc(2026, 9, 5),
+        # An offset or zone name that repeats the one read (TimeWithZone#inspect, Go, Ruby's own to_s).
+        "2026-09-05 06:00:00.000000000 EDT -04:00" => Time.utc(2026, 9, 5, 10),
+        "Sat, 05 Sep 2026 06:00:00.000000000 EDT -04:00" => Time.utc(2026, 9, 5, 10),
+        "2026-09-05 10:00:00 UTC +00:00" => Time.utc(2026, 9, 5, 10), "2026-09-05 10:00:00 +0000 +0000" => Time.utc(2026, 9, 5, 10),
+        "2026-09-05 06:00:00 -0400 EDT" => Time.utc(2026, 9, 5, 10), "2026-09-05 22:00 PM" => Time.utc(2026, 9, 5, 22),
+        "September 5, 2026 at 10:00 AM" => Time.utc(2026, 9, 5, 10),
+        # RFC 9557 zone ids and annotations, which the offset governs, and remarks in any script.
+        "2026-09-05T10:00+01:00[Europe/London]" => Time.utc(2026, 9, 5, 9),
+        "2026-09-05T06:00-04:00[America/New_York]" => Time.utc(2026, 9, 5, 10),
+        "2026-09-05T10:00:00Z[Etc/UTC]" => Time.utc(2026, 9, 5, 10),
+        "2026-09-05T10:00:00+09:00[Asia/Tokyo][u-ca=japanese]" => Time.utc(2026, 9, 5, 1),
+        "Sat Sep 05 2026 06:00:00 GMT-0400 (heure d\u2019\u00e9t\u00e9 de l\u2019Est)" => Time.utc(2026, 9, 5, 10),
+        "Sat Sep 05 2026 12:00:00 GMT+0200 (Ora legale dell\u2019Europa centrale)" => Time.utc(2026, 9, 5, 10)
       }.each do |value, instant|
         expect(permit({ at: value }, &decl)[:at]).to eq(instant), value
       end
