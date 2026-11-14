@@ -1035,6 +1035,7 @@ module Permittable
         date ? [:ok, date] : [:error, "invalid_type"]
       when Date then [:ok, value]
       when String
+        value = value.delete_prefix(BOM) if value.start_with?(BOM)
         # A bare ISO date ("2026-09-05", the common case) carries no zone, T
         # or offset, so it skips every check for one.
         plain = PLAIN_ISO_DATE.match?(value)
@@ -1146,6 +1147,7 @@ module Permittable
       when Time, DateTime then [:ok, value.to_time.getutc]
       when Date then [:ok, Time.utc(value.year, value.month, value.day)]
       when String
+        value = value.delete_prefix(BOM) if value.start_with?(BOM)
         # Same rule as :date — the DATE part must be named in full, or it is
         # taken from today ("10:30" meant today at 10:30). An absent TIME part
         # is fine and means midnight, which is the documented reading of a
@@ -1379,7 +1381,7 @@ module Permittable
     # Time)", "(heure d'été de l'Est)"), an RFC 9557 zone id
     # ("[Europe/London]", "[u-ca=japanese]": the offset governs) and Go's "m=+0.1".
     def unread_text?(value, found)
-      return false if ISO_DATE_TIME.match?(value) # all of it is read; skips the parses below
+      return false if ISO_DATE_TIME.match?(value) || PLAIN_ISO_DATE.match?(value) # all of it is read; skips the parses below
       return true if value.match?(INVISIBLE)
 
       text = value.gsub(REMARK, " ")
@@ -1390,17 +1392,30 @@ module Permittable
         Date._parse("00:00 GMT#{Regexp.last_match(1)}")[:offset] == found[:offset] ? " " : Regexp.last_match(0)
       end
       text = text.gsub(%r{[^-+',./:@[:alnum:]\[\]]+}, " ")
+      return true if text.scan(PART).size > MAX_PARTS # each part below costs a parse
+
       text.scan(PART) do
         part = Regexp.last_match
         next if part[0].match?(part.pre_match.match?(/\d\z/) ? GLUED_NOISE : LONE_WORD)
         next if part[0].casecmp?("at") && found.key?(:hour) && part.post_match.match?(/\d/) # joins a date to its time
         # "10:30 am", "12 pm" and "22:00 pm" are what the hour already says.
         next if { "am" => found[:hour].to_i < 12, "pm" => found[:hour].to_i >= 12 }[part[0].downcase]
-        next if found[:offset] && Date._parse("00:00 #{part[0]}")[:offset] == found[:offset]
+        next unless Date._parse("#{part.pre_match} #{part.post_match}") == found # the parse needed this part
 
-        return true if Date._parse("#{part.pre_match} #{part.post_match}") == found
+        # What it left unread may still repeat the zone read, or label it.
+        zone = Date._parse("00:00 #{part[0]}")[:offset] if found[:offset]
+        next if zone && (zone == found[:offset] || offset_label?(found, part))
+
+        return true
       end
       false
+    end
+
+    # "+0800 CST": a zone abbreviation right after the numeric offset read is a
+    # label for it (Go and `date` print one), even where Ruby's table maps it to
+    # another offset. The other order ("CST +08:00") reads the abbreviation, so no.
+    def offset_label?(found, part)
+      found[:zone].match?(/\A[+-]/) && part[0].match?(/\A[[:alpha:]]+\z/) && part.pre_match.rstrip.end_with?(found[:zone])
     end
 
     def same_time?(rest, found)
@@ -1410,13 +1425,21 @@ module Permittable
     TIME_PARTS = %i[hour min sec sec_fraction].freeze
     GLUED_OFFSET = /\A[+-](?:\d{1,2}|\d{2}[0-5]\d)\z/
     ISO_DATE_TIME = /\A\d{4}-?\d\d-?\d\d[Tt ]\d\d:?\d\d(?::?\d\d(?:[.,]\d+)?)?(?:[Zz]| ?[+-]\d\d(?::?\d\d)?)?\z/
+    # One leading U+FEFF is a UTF-8 signature (a CSV or text file saved with one), not text.
+    BOM = "\uFEFF".freeze
     INVISIBLE = /[\p{Cc}\p{Cf}&&[^\s]]/
-    REMARK = %r{\([\p{L}\p{M} .'’-]*\)|(?:\[!?[\w/+=-]+\])+\z|\sm=[+-]\d+(?:\.\d+)?\z}
+    REMARK_TEXT = /[\p{L}\p{M} .'’,&-]/
+    REMARK = %r{\((?:#{REMARK_TEXT}|\(#{REMARK_TEXT}*\))*\)|(?:\[!?[\w/+=:-]+\])+\z|\sm=[+-]\d+(?:\.\d+)?\z}
+    # No date format in use has more parts than this: the longest read in the
+    # specs and corpora has 8, e.g. "September 5, 2026 at 10:00:00 AM GMT+2".
+    MAX_PARTS = 16
     PART = /[[:alpha:]]+|[+-]?\d[^[:alpha:]\s]*/
     GLUED_NOISE = /\A(?:t|st|nd|rd|th)\z/i
-    LONE_WORD = /\A(?:[[:alpha:]]|ad|ce)\z/i
+    # No /i: Onigmo then lets [[:alpha:]] match a ligature's folding ("st", "ss", "ff") once it has met non-ASCII text.
+    LONE_WORD = /\A(?:[[:alpha:]]|[Aa][Dd]|[Cc][Ee])\z/
     OFFSET_REMARK = /\((?:GMT|UTC)([+-]\d{1,2}(?::?\d{2})?)\)/
-    private_constant :TIME_PARTS, :GLUED_OFFSET, :ISO_DATE_TIME, :INVISIBLE, :REMARK, :PART, :GLUED_NOISE, :LONE_WORD, :OFFSET_REMARK
+    private_constant :TIME_PARTS, :GLUED_OFFSET, :ISO_DATE_TIME, :BOM, :INVISIBLE, :REMARK_TEXT, :REMARK, :MAX_PARTS, :PART,
+                     :GLUED_NOISE, :LONE_WORD, :OFFSET_REMARK
 
     def same_date?(rest, found)
       complete_date?(rest) && rest.values_at(:year, :mon, :mday) == found.values_at(:year, :mon, :mday)

@@ -367,6 +367,25 @@ RSpec.describe Permittable::Contract do
       )
     end
 
+    # Onigmo, in a case-insensitive pattern, lets [[:alpha:]] match a ligature's
+    # folding ("st", "ss", "ff", "fi") once the pattern has met a non-ASCII String,
+    # so a word after a date was a "lone letter" in one request and junk in the next.
+    # Clean process: spec_helper has long since warmed this one.
+    it "refuses a word after a date the same way before and after a non-ASCII String was read" do
+      script = <<~'RUBY'
+        require "permittable"
+        c = Permittable::Contract.define { optional :at, :datetime }
+        words = %w[st ss ff fi fl]
+        read = -> { words.map { |w| c.call("at" => "2026-09-05 #{w} (Central Time)").valid? } }
+        before = read.call
+        c.call("at" => "2026-09-05T10:00:00Z \u041c\u043e\u0441\u043a\u0432\u0430")
+        print [before, read.call].inspect
+      RUBY
+      out, err, status = Open3.capture3(RbConfig.ruby, "-I", File.expand_path("../lib", __dir__), "-e", script)
+      expect(status).to be_success, err
+      expect(out).to eq("[[false, false, false, false, false], [false, false, false, false, false]]")
+    end
+
     it "reads an ISO date with an offset but no time of day as midnight at it, whatever the host has loaded" do
       script = <<~RUBY
         require "permittable"
