@@ -1006,9 +1006,11 @@ module Permittable
       result.exponent.abs > [DECIMAL_DIGIT_ALLOWANCE, source.length].max
     end
 
+    # eql?, not ==: 1.0, BigDecimal("1"), Rational(1, 1) and Complex(1, 0) are
+    # == 1, and a JSON `1.0` arrives as a Float, but only the Integer is listed.
     def cast_boolean(value)
-      return [:ok, true] if TRUE_VALUES.include?(value)
-      return [:ok, false] if FALSE_VALUES.include?(value)
+      return [:ok, true] if TRUE_VALUES.any? { |true_value| true_value.eql?(value) }
+      return [:ok, false] if FALSE_VALUES.any? { |false_value| false_value.eql?(value) }
 
       [:error, "invalid_type"]
     end
@@ -1033,6 +1035,7 @@ module Permittable
         date ? [:ok, date] : [:error, "invalid_type"]
       when Date then [:ok, value]
       when String
+        value = value.delete_prefix(BOM) if value.start_with?(BOM)
         # A bare ISO date ("2026-09-05", the common case) carries no zone, T
         # or offset, so it skips every check for one.
         plain = PLAIN_ISO_DATE.match?(value)
@@ -1048,6 +1051,7 @@ module Permittable
         if !plain && (dropped = dropped_tail(value, found))
           return date_at_midnight(*dropped)
         end
+        return [:error, "invalid_type"] if !plain && unread_text?(value, found)
 
         # Built from the components rather than re-running Date.parse, which
         # would parse the same string a second time — and Date.parse is the
@@ -1143,6 +1147,7 @@ module Permittable
       when Time, DateTime then [:ok, value.to_time.getutc]
       when Date then [:ok, Time.utc(value.year, value.month, value.day)]
       when String
+        value = value.delete_prefix(BOM) if value.start_with?(BOM)
         # Same rule as :date — the DATE part must be named in full, or it is
         # taken from today ("10:30" meant today at 10:30). An absent TIME part
         # is fine and means midnight, which is the documented reading of a
@@ -1177,6 +1182,7 @@ module Permittable
 
       dropped = dropped_tail(value, found)
       return dropped if dropped
+      return [:error, "invalid_type"] if unread_text?(value, found)
 
       [:ok, DateTime.parse(value, true, Date::GREGORIAN).to_time.utc]
     rescue ArgumentError, RangeError
@@ -1286,6 +1292,8 @@ module Permittable
     # without it names the same date (and time). Only a String that ends in a
     # signed number or a word is parsed again, so a plain "2026-09-05" is not.
     def dropped_tail(value, found)
+      # "at" joins a date to its time, and Ruby reads it as a zone (or drops it) when none follows.
+      return [:error, "invalid_type"] if /\sat\s*\z/i.match?(value)
       return [:error, "invalid_type"] if !found.key?(:hour) && ISO_DATE_T_START.match?(value)
       return if found.key?(:zone)
 
@@ -1351,8 +1359,63 @@ module Permittable
     def instant_in_zone(date, text)
       zone = Date._parse("00:00 #{text}")
       return [:error, "invalid_type"] unless zone.key?(:zone) && honoured_zone?(zone)
+      # Ruby reads a zone name and drops what follows it ("EST xyz" is EST).
+      return [:error, "invalid_type"] unless zone[:zone].casecmp?(text.split.join(" "))
+      return [:error, "invalid_type"] if unread_text?(date, Date._parse(date))
 
       [:ok, DateTime.parse(date, true, Date::GREGORIAN).to_time.utc - zone[:offset]]
+    end
+
+    # Text Date._parse read nothing from, which the parse then leaves out of
+    # the result without a word: "2026-01-01xyz", a second date after the
+    # first ("2026-01-15\n2099-12-31"), "<script>", and any control or
+    # zero-width character (the parser takes it for a space). Found by
+    # leaving each word and number out in turn: if the parse is unchanged,
+    # that part of the String meant nothing to it.
+    #
+    # A part may stay unread only when it says nothing new: the T of an ISO
+    # date-time, an ordinal or era word, "at", a lone letter after a date, an am
+    # or pm the hour already says, or an offset or zone name that repeats the
+    # one read ("EDT -04:00", "+0000 UTC"; "-0400 PST" disagrees, so is
+    # refused). Remarks are set aside: a bracketed name ("(Central Daylight
+    # Time)", "(heure d'été de l'Est)"), an RFC 9557 zone id
+    # ("[Europe/London]", "[u-ca=japanese]": the offset governs) and Go's "m=+0.1".
+    def unread_text?(value, found)
+      return false if ISO_DATE_TIME.match?(value) || PLAIN_ISO_DATE.match?(value) # all of it is read; skips the parses below
+      return true if value.match?(INVISIBLE)
+
+      text = value.gsub(REMARK, " ")
+      # A remark the parser read (a "(Sat)") is part of the parse: look at it too.
+      text = value if text != value && Date._parse(text) != found
+      # "(GMT+02:00)" after "GMT+0200": a remark that repeats the offset read.
+      text = text.gsub(OFFSET_REMARK) do
+        Date._parse("00:00 GMT#{Regexp.last_match(1)}")[:offset] == found[:offset] ? " " : Regexp.last_match(0)
+      end
+      text = text.gsub(%r{[^-+',./:@[:alnum:]\[\]]+}, " ")
+      return true if text.scan(PART).size > MAX_PARTS # each part below costs a parse
+
+      text.scan(PART) do
+        part = Regexp.last_match
+        next if part[0].match?(part.pre_match.match?(/\d\z/) ? GLUED_NOISE : LONE_WORD)
+        next if part[0].casecmp?("at") && found.key?(:hour) && part.post_match.match?(/\d/) # joins a date to its time
+        # "10:30 am", "12 pm" and "22:00 pm" are what the hour already says.
+        next if { "am" => found[:hour].to_i < 12, "pm" => found[:hour].to_i >= 12 }[part[0].downcase]
+        next unless Date._parse("#{part.pre_match} #{part.post_match}") == found # the parse needed this part
+
+        # What it left unread may still repeat the zone read, or label it.
+        zone = Date._parse("00:00 #{part[0]}")[:offset] if found[:offset]
+        next if zone && (zone == found[:offset] || offset_label?(found, part))
+
+        return true
+      end
+      false
+    end
+
+    # "+0800 CST": a zone abbreviation right after the numeric offset read is a
+    # label for it (Go and `date` print one), even where Ruby's table maps it to
+    # another offset. The other order ("CST +08:00") reads the abbreviation, so no.
+    def offset_label?(found, part)
+      found[:zone].match?(/\A[+-]/) && part[0].match?(/\A[[:alpha:]]+\z/) && part.pre_match.rstrip.end_with?(found[:zone])
     end
 
     def same_time?(rest, found)
@@ -1361,7 +1424,22 @@ module Permittable
 
     TIME_PARTS = %i[hour min sec sec_fraction].freeze
     GLUED_OFFSET = /\A[+-](?:\d{1,2}|\d{2}[0-5]\d)\z/
-    private_constant :TIME_PARTS, :GLUED_OFFSET
+    ISO_DATE_TIME = /\A\d{4}-?\d\d-?\d\d[Tt ]\d\d:?\d\d(?::?\d\d(?:[.,]\d+)?)?(?:[Zz]| ?[+-]\d\d(?::?\d\d)?)?\z/
+    # One leading U+FEFF is a UTF-8 signature (a CSV or text file saved with one), not text.
+    BOM = "\uFEFF".freeze
+    INVISIBLE = /[\p{Cc}\p{Cf}&&[^\s]]/
+    REMARK_TEXT = /[\p{L}\p{M} .'’,&-]/
+    REMARK = %r{\((?:#{REMARK_TEXT}|\(#{REMARK_TEXT}*\))*\)|(?:\[!?[\w/+=:-]+\])+\z|\sm=[+-]\d+(?:\.\d+)?\z}
+    # No date format in use has more parts than this: the longest read in the
+    # specs and corpora has 8, e.g. "September 5, 2026 at 10:00:00 AM GMT+2".
+    MAX_PARTS = 16
+    PART = /[[:alpha:]]+|[+-]?\d[^[:alpha:]\s]*/
+    GLUED_NOISE = /\A(?:t|st|nd|rd|th)\z/i
+    # No /i: Onigmo then lets [[:alpha:]] match a ligature's folding ("st", "ss", "ff") once it has met non-ASCII text.
+    LONE_WORD = /\A(?:[[:alpha:]]|[Aa][Dd]|[Cc][Ee])\z/
+    OFFSET_REMARK = /\((?:GMT|UTC)([+-]\d{1,2}(?::?\d{2})?)\)/
+    private_constant :TIME_PARTS, :GLUED_OFFSET, :ISO_DATE_TIME, :BOM, :INVISIBLE, :REMARK_TEXT, :REMARK, :MAX_PARTS, :PART,
+                     :GLUED_NOISE, :LONE_WORD, :OFFSET_REMARK
 
     def same_date?(rest, found)
       complete_date?(rest) && rest.values_at(:year, :mon, :mday) == found.values_at(:year, :mon, :mday)
