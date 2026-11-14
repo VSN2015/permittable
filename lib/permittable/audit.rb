@@ -46,9 +46,11 @@ module Permittable
     # What an entry's `inert` reason reads as in the table.
     INERT_NOTES = {
       no_callbacks: "contract cannot run: controller lacks AbstractController::Callbacks (no before_action)",
-      skipped: "contract cannot run: skip_before_action :enforce_params_contract removed its before_action",
-      conditional: "contract may not run: skip_before_action :enforce_params_contract is conditional " \
-                   "(if:/unless:) and the audit cannot evaluate the condition"
+      skipped: "request not checked before the action: skip_before_action :enforce_params_contract took its " \
+               "before_action off this action (checked only if the action reads permitted_params)",
+      conditional: "request may not be checked before the action: skip_before_action :enforce_params_contract is " \
+                   "conditional (if:/unless:) and the audit cannot evaluate the condition " \
+                   "(checked only if the action reads permitted_params)"
     }.freeze
 
     # One routed action, paired with the rule a request for it would resolve
@@ -189,6 +191,10 @@ module Permittable
       defined?(::ActionController::Metal) && controller.is_a?(Class) && controller < ::ActionController::Metal &&
         !(controller.respond_to?(:permittable_callback_registered) && controller.permittable_callback_registered)
     end
+
+    # module_function made public singleton copies of these; they are this
+    # module's own steps, not API.
+    private_class_method :inert_reason, :skip_reason, :skip_effect, :never_registered?
 
     # Why `controller` — or one of its actions — is left out of the audit and
     # of permittable:generate: :configured (Permittable.audit_ignore names the

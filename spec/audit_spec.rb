@@ -465,7 +465,73 @@ RSpec.describe Permittable::Audit do
           expect([entry.covered?, entry.inert?, status]).to eq([false, true, 200])
           expect(described_class.summary([entry])).to include(enforced: 0, uncovered: 1, uncovered_with_body: 1)
           expect(described_class.format([entry]))
-            .to match(%r{POST\s+/skip\s+create\s+no contract — contract cannot run: .*skip_before_action.* — ACCEPTS A BODY})
+            .to match(%r{POST\s+/skip\s+create\s+no contract — request not checked before the action: .*skip_before_action.* — ACCEPTS})
+        end
+
+        # An action that reads permitted_params validates lazily, so the request
+        # IS checked with the callback gone, just not before the action runs.
+        # The verdict stays uncovered (enforce: true promises the earlier
+        # check), and the note must be true whether or not the action reads.
+        describe "when the action reads permitted_params" do
+          let(:note) do
+            Regexp.new("no contract — request not checked before the action: .*skip_before_action.* " \
+                       "\\(checked only if the action reads permitted_params\\) — ACCEPTS A BODY")
+          end
+
+          def invalid_events
+            events = []
+            subscriber = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") { |*args| events << args }
+            yield
+            events
+          ensure
+            ActiveSupport::Notifications.unsubscribe(subscriber)
+          end
+
+          { "a bare skip" => {}, "an only: skip" => { only: :create } }.each do |label, options|
+            it "words an enforce: true rule under #{label} so it holds for the request that is checked" do
+              controller = declare(reads: true, enforce: true, unknown: :error) do
+                skip_before_action :enforce_params_contract, **options
+              end
+              entry, status = verdict(controller)
+              expect([entry.covered?, entry.inert, status]).to eq([false, :skipped, 422])
+              expect(described_class.format([entry])).to match(note)
+              expect(described_class.summary([entry])).to include(uncovered: 1, uncovered_with_body: 1)
+            end
+
+            it "words a monitor-mode rule under #{label} so it holds for the event that fires" do
+              controller = declare(reads: true, mode: :monitor, unknown: :error) do
+                skip_before_action :enforce_params_contract, **options
+              end
+              entry = status = nil
+              events = invalid_events { entry, status = verdict(controller) }
+              expect([entry.covered?, entry.inert, status]).to eq([false, :skipped, 200])
+              expect(events).not_to be_empty
+              expect(described_class.format([entry])).to match(note)
+            end
+          end
+
+          it "words a conditional skip the same way" do
+            controller = declare(reads: true, enforce: true, unknown: :error) do
+              skip_before_action :enforce_params_contract, if: -> { true }
+            end
+            entry, status = verdict(controller)
+            expect([entry.covered?, entry.inert, status]).to eq([false, :conditional, 422])
+            expect(described_class.format([entry]))
+              .to match(/may not be checked before the action: .*cannot evaluate.* \(checked only if the action reads permitted_params\)/)
+          end
+
+          # What the README tells a host: a lazy rule is not promised before the
+          # action, so the skip takes nothing away from it.
+          it "audits a lazy rule under the same skip as covered, and its request is rejected" do
+            controller = declare(reads: true, unknown: :error) { skip_before_action :enforce_params_contract }
+            entry, status = verdict(controller)
+            expect([entry.covered?, status]).to eq([true, 422])
+          end
+        end
+
+        it "keeps its helpers out of the module's public API" do
+          expect(described_class.methods(false)).not_to include(:inert_reason, :skip_reason, :skip_effect, :never_registered?)
+          expect(described_class).not_to respond_to(:inert?)
         end
 
         it "audits a skip on a Metal controller with Callbacks as uncovered" do
@@ -553,7 +619,7 @@ RSpec.describe Permittable::Audit do
             entry = verdict(skipping).first
             expect(entry).to have_attributes(inert: :conditional)
             expect(described_class.format([entry]))
-              .to match(/no contract — contract may not run: .*conditional.*cannot evaluate.* — ACCEPTS A BODY/)
+              .to match(/no contract — request may not be checked before the action: .*conditional.*cannot evaluate.* — ACCEPTS A BODY/)
 
             # The condition is false here, so the requests ARE checked: the audit is conservative.
             checked = declare(**rule) { skip_before_action :enforce_params_contract, unless: -> { true } }
