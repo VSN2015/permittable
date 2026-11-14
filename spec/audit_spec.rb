@@ -410,6 +410,398 @@ RSpec.describe Permittable::Audit do
         end
       end
 
+      # `skip_before_action :enforce_params_contract` removes the callback an
+      # enforce: true or monitor-mode rule validates from, so the request is
+      # never checked. Every verdict is compared with a REAL request.
+      context "with enforce_params_contract skipped" do
+        # `reads:` makes the action read permitted_params, as a lazy rule needs.
+        def declare(parent = ActionController::Base, reads: false, **rule, &after_rule)
+          Class.new(parent) do
+            include Permittable unless self < Permittable
+
+            def self.controller_path = "audit_skip"
+            permit_params(:create, :update, **rule) { optional :n, :integer } if rule.any?
+            class_eval(&after_rule) if after_rule
+            %i[create update].each do |name|
+              define_method(name) { render(json: reads ? permitted_params(name).to_h : { ok: 1 }) }
+            end
+          end
+        end
+
+        def verdict(controller, action = :create)
+          route = { controller: "audit_skip", action: action.to_s, verb: "post", path: "/skip" }
+          entry = described_class.entries(controllers: [controller], routes: [route]).first
+          status = IntegrationHarness.dispatch(controller, action, method: "POST", json: { bogus: 1 }).status
+          [entry, status]
+        end
+
+        # [audit covered?, real status] for create and update: 422 means the
+        # request was checked, 200 that it ran unchecked.
+        def both(controller)
+          %i[create update].map { |action| verdict(controller, action).then { |entry, status| [entry.covered?, status] } }
+        end
+
+        def metal_base
+          Class.new(ActionController::Metal) do
+            include AbstractController::Callbacks
+            include ActionController::Rescue
+            include AbstractController::Rendering
+            include ActionController::Rendering
+            include ActionController::Renderers::All
+            include ActionController::StrongParameters
+          end
+        end
+
+        after { Permittable.mode = :enforce }
+
+        it "audits an unskipped enforce: true rule as covered, and the request is rejected (control)" do
+          entry, status = verdict(declare(enforce: true, unknown: :error))
+          expect([entry.covered?, entry.inert?, status]).to eq([true, false, 422])
+        end
+
+        it "audits a skip with no options as uncovered, with the reason and the body warning" do
+          controller = declare(enforce: true, unknown: :error) { skip_before_action :enforce_params_contract }
+          entry, status = verdict(controller)
+          expect([entry.covered?, entry.inert?, status]).to eq([false, true, 200])
+          expect(described_class.summary([entry])).to include(enforced: 0, uncovered: 1, uncovered_with_body: 1)
+          expect(described_class.format([entry]))
+            .to match(%r{POST\s+/skip\s+create\s+no contract — request not checked before the action: .*skip_before_action.* — ACCEPTS})
+        end
+
+        # An action that reads permitted_params validates lazily, so the request
+        # IS checked with the callback gone, just not before the action runs.
+        # The verdict stays uncovered (enforce: true promises the earlier
+        # check), and the note must be true whether or not the action reads.
+        describe "when the action reads permitted_params" do
+          let(:note) do
+            Regexp.new("no contract — request not checked before the action: .*skip_before_action.* " \
+                       "\\(checked only if the action reads permitted_params\\) — ACCEPTS A BODY")
+          end
+
+          def invalid_events
+            events = []
+            subscriber = ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") { |*args| events << args }
+            yield
+            events
+          ensure
+            ActiveSupport::Notifications.unsubscribe(subscriber)
+          end
+
+          { "a bare skip" => {}, "an only: skip" => { only: :create } }.each do |label, options|
+            it "words an enforce: true rule under #{label} so it holds for the request that is checked" do
+              controller = declare(reads: true, enforce: true, unknown: :error) do
+                skip_before_action :enforce_params_contract, **options
+              end
+              entry, status = verdict(controller)
+              expect([entry.covered?, entry.inert, status]).to eq([false, :skipped, 422])
+              expect(described_class.format([entry])).to match(note)
+              expect(described_class.summary([entry])).to include(uncovered: 1, uncovered_with_body: 1)
+            end
+
+            it "words a monitor-mode rule under #{label} so it holds for the event that fires" do
+              controller = declare(reads: true, mode: :monitor, unknown: :error) do
+                skip_before_action :enforce_params_contract, **options
+              end
+              entry = status = nil
+              events = invalid_events { entry, status = verdict(controller) }
+              expect([entry.covered?, entry.inert, status]).to eq([false, :skipped, 200])
+              expect(events).not_to be_empty
+              expect(described_class.format([entry])).to match(note)
+            end
+          end
+
+          it "words a conditional skip the same way" do
+            controller = declare(reads: true, enforce: true, unknown: :error) do
+              skip_before_action :enforce_params_contract, if: -> { true }
+            end
+            entry, status = verdict(controller)
+            expect([entry.covered?, entry.inert, status]).to eq([false, :conditional, 422])
+            expect(described_class.format([entry]))
+              .to match(/may not be checked before the action: .*cannot evaluate.* \(checked only if the action reads permitted_params\)/)
+          end
+
+          # What the README tells a host: a lazy rule is not promised before the
+          # action, so the skip takes nothing away from it.
+          it "audits a lazy rule under the same skip as covered, and its request is rejected" do
+            controller = declare(reads: true, unknown: :error) { skip_before_action :enforce_params_contract }
+            entry, status = verdict(controller)
+            expect([entry.covered?, status]).to eq([true, 422])
+          end
+        end
+
+        it "keeps its helpers out of the module's public API" do
+          expect(described_class.methods(false)).not_to include(:inert_reason, :skip_reason, :skip_effect, :never_registered?)
+          expect(described_class).not_to respond_to(:inert?)
+        end
+
+        it "audits a skip on a Metal controller with Callbacks as uncovered" do
+          controller = declare(metal_base, enforce: true, unknown: :error) { skip_before_action :enforce_params_contract }
+          entry, status = verdict(controller)
+          expect([entry.covered?, status]).to eq([false, 200])
+        end
+
+        it "audits a monitor-mode rule whose callback is skipped as uncovered, and a lazy rule as still covered" do
+          monitored = declare(mode: :monitor, unknown: :error) { skip_before_action :enforce_params_contract }
+          expect(verdict(monitored).first).to have_attributes(covered?: false, inert?: true)
+
+          lazy = declare(reads: true, unknown: :error) { skip_before_action :enforce_params_contract }
+          entry, status = verdict(lazy)
+          expect([entry.covered?, status]).to eq([true, 422])
+        end
+
+        it "audits a subclass that skips what its parent declared as uncovered, and the parent as covered" do
+          parent = declare(enforce: true, unknown: :error)
+          child = Class.new(parent) { skip_before_action :enforce_params_contract }
+          expect([verdict(parent).first.covered?, verdict(parent).last]).to eq([true, 422])
+          entry, status = verdict(child)
+          expect([entry.covered?, status]).to eq([false, 200])
+        end
+
+        # permit_params registers the callback once per class tree, so a child
+        # declaring a rule under a parent that skipped it does not get it back.
+        it "audits a child's new permit_params under a skipping parent as uncovered" do
+          parent = declare(enforce: true, unknown: :error) { skip_before_action :enforce_params_contract }
+          child = Class.new(parent) do
+            permit_params(:create, enforce: true, unknown: :error) { optional :n, :integer }
+          end
+          entry, status = verdict(child)
+          expect([entry.covered?, status]).to eq([false, 200])
+        end
+
+        it "audits a skip on a Metal child of a Metal parent as uncovered" do
+          parent = declare(metal_base, enforce: true, unknown: :error)
+          child = Class.new(parent) { skip_before_action :enforce_params_contract }
+          entry, status = verdict(child)
+          expect([entry.covered?, status]).to eq([false, 200])
+        end
+
+        it "audits a callback declared again after a skip as covered" do
+          controller = declare(enforce: true, unknown: :error) do
+            skip_before_action :enforce_params_contract
+            before_action :enforce_params_contract
+          end
+          entry, status = verdict(controller)
+          expect([entry.covered?, status]).to eq([true, 422])
+        end
+
+        # A skip with only:/except: leaves the callback in the chain, so the
+        # audit asks per action, as Rails does; if:/unless: is a condition it
+        # cannot evaluate, so every action it could reach is uncovered.
+        describe "with a conditional skip" do
+          let(:rule) { { enforce: true, unknown: :error } }
+
+          {
+            "only: a Symbol" => [{ only: :create }, [[false, 200], [true, 422]]],
+            "only: a String" => [{ only: "create" }, [[false, 200], [true, 422]]],
+            "only: an Array of Symbols and Strings" => [{ only: [:create, "other"] }, [[false, 200], [true, 422]]],
+            "except: a Symbol" => [{ except: :create }, [[true, 422], [false, 200]]],
+            "except: an Array of Strings" => [{ except: %w[create] }, [[true, 422], [false, 200]]],
+            "only: and except: together" => [{ only: :create, except: :update }, [[false, 200], [true, 422]]]
+          }.each do |label, (options, expected)|
+            it "matches a real request per action for a skip with #{label}" do
+              controller = declare(**rule) { skip_before_action :enforce_params_contract, **options }
+              expect(both(controller)).to eq(expected)
+            end
+          end
+
+          it "reports the skipped action with the skip's wording and the spared one as covered" do
+            controller = declare(**rule) { skip_before_action :enforce_params_contract, only: :create }
+            skipped, spared = %i[create update].map { |action| verdict(controller, action).first }
+            expect(skipped).to have_attributes(covered?: false, inert: :skipped)
+            expect(spared).to have_attributes(covered?: true, inert?: false)
+            expect(described_class.summary([skipped])).to include(uncovered: 1, uncovered_with_body: 1)
+            expect(described_class.summary([spared])).to include(enforced: 1, uncovered: 0)
+          end
+
+          it "reports every action of an if: skip as uncovered, with its own wording, though the request may be checked" do
+            skipping = declare(**rule) { skip_before_action :enforce_params_contract, if: -> { true } }
+            expect(both(skipping)).to eq([[false, 200], [false, 200]])
+            entry = verdict(skipping).first
+            expect(entry).to have_attributes(inert: :conditional)
+            expect(described_class.format([entry]))
+              .to match(/no contract — request may not be checked before the action: .*conditional.*cannot evaluate.* — ACCEPTS A BODY/)
+
+            # The condition is false here, so the requests ARE checked: the audit is conservative.
+            checked = declare(**rule) { skip_before_action :enforce_params_contract, unless: -> { true } }
+            expect(both(checked)).to eq([[false, 422], [false, 422]])
+          end
+
+          it "reports an only: skip that also carries if: as skipped for the named action and conditional for the rest" do
+            controller = declare(**rule) { skip_before_action :enforce_params_contract, only: :create, if: -> { false } }
+            expect(verdict(controller, :create).first.inert).to eq(:skipped)
+            expect(verdict(controller, :update).first.inert).to eq(:conditional)
+          end
+
+          it "reports a skip with only: on a Metal controller per action, whatever the include order" do
+            before = declare(metal_base, **rule) { skip_before_action :enforce_params_contract, only: :create }
+            expect(both(before)).to eq([[false, 200], [true, 422]])
+
+            options = rule
+            [%i[callbacks rescue permittable], %i[permittable callbacks rescue]].each do |order|
+              metal = Class.new(ActionController::Metal) do
+                include AbstractController::Rendering
+                include ActionController::Rendering
+                include ActionController::Renderers::All
+                include ActionController::StrongParameters
+
+                order.each do |name|
+                  include({ callbacks: AbstractController::Callbacks, rescue: ActionController::Rescue,
+                            permittable: Permittable }.fetch(name))
+                end
+                def self.controller_path = "audit_skip"
+                permit_params(:create, :update, **options) { optional :n, :integer }
+                skip_before_action :enforce_params_contract, only: :create
+                %i[create update].each { |name| define_method(name) { render(json: { ok: 1 }) } }
+              end
+              expect(both(metal)).to eq([[false, 200], [true, 422]])
+            end
+          end
+
+          it "keeps the parent covered when a subclass skips with only:" do
+            parent = declare(**rule)
+            child = Class.new(parent) { skip_before_action :enforce_params_contract, only: :create }
+            expect([both(parent), both(child)]).to eq([[[true, 422], [true, 422]], [[false, 200], [true, 422]]])
+          end
+
+          it "applies a parent's only: skip to its subclass, and a subclass's own skip adds to it" do
+            parent = declare(**rule) { skip_before_action :enforce_params_contract, only: :create }
+            child = Class.new(parent)
+            grandchild = Class.new(child) { skip_before_action :enforce_params_contract, only: :update }
+            expect([both(parent), both(child), both(grandchild)])
+              .to eq([[[false, 200], [true, 422]], [[false, 200], [true, 422]], [[false, 200], [false, 200]]])
+          end
+
+          it "keeps every skip of several in a row" do
+            controller = declare(**rule) do
+              skip_before_action :enforce_params_contract, only: :create
+              skip_before_action :enforce_params_contract, only: :update
+            end
+            expect(both(controller)).to eq([[false, 200], [false, 200]])
+          end
+
+          it "covers the action again when the callback is declared again after a conditional skip" do
+            controller = declare(**rule) do
+              skip_before_action :enforce_params_contract, only: :create
+              before_action :enforce_params_contract
+            end
+            expect(both(controller)).to eq([[true, 422], [true, 422]])
+          end
+
+          it "audits a monitor-mode rule with an only: skip per action" do
+            controller = declare(mode: :monitor, unknown: :error) { skip_before_action :enforce_params_contract, only: :create }
+            skipped, spared = %i[create update].map { |action| verdict(controller, action).first }
+            expect(skipped).to have_attributes(covered?: false, inert: :skipped)
+            expect(spared).to have_attributes(covered?: true, mode: :monitor)
+          end
+
+          # Rails deletes only:/except: from, and adds :if to, a Hash passed as
+          # the last positional argument, so the record must be read from a copy.
+          it "reads a positional options Hash the way a real request sees it, with only:" do
+            controller = declare(**rule) { skip_before_action :enforce_params_contract, { only: :create } }
+            expect(both(controller)).to eq([[false, 200], [true, 422]])
+          end
+
+          it "reads a positional options Hash the way a real request sees it, with except:" do
+            controller = declare(**rule) { skip_before_action :enforce_params_contract, { except: :create } }
+            expect(both(controller)).to eq([[true, 422], [false, 200]])
+          end
+
+          # The audit applies a record while the callback in the chain is the
+          # very object the skip left there. If Rails ever copies callbacks when
+          # other ones are declared, this fails on that Rails: see SkipRecorder.
+          it "keeps a skip's verdict after unrelated callbacks are declared" do
+            controller = declare(**rule) do
+              skip_before_action :enforce_params_contract, only: :create
+              before_action :other
+              skip_before_action :other2, raise: false
+              prepend_before_action :other
+              around_action ->(_controller, block) { block.call }
+              after_action :other
+              def other = nil
+            end
+            expect(both(controller)).to eq([[false, 200], [true, 422]])
+          end
+
+          it "does not change what skip_before_action does for other callbacks, raise: false, or inherited calls" do
+            controller = declare(**rule) do
+              before_action :other
+              skip_before_action :other, only: :create
+              skip_before_action :missing, raise: false
+              skip_before_action :enforce_params_contract, only: :create, raise: false
+              def other = nil
+            end
+            expect(both(controller)).to eq([[false, 200], [true, 422]])
+            expect(controller._process_action_callbacks.map(&:filter)).to include(:other)
+            expect { Class.new(controller) { skip_before_action :nope } }.to raise_error(ArgumentError, /nope/)
+          end
+
+          it "works on an ActionController::API controller" do
+            controller = declare(ActionController::API, **rule) { skip_before_action :enforce_params_contract, only: :create }
+            expect(both(controller)).to eq([[false, 200], [true, 422]])
+          end
+
+          # Rails rebuilds the callback of the classes already below the one that
+          # skips, each with its own new object.
+          it "applies a parent's skip to a subclass defined before the skip" do
+            parent = declare(**rule)
+            child = Class.new(parent)
+            parent.skip_before_action :enforce_params_contract, only: :create
+            expect([both(parent), both(child)]).to eq([[[false, 200], [true, 422]]] * 2)
+          end
+
+          # Rails refuses to skip a callback that does not exist yet, so a
+          # Permittable-before-Callbacks Metal controller can only do it with
+          # raise: false, which skips nothing: the callback is then registered
+          # at permit_params and runs for every action.
+          it "covers a Metal controller whose skip came before the gem registered its callback" do
+            metal = Class.new(ActionController::Metal) do
+              include AbstractController::Rendering
+              include ActionController::Rendering
+              include ActionController::Renderers::All
+              include ActionController::StrongParameters
+              include Permittable
+              include AbstractController::Callbacks
+              include ActionController::Rescue
+
+              def self.controller_path = "audit_skip"
+              skip_before_action :enforce_params_contract, only: :create, raise: false
+              permit_params(:create, :update, enforce: true, unknown: :error) { optional :n, :integer }
+              %i[create update].each { |name| define_method(name) { render(json: { ok: 1 }) } }
+            end
+            expect(both(metal)).to eq([[true, 422], [true, 422]])
+          end
+
+          # An ancestor that never included Permittable has no recorder, so its
+          # raise: false skip (nothing to skip on it) is rewritten into the
+          # subclass's callback by Rails, with nothing recorded.
+          it "cannot see a skip made on an ancestor that never included Permittable" do
+            ancestor = Class.new(ActionController::Base)
+            controller = declare(ancestor, **rule)
+            ancestor.skip_before_action :enforce_params_contract, only: :create, raise: false
+            expect(both(controller)).to eq([[true, 200], [true, 422]])
+          end
+
+          # Not seen: the skip never went through skip_before_action, so there is
+          # no record of its condition and the callback is simply in the chain.
+          it "cannot see a conditional skip made with skip_callback directly, but sees a bare one" do
+            conditional = declare(**rule) { skip_callback(:process_action, :before, :enforce_params_contract, if: -> { true }) }
+            expect(both(conditional)).to eq([[true, 200], [true, 200]])
+
+            bare = declare(**rule) { skip_callback(:process_action, :before, :enforce_params_contract) }
+            expect(both(bare)).to eq([[false, 200], [false, 200]])
+          end
+        end
+
+        it "keeps the verdicts of monitor-mode and unknown: :log / :ignore rules when nothing is skipped" do
+          Permittable.mode = :monitor
+          expect(verdict(declare(unknown: :error)).first).to have_attributes(covered?: true, inert?: false, mode: :monitor)
+          Permittable.mode = :enforce
+          %i[log ignore].each do |unknown|
+            expect(verdict(declare(enforce: true, unknown: unknown)).first).to have_attributes(covered?: true, inert?: false)
+          end
+        end
+      end
+
       # A via: :all route is five entries for one action; Rails need only be
       # asked once.
       it "asks Rails's resolver once per action, not once per verb" do
