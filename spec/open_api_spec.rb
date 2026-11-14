@@ -162,6 +162,25 @@ RSpec.describe Permittable::OpenAPI do
       expect(operations["*"]).not_to have_key("operationId")
     end
 
+    it "documents a literal \"*\" action name as an ordinary action, not a catch-all, on a plain host" do
+      klass = controller_class { permit_params("*") { required :name, :string } }
+      operations = described_class.operations_for(klass)
+      expect(operations.keys).to eq(["*"])
+      expect(operations["*"]).not_to have_key("x-permittable-catch-all")
+      expect(operations["*"]["requestBody"]["content"]["application/json"]["schema"]["properties"].keys).to eq(["name"])
+    end
+
+    it "documents a literal \"*\" action name on a Rails controller", :integration do
+      klass = IntegrationHarness.build_controller do
+        include Permittable
+
+        permit_params("*") { required :name, :string }
+
+        def index; end
+      end
+      expect(described_class.operations_for(klass).keys).to eq(["*"])
+    end
+
     it "expands a catch-all through action_methods on real controllers, excluding the concern's own methods",
        :integration do
       klass = IntegrationHarness.build_controller do

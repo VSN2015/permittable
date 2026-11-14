@@ -43,7 +43,8 @@ module Permittable
     # lists the column. They ride on the column, set by in_rule, so the scan
     # path hands them to column_line without its own methods changing.
     DraftColumn = Struct.new(:name, :type, :null, :default, :default_function, :enum, :enum_integers, :sensitive,
-                             :unread, :rule, :listed, :assigned, :array, :array_default, keyword_init: true) do
+                             :unread, :rule, :listed, :assigned, :array, :array_default, :precision, :scale,
+                             keyword_init: true) do
       def in_rule(rule, listed: false)
         self.class.new(**to_h, rule: rule, listed: listed)
       end
@@ -556,6 +557,8 @@ module Permittable
                       default_function: column.respond_to?(:default_function) && column.default_function,
                       array: column.respond_to?(:array?) && column.array? == true,
                       array_default: array_default?(column.default),
+                      precision: column.respond_to?(:precision) && column.precision,
+                      scale: column.respond_to?(:scale) && column.scale,
                       sensitive: sensitive_role(model, column.name), assigned: assigned?(model, column),
                       **model_facts(model, column))
     end
@@ -1159,8 +1162,29 @@ module Permittable
       todos << "TODO: #{column.name} #{SCANNED_SENSITIVE.fetch(column.sensitive)}" if column.sensitive
       todos << enum_todo(column) if column.enum_integers
       todos << unread_todo(column) if column.unread
+      todos.concat(hint_todos(column))
+    end
+
+    # Hints about what a contract cannot say for a column, so a reviewer
+    # sees them before the draft is enforced. Comments only.
+    def hint_todos(column)
+      todos = []
+      if column.type == :decimal && column.precision
+        todos << "TODO: decimal(#{column.precision},#{column.scale || 0}): the contract does not bound precision; " \
+                 "a Postgres app may 500 on overflow"
+      end
+      if RAILS_REQUEST_KEYS.include?(column.name.to_s)
+        todos << "TODO: #{column.name} is also a Rails request key — if this contract is rootless (root: false) " \
+                 "the router's value collides with it"
+      end
+      if JSON_TYPES.include?(column.type)
+        todos << "TODO: #{column.name} (#{column.type}): a :json field accepts an object only, not an array"
+      end
       todos
     end
+
+    RAILS_REQUEST_KEYS = %w[controller action format authenticity_token].freeze
+    JSON_TYPES = %i[json jsonb].freeze
 
     SCANNED_SENSITIVE = {
       locking: "is the optimistic-locking column — kept because the permit call lists it: an edit form that " \
@@ -1320,9 +1344,22 @@ module Permittable
       return nil if rules.empty?
 
       bodies = rules.map do |actions, body|
-        "#{signature(root: root, model: model, actions: actions)}\n#{body.map { |line| "  #{line}\n" }.join}end\n"
+        "#{one_line(signature(root: root, model: model, actions: actions))}\n" \
+          "#{body.map { |line| "  #{one_line(line)}\n" }.join}end\n"
       end
       HEADER + bodies.join("\n#{UPDATE_NOTE}")
+    end
+
+    # Every drafted line passes through here, the one place text from the
+    # database or the app (a column name in a TODO) meets a comment. A line
+    # break in it would end that comment and leave the rest as live Ruby for
+    # whoever pastes the draft. Ruby's lexer ends a comment at "\n" only (a
+    # lone "\r", "\v", "\f", U+0085, U+2028/9 and NUL stay inside it), but an
+    # editor or terminal shows "\r" as a break too, so it goes as well. A name
+    # inside a quoted literal is already escaped by `inspect`, with no raw
+    # break left.
+    def one_line(line)
+      line.gsub(/\r\n|[\r\n]/, " ")
     end
   end
 end

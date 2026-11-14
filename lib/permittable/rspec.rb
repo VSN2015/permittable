@@ -669,6 +669,10 @@ module Permittable
         "expected #{subject_name} not to #{verb} those params#{action_label}, but it did"
       end
 
+      # The root a scoped filter_parameters entry needs comes from the subject,
+      # which a matcher only learns in matches?. Before any run there is none to
+      # resolve, so a description read then prints through the shallow filter
+      # (RSpec builds a one-liner's name after the run, so it is not affected).
       def description
         label = @expect_accepted ? "accept those params" : "reject those params"
         label += action_label

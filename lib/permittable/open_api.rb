@@ -402,11 +402,10 @@ module Permittable
     end
 
     def operation_for(controller, action)
-      rule = if action == "*"
-               controller.permittable_contracts.reverse_each.find { |r| r[:actions].empty? }
-             else
-               controller.permit_rule_for(action)
-             end
+      # "*" is the catch-all's marker on a plain host; a rule that names "*"
+      # literally is an ordinary action and is found through permit_rule_for.
+      rule = (action == "*" && controller.permittable_contracts.reverse_each.find { |r| r[:actions].empty? }) ||
+             controller.permit_rule_for(action)
       operation = {}
       key = controller_key(controller)
       operation["operationId"] = "#{key.tr('/', '_')}_#{action}" if key && action != "*"
@@ -419,7 +418,7 @@ module Permittable
       # the rule's own declaration is contract data — the app-wide
       # Permittable.mode is runtime configuration the export can't see.
       operation["x-permittable-mode"] = "monitor" if rule[:mode] == :monitor
-      operation["x-permittable-catch-all"] = true if action == "*"
+      operation["x-permittable-catch-all"] = true if action == "*" && rule[:actions].empty?
       # `finalize` is flagged on the rule's object schema too (see
       # JsonSchema.rule), but that sits inside the requestBody, and an
       # operation can end up with no body (every field a path variable) while
