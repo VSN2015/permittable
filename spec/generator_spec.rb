@@ -1204,6 +1204,51 @@ RSpec.describe Permittable::Generator do
         expect(violations(load_draft(draft), params, action: "create")).to eq([])
       end
     end
+
+    # A column name reaches the draft in comments too (a TODO note), outside any
+    # quoted literal. A line break in it must not end that comment: the text
+    # after it would be live Ruby for whoever pastes the draft. Only "\n" (and
+    # "\r\n") ends a comment in Ruby's lexer; "\r" is collapsed as well since
+    # editors and terminals show it as a break. The others never end one, and
+    # the draft must stay valid with them too.
+    context "with a line terminator in a column name" do
+      marker = "INJECTED"
+      terminators = { "LF" => "\n", "CRLF" => "\r\n", "CR" => "\r", "VT" => "\v", "FF" => "\f",
+                      "NEL" => "\u0085", "LS" => " ", "PS" => " " }
+
+      # Every token holding the marker is a comment or a quoted literal's text,
+      # so nothing injected from a name is code.
+      def injected_outside_comment(draft, marker)
+        Ripper.lex(draft).select { |(_, type, text)| text.include?(marker) && %i[on_comment on_tstring_content].exclude?(type) }
+      end
+
+      terminators.each do |label, term|
+        it "keeps a draft valid and the text inert for a #{label} (json, json array default, binary)" do
+          json = "json_#{label}#{term}#{marker}('id') #"
+          array = "array_#{label}#{term}#{marker}('id') #"
+          blob = "blob_#{label}#{term}#{marker}('id') #"
+          ActiveRecord::Schema.define do
+            create_table :gen_injected do |t|
+              t.json json
+              t.json array, default: []
+              t.binary blob
+            end
+          end
+          stub_const("GenInjected", Class.new(TestModel) { self.table_name = "gen_injected" })
+          draft = described_class.draft(model: GenInjected)
+
+          expect(Ripper.sexp(draft)).not_to be_nil
+          expect { RubyVM::InstructionSequence.compile(draft) }.not_to raise_error
+          expect(draft).to include(json.to_sym.inspect, array.to_sym.inspect)
+          expect(draft.scan(marker).size).to be >= 5
+          expect(injected_outside_comment(draft, marker)).to eq([])
+          expect(draft.delete("\n")).not_to include("\r") # Symbol#inspect escapes it inside the literal
+          expect(load_draft(draft).permit_rule_for("create")[:fields].map { |f| f[:name] }).to eq([json.to_sym])
+        ensure
+          ActiveRecord::Base.connection.drop_table(:gen_injected, if_exists: true)
+        end
+      end
+    end
   end
 
   describe ".draft from a scan plus a model" do

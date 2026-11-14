@@ -1344,9 +1344,22 @@ module Permittable
       return nil if rules.empty?
 
       bodies = rules.map do |actions, body|
-        "#{signature(root: root, model: model, actions: actions)}\n#{body.map { |line| "  #{line}\n" }.join}end\n"
+        "#{one_line(signature(root: root, model: model, actions: actions))}\n" \
+          "#{body.map { |line| "  #{one_line(line)}\n" }.join}end\n"
       end
       HEADER + bodies.join("\n#{UPDATE_NOTE}")
+    end
+
+    # Every drafted line passes through here, the one place text from the
+    # database or the app (a column name in a TODO) meets a comment. A line
+    # break in it would end that comment and leave the rest as live Ruby for
+    # whoever pastes the draft. Ruby's lexer ends a comment at "\n" only (a
+    # lone "\r", "\v", "\f", U+0085, U+2028/9 and NUL stay inside it), but an
+    # editor or terminal shows "\r" as a break too, so it goes as well. A name
+    # inside a quoted literal is already escaped by `inspect`, with no raw
+    # break left.
+    def one_line(line)
+      line.gsub(/\r\n|[\r\n]/, " ")
     end
   end
 end
