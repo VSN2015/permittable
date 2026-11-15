@@ -62,7 +62,7 @@ RSpec.describe "RFC 9457 problem+json error format" do
     it "renders the RFC 9457 members in order, with the numeric status and the field errors" do
       rendered = render({ user: { email: "nope", age: 9 } }, &decl)
       expect(rendered[:content_type]).to eq("application/problem+json")
-      expect(rendered[:status]).to eq(:unprocessable_entity)
+      expect(rendered[:status]).to eq(422)
       expect(rendered[:json].keys).to eq(%i[type title status detail errors])
       expect(rendered[:json]).to include(
         type: "about:blank",
@@ -75,7 +75,7 @@ RSpec.describe "RFC 9457 problem+json error format" do
 
     it "titles a malformed envelope differently and carries its 400" do
       rendered = render({}, &decl)
-      expect(rendered[:status]).to eq(:bad_request)
+      expect(rendered[:status]).to eq(400)
       expect(rendered[:json]).to include(title: "Malformed request", status: 400)
     end
 
