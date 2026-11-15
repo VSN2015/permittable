@@ -800,6 +800,32 @@ RSpec.describe Permittable do
         .to raise_error(described_class::InvalidParameters)
     end
 
+    # `==` made 1.0, BigDecimal("1"), Rational(1, 1) and Complex(1, 0) equal to
+    # the listed 1, and a JSON `1.0` arrives as a Float: it passed as true.
+    it "refuses a number other than the Integer 1 or 0 for :boolean, however it equals them" do
+      klass = permittable_class { permit_params(:create) { required :flag, :boolean } }
+      [1.0, 0.0, -0.0, BigDecimal("1"), BigDecimal("0"), Rational(1, 1), Complex(1, 0), 2, "1.0", "2"].each do |value|
+        expect { controller(klass, params: { flag: value }).permitted_params }
+          .to raise_error(described_class::InvalidParameters), value.inspect
+      end
+      expect(controller(klass, params: { flag: 1 }).permitted_params[:flag]).to be(true)
+      expect(controller(klass, params: { flag: 0 }).permitted_params[:flag]).to be(false)
+    end
+
+    it "refuses a JSON 1.0 or 0.0 for :boolean on a request" do
+      controller = IntegrationHarness.build_controller do
+        include Permittable
+
+        permit_params(:create, unknown: :error) { optional :flag, :boolean }
+
+        def create = render(json: { flag: permitted_params[:flag] })
+      end
+      { "1.0" => 422, "0.0" => 422, "1" => 200, "0" => 200 }.each do |literal, status|
+        result = IntegrationHarness.dispatch(controller, :create, method: "POST", raw_json: %({"flag": #{literal}}))
+        expect(result.status).to eq(status), literal
+      end
+    end
+
     it "casts float, decimal, date, and datetime" do
       result = permit({ f: "3.14", d: "19.99", day: "2026-08-15", at: "2026-08-15T10:00:00" }) do
         permit_params(:create) do
@@ -1205,6 +1231,149 @@ RSpec.describe Permittable do
     # taken for a zone, and one Ruby does not know is not honoured.
     it "refuses an unknown word after a date" do
       ["2026-09-05 foo", "2026-09-05 noon", "2026-09-05 BC foo", "2026-09-05 W. Nowhere Standard Time"].each do |value|
+        expect(violations_for({ at: value }, &decl).details).to eq([{ param: "at", code: "invalid_type" }]), value
+        expect(violations_for({ on: value }, &decl).details).to eq([{ param: "on", code: "invalid_type" }]), value
+      end
+    end
+
+    # Date._parse reads what it can find and says nothing of the rest, so text
+    # after (or before, or between) a complete date was dropped and the
+    # String taken as the date alone: "2026-01-15\n2099-12-31" passed an
+    # in: range for January, "2026-01-01 <script>" was a date. A part of the
+    # String it read nothing from is refused, as "2026-01-01 hello" always was.
+    it "refuses text the parser read nothing from, around a date or a date-time" do
+      ["2026-01-01xyz", "2026-01-15\n2099-12-31", "2026-01-01 <script>", "2026-01-01;DROP", "2026-01-01\u200b",
+       "\u200b2026-01-01", "2026-01-01 \u0000", "2026-01-01 2026-02-02", "xyz 2026-01-01", "2026-01-01 (2099-12-31)",
+       "2026-01-01#frag", "2026-01-01 OR 1=1", "Sep 5 2026\u200b", "GMT+5 2026-09-05", "Sep 5 junk 2026",
+       "2026-09-05 10:30 12", "2026-09-05 10:30:00Z xyz", "2026-09-05 10:30:00 +0200 xyz", "Sat, 05 Sep 2026 10:00:00 GMT xyz",
+       "2026-09-05 10:30\u200b", "2026-09-05T10:30:00Z pm", "2026-01-01 EST xyz", "xyz 2026-01-01 EST",
+       "(Sat) 2026-01-15\n2099-12-31", "2026-01-15 (Sat) 2099-12-31", "2026-01-15 <script> (Thu)", "2026-01-15 xyz (Thu)",
+       "2026-01-15 10:00 (PST) xyz", "2026-09-05 06:00:00 EDT -0700",
+       "2026-09-05 10:00 EST UTC PST GMT", "2026-09-05 10:00 UTC EST", "2026-09-05T10:00+01:00[Europe/London] xyz",
+       "Sat Sep 05 2026 10:00:00 GMT+0200 (GMT-05:00)", "Sat Sep 05 2026 10:00:00 GMT+0200 (UTC+3)",
+       "2026-09-05 at", "Sep 5 2026 at", "2026-09-05 10:00 at"].each do |value|
+        expect(violations_for({ at: value }, &decl).details).to eq([{ param: "at", code: "invalid_type" }]), value
+        expect(violations_for({ on: value }, &decl).details).to eq([{ param: "on", code: "invalid_type" }]), value
+      end
+    end
+
+    it "refuses such text on a request, before an in: range can be met with the date it hid" do
+      controller = IntegrationHarness.build_controller do
+        include Permittable
+
+        permit_params :create, unknown: :error do
+          optional :d, :date, in: Date.new(2026, 1, 1)..Date.new(2026, 1, 31)
+        end
+
+        def create = render(json: { d: permitted_params[:d] })
+      end
+      ["2026-01-01xyz", "2026-01-15\n2099-12-31", "2026-01-01 <script>"].each do |value|
+        expect(IntegrationHarness.dispatch(controller, :create, method: "POST", params: { d: value }).status).to eq(422), value
+      end
+      expect(IntegrationHarness.dispatch(controller, :create, method: "POST", params: { d: "2026-01-15" }).status).to eq(200)
+    end
+
+    it "still reads every date String the parser accounts for in full" do
+      {
+        "Sat, 05 Sep 2026 10:00:00 -0500 (CDT)" => Time.utc(2026, 9, 5, 15),
+        "Sat Sep 05 2026 10:00:00 GMT-0500 (Central Daylight Time)" => Time.utc(2026, 9, 5, 15),
+        "2026-09-05 10:00:00.5 +0000 UTC m=+0.000123456" => Time.utc(2026, 9, 5, 10, 0, 0.5),
+        "2026-09-05 10:00:00 -0500 CDT m=+12.5" => Time.utc(2026, 9, 5, 15),
+        "Sat Sep 5 10:00:00 UTC 2026" => Time.utc(2026, 9, 5, 10), "2026-09-05 10:30 am" => Time.utc(2026, 9, 5, 10, 30),
+        "2026-09-05 12pm" => Time.utc(2026, 9, 5, 12), "2026-09-05 10:00 PM" => Time.utc(2026, 9, 5, 22),
+        "1st Jan 2026" => Time.utc(2026, 1, 1), "22nd Jan 2026" => Time.utc(2026, 1, 22),
+        "Saturday, September 5, 2026" => Time.utc(2026, 9, 5),
+        "20260905T100000Z" => Time.utc(2026, 9, 5, 10), "2026-09-05 EST DST" => Time.utc(2026, 9, 5, 4),
+        "2026-09-05," => Time.utc(2026, 9, 5), "2026-09-05\n" => Time.utc(2026, 9, 5), "\t2026-09-05\t" => Time.utc(2026, 9, 5),
+        # An offset or zone name that repeats the one read (TimeWithZone#inspect, Go, Ruby's own to_s).
+        "2026-09-05 06:00:00.000000000 EDT -04:00" => Time.utc(2026, 9, 5, 10),
+        "Sat, 05 Sep 2026 06:00:00.000000000 EDT -04:00" => Time.utc(2026, 9, 5, 10),
+        "2026-09-05 10:00:00 UTC +00:00" => Time.utc(2026, 9, 5, 10), "2026-09-05 10:00:00 +0000 +0000" => Time.utc(2026, 9, 5, 10),
+        "2026-09-05 06:00:00 -0400 EDT" => Time.utc(2026, 9, 5, 10), "2026-09-05 22:00 PM" => Time.utc(2026, 9, 5, 22),
+        "September 5, 2026 at 10:00 AM" => Time.utc(2026, 9, 5, 10),
+        # Chrome's toString for a zone with no long name: the remark repeats the offset.
+        "Sat Sep 05 2026 10:00:00 GMT+0200 (GMT+02:00)" => Time.utc(2026, 9, 5, 8),
+        "Sat Sep 05 2026 10:00:00 GMT+0200 (UTC+2)" => Time.utc(2026, 9, 5, 8),
+        # RFC 9557 zone ids and annotations, which the offset governs, and remarks in any script.
+        "2026-09-05T10:00+01:00[Europe/London]" => Time.utc(2026, 9, 5, 9),
+        "2026-09-05T06:00-04:00[America/New_York]" => Time.utc(2026, 9, 5, 10),
+        "2026-09-05T10:00:00Z[Etc/UTC]" => Time.utc(2026, 9, 5, 10),
+        "2026-09-05T10:00:00+09:00[Asia/Tokyo][u-ca=japanese]" => Time.utc(2026, 9, 5, 1),
+        "Sat Sep 05 2026 06:00:00 GMT-0400 (heure d\u2019\u00e9t\u00e9 de l\u2019Est)" => Time.utc(2026, 9, 5, 10),
+        "Sat Sep 05 2026 12:00:00 GMT+0200 (Ora legale dell\u2019Europa centrale)" => Time.utc(2026, 9, 5, 10)
+      }.each do |value, instant|
+        expect(permit({ at: value }, &decl)[:at]).to eq(instant), value
+      end
+      ["Sep 5th 2026", "5 Sep 2026 BC", "2026-09-05 CE", "2026-09-05 A. D.", "2026-09-05 Sat", "Sat Sep 05 2026 (UTC)"].each do |value|
+        expect { permit({ on: value }, &decl) }.not_to raise_error, value
+      end
+    end
+
+    # Browser Date#toString in a locale whose zone name has a comma, an "&" or a
+    # bracket of its own: the remark repeats the offset, in any script.
+    it "reads a remark in brackets that holds a comma, an ampersand or a nested bracket" do
+      {
+        "Sat Sep 05 2026 11:00:00 GMT+0300 (Москва, стандартное время)" => Time.utc(2026, 9, 5, 8),
+        "Sat Sep 05 2026 13:00:00 GMT+0500 (Екатеринбург, стандартное время)" => Time.utc(2026, 9, 5, 8),
+        "Sat Sep 05 2026 11:00:00 GMT+0300 (Израиль, летнее время)" => Time.utc(2026, 9, 5, 8),
+        "Sat Sep 05 2026 11:00:00 GMT+0300 (שעון ישראל (קיץ))" => Time.utc(2026, 9, 5, 8),
+        "Sat Sep 05 2026 06:00:00 GMT-0200 (St. Pierre & Miquelon Daylight Time)" => Time.utc(2026, 9, 5, 8)
+      }.each do |value, instant|
+        expect(permit({ at: value }, &decl)[:at]).to eq(instant), value
+      end
+      expect(permit({ on: "Sat Sep 05 2026 00:00:00 GMT+0000 (Москва, время)" }, &decl)[:on])
+        .to eq(Date.new(2026, 9, 5))
+    end
+
+    it "still refuses text after such a remark, and a remark that holds a number" do
+      ["Sat Sep 05 2026 11:00:00 GMT+0300 (Moscow, Standard Time) xyz", "Sat Sep 05 2026 11:00:00 GMT+0300 (2099)",
+       "Sat Sep 05 2026 11:00:00 GMT+0300 (Moscow, 2099)", "Sat Sep 05 2026 11:00:00 GMT+0300 (Moscow (2099))",
+       "Sat Sep 05 2026 11:00:00 GMT+0300 (Moscow, Standard Time",
+       "2026-01-15 (2099-12-31)"].each do |value|
+        expect(violations_for({ at: value }, &decl).details).to eq([{ param: "at", code: "invalid_type" }]), value
+      end
+    end
+
+    # Go's time.String() and `date` print the numeric offset, then the zone's
+    # abbreviation as a label; Ruby's table maps some of those to another offset
+    # (CST is -06:00, IST is not +01:00). The offset read is the one the client sent.
+    it "reads the numeric offset when a zone abbreviation follows it as a label" do
+      {
+        "2026-09-05 10:00:00 +0800 CST" => Time.utc(2026, 9, 5, 2), "2026-09-05 10:00:00 +0800 CST m=+0.001" => Time.utc(2026, 9, 5, 2),
+        "2026-09-05 10:00:00 +0800 PST" => Time.utc(2026, 9, 5, 2), "2026-09-05 10:00:00 +0100 IST" => Time.utc(2026, 9, 5, 9),
+        "2026-09-05 10:00:00 +0400 GST" => Time.utc(2026, 9, 5, 6), "2026-09-05 10:00:00 -0230 NDT" => Time.utc(2026, 9, 5, 12, 30),
+        "2026-09-05 10:00:00 -0400 PST" => Time.utc(2026, 9, 5, 14)
+      }.each do |value, instant|
+        expect(permit({ at: value }, &decl)[:at]).to eq(instant), value
+      end
+    end
+
+    it "still refuses two zones that disagree, and a word that is no zone after an offset" do
+      ["Sat, 05 Sep 2026 18:00:00.000000000 CST +08:00", "2026-09-05 06:00:00 EDT -0700", "2026-09-05 10:00 +02:00 +03:00",
+       "2026-09-05 10:00:00 +0800 CST CST", "2026-09-05 10:00:00 +0800 CST xyz", "2026-09-05 10:00 +0200 xyz",
+       "2026-09-05 10:00:00 +0800 CST +0900"].each do |value|
+        expect(violations_for({ at: value }, &decl).details).to eq([{ param: "at", code: "invalid_type" }]), value
+      end
+    end
+
+    # Java's ZonedDateTime#toString: the zone id is a bracketed suffix, and the offset governs.
+    it "reads an RFC 9557 suffix whose zone id holds a colon" do
+      ["2026-09-05T10:00+01:00[GMT+01:00]", "2026-09-05T10:00+01:00[UTC+01:00]"].each do |value|
+        expect(permit({ at: value }, &decl)[:at]).to eq(Time.utc(2026, 9, 5, 9)), value
+      end
+      ["2026-09-05T10:00+01:00[Europe/Paris]junk", "2026-09-05T10:00+01:00[GMT+01:00]junk",
+       "2026-09-05T10:00+01:00[GMT+01:00] xyz", "2026-09-05T10:00+01:00[GMT+01:00"].each do |value|
+        expect(violations_for({ at: value }, &decl).details).to eq([{ param: "at", code: "invalid_type" }]), value
+      end
+    end
+
+    # A CSV or text file saved as UTF-8 with a signature starts with U+FEFF.
+    it "drops one leading byte-order mark, and no other invisible character" do
+      expect(permit({ at: "﻿2026-09-05" }, &decl)[:at]).to eq(Time.utc(2026, 9, 5))
+      expect(permit({ at: "﻿2026-09-05T10:00:00Z" }, &decl)[:at]).to eq(Time.utc(2026, 9, 5, 10))
+      expect(permit({ on: "﻿2026-09-05" }, &decl)[:on]).to eq(Date.new(2026, 9, 5))
+      ["﻿﻿2026-09-05", "2026-09-05﻿", "2026-09-0﻿5", "​2026-09-05", "﻿​2026-09-05",
+       "‎2026-09-05", "2026-09-05​"].each do |value|
         expect(violations_for({ at: value }, &decl).details).to eq([{ param: "at", code: "invalid_type" }]), value
         expect(violations_for({ on: value }, &decl).details).to eq([{ param: "on", code: "invalid_type" }]), value
       end
