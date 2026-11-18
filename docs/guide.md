@@ -1,0 +1,1498 @@
+# Permittable guide
+
+The full manual: every option, every mode, every rake task. New here? Start with the [README](../README.md) for what Permittable is and a two-minute quick start.
+
+## Contents
+
+- **[Complete example](#complete-example)**: every option in one events API
+- **[Guide](#guide)**
+  - [How a request flows](#how-a-request-flows)
+  - [Declaring a contract](#declaring-a-contract)
+  - [The field DSL](#the-field-dsl)
+  - [Field options](#field-options)
+  - [`format:` presets](#format-presets)
+  - [Types and strict coercion](#types-and-strict-coercion)
+  - [Free-form hashes](#free-form-hashes-json)
+  - [Absence, defaults, and partial updates](#absence-defaults-and-partial-updates)
+  - [Explicit nulls](#explicit-nulls-nullable)
+  - [Violations and error responses](#violations-and-error-responses)
+  - [Custom error messages](#custom-error-messages-message) · [Localizing with I18n](#localizing-default-messages-i18n)
+  - [RFC 9457 problem+json](#rfc-9457-problemjson)
+  - [Unknown parameters](#unknown-parameters)
+  - [Reusing fields](#reusing-fields-permittablefields-and-use)
+  - [Output reshaping](#output-reshaping-transform-and-finalize)
+  - [The schema-drift guard](#the-schema-drift-guard)
+  - [Sensitive parameters and log redaction](#sensitive-parameters-and-log-redaction)
+  - [Instrumentation](#instrumentation)
+- **[Adopting on a live API](#adopting-on-a-live-api)**
+  - [Monitor mode](#monitor-mode-roll-out-without-rejecting)
+  - [Generating draft contracts](#generating-draft-contracts-permittablegenerate)
+  - [Auditing coverage](#auditing-coverage-permittableaudit) · [Ignoring controllers and actions](#ignoring-controllers-and-actions)
+- **[Beyond the controller](#beyond-the-controller)**
+  - [Testing contracts](#testing-contracts-rspec-matchers)
+  - [Standalone contracts](#standalone-contracts-no-controller)
+  - [Exporting OpenAPI](#exporting-openapi-docs-that-cannot-drift)
+- **[Reference](#reference)**
+  - [API](#api) · [Errors caught at class load](#errors-caught-at-class-load) · [Compatibility](#compatibility)
+
+---
+
+## Complete example
+
+Every feature in one place: a small events API that uses every field type, every field option, every `permit_params` option and every app-wide setting. Nothing here is required. Copy the parts you need, and follow the links into the [Guide](#guide) for the details.
+
+**1. App-wide settings.** All of them are optional.
+
+```ruby
+# config/initializers/permittable.rb
+
+# Roll out without rejecting: PERMITTABLE_MODE=monitor reports violations and lets the request through.
+Permittable.mode = ENV.fetch("PERMITTABLE_MODE", "enforce").to_sym
+
+# Render RFC 9457 problem+json instead of the default { success:, error: } envelope.
+Permittable.error_format     = :problem
+Permittable.problem_base_uri = "https://api.example.com/problems"
+
+# The drift guard always checks that a field's column exists. This also checks the column's type.
+Permittable.check_column_types = true
+
+# Endpoints that permittable:audit and permittable:generate leave alone.
+Permittable.audit_ignore              = %w[active_storage/direct_uploads application#not_found]
+Permittable.audit_ignore_outside_root = true   # the default: controllers from gems and engines are skipped
+
+# One event per rejected request, and per would-be rejection in monitor mode.
+ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
+  Rails.logger.info("params #{payload[:mode]}: #{payload[:controller]}##{payload[:action]} #{payload[:details]}")
+end
+```
+
+```yaml
+# config/locales/en.yml: app-wide copy for any violation code a field gives no message: for
+en:
+  permittable:
+    errors:
+      missing: "is required"
+      invalid_type: "is the wrong type"
+      unknown: "is not a recognized parameter"
+```
+
+**2. Reusable field groups.** See [reusing fields](#reusing-fields-permittablefields-and-use).
+
+```ruby
+# app/contracts/address_fields.rb
+AddressFields = Permittable.fields do
+  required :line1,     :string, length: 1..100, normalize: :squish    # collapses runs of whitespace
+  optional :line2,     :string, length: 0..100, normalize: :strip
+  required :city,      :string, length: 1..80
+  required :country,   :string, length: 2, normalize: :upcase         # an Integer length is exact
+  optional :postcode,  :string, format: /\A[A-Z0-9 -]{3,10}\z/, normalize: :upcase   # any Regexp
+  optional :latitude,  :float,  in: -90.0..90.0
+  optional :longitude, :float,  in: -180.0..180.0
+end
+```
+
+```ruby
+# app/contracts/event_fields.rb: shared by the create and update contracts below
+EventFields = Permittable.fields do
+  # Scalars. Checks run in a fixed order: normalize → cast → length → in → format → validate.
+  required :title,            :string,   length: 1..120, normalize: :squish,
+                                         desc: "Shown as the page heading",   # documentation only (OpenAPI)
+                                         example: "RubyConf 2026"             # checked against the field at boot
+  required :slug,             :string,   length: 3..60, format: :slug, normalize: :downcase
+  optional :subtitle,         :string,   length: 1..140, nullable: true       # null or "" clears the column
+  required :organizer_email,  :string,   format: :email, normalize: :email,   # :email strips and downcases
+                                         message: { missing: "is required", format: "must be a valid email address" }
+  optional :website,          :string,   format: :url
+  optional :custom_domain,    :string,   format: :hostname, normalize: :downcase
+  optional :venue_id,         :string,   format: :uuid
+  required :capacity,         :integer,  in: 1..10_000, message: "must be between 1 and 10,000"
+  optional :ticket_price,     :decimal,  in: BigDecimal("0")..BigDecimal("9999.99"),
+                                         transform: ->(price) { price.round(2) }   # runs after cast and checks
+  optional :waitlist_enabled, :boolean
+  required :starts_at,        :datetime                                       # converted to UTC
+  optional :ends_at,          :datetime
+  optional :registration_closes_on, :date
+  optional :metadata,         :json, length: 0..32, max_depth: 3              # any hash: ≤ 32 keys, ≤ 3 levels
+
+  # Arrays. length: bounds the element count, and is checked before any element is.
+  array :tags,        of: :string,  length: 0..10, transform: ->(tags) { tags.map(&:downcase).uniq }
+  array :co_host_ids, of: :integer, length: 0..5
+  array :ticket_tiers, required: true, length: 1..5,                          # arrays are optional by default
+        validate: ->(tiers) { tiers.map { |t| t[:name] }.uniq.size == tiers.size || :duplicate_names },
+        message:  { duplicate_names: "must have unique names" } do            # a Symbol from validate: is the code
+    required :name,     :string,  length: 1..40
+    required :price,    :decimal, in: BigDecimal("0")..BigDecimal("9999.99")
+    optional :quantity, :integer, in: 1..10_000
+  end
+
+  # A nested hash. Violation paths are dotted: event.venue_address.city
+  optional :venue_address do
+    use AddressFields                                                         # groups compose
+  end
+end
+```
+
+**3. The controller.** See [declaring a contract](#declaring-a-contract) and [field options](#field-options).
+
+```ruby
+# app/controllers/events_controller.rb
+class EventsController < ApplicationController
+  include Permittable   # or once, in ApplicationController
+
+  # No actions listed: a catch-all for every action without its own rule (index, show, destroy, ...).
+  # The last matching rule wins, so the catch-all goes first.
+  permit_params(unknown: :log) do                # undeclared keys are dropped, and logged
+    optional :page,     :integer, in: 1..1000, default: 1
+    optional :per_page, :integer, in: 1..100,  default: 25
+    optional :q,        :string,  length: 0..100, normalize: :squish
+    optional :status,   :string,  in: Event.statuses.keys
+    optional :from,     :date
+  end
+
+  permit_params :create,
+                root:    :event,                 # unwrap params[:event]; missing or not a hash → 400
+                model:   Event,                  # drift guard: each non-virtual scalar must be a column
+                unknown: :error,                 # an undeclared key is a violation, at every level
+                enforce: true,                   # validate in a before_action, not on first read
+                desc:    "Create an event" do    # documentation only (OpenAPI)
+    use EventFields
+
+    # Create-only fields. On an update rule, a default would overwrite the column on every PATCH that omits it.
+    optional :status,   :string, in: Event.statuses.keys, default: "draft"   # a Rails enum, sent by name
+    optional :currency, :string, in: %w[USD EUR GBP], default: "USD",
+                                 normalize: ->(code) { code.strip.upcase }    # a Proc works too
+    required :terms_accepted, :boolean,
+             virtual:  true,                                                  # not a column: no drift check
+             validate: ->(accepted) { accepted || :not_accepted },
+             message:  { not_accepted: "must be accepted" }
+
+    optional :payout, sensitive: true do          # cascades: every sub-field is redacted from logs...
+      required :iban, :string, length: 15..34
+      required :account_holder                    # the type defaults to :string
+      optional :scheme, :string, in: %w[sepa swift], sensitive: false        # ...except an explicit opt-out
+    end
+
+    # Runs once every field is valid: cross-field rules, and reshaping the result.
+    finalize do |event|
+      if event[:ends_at] && event[:ends_at] <= event[:starts_at]
+        violate!("event.ends_at", :before_start, message: "must be after starts_at")   # halts the block
+      end
+      event.except(:terms_accepted)               # must return the final Hash
+    end
+  end
+
+  # PATCH: the same fields with nothing mandatory, and the slug fixed once created.
+  permit_params :update, root: :event, model: Event, unknown: :error, desc: "Edit an event" do
+    use EventFields, optional: true, except: %i[slug]
+  end
+
+  # A legacy action mid-rollout: violations are reported, nothing is rejected.
+  permit_params :reschedule, root: :event, model: Event, mode: :monitor do
+    use EventFields, only: %i[starts_at ends_at], optional: true
+  end
+
+  def index
+    render json: Events::Search.call(permitted_params)   # page: 1, per_page: 25 when nothing is sent
+  end
+
+  def create
+    render json: Events::Create.call(permitted_params), status: :created
+  end
+
+  def update
+    Events::Update.call(params[:id], permitted_params)   # holds only the keys the client sent
+    head :no_content
+  end
+
+  def reschedule
+    # The before_action has already validated. permittable_violations is [] for a clean request.
+    Rails.logger.info("reschedule would reject: #{permittable_violations}") if permittable_violations.any?
+    Event.find(params[:id]).update!(params.require(:event).permit(:starts_at, :ends_at))   # legacy code, unchanged
+    head :no_content
+  end
+end
+```
+
+Because of `model: Event` and `check_column_types`, a migration that drops the `capacity` column, or changes it to a string, fails at boot, not on a request. See [the schema-drift guard](#the-schema-drift-guard).
+
+**4. What the action receives.** This request to `POST /events`:
+
+```json
+{ "event": {
+    "title": "  RubyConf   2026 ", "slug": "RubyConf-2026", "organizer_email": " Ana@Example.COM ",
+    "capacity": "800", "ticket_price": "249.999", "waitlist_enabled": "true",
+    "starts_at": "2026-11-12T09:00:00-05:00", "ends_at": "2026-11-14T18:00:00-05:00",
+    "tags": ["Ruby", "rails", "ruby"], "co_host_ids": ["12", "31"],
+    "ticket_tiers": [{ "name": "Early bird", "price": "199", "quantity": "100" }],
+    "venue_address": { "line1": " 1 Main   St ", "city": "Chicago", "country": "us" },
+    "currency": " eur ", "terms_accepted": "1",
+    "payout": { "iban": "DE89370400440532013000", "account_holder": "Ruby Central" } } }
+```
+
+gives `#create` this `permitted_params`:
+
+```ruby
+{
+  "title"            => "RubyConf 2026",           # squished
+  "slug"             => "rubyconf-2026",           # downcased, then format-checked
+  "organizer_email"  => "ana@example.com",
+  "capacity"         => 800,                       # cast from "800"
+  "ticket_price"     => 0.25e3,                    # BigDecimal, rounded by transform:
+  "waitlist_enabled" => true,
+  "starts_at"        => 2026-11-12 14:00:00 UTC,   # a Time, converted to UTC
+  "ends_at"          => 2026-11-14 23:00:00 UTC,
+  "tags"             => ["ruby", "rails"],         # transform: downcased, duplicates removed
+  "co_host_ids"      => [12, 31],
+  "ticket_tiers"     => [{ "name" => "Early bird", "price" => 0.199e3, "quantity" => 100 }],
+  "venue_address"    => { "line1" => "1 Main St", "city" => "Chicago", "country" => "US" },
+  "status"           => "draft",                   # the default
+  "currency"         => "EUR",                     # the normalize: Proc
+  "payout"           => { "iban" => "DE89370400440532013000", "account_holder" => "Ruby Central" }
+}                                                  # terms_accepted was checked, then removed by finalize
+```
+
+A request with a bad email, a `capacity` of `"0"`, two tiers with the same name, no `terms_accepted` and an extra `admin` key never reaches the action:
+
+```http
+HTTP/1.1 422 Unprocessable Entity
+Content-Type: application/problem+json
+```
+
+```json
+{
+  "type": "https://api.example.com/problems/invalid-parameters",
+  "title": "Invalid parameters",
+  "status": 422,
+  "detail": "Invalid parameters: event.organizer_email must be a valid email address, event.capacity must be between 1 and 10,000, event.ticket_tiers must have unique names, event.terms_accepted is required, event.admin is not a recognized parameter",
+  "instance": "/events",
+  "errors": [
+    { "param": "event.organizer_email", "code": "format",          "message": "must be a valid email address" },
+    { "param": "event.capacity",        "code": "inclusion",       "message": "must be between 1 and 10,000" },
+    { "param": "event.ticket_tiers",    "code": "duplicate_names", "message": "must have unique names" },
+    { "param": "event.terms_accepted",  "code": "missing",         "message": "is required" },
+    { "param": "event.admin",           "code": "unknown",         "message": "is not a recognized parameter" }
+  ]
+}
+```
+
+The first three messages come from the fields' own `message:`, the last two from the locale file. `finalize` did not run, because it runs only when every field is valid.
+
+**5. The same fields outside a controller.** See [standalone contracts](#standalone-contracts-no-controller).
+
+```ruby
+# app/contracts/event_webhook.rb: webhooks, jobs, CSV rows, any Hash
+EventWebhook = Permittable::Contract.define(root: :event, unknown: :error, desc: "Partner event feed") do
+  required :external_id, :string, format: :uuid
+  use EventFields, only: %i[title starts_at ends_at capacity]
+end
+
+result = EventWebhook.call(payload)   # bad client data is a violation, never an exception
+result.valid?                         # => false
+result.violations                     # => [{ param: "event.capacity", code: "inclusion", message: "must be between 1 and 10,000" }]
+result.params                         # the validated HashWithIndifferentAccess; nil when invalid
+
+EventWebhook.call!(payload)           # the params, or raises Permittable::InvalidParameters
+EventWebhook.json_schema              # JSON Schema (draft 2020-12)
+```
+
+**6. Tests.** See [testing contracts](#testing-contracts-rspec-matchers).
+
+```ruby
+# spec/controllers/events_contract_spec.rb
+require "permittable/rspec"
+
+RSpec.describe EventsController do
+  it "declares the contract" do
+    expect(described_class).to permit_param(:title).for_action(:create).as(:string).with_length(1..120).required
+    expect(described_class).to permit_param(:organizer_email).for_action(:create).matching(:email)
+    expect(described_class).to permit_param(:capacity).for_action(:create).as(:integer).within(1..10_000)
+    expect(described_class).to permit_param(:status).for_action(:create).with_default("draft")
+    expect(described_class).to permit_param(:tags).for_action(:create).as_array(of: :string)
+    expect(described_class).to permit_param("ticket_tiers.price").for_action(:create).as(:decimal)
+    expect(described_class).to permit_param(:terms_accepted).for_action(:create).virtual
+    expect(described_class).to permit_param("payout.iban").for_action(:create).sensitive
+    expect(described_class).to permit_param(:subtitle).for_action(:update).nullable.optional
+    expect(described_class).not_to permit_param(:slug).for_action(:update)
+  end
+
+  it "casts what it accepts and names what it rejects" do
+    expect(described_class).to accept_params(event: { title: "Ruby Night", capacity: "40" })
+      .for_action(:update).returning("title" => "Ruby Night", "capacity" => 40)
+
+    expect(described_class).to reject_params(event: { title: "Ruby Night", capacity: "0" })
+      .for_action(:create)
+      .with_violation("event.capacity", :inclusion)
+      .with_violation("event.terms_accepted", :missing)
+  end
+end
+```
+
+**7. Tooling.** See [adopting on a live API](#adopting-on-a-live-api) and [exporting OpenAPI](#exporting-openapi-docs-that-cannot-drift).
+
+```sh
+bin/rails permittable:generate                      # draft contracts for controllers that have none
+bin/rails "permittable:generate[EventsController]"  # draft one controller, even a covered one
+bin/rails permittable:audit                         # every routed action: its contract and its mode
+bin/rails "permittable:audit[strict]"               # CI gate: exit 1 on any unguarded write action
+bin/rails "permittable:openapi[openapi/api.json]"   # OpenAPI 3.1, from the contracts above
+```
+
+```ruby
+EventsController.permittable_contracts                            # every rule: frozen, introspectable data
+EventsController.permit_rule_for(:destroy)                        # the rule a request would use (the catch-all)
+Permittable::OpenAPI.request_body_for(EventsController, :create)  # one requestBody object
+Permittable::OpenAPI.operations_for(EventsController)             # { "create" => ..., "update" => ..., ... }
+```
+
+Not shown above: a controller's own [`render_error`](#violations-and-error-responses) (used when `error_format` is the default `:envelope`), overriding `render_invalid_parameters`, swapping in your own `Permittable.filter_parameter_registry`, and the plain-Ruby `Permittable::Generator` and `Permittable::Audit` APIs. The [Reference](#reference) lists them all.
+
+---
+
+## Guide
+
+### How a request flows
+
+```
+request params
+   │
+   ├─ 1  unwrap root:        params[:user]                missing or not a hash → 400
+   ├─ 2  each field          normalize → absent? → cast → validate → transform
+   ├─ 3  unknown-key check   at every nesting level       (unknown: :ignore | :log | :error)
+   ├─ 4  finalize            only when nothing violated
+   │
+   └─ permitted_params  →  HashWithIndifferentAccess      or raises InvalidParameters → 422
+```
+
+Validation is **lazy by default**: it runs on the first `permitted_params` call, so an action that never reads params never pays for it. Pass `enforce: true` to run it in a `before_action` instead, rejecting bad requests before the action body executes. Results are **memoized per action**.
+
+In [monitor mode](#monitor-mode-roll-out-without-rejecting) the same flow runs, but a violation is reported instead of raised and the request proceeds with the raw params passed through. `permitted_params` is a `HashWithIndifferentAccess` in every mode, never an `ActionController::Parameters`, so `.permitted?` and `.require` are not available on it and `Model.create!(permitted_params)` does not raise `ForbiddenAttributesError`.
+
+A bare `ActionController::Metal` controller has no callbacks and no `rescue_from` until it includes them. `include AbstractController::Callbacks` and then `include ActionController::Rescue` (the order `ActionController::Base` uses, so a rejection also covers the `before_action`), before or after `include Permittable`. The rendering modules (`AbstractController::Rendering`, `ActionController::Rendering`, `ActionController::Renderers::All`) are optional: without `ActionController::Rendering` the gem writes the error response itself, with the same status, content type and JSON body. An `enforce: true` rule, or a rule declaring `mode: :monitor`, raises `ArgumentError` at class load when `AbstractController::Callbacks` is missing. The class-load check reads only the rule's own `mode:`, not the app-wide `Permittable.mode`, which an initializer usually sets after the controller loads. A rule with no `mode:` under an app-wide `Permittable.mode = :monitor` therefore loads, but its `before_action` is not there to run it: `permittable:audit` reports those actions as `no contract` (`contract cannot run`) instead of as monitored. An `enforce: true` rule that is not in monitor mode still raises at class load when `ActionController::Rescue` is missing or was included before `AbstractController::Callbacks`. Both modules have to be in by the time of `permit_params`. A check registered at that first `permit_params` runs after any callback declared between the include and it (see [Per-request locales](#custom-error-messages-message)), and with `include Permittable` first, a `skip_before_action :enforce_params_contract` goes after the first `permit_params`, since the callback does not exist before it. On a bare `ActionController::Metal` controller that includes `ActionController::Rescue` after `include Permittable`, the gem registers its handler at the first `permit_params` instead, so there it is a catch-all declared after that `permit_params` that answers first, and a re-declaration goes after it.
+
+### Declaring a contract
+
+```ruby
+permit_params(*actions, root: false, model: nil, unknown: :ignore, enforce: false, mode: nil, desc: nil, &contract)
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `*actions` | — | Actions the contract covers. **No actions = catch-all** for the controller |
+| `root:` | `false` | Key to unwrap first (the `require(:user)` equivalent). Missing or non-hash root → **400** |
+| `model:` | `nil` | Model class, or `true` to infer from `controller_name`, enabling the [drift guard](#the-schema-drift-guard) |
+| `unknown:` | `:ignore` | `:ignore` / `:log` / `:error` — how to treat undeclared keys |
+| `enforce:` | `false` | `false` validates lazily on first use; `true` validates in a `before_action` |
+| `mode:` | `nil` | `nil` follows `Permittable.mode`; `:monitor` reports violations instead of rejecting — see [monitor mode](#monitor-mode-roll-out-without-rejecting) |
+| `desc:` | `nil` | Documentation only — becomes the operation description in [exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) |
+
+`permit_params` is **repeatable**, and **the last matching rule wins**. Contracts behave like configuration: a base controller declares a catch-all, and a subclass overrides it for specific actions.
+
+```ruby
+class ApiController < ApplicationController
+  permit_params(unknown: :error) { optional :page, :integer, in: 1..1000 }   # catch-all
+end
+
+class ReportsController < ApiController
+  permit_params :export, root: :report do                                    # wins for #export
+    required :format, :string, in: %w[csv pdf]
+  end
+end
+```
+
+A literal `"*"` in `permit_params` is only an action name: it matches an action called `"*"` and nothing else, and a rule with no actions is the catch-all. The `"*"` key is the OpenAPI export's catch-all marker for plain-Ruby hosts only.
+
+Rules accumulate by **reassignment, never mutation**, so subclasses inherit copy-on-write and can never corrupt a parent's contract.
+
+### The field DSL
+
+Three verbs. `required` and `optional` declare scalars (or, with a block, nested hashes); `array` declares a list.
+
+```ruby
+# Scalars — the type defaults to :string
+required :name, :string
+optional :age,  :integer
+
+# Nested hashes — pass a block instead of a type. Violation paths are dotted: user.address.zip
+optional :address do
+  required :city, :string
+  optional :zip,  :string, format: /\A\d{5}\z/
+end
+
+# Arrays — of: for scalars, a block for hashes. Element failures carry their index: items[1].sku
+array :tag_names,  of: :string, length: 0..10
+array :line_items, required: true, length: 1..50 do
+  required :sku,      :string
+  required :quantity, :integer, in: 1..99
+end
+
+# Free-form hashes — :json takes any hash, uncast and unfiltered, with bounds
+optional :metadata, :json, max_depth: 3, length: 0..32
+```
+
+An upload is a `:file` field. It takes the objects Rails' strong parameters permit as scalars (`ActionDispatch::Http::UploadedFile`, `Rack::Test::UploadedFile`), passes the object through uncast, and refuses anything else, a String included, as `invalid_type`. Size and content-type checks belong in `validate:`:
+
+```ruby
+optional :avatar, :file, validate: ->(file) { file.size <= 2.megabytes && file.content_type.start_with?("image/") }
+array    :attachments, of: :file, length: 0..5
+```
+
+`:file` takes `required:`, `nullable:`, `validate:`, `transform:`, `desc:`, `sensitive:`, `virtual:` and `message:`. `in:`, `length:`, `format:`, `normalize:`, `default:` and `example:` are refused at class load. A form's empty file input sends `""`, which is absent as everywhere else. The [drift guard](#the-schema-drift-guard) does not look for a column behind a `:file` field (an attachment is not a column), and the OpenAPI export documents an operation with a file as `multipart/form-data`, its properties named the way Rails reads the parts (`user[avatar]`, `docs[]`, `user[address][scan]`). An array of hashes is sent with an index (`items[0][photo]`, `items[0][name]`, `items[1][photo]`, …), as Rails' `fields_for` renders it, and the document describes those leaves with anchored `patternProperties`. What a flat body cannot carry, a container's own `required`, `minItems`/`maxItems`, `nullable`, `description` and custom-validation marker, is kept in the body's `x-permittable-form-groups`, keyed by the container's bracket name (`user[items]`), with `[]` standing for the index of a container inside an element (`user[items][][info]`). Send a nullable container's null as an empty part named by that bracket name, without `[]` (`user[docs]=""`; `user[docs][]=""` is an empty array). Under `unknown: :error` the multipart body sets `additionalProperties: false`, which refuses an undeclared part at any depth (`user[address][bogus]`, `user[items][0][bogus]`), and it lists the parts the server still takes: a nullable container's null as `{"const": ""}`, a `:json` field's keys (`user[extra][any]`) and, for a `root:` rule, any part outside the root, or for a rootless one, the keys the runtime exempts: Rails' routing keys (`controller`, `action`, `format`), the form keys (`authenticity_token`, `_method`, `utf8`, `commit`, `button`) and the CSRF token name the controller renamed with `request_forgery_protection_token`. An image submit's `x`/`y` and a per-instance override of the token cannot be known when the document is built, so they are not listed. The children of an optional hash are required only when the hash is sent (the group entry says the hash is optional), and `patternProperties` cannot mark a leaf of an array element required.
+
+An ActiveStorage direct upload (`form.file_field :avatar, direct_upload: true`) sends the file from the browser straight to the storage service, and the form then submits only the blob's signed id, a String, which a `:file` field refuses as `invalid_type`. Declare such a field `:string` and attach the signed id (`record.avatar.attach(signed_id)`):
+
+```ruby
+optional :avatar, :string # direct upload: a signed blob id
+```
+
+Arrays are **optional unless `required: true`**, and `length:` on an array constrains the element **count**.
+
+An array of hashes also accepts the shape Rails' `fields_for` sends for nested attributes: `user[addresses_attributes][0][city]` reaches the params as a Hash keyed `"0"`, `"1"`, … and is read as the records it encodes, in the order sent, exactly as strong params and `accepts_nested_attributes_for` read it. Only that shape qualifies: every key an integer and every value a hash.
+
+`length:` is a **bound, not a report**: an array outside it is rejected without its elements being examined at all. A 200,000-element payload against `length: 0..10` is refused by its first check, so it costs one violation and a 40-byte body instead of 200,001 violations and several megabytes — milliseconds of contract work instead of seconds. There is **no default cap**: an array with no `length:` is unbounded, and every element of it is cast and checked however many arrive. Declare `length:` on every array you accept.
+
+### Field options
+
+Which options are legal depends on the field kind — anything else raises at class load.
+
+| Option | Scalar | Array | Nested | Meaning |
+|---|:---:|:---:|:---:|---|
+| `in:` | ✅ | — | — | Allowed values: a `Range` (bounds-checked with `cover?`), a list (an `Array`, `Set`, `Enumerator`, or `Hash` read as its keys — so `in: Post.statuses` works — or a subclass of one that keeps its `include?`, such as the `ActiveSupport::OrderedOptions` that `config_for` returns), or any other object answering `include?` (used as given, and read on every request, so it may be empty when the class loads: a live list filled in an initializer or `after_initialize` is fine, and for the same reason a `default:` or `example:` is not checked against it at class load, though every other rule still is) — including a Hash/Array/Set **subclass that overrides `include?`**, whose override is kept rather than read for its raw contents. A list is cast with the field's own type and **snapshotted** at class load, so `in: %i[draft published]` on a `:string` and `in: %w[1 2 3]` on an `:integer` match what a request casts to — and a later `PLANS << "gold"` is not seen; pass your own `include?` object for a live list. A `nil` member is dropped on a `nullable:` field |
+| `format:` | ✅¹ | — | — | Regexp the value must match, or a [preset name](#format-presets): `:email`, `:uuid`, `:url`, `:slug`, `:hostname` |
+| `length:` | ✅¹ | ✅ | — | `Range` or `Integer`. Character count on strings, **element count** on arrays, where it short-circuits — see [the field DSL](#the-field-dsl) |
+| `normalize:` | ✅¹ | — | — | `:squish`, `:strip`, `:downcase`, `:upcase`, `:email`, or a Proc. Runs **first** — before the absence rule, so a value that normalizes to `""` is absent |
+| `default:` | ✅ | ✅ | — | Value used when the field is absent. Validated against the field's own contract at class load either way. On a field with **no** `transform:`, stored as a request sending it would read it — normalized, cast (`default: "18"` on an `:integer` is `18`), an array walked at every depth with its sub-fields' own `transform:` applied. On a field **with** `transform:`, stored exactly **as authored** instead — `transform:` never runs on a default (see [output reshaping](#output-reshaping-transform-and-finalize)), and neither does the cast, so the value you write is the value the action receives. (An array with its own `transform:` still has its default checked as a request would be: a sub-field's `transform:` runs at class load only for a field below an array that declares `validate:`, which receives the transformed values.) Either way it is frozen, and each request gets its own deep copy |
+| `validate:` | ✅ | ✅ | — | Callable. Falsy fails as `"invalid"`; a returned `Symbol` becomes the violation code. On an array it runs only when no element violated — an undeclared key inside an element does not count — and `transform:` runs only when nothing violated at all |
+| `transform:` | ✅ | ✅ | — | Callable applied **after** cast and validation — see [output reshaping](#output-reshaping-transform-and-finalize) |
+| `virtual:` | ✅ | ✅ | ✅ | Exempt this field from the schema-drift guard |
+| `sensitive:` | ✅ | ✅ | ✅ | Register the field name for [log redaction](#sensitive-parameters-and-log-redaction) |
+| `message:` | ✅ | ✅ | ✅ | Human-readable copy for violations on this field — a String, or a Hash of code → String. See [custom messages](#custom-error-messages-message) |
+| `of:` | — | ✅ | — | Element type for an array of scalars (default `:string`) |
+| `max_depth:` | — | — | — | `:json` fields only — maximum container nesting. See [free-form hashes](#free-form-hashes-json) |
+| `required:` | — | ✅ | — | Arrays are optional unless this is `true` |
+| `desc:` | ✅ | ✅ | ✅ | Documentation only — the field's `description` in [exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) |
+| `example:` | ✅ | ✅ | — | Documentation only, but **validated against the field's own contract at class load**, like `default:`. Published as a client would send it: cast (`example: "18"` on an `:integer` is `18`), and never a `transform:`'s output, at any depth, even on a field that declares one. An array example is validated as a request would be, but the sub-field `default:`s a request would fill in are not published. A sub-field's `transform:` runs at class load only for a field below an array that declares `validate:` (which receives the transformed values), and its output is never published |
+| `nullable:` | ✅ | ✅ | ✅ | An explicitly-sent empty value yields `nil` instead of counting as absent — see [explicit nulls](#explicit-nulls-nullable) |
+
+¹ `format:`, `length:`, and `normalize:` reason about characters and are **only valid on `:string` fields**. On any other type they would silently apply to an already-cast value, so declaring them raises at class load.
+
+**Checks run in a fixed order**, and the first failure is the one reported:
+
+```
+normalize:  →  cast  →  length:  →  in:  →  format:  →  validate:
+```
+
+`length:` comes before `in:` and `format:` on purpose. It is an O(1) read of a string's size, while `format:` runs a regexp over the whole value and `validate:` runs your own code — so a value the length bound already excludes never pays for the expensive checks. A 5 MB string against `length: 1..80` is rejected on its length without the regexp ever seeing it, which matters most when the regexp is one with poor worst-case behaviour.
+
+The visible consequence: a value that violates *both* its length and its format reports `length`. That is the more useful answer anyway — a client can't act on "wrong format" for a value that is also far too long.
+
+`validate:` is the escape hatch for anything the built-ins don't cover:
+
+```ruby
+optional :slug, :string, validate: ->(v) { v.match?(/\A[a-z0-9-]+\z/) || :malformed_slug }
+```
+
+### `format:` presets
+
+The regexps every app writes by hand, named once:
+
+```ruby
+required :email,   :string, format: :email
+required :id,      :string, format: :uuid
+optional :website, :string, format: :url
+optional :slug,    :string, format: :slug
+optional :host,    :string, format: :hostname
+```
+
+| Preset | Matches | Exported JSON Schema `format` |
+|---|---|---|
+| `:email` | Exactly `URI::MailTo::EMAIL_REGEXP` — the regexp Rails apps already paste in, so switching to the preset cannot change which addresses an endpoint accepts | `email` |
+| `:uuid` | A canonical `8-4-4-4-12` UUID, either case | `uuid` |
+| `:url` | An `http`/`https` URL. A **shape** check, not a reachability guarantee — but it does reject `javascript:` and other schemes | `uri` |
+| `:slug` | Lowercase, digits, single hyphens between segments | — |
+| `:hostname` | A DNS hostname (label rules, no trailing dot) | `hostname` |
+
+A preset carries something a hand-written Regexp cannot: the JSON Schema **`format` keyword** the wider ecosystem understands, so [exported docs](#exporting-openapi-docs-that-cannot-drift) say `"format": "uuid"` rather than only a wall of `pattern`. The `pattern` is still emitted next to it — in draft 2020-12 `format` is an annotation unless a validator opts into asserting it, so the pattern is what actually enforces.
+
+An unknown preset name fails at class load, listing the presets. Passing a `Regexp` directly works exactly as before, and the RSpec matcher speaks both spellings: `matching(:email)` (or `matching("email")`, as the contract accepts either) asserts the preset, `matching(/re/)` the Regexp.
+
+### Types and strict coercion
+
+Coercion is **deliberately strict**, and deliberately *not* `ActiveModel::Type`. Rails' casts are lenient by design — `"abc".to_i` is `0`, `Boolean.cast("abc")` is `true` — and silently corrupting untrusted input is precisely what a contract must not do. A value the type cannot faithfully represent is a **violation, not a guess**.
+
+| Type | Accepts | Rejects (`invalid_type`) |
+|---|---|---|
+| `:string` | `String`, returned in the encoding it arrived in; `Numeric`/`true`/`false` are stringified | Arrays, hashes, a `String` whose bytes are invalid in its own encoding (`"caf\xC3"`) |
+| `:integer` | `Integer`; whole `Float`s (`4.0`); canonical base-10 numeric strings (`"-12"`, `"007"`) | `"4.5"`, `"abc"`, `"1_8"`, `" 99 "`, `4.5`, NaN/Infinity |
+| `:float` | a real `Numeric`; a canonical numeric string (`"1.5"`, `".5"`, `"-2e3"`) | `"abc"`, `"1_8.5"`, `" 1.5 "`, and any number outside a Float's range, as a `Numeric` or a string alike (`BigDecimal("1e-400")`, `"1e400"`), a `Complex` (even `Complex(1, 0)`), a `Numeric` that cannot be converted |
+| `:decimal` | a real `Numeric`, or a canonical numeric string → `BigDecimal`; a `Rational` whose decimal expansion is exact (`Rational(1, 2)`, `3r`) | Unparseable strings, `"1_000"`, `" 1.5 "`, a `Complex`, a `Rational` no decimal holds exactly (`Rational(1, 3)`), a `Numeric` that cannot be converted |
+| `:boolean` | `true`/`false`, `"true"`/`"false"`, `"1"`/`"0"`, the Integers `1`/`0` | `"yes"`, `"on"`, `2`, and a number that merely equals 1 or 0 (`1.0`, which is how JSON can send it) |
+| `:date` | `Date`; a `Time`, `DateTime` or `ActiveSupport::TimeWithZone` that is exactly midnight UTC, as that `Date`; a string naming a **complete** date, in any format `Date.parse` understands (`"2026-09-05"`, `"2026/09/05"`, `"Sep 5, 2026"`); a string with a time or zone only if it is exactly midnight UTC (`"2026-09-05T00:00:00Z"`) | Unparseable strings, **incomplete** ones (`"09/2026"`, `"5th"`, `"Sept"`), and any other instant, as an object or a string — one with a time of day, or a midnight in another zone |
+| `:datetime` | `Time`, `DateTime`, `ActiveSupport::TimeWithZone`, `Date`; a string naming a complete date, with or without a time (an ISO date with an offset or `Z` and no time, `"2026-09-05-05:00"`, is midnight at that offset) | Unparseable strings, any string without a complete date (`"10:30"`), any other date followed by a bare offset and no time of day (`"Sep 5 2026 -05:00"`), an offset or an hour the parser would drop (`"12:00 2026-09-05 -05:00"`, `"2026-09-05 10 -05:00"`, `"2026-09-05T10"`), any word after a date that is not a zone Ruby knows, a day name or an era (`"2026-09-05 XYZ"`, `"2026-09-05 noon"`), and an ISO date followed by `T` and no time (`"2026-09-05T"`) |
+| `:json` | Any `Hash` — passed through uncast, see [free-form hashes](#free-form-hashes-json) | Arrays, scalars |
+| `:file` | An upload object (`ActionDispatch::Http::UploadedFile`, `Rack::Test::UploadedFile`), passed through uncast | A `String` (including a form's file field sent as text), numbers, hashes, arrays |
+
+**Dates are parsed, never guessed.** `Date.parse` fills in what a string omits *from today* — `"09/2026"` becomes the 1st, `"5th"` becomes this month of this year — so the same request would mean different things on different days. A `:date` or `:datetime` string must therefore name all three of year, month and day; which **format** it names them in is `Date.parse`'s business, so every complete format it understands still works. A `:datetime` may omit the *time* part, which reads as midnight UTC. An ISO date with an offset or `Z` and no time is midnight at that offset (`"2026-09-05 -05:00"` is `2026-09-05T05:00:00Z`; a `:date` takes it only where that is midnight UTC, as in `"2026-09-05+00:00"`); any other date followed by a bare offset and no time of day is refused, since Ruby's parser reads the offset as a time of day or drops it, and so is an ISO date followed by `T` and no time. A zone *name* after a date is honoured where Ruby knows it, with or without a time (`"2026-09-05 EST"` is `2026-09-05T05:00:00Z`, so a `:date` refuses it, and `"Sat Sep  5 10:00:00 2026 EST"` is `15:00:00Z`), and refused where it does not. So is **any other word** after a complete date that is not a day name or an era (`"2026-09-05 XYZ"`, `"2026-09-05 noon"`, `"2026-09-05 foo"`): all it can be is a zone, and a zone Ruby cannot honour is never guessed at. An offset glued to a zone name with no time is midnight at that offset where Ruby honours it (`"2026-09-05 GMT+5"` is `2026-09-04T19:00:00Z`) and refused where it does not (`"2026-09-05 UTC+99"`, `"2026-09-05 EST+5"`). An offset after the year of git's and ctime's format is read (`"Sat Sep  5 10:00:00 2026 -0500"` is `15:00:00Z`). An hour or offset the parser would drop or misread (`"2026-09-05T10"`, `"2026-09-05 10 -05:00"`, `"2026-09-05 10 A.D."`, `"2026-09-05 10 a"`, `"12:00 2026-09-05 -05:00"`) is refused rather than read as some other instant. Likewise any part of the string the parser read nothing from is refused, not dropped: junk after, before or between dates (`"2026-01-01xyz"`, `"2026-01-15\n2099-12-31"`, `"2026-01-01 <script>"`), and control or zero-width characters (bar one leading byte-order mark, which a CSV or text file saved as UTF-8 starts with, and which is dropped). What is let through repeats something that was read: a remark in brackets (`"(Central Daylight Time)"`, `"(Москва, стандартное время)"`, in any language, with commas, `&` or a nested bracket but no digits), an RFC 9557 suffix (`"[Europe/London]"`, `"[GMT+01:00]"`, the offset governs), Go's `m=+0.1`, and an offset or zone name that agrees with the one read (`"EDT -04:00"`), and a zone abbreviation after a numeric offset, which only labels it (`"2026-09-05 10:00:00 +0800 CST"` is `02:00:00Z`, as Go and `date` print it). Two zones in the other order (`"EDT -0700"`, `"CST +08:00"`: the abbreviation is what is read) or two different offsets are refused.
+
+**Strings in other encodings are inspected, never converted.** A String whose bytes are not valid in its **own** encoding (`"caf\xC3"` in UTF-8, a lone UTF-16 surrogate) is `invalid_type` for every scalar type, before `normalize:` or `format:` sees it. Any other String keeps its encoding: a `:string` value is handed back exactly as it arrived, so a controller using Rails' `skip_parameter_encoding` or `param_encoding` gets its binary or Shift_JIS text unchanged. The number, boolean and date types parse a UTF-8 **copy** of the text, so UTF-16 `"12"` casts to `12` for an `:integer`; when the text has no UTF-8 reading (a byte Windows-1252 leaves undefined) that is `invalid_type`. `normalize:` and `format:` work on the String in its own encoding. Where a normalizer cannot handle that encoding (`:squish` on UTF-16), the value is left as it is; where a `format:` pattern cannot be applied to it (a non-ASCII pattern against UTF-16 or binary bytes), that is a `format` violation. `in:` compares Strings as Ruby does, encoding included. A `:json` field's contents are not examined.
+
+**Numbers must be finite.** `Float("1e400")` is `Infinity` and `Float("1e-400")` is `0.0` — neither represents what was sent, and neither is a value a numeric column can store, so both are `invalid_type`. A genuine zero is unaffected however it is spelled (`"0"`, `"0.0"`, `"0e10"`). `:decimal`'s exponent range is far wider, so `"1e400"` is fine there, though not unlimited: a string past it (`"1e-99999999999999999999"`) underflows to zero or overflows to Infinity and is `invalid_type` by the same rule. A string whose plain form would run past a thousand digits and past its own length (`"1e4000000000000000000"`, 22 bytes) is `invalid_type` too, because formatting it to save, render or log it would exhaust memory; a number spelled out digit by digit is accepted however long it is. And `BigDecimal("NaN")` and `BigDecimal("Infinity")` *succeed* where `Float()` raises, so those literal strings are rejected explicitly.
+
+**Numbers are spelled the way a client spells them.** `Integer()`, `Float()` and `BigDecimal()` all read underscore digit separators and surrounding whitespace — conveniences for a number literal in Ruby source — so `"1_8"` would be eighteen and `" 99 "` ninety-nine. A numeric string must instead be canonical: an optional sign, digits, an optional fraction and an optional exponent (`"-12"`, `"007"`, `".5"`, `"1.5e10"`). Anything else is `invalid_type`.
+
+Two more behaviours worth committing to memory:
+
+- **Type confusion is a violation, not a 500.** A request of `?age[]=1` against a scalar `:integer` field yields `invalid_type`. Arrays, hashes, and nested `ActionController::Parameters` can never satisfy a scalar type, so the classic "`NoMethodError` on `[]`" crash is impossible.
+- **Datetimes are normalised to UTC.** A zoneless string parses as UTC regardless of the host timezone, which keeps behaviour deterministic across machines; explicit offsets are honoured and converted. A zone the parser cannot honour — an offset of a day or more (`+25:00`), or an abbreviation it does not know — is `invalid_type` rather than read as UTC, and dates are read in the proleptic Gregorian calendar ISO 8601 uses, so `"1500-01-01"` is that day whatever the host has loaded.
+
+### Free-form hashes (`:json`)
+
+A `json`/`jsonb` column exists precisely so its contents need no schema. Every other field kind describes a shape, so until `:json` a contract had only bad options for one: declare sub-keys you don't know, or leave the key undeclared — in which case the contract **silently dropped it**, and the column never saw the data. Strong parameters has always had an answer here (`params.permit(metadata: {})`); now so does a contract.
+
+```ruby
+permit_params :create, root: :user, model: User do
+  required :name,     :string
+  optional :metadata, :json, max_depth: 3, length: 0..32
+end
+```
+
+The hash passes through **untouched** — keys are neither filtered nor cast, nested arrays and mixed scalars survive, and `unknown:` does not descend into it. `{}` is a value, not an absence. Anything that is not a hash (an array, a string, a number) is `invalid_type`.
+
+What you give up is the shape. What you keep:
+
+| | |
+|---|---|
+| `length:` | Caps the **top-level key count** — same reading as an array's element count |
+| `max_depth:` | Caps **container nesting**, counting arrays as a level: `{"a": 1}` is 1, `{"a": {"b": 1}}` and `{"a": [1, 2]}` are 2, `{"a": [{"b": 1}]}` is 3. Violation code `depth` |
+| `validate:` / `transform:` | See the whole hash, so any check you can write in Ruby still applies |
+| `model:` | The field maps onto a column like a scalar does, so the [drift guard](#the-schema-drift-guard) still catches a dropped `metadata` column |
+| `sensitive:` / `nullable:` / `message:` / `desc:` / `default:` / `example:` | Behave as on any other field (`default:`/`example:` must be a hash holding no NaN or Infinity, and are checked against the field's own bounds at class load) |
+
+Bounding it matters more than it looks: an unbounded `jsonb` column is where clients put megabytes and 200-level-deep objects. `max_depth:` and `length:` are how a contract says "opaque, but not unlimited" — which is strictly more than `permit(metadata: {})` can say.
+
+Values arrive as plain data (`HashWithIndifferentAccess`), never `ActionController::Parameters`, so assigning straight to a `jsonb` attribute is safe.
+
+In [exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) the field is `{"type": "object"}` plus `minProperties`/`maxProperties`; JSON Schema has no nesting-depth keyword, so `max_depth:` stays visible as `x-permittable-max-depth` rather than being dropped or mistranslated.
+
+### Absence, defaults, and partial updates
+
+`nil` and `""` are **both treated as absent** — the query-parameter convention, where an untouched form field arrives as an empty string. Boolean `false` is present. `normalize:` runs *before* this rule, so a field declared `normalize: :squish` treats `"   "` as absent too: whitespace cannot satisfy a `required` field by becoming `""`. The same goes for a `""` **element** of a scalar `array ..., of:`: it is dropped before casting and before `length:` counts, because `collection_check_boxes` and `select multiple: true` always send a hidden `""` so that unchecking everything still sends the key. A `null` element, which no form sends, never reaches a Rails controller's contract under the default `perform_deep_munge` (Rails drops it from every array first); on a standalone `Contract`, or with deep munge off, it is still `invalid_type`.
+
+That single rule produces the behaviour you want from a `PATCH`:
+
+| The field is… | Result |
+|---|---|
+| absent and **optional** | omitted from the result, so partial updates never nil-out columns |
+| absent and **required** | a `missing` violation |
+| absent with a **`default:`** | the default — a defaulted field can never report `missing` |
+
+Declaring `required:` alongside `default:` is a class-load error, since a default implies optionality. And because absence and `nil` are the same thing here, a plain field cannot clear a column to NULL — declare it [`nullable:`](#explicit-nulls-nullable) when it should.
+
+Defaults are checked against the field's own contract when the class loads, so `default: "gold"` on a field declared `in: %w[free pro]` fails at boot rather than on every request.
+
+### Explicit nulls (`nullable:`)
+
+One rule — `nil` and `""` are absent — is right for `PATCH` and wrong for the request that means *clear this*. `nullable: true` splits it in two for a single field:
+
+```ruby
+permit_params :update, root: :user, model: User do
+  optional :nickname, :string, nullable: true
+  optional :plan,     :string, in: %w[free pro], default: "free", nullable: true
+end
+```
+
+| Request | `nickname` in the result |
+|---|---|
+| `{ "user": {} }` | **omitted** — the column is untouched |
+| `{ "user": { "nickname": null } }` | `nil` — the column is cleared |
+| `{ "user": { "nickname": "" } }` | `nil` — the form-encoded spelling of the same intent |
+
+A key the client never sent is still **absent**: `default:` applies to it and a `required` field still violates with `missing`. Only *present-but-empty* changes meaning, and it changes it decisively — an explicit null wins over the field's `default:`, which is the behaviour a `PATCH` needs (`{ "plan": null }` clears the plan instead of silently resetting it to `"free"`).
+
+Nothing is cast or checked for an explicit null. `in:`, `format:`, `length:`, `validate:`, and `transform:` all see a value or nothing at all — never a `nil` they never agreed to handle.
+
+Three more readings worth knowing:
+
+- **`required` + `nullable`** is coherent, and means what it says in SQL: the client *must* state the field, and `null` is a legal statement. A missing key still violates.
+- **`default: nil`** — legal only on a nullable field — gives the `PUT` reading, where absence *also* means clear.
+- **On arrays and nested blocks**, `nullable:` applies to the array or object itself, never to its contents. `{ "tags": null }` yields `nil` (distinct from `[]`, which still gets length-checked); a null *element* inside `tags` is still `invalid_type` wherever Rails has not already dropped it (a standalone `Contract`, or `perform_deep_munge` off).
+
+Exported [OpenAPI](#exporting-openapi-docs-that-cannot-drift) tells the truth about all of this: a nullable field's `type` gains `"null"`, and a nullable `in:` set lists `null` in its `enum`.
+
+### Violations and error responses
+
+Every failure raises `Permittable::InvalidParameters`, carrying `details` (an array of `{ param:, code: }`, plus a `message:` when the field [declares one](#custom-error-messages-message)) and a `status`. On a real controller it is auto-rescued into the error envelope shown at the [top of the README](../README.md).
+
+Rails searches `rescue_from` handlers from the last declared to the first, so a catch-all such as `rescue_from StandardError` declared *after* `include Permittable` answers an invalid request first, and the client gets that handler's response instead of the 422 or 400. Either declare the catch-all before the include, or re-declare the gem's handler after it:
+
+```ruby
+rescue_from Permittable::InvalidParameters, with: :render_invalid_parameters
+```
+
+| Code | Raised when |
+|---|---|
+| `missing` | A required field is absent, or the `root:` key is absent (that one is a **400**) |
+| `invalid_type` | The value cannot be faithfully cast to the declared type — including a `root:` key the client *did* send with the wrong shape (`{"user": "bob"}`), which is also a **400** |
+| `inclusion` | The value is outside `in:` |
+| `format` | The value doesn't match `format:` |
+| `length` | A string's length, or an array's element count, is outside `length:` |
+| `unknown` | An undeclared key was sent while `unknown: :error` |
+| `invalid` | A `validate:` callable returned a falsy value |
+| *your symbol* | A `validate:` callable returned a `Symbol`, or `violate!` was called in `finalize` |
+
+Paths are fully qualified: `user.address.zip`, `line_items[1].sku`.
+
+**`details` is complete; `message` is prose.** The `details` array names **every** offender, however many there are — it is the machine-readable channel and nothing is dropped from it. The `message` string is a sentence for a person, and it also lands in your logs and in every exception tracker, so it is bounded: at most ten offenders, each truncated past 120 characters, then a count of the rest (`…, and 49990 more`). Before that bound, a request carrying 50,000 undeclared keys against `unknown: :error` produced a **1 MB** exception message and a 1 MB log line. The 422 body still carries the complete `details`, so it stays proportional to the number of violations; the field bounds are what keep that number down. The check itself lists one violation per undeclared key, so its cost grows with the key count (tens of seconds at a few hundred thousand keys, growing linearly); cap the request body size or key count in front of the app.
+
+**Status codes.** A bad root key renders **400** — the request is malformed; the envelope you asked for isn't there, or isn't an object. Field-level violations render **422** — well-formed, semantically wrong. The two root failures are told apart by their code: `missing` when the key really is absent (`{}`, `{"user": null}`, `{"user": ""}`), `invalid_type` when the client sent it with the wrong shape.
+
+**Custom rendering.** If your controller defines `render_error`, the envelope delegates to it as `render_error(message:, code:, status:, errors:)` — the `errors:` key is passed only when the method can take it (it names `errors:`, takes `**kwargs`, or declares no keywords at all), so hosts documenting a three-keyword `(message:, code:, status:)` contract keep working. A **private** `render_error`, the usual spelling on an `ApplicationController` so it never becomes a routable action, is delegated to as well when it takes `message:`, `code:` and `status:` and requires nothing else; a private one with some other signature (`render_error(message, status)`, or `render_error(message:, status:)`) is left alone. Otherwise the inline JSON shape is rendered. Either way, `render_invalid_parameters` is a normal method you can override, and [`Permittable.error_format = :problem`](#rfc-9457-problemjson) swaps the whole shape for RFC 9457 problem details. For full control beyond that, `error.details` gives you the structured violations to build from.
+
+### Custom error messages (`message:`)
+
+Violations stay machine-first — the `code` is the contract — but any field can attach human-readable copy with `message:`. A **String** covers every code on the field; a **Hash of code → String** targets specific codes, and codes without an entry keep the default rendering:
+
+```ruby
+permit_params :create, root: :user do
+  required :email, :string, format: URI::MailTo::EMAIL_REGEXP,
+                            message: { missing: "is required", format: "must be a valid email address" }
+  optional :age,   :integer, in: 18..120, message: "must be between 18 and 120"
+  array    :tags,  of: :string, length: 0..10, message: "must be at most ten tags"
+end
+```
+
+A resolved message rides into the violation detail and replaces the `(code)` part of the exception's summary line, so both the envelope's `message` and its `details` read naturally:
+
+```json
+{ "success": false,
+  "error": { "message": "Invalid parameters: user.email must be a valid email address",
+             "code": "invalid_parameters",
+             "details": [{ "param": "user.email", "code": "format",
+                           "message": "must be a valid email address" }] } }
+```
+
+The rules:
+
+- Messages are written to read after the param name: `"is required"`, not `"Email is required"`.
+- A Hash key matches the violation code, **including Symbol codes returned by `validate:`** — `validate: ->(v) { v.even? || :must_be_even }, message: { must_be_even: "must be an even number" }`.
+- An array's message covers the array's own violations (`length`, `invalid_type`, `missing`) **and** its elements' (`tags[3]`); sub-fields of a nested block resolve their own `message:` declarations.
+- `violate!` in `finalize` takes the same idea as a keyword: `violate!("user.ends_at", :before_start, message: "must be after starts_at")`.
+- A `message:` that is neither a String nor a code → String Hash raises at class load, like every other contract mistake.
+
+#### Localizing default messages (I18n)
+
+App-wide copy for a violation code — without repeating `message:` on every field — comes from I18n, under `permittable.errors.<code>`:
+
+```yaml
+# config/locales/en.yml
+en:
+  permittable:
+    errors:
+      missing: "is required"
+      invalid_type: "is the wrong type"
+      inclusion: "is not an allowed value"
+      unknown: "is not a recognized parameter"
+```
+
+Resolution order per violation: the field's own `message:` (String, or the Hash entry for that code) → the app's `permittable.errors.<code>` translation → the bare `{ param:, code: }` shape. The lookup also covers a missing `root:`, `unknown` keys, Symbol codes returned by `validate:` (`permittable.errors.must_be_even`), and `violate!` codes in `finalize` (an explicit `violate!(..., message:)` still wins). Only a String translation counts — a missing key or a nested Hash falls back to the bare shape rather than leaking structure to clients. No I18n, no change: apps without the gem or the keys behave exactly as before.
+
+**Per-request locales.** Messages are resolved in the locale that is current when the check runs. A lazy rule runs inside the action, so a locale switch such as the Rails i18n guide's `around_action :switch_locale` covers it as long as nothing reads `permitted_params` before the switch runs. An app `before_action` that runs earlier and reads `permitted_params` or `permittable_violations` (an authorization callback, say) validates the rule before the switch. An `enforce: true` rule and every [monitor-mode](#monitor-mode-roll-out-without-rejecting) rule run earlier, in a `before_action` that `include Permittable` registers. Rails runs callbacks in the order they were declared, so a switch declared *after* the include runs after that check, and the same request is answered in the default locale (`"is required"`) with `enforce: true` and in the request's (`"fehlt"`) without it. Put the switch first, with `prepend_around_action` (which puts it ahead of every callback, the app's own authentication included, which is normally what a locale switch wants), or declare it before the include:
+
+```ruby
+class ApplicationController < ActionController::API
+  include Permittable
+  prepend_around_action :switch_locale
+
+  private
+
+  def switch_locale(&action)
+    I18n.with_locale(params[:locale] || I18n.default_locale, &action)
+  end
+end
+```
+
+### RFC 9457 problem+json
+
+For a public API, the standard shape for an error is [RFC 9457 Problem Details](https://www.rfc-editor.org/rfc/rfc9457.html). One app-wide setting renders it:
+
+```ruby
+# config/initializers/permittable.rb
+Permittable.error_format = :problem
+Permittable.problem_base_uri = "https://api.example.com/problems"   # optional
+```
+
+```http
+HTTP/1.1 422 Unprocessable Entity
+Content-Type: application/problem+json
+```
+
+```json
+{
+  "type": "https://api.example.com/problems/invalid-parameters",
+  "title": "Invalid parameters",
+  "status": 422,
+  "detail": "Invalid parameters: user.email (format), user.age (inclusion)",
+  "instance": "/users",
+  "errors": [
+    { "param": "user.email", "code": "format" },
+    { "param": "user.age",   "code": "inclusion" }
+  ]
+}
+```
+
+- **`errors`** is the field-violation extension member, carrying the identical `{ param:, code: }` entries (plus `message:` when the field [declares one](#custom-error-messages-message)) that the default envelope puts in `details`. Nothing about violation reporting changes — only the wrapper.
+- **`title`** describes the problem *type*, not the instance: a missing `root:` is `"Malformed request"` (400), a field violation is `"Invalid parameters"` (422).
+- **`type`** is RFC 9457's default `"about:blank"` until you set `problem_base_uri`, at which point each problem type gets its own URI under it.
+- **`instance`** is the request path, and is omitted rather than guessed when the host can't name one (a params duck, a job).
+- **Setting `:problem` opts out of `render_error` delegation.** A host envelope and a problem document are two answers to the same question, and the explicit setting is the one honoured.
+
+The setting is app-wide, not per-contract, because the error format of an API is a property of the API. [Exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) follows it: with `:problem` configured, the shared response components describe the problem schema under `application/problem+json` instead of the envelope under `application/json` — an export runs inside the app that made the setting, so the documented shape can't drift from the rendered one.
+
+### Unknown parameters
+
+`unknown:` decides what happens to keys you never declared, **at every nesting level**.
+
+| Mode | Behaviour |
+|---|---|
+| `:ignore` (default) | Silently dropped, exactly like strong parameters |
+| `:log` | Dropped, with a `logger.warn` naming the full paths — at most ten of them, then a count, so one request cannot write a megabyte of log |
+| `:error` | Each undeclared key becomes an `unknown` violation |
+
+Under `:log` that bound is the whole record: nothing else names an undeclared key, so beyond the tenth only the count survives. Where you need every name — auditing what a client really sends during a rollout — use `unknown: :error` in monitor mode, which records all of them in `details` and in the instrumentation payload without rejecting the request.
+
+Rails merges its own keys into `params`: `controller`, `action`, and `format` from the router, plus `authenticity_token` (or whatever `config.action_controller.request_forgery_protection_token` renames it to), `_method`, `utf8`, and the submit button's name from an ordinary form POST: `commit` from `f.submit` / `submit_tag`, `button` from `f.button` / `button_tag` (sent as `button=` when the `<button>` has no value). All eight are exempt at the top level. So is the click point of an image submit: `image_submit_tag("save.png")` renders an `<input type="image">` with no name, and a browser submitting through it posts where it was clicked as `x=12&y=7` (or `save.x=12&save.y=7` when the tag is named `"save"`, which Rack keeps as those literal keys). `x` and `y` are ordinary names a contract may really be sent, so they are exempt only as a pair, both present and both plain digits (never negative or fractional); a lone `x`, or a pair that is not digits, is flagged as usual, and a contract that *declares* `x` or `y` has it validated as usual and sees the other flagged unless it declares that too. A bracketed image-submit name is not covered (`name: "user[save]"` is parsed by Rack as `{"user"=>{"save"=>{".x"=>..}}}`, nested rather than top level), just as only the top-level `commit` and `button` are. So are the route's **path parameters** (`PATCH /users/1` merges `id`, which the exported OpenAPI documents as a path parameter rather than a body field); a contract that *declares* `id` has it validated as usual, since the URL really carried it, and the export then documents that field as the path parameter's schema (`required :id, :integer, in: 1..1000` becomes `{"type":"integer","minimum":1,"maximum":1000}`) and leaves it out of the request body, `required` list included, so a body without `id` is valid. Only a rootless contract does this, and only for a name the route templates; a `root:` contract's `id` is a body field and stays one, and so does an `array`, nested or `:json` field, since no URL segment can be one. Under `unknown: :error` the body schema forbids undeclared keys, but the keys the runtime exempts (`controller`, `action`, `format`, `authenticity_token`, `_method`, `utf8`, `commit`, `button`, and the controller's renamed CSRF token, if any) stay in a rootless contract's JSON body as free, optional properties, as in its multipart body, because the runtime accepts them (a `root:` contract's body is unchanged: they sit outside the root; a name the contract declares keeps its own schema; `Contract#json_schema` describes the contract alone and lists none), and every name the route templates stays in it as a property that takes any value and is never required, declared or not: `PATCH /users/1` with `{"id":1,"name":"x"}` is accepted, because the path parameter is exempt and the URL's `id` overwrites the body's. A name the route fills from `defaults:` (`post "w", to: "widgets#create", defaults: { kind: "x" }`, on the route, its `scope` or the `mount` it is reached through) is no body field either, since the router overwrites the body's value: the export leaves it out of the body, `required` list included, and under `unknown: :error` keeps it as that same free property, but declares no path parameter for it, because no URL carries it. `rails_routes` names such keys in each descriptor's `defaults:`, apart from `controller` and `action`; a `format:` default (`defaults: { format: "json" }`) is named like any other, so a contract field called `format` leaves the body and its `required` list for such a route. **ParamsWrapper's copy of a JSON body** under the controller's wrapper key (`user` for `UsersController`) goes further: when Rails made that copy, a rootless contract does not see the key at all, because the client never sent it. So an undeclared wrapper key is not flagged, and a scalar or array field that happens to share the wrapper's name (`optional :feedback, :string` on `FeedbackController`) is simply absent, rather than failing as `invalid_type` against Rails' copy of the whole body. The one exception is a rootless contract that declares the wrapper key as a hash container — a nested block (`required :user do ... end`) or `:json`. That contract is reading the copy on purpose, like a `root:` spelled as a field, so the copy is kept and validated as that field. A client that sends `user` itself is checked like any other key: validated if declared, flagged if not. That holds whether the wrapper name is configured as a String or as a Symbol (`wrap_parameters :user`). Either way `unknown: :error` flags what the *client* got wrong rather than what the framework added. Inside a `root:` or a nested hash there is no such exemption, because nothing legitimately injects keys there — and a standalone `Contract` exempts nothing at all, having neither a router, a form, nor a request.
+
+All of this changes what is *checked* only. Monitor mode still hands back the form keys, the path parameters and the wrapper's copy in its raw pass-through, where behaving exactly like the pre-contract app is the whole promise and a legacy action may read `params[:id]` or `_method` itself; only the router's three are dropped there.
+
+**Rails' `date_select`, `datetime_select` and `time_select`** submit one value as several keys, each named for its position: `starts_on(1i)` is the year, `(2i)` the month, `(3i)` the day, `(4i)` the hour, `(5i)` the minute and `(6i)` the second. A `:date` or `:datetime` field reads these parts as its own value whenever its own key is absent. `permitted_params` carries `"starts_on" => Date`, never the parts, and `unknown:` does not report the parts it read. The parts are assembled into the ISO 8601 string the field already accepts (`"2026-10-17"`, or `"2026-10-17T09:30:00"` with seconds `00` unless `(6i)` is sent), and that string goes through the field's cast and rules like any other value. A `:date` or `:datetime` needs `(1i)`–`(3i)`; a `:datetime`'s `(4i)`, `(5i)` and `(6i)` are optional. As in ActiveRecord, the field reads as if it were sent empty (absent, or an explicit null when it is `nullable:`) when any one of `(1i)`–`(3i)` is blank, which is what a select left on its `prompt:` or `include_blank:` sends. It is any one, not all of them, because Rails sends a part it discards through a hidden input: `date_select(:event, :on, discard_day: true, prompt: true)` always sends `on(3i)=1`, so a month and year picker nobody touched arrives as `""`, `""`, `"1"` and is still no date. Once the date is there, a blank or missing `(4i)`, `(5i)` or `(6i)` reads as `00`, as ActiveModel reads it, so `date_select` on a `:datetime` field (which sends the date alone) and `datetime_select(discard_hour: true)` give midnight, as they do in ActiveRecord: a `time_select` left on its prompts for an empty value sends the hidden date `1`, `1`, `1`, and gives `0001-01-01T00:00:00`, as it does in ActiveRecord. A part is a String of digits or a non-negative Integer (a JSON body cannot send the String a form does). Any other part, a missing `(1i)`–`(3i)` that has no blank part beside it (a blank part among those sent reads the field as sent empty first, whichever of the others is missing, as it does in ActiveRecord) or a part that is not plain digits (`"Oct"`, `"-1"`, `"1.5"`, a Float, a nested hash or array), is `invalid_type` on the field itself (`event.starts_on`). `time_select`'s `ignore_date: true` is not supported: it sends only `(4i)` and `(5i)`, a `:datetime` needs a date, and the field is `invalid_type`. If a request sends both `starts_on` and its parts, `starts_on` wins the value and the parts are left alone: they are ordinary undeclared keys, so `unknown: :error` flags them (`event.starts_on(1i)`), `:log` logs them and `:ignore` drops them. They are not hidden from `unknown:`, because a legacy action that still calls `permit(:starts_on)` hands them to ActiveRecord, which assigns them after the plain key. Only a declared `:date` or `:datetime` field reads parts (a `:date` has no `(4i)`); for any other name, they are ordinary undeclared keys. When monitor mode passes a rejected request through raw, the parts come back as they were sent.
+
+The parts carry no time zone, so a datetime read from them is UTC, like any zoneless string ([see above](#types-and-strict-coercion)). ActiveRecord reads the same parts in `Time.zone`. So in an app with `config.time_zone = "Tokyo"`, a form showing 09:30 gives the contract 09:30 UTC, where strong parameters would have stored 00:30 UTC. Such an app can read the wall-clock time in its own zone with `transform: ->(t) { Time.zone.local(t.year, t.month, t.day, t.hour, t.min, t.sec) }`. Use that only where clients send zoneless times: a string with an explicit offset has already been converted to UTC, and the transform would shift it again.
+
+### Reusing fields (`Permittable.fields` and `use`)
+
+A growing API produces two kinds of duplication: the `address` block three controllers want, and the `update` contract that is the `create` contract with nothing mandatory. A **field group** is a reusable field list — the same frozen data a contract's fields are, without the contract around them.
+
+```ruby
+AddressFields = Permittable.fields do
+  required :city, :string, length: 1..80
+  optional :zip,  :string, format: /\A\d{5}\z/
+end
+
+UserFields = Permittable.fields do
+  required :name,  :string
+  required :email, :string, format: URI::MailTo::EMAIL_REGEXP
+  optional :plan,  :string, in: %w[free pro], default: "free"
+  optional :address do
+    use AddressFields          # groups compose
+  end
+end
+
+class UsersController < ApplicationController
+  include Permittable
+
+  permit_params :create, root: :user, model: User do
+    use UserFields
+  end
+
+  # PATCH: the same fields, nothing mandatory, no defaults.
+  permit_params :update, root: :user, model: User do
+    use UserFields, optional: true
+  end
+end
+```
+
+The defaults go because a default is filled in for every request that omits the field. On a `PATCH` that would overwrite the column the client left alone: with `plan`'s `default: "free"` kept, `PATCH {"user": {"name": "Jo"}}` would hand the action `{"name" => "Jo", "plan" => "free"}` and downgrade every `"pro"` user who renamed themself. The exported schema of the update rule leaves them out too.
+
+`use` splices the group in **at the point of use**, in the group's own order, exactly as if the fields had been typed there — so the request-time behaviour, the [drift guard](#the-schema-drift-guard), `sensitive:` registration and the [exported schema](#exporting-openapi-docs-that-cannot-drift) are all identical to the inline spelling. It works at the top level of a contract, inside a nested or array block, and inside another group.
+
+| Option | Meaning |
+|---|---|
+| `optional: true` | Relax every spliced field: nothing is mandatory, and no `default:` is filled in. **Top level only** — if a client sends an `address` at all, the address's own required sub-fields and defaults still hold. Types and bounds are untouched, so `use UserFields, optional: true` is a complete `PATCH` contract |
+| `only:` / `except:` | Select a subset, in the group's own order. Mutually exclusive |
+
+Because a group is built by the same builder a contract is, **every declaration is validated when the group is defined** — a typo fails once, at the group, instead of at each contract that uses it. Two more things fail at class load rather than silently: `only:`/`except:` naming a field the group doesn't declare (so a typo can't quietly drop a field), and a field declared twice. That last one makes overriding deliberate:
+
+```ruby
+permit_params :create do
+  use AddressFields, except: %i[city]
+  required :city, :string, length: 1..5   # this contract's own stricter city
+end
+```
+
+A group is deliberately **not** a contract: it has no `root:`, `unknown:`, `model:` or `mode:` — those describe the request being validated, not a set of fields — and `finalize` is rejected for the same reason. A [standalone `Contract`](#standalone-contracts-no-controller) does answer `#fields`, though, so `use SomeContract` lets a webhook payload and a controller action share one set of fields instead of two that drift. Only the fields: `use` cannot carry a contract's `finalize`, so using a contract that declares one raises at class load rather than silently dropping its cross-field rule. To share both, declare the fields in a `Permittable.fields` group that the contract and the controller each `use`, and declare `finalize` in each; passing one proc to both as `finalize(&EndsAfterStart)` keeps the rule itself in one place.
+
+### Output reshaping (`transform:` and `finalize`)
+
+This is the safe replacement for params-mutating `before_action`s. **Both layers operate on the validated copy — the request's `params` is never touched.**
+
+**`transform:` — per field.** A callable applied **after** cast and validation, reshaping one field's output:
+
+```ruby
+required :tags, :string, transform: ->(v) { v.split(",") }
+```
+
+It runs only on request-supplied values. Absent fields stay absent, and a `default:` is handed out exactly **as authored** — validated against the field's own contract at class load like any default, but neither cast nor transformed (a request that sends the default's value gets it transformed, one that omits the field does not). So author such a default already in the shape the action should receive: `transform: ->(v) { v.to_i }, default: 25` on a `:string` field hands the action the Integer `25` whether the request sent `"25"` (cast, then transformed) or omitted the field (already the final Integer). A field with no `transform:` still gets its `default:` cast to the field's own type, as [`default:`](#the-field-dsl) documents. And a **partially-invalid array is never transformed** — user code is never handed garbage it didn't agree to see.
+
+**`finalize` — per contract.** Declared once, at the top level only. It runs after every field has validated cleanly, receives the result hash, and must return the final `Hash`. Use it to combine parallel fields, build value objects, or drop scaffolding keys.
+
+It executes on a **bare runner, not the controller**, so contracts stay pure data plus pure functions and can never grow a dependency on request state. Its one extra verb is `violate!(param, code, message: nil)`, which records a violation and **halts the block immediately** — so the code after a `violate!` may assume the invariant it just checked. That makes `finalize` the natural home for cross-field validation (`ends_at` after `starts_at`, matching array lengths).
+
+```ruby
+permit_params :create, root: :lease_addendum_form do
+  required :resident_signatures, :string, transform: ->(v) { v.split("<<delimiter>>") }
+  required :signer_names,        :string, transform: ->(v) { v.split(",") }
+
+  finalize do |p|
+    unless p[:signer_names].length == p[:resident_signatures].length
+      violate!("lease_addendum_form.signer_names", :length_mismatch)
+    end
+
+    p[:signatures] = p[:resident_signatures].zip(p[:signer_names]).map do |image, name|
+      Signature.new(image: image, full_name: name)
+    end
+    p.except(:resident_signatures, :signer_names)
+  end
+end
+```
+
+Forgetting to return the hash raises an `ArgumentError` telling you exactly that.
+
+### The schema-drift guard
+
+This is why `model:` exists. Pass a model class (or `true` to infer it from `controller_name`) and **every non-virtual scalar field is checked against the model's columns when the macro runs** — that is, at controller class load.
+
+Production eager-loads controllers, so a column dropped by a migration **fails the deploy, not the request**:
+
+```
+Permittable: 'nickname' does not exist in the database (table: users).
+Add it with: bin/rails generate migration AddNicknameToUsers nickname:string
+If this parameter is not backed by a column, declare it with virtual: true.
+```
+
+The error carries a ready-to-paste migration command, typed from your own field declaration.
+
+A field naming a column the model lists in `ignored_columns` raises too, but says so (remove it from `ignored_columns`, or declare it `virtual: true`) rather than suggesting a migration.
+
+An attribute assignment accepts without a column of its own is checked against the column behind it. A field named for an `alias_attribute` (`alias_attribute :title, :name`) is checked as its target `name`, type included. A field named for a `store_accessor` (`store_accessor :settings, :theme`) passes when the store's column (`settings`) exists, since the value lives inside that column; it has no type of its own to compare, and a missing store column is reported by the store's name rather than as a missing `theme` column. The name is the one assignment takes, so with `prefix: true` it is `settings_theme` and the bare `theme` is still reported missing. An accessor a parent model declared counts too. Rails does not record which prefix built which accessor, so two stores that share a key under different prefixes are ambiguous: the guard picks the store by the longest matching key, and may then check the other store's column. An alias whose target column is missing is reported as `'title' is an alias of 'name'`, with the migration for `name`. Only a name no column, alias or store accessor backs still needs `virtual: true`.
+
+#### Checking types too (opt-in)
+
+A dropped column fails the deploy; a **retyped** one doesn't, unless you ask:
+
+```ruby
+# config/initializers/permittable.rb
+Permittable.check_column_types = true
+```
+
+```
+Permittable: 'placed_at' is declared :string but the column is :datetime (table: orders).
+Change the contract to match the column, migrate the column to match the contract,
+or declare the field virtual: true if it is not backed by this column.
+```
+
+**It is off by default on purpose.** Every cross-type declaration has some legitimate use — a `:string` contract on a `date` column that lets ActiveRecord do the casting, a `:boolean` contract on a legacy integer column — and breaking those apps on an upgrade would cost more than the drift it catches. Turn it on and fix what it finds.
+
+When enabled it compares **groups**, not exact types, so it fires on a genuine cross-family mismatch and stays quiet otherwise:
+
+| Group | Column types |
+|---|---|
+| text | `string`, `text`, `citext`, `uuid`, `enum`, `char` |
+| numeric | `integer`, `bigint`, `float`, `decimal`, **`boolean`** |
+| temporal | `date`, `datetime`, `time`, `timestamp`, `timestamptz` |
+
+`boolean` sits with the numerics because a boolean stored as an integer `0`/`1` is a real legacy pattern and ActiveRecord casts cleanly between them; the temporal types are one group because a `:date` contract on a `datetime` column is a narrowing, not drift.
+
+Any column type **not** in that table — `json`, `jsonb`, `binary`, an adapter's own `inet` or `money` — is never checked. A contract has no faithful type for those, so whatever you improvised is left alone rather than guessed about.
+
+**A PostgreSQL array column is checked for its shape.** Rails reports `t.string :tags, array: true` as a `string` column, so a scalar `optional :tags, :string` sits in the right group and would pass — yet it rejects as `invalid_type` every array the column stores. A scalar or `:json` declaration over an array column fails at class load and names the fix, `array :tags, of: :string`.
+
+**A Rails `enum` is compared by what clients send, not what the column stores.** An enum is submitted by name — `status: "shipped"` — so `optional :status, :string, in: Order.statuses.keys` is the right contract for an integer-backed enum, and a text declaration on any attribute in the model's `defined_enums` is not held to the column's group. It **must** carry that `in:`, though: assignment raises `ArgumentError` for a value the enum does not map, so without one `status: "bogus"` would pass the contract and become a 500 in the action. A text declaration with no `in:`, or with an `in:` listing anything the enum would refuse, fails at class load:
+
+```
+Permittable: 'status' is an enum on Order, declared :string without an in: (table: orders).
+A value outside the enum would pass the contract and then raise on assignment.
+Declare it with in: Order.statuses.keys.
+```
+
+The `in:` may list names and, for a string-backed enum, stored values, since assignment accepts both. An integer-backed enum's stored integers (`"1"`) are accepted only beside a `transform:` that maps them back to names, which is the recipe `permittable:generate`'s TODO spells out. It must be a list: a Range is refused because it cannot be checked. String-backed enums follow the same rule. Other declarations are still held to the column's own group: `:integer` on an integer-backed enum passes, and `:datetime` fails with a suggestion of the enum contract rather than `virtual: true`.
+
+The attribute API is **not** treated the same way, by choice. `attribute :starts_at, :datetime` over a string column is still compared against the string column. An enum's mapping says exactly which strings are valid, so the exemption can demand a matching `in:`. An attribute override gives the guard nothing comparable to check the contract against, so exempting it would only switch the check off for that field. Declare such a field to match its column, or leave the check off.
+
+- **Fields not backed by a column** — `password_confirmation`, terms checkboxes, search filters — opt out with `virtual: true`.
+- **Nested and array fields are implicitly virtual**, since only scalars map one-to-one onto columns.
+- **The check skips when the schema is unreachable** (`db:create`, a fresh `db:migrate`, `assets:precompile`, CI bootstrap), so controller classes stay loadable. Skipping is self-healing: once the migration runs and classes reload, the check happens for real. A missing column with a *reachable* schema still raises — the rescue is scoped to `ActiveRecord::ActiveRecordError` precisely so real bugs keep surfacing.
+
+In CI, one spec calling `Rails.application.eager_load!` exercises every contract in the whole app.
+
+### Sensitive parameters and log redaction
+
+Mark a field `sensitive: true` and its name is registered with `Permittable.filter_parameter_registry`; `Permittable::Railtie` appends a filter proc to `config.filter_parameters` at boot.
+
+```ruby
+optional :ssn, :string, sensitive: true
+```
+
+**On a nested block or an array, `sensitive:` cascades to everything inside it:**
+
+```ruby
+optional :payment, sensitive: true do
+  required :card_number, :string        # redacted
+  optional :cvv,         :string        # redacted
+  optional :id,          :string, sensitive: false   # NOT redacted — see below
+end
+```
+
+It has to. Rails' parameter filtering walks into hashes and arrays itself and asks a proc filter about the **leaf values only**, handing it the leaf's own key and never the path that led there. So registering `payment` alone redacts nothing inside it: the filter descends and asks about `card_number`, which the container's name does not match.
+
+A sub-field opts out with an explicit `sensitive: false`. That exists because matching is a case-insensitive **substring** match, so cascading a generic name like `:id` or `:name` would redact every parameter in the app that happens to contain it — occasionally a worse outcome than the leak it prevents. Only `false` opts out; `sensitive: nil` reads as "not stated" and still inherits.
+
+The cascade is resolved onto the field when the contract loads, so everything that reads a contract agrees: the value is redacted from logs, the exported schema marks the child `writeOnly`, and `permit_param("payment.card_number").sensitive` passes.
+
+Two mechanisms, because neither covers the ground alone.
+
+A **single proc appended once at boot, consulting a live registry at filter time**, is what reaches consumers that snapshot `config.filter_parameters` at boot — ActiveRecord's `filter_attributes` copy, lograge-style initializers — so a field registered when a controller loads later (lazy loading in development) is still redacted there. The initializer runs before `active_record.set_filter_attributes`, so values are redacted from both request logs and `#inspect`.
+
+But a proc filter can only redact **String** values: ActiveSupport dups the value and expects in-place mutation, and for a `Hash` value it never calls the proc at all, recursing into it instead. So each name is **also registered as a name** in `config.filter_parameters`, which redacts a value of any type — an `:integer` field, or a whole sensitive nested block. Appending later still works: Rails' `precompile_filter_parameters` replaces that array *in place*, and `ActionDispatch` reads the same object on every request, so a name registered at class-load time is seen by the next request. ActiveRecord is the exception that has to be fed by hand: it copies `config.filter_parameters` into `filter_attributes` once, when `ActiveRecord::Base` loads, which in a real app is before any controller registers its names (the first controller's own `model: Person` loads it). So each name is also appended to `ActiveRecord::Base.filter_attributes` directly, which is what keeps an `:integer` sensitive value out of the SQL bind log (`[["pin_code", 4321]]`), where the proc alone redacts only Strings. (Rails 6.1 does not filter bind values at all.) Every registration also restores any registered name that is missing from that list, so a name lost to an app *assigning* `filter_attributes` is back as soon as the next contract loads or reloads. (This is also why the mechanism is a name and not a live matcher object: precompilation joins patterns by source, which discards anything whose matching is decided at filter time.)
+
+Two things for an app that logs SQL, because `filter_attributes` is ActiveRecord's list and the gem only feeds it parameter names:
+
+- **Append to `filter_attributes` (`+=`), never assign it.** `ActiveRecord::Base.filter_attributes = [:password]` in an initializer or a `to_prepare` block discards every name fed in so far. The gem puts them back the next time a contract registers a name (on a code reload, or when the next controller loads), but until then, and for a name that is never registered again, the bind log and `#inspect` show the value.
+- **A sensitive parameter name is matched against *attribute* names, by Rails' substring rule, so a column the name is not a substring of is not covered.** `optional :pin_alias, :integer, sensitive: true` guards a column called `pin_alias`, but not `alias_attribute :pin_alias, :secret_pin`, whose column is `secret_pin`; nor does `sensitive: true` on a param `pin_code` cover a virtual `attribute :pin` (`"pin"` does not contain `"pin_code"`). Add that attribute name to `filter_parameters` yourself (`config.filter_parameters += [:secret_pin, :pin]` in `config/application.rb`, which ActiveRecord copies when it loads).
+
+Matching mirrors Rails' own symbol-filter semantics: case-insensitive substring match on the parameter key. The registry is fully duck-typed (`#add`, `#include?`, `#to_proc`, `#names`, `#reset!`) and swappable via `Permittable.filter_parameter_registry=`, so a host gem can pool registrations into its own. `#to_proc` must return a callable of arity 2 (`key, value`) or 3 (`key, value, original_params`), matching what Rails' own parameter filtering accepts; anything that does not respond to `#to_proc` is refused at the point of the swap rather than on the next request.
+
+**The swap works at any point**, including from `config/initializers` — which matters, because Rails runs railtie initializers *before* those, so a swap always happens after `Permittable::Railtie` has appended its filter. Two things make that safe. The appended proc (`Permittable.filter_parameter_proc`) resolves the registry at **filter time** rather than closing over whichever instance existed at boot, so whichever registry is current does the redacting. And the swap **carries the previous registry's names into the new one**, so a `sensitive:` field registered by a contract that loaded before the swap keeps being redacted afterwards. Without that, the two halves of an app would each redact only what the other did not.
+
+### Instrumentation
+
+Every violation emits an `ActiveSupport::Notifications` event, so rejected requests can be dashboarded and alerted on — **exactly once per action per request**, however many times the action reads the params (`permitted_params` memoizes the outcome, rejections included):
+
+```ruby
+ActiveSupport::Notifications.subscribe("invalid_parameters.permittable") do |*, payload|
+  payload[:controller]  # "users"
+  payload[:action]      # "create"
+  payload[:mode]        # :enforce, or :monitor for a would-be rejection
+  payload[:details]     # [{ param: "user.age", code: "inclusion" }]
+end
+```
+
+---
+
+## Adopting on a live API
+
+Adding contracts to an API with real traffic has a chicken-and-egg problem: you cannot know what the 422s would break until you enforce them, and you dare not enforce them until you know. Old mobile app versions, third-party integrations, and forgotten cron jobs all send what they send.
+
+Permittable's answer is an afternoon-sized recipe:
+
+1. **Draft.** `bin/rails permittable:generate` writes a first contract for every controller from the model's columns and the `params.permit` calls already in the source. Action code stays as-is.
+2. **Monitor.** Deploy with `PERMITTABLE_MODE=monitor`. Behaviour is unchanged; every would-be rejection is logged and instrumented.
+3. **Watch.** Point your existing notification subscriber at a dashboard. Every entry is a real client that would have been rejected — fix the contract, or wait for that traffic to drain.
+4. **Enforce.** Flip to enforce, controller by controller. Every 422 you now return is one you already counted.
+
+The two halves of that recipe are below.
+
+### Monitor mode (roll out without rejecting)
+
+`mode: :monitor` runs the full pipeline — unwrap, cast, validate, defaults — but a violation is **reported instead of rejected** and the request proceeds exactly as it did before the contract existed.
+
+```ruby
+class OrdersController < ApplicationController
+  permit_params :create, root: :order, mode: :monitor do
+    required :sku,      :string
+    optional :quantity, :integer, in: 1..99
+  end
+
+  # The action doesn't have to change while monitoring — it can keep reading
+  # params the old way; the contract validates in the before_action.
+end
+```
+
+Or flip the whole app at once and pin controllers to their final mode one at a time — a rule's own `mode:` always beats the global, in both directions:
+
+```ruby
+# config/initializers/permittable.rb
+Permittable.mode = ENV.fetch("PERMITTABLE_MODE", "enforce").to_sym
+```
+
+On a violating request in monitor mode:
+
+- **Nothing raises and nothing renders** — the action runs.
+- The [`invalid_parameters.permittable` event](#instrumentation) fires with `mode: :monitor` in the payload (enforced violations carry `mode: :enforce`), and the logger warns with the offending paths.
+- `permitted_params` returns the **raw pass-through**: exactly what the client sent, untouched — no casts, no defaults, no transforms. A missing `root:` passes an empty hash; a rootless contract drops only Rails' routing keys.
+- `permittable_violations` returns the recorded details (`[]` when the request was clean), if the action wants to branch on or tag the traffic.
+
+The before-action check that monitors actions which never call `permitted_params` keeps that promise when it cannot check at all. A body Rails cannot parse, or an exception from the contract's own code (`validate:`, `transform:`, `finalize`), is logged as `[monitor] #create could not be checked: <exception class>` and the action runs. An action that then reads `permitted_params` meets the same exception itself, as it would without a contract.
+
+Monitor-mode rules validate **eagerly in the `before_action`, regardless of `enforce:`** — telemetry must not depend on the action calling `permitted_params`, since legacy actions still reading `params` directly are exactly the ones worth monitoring. (On a plain-Ruby host without `before_action`, validation stays lazy.)
+
+[Exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) marks operations whose rule declares `mode: :monitor` with `x-permittable-mode: "monitor"` — the docs shouldn't promise a 422 the server doesn't yet send. Only the per-rule declaration is exported: the global `Permittable.mode` is runtime configuration, not contract data.
+
+### Generating draft contracts (`permittable:generate`)
+
+The blank-page problem, solved: the first draft of every contract is generated from what the app already knows — the model's columns, and the params calls already sitting in the controller, in either spelling (`params.require(...).permit(...)` or Rails 8's `params.expect(...)`).
+
+```sh
+bin/rails permittable:generate                      # every controller without a contract
+bin/rails "permittable:generate[UsersController]"   # one controller, even if covered
+```
+
+The sweep skips what the audit [ignores](#ignoring-controllers-and-actions): controllers whose source is outside `Rails.root` (so ActiveStorage's direct uploads controller is not drafted), and anything in `Permittable.audit_ignore`. A `controller#action` entry leaves only that action out of the controller's draft.
+
+A draft covers `:create` and `:update`, and only the ones the controller defines, read the way `permittable:audit` reads them (an `action_missing` handler or a template answers an action too): a `SessionsController` with `create` and `destroy` gets a `:create` rule and no `:update`, which would guard nothing and which the audit would list as stale. A controller that defines neither, like `ApplicationController`, is not drafted at all — a rule there would be inherited by every controller below it. Naming a controller drafts it regardless, the same way it drafts a covered one, and leaves out an action it does not define in the same way; only a controller that defines neither is drafted with both.
+
+For each controller the task infers the model from `controller_name` (columns give types, NOT NULL gives `required`), scans the controller source for `params.require(...).permit(...)` and `params.expect(...)` calls (permitted keys give the field list and the `root:`), and prints a paste-ready draft:
+
+```ruby
+# Drafted by permittable:generate — review the TODOs, then deploy: monitor
+# mode reports violations (instrumentation + log) without rejecting requests.
+permit_params :create, root: :user, model: User, mode: :monitor do
+  required :name, :string
+  optional :age, :integer
+  optional :status, :string, in: User.statuses.keys # database default: "active"; TODO: Rails also assigns the stored integers (status: 1) — if API clients send them, add User.statuses.values.map(&:to_s) to in: and map them back to keys with transform: ->(v) { User.statuses.key(Integer(v, exception: false)) || v }
+  optional :password_confirmation, :string, virtual: true # TODO: not a database column — confirm the type
+  array :tag_names, of: :string # TODO: confirm the element type, and declare length: — an array without one is unbounded
+end
+
+# :update has nothing required — a PATCH sends only the fields it changes.
+permit_params :update, root: :user, model: User, mode: :monitor do
+  optional :name, :string
+  optional :age, :integer
+  optional :status, :string, in: User.statuses.keys # database default: "active"; TODO: Rails also assigns the stored integers (status: 1) — if API clients send them, add User.statuses.values.map(&:to_s) to in: and map them back to keys with transform: ->(v) { User.statuses.key(Integer(v, exception: false)) || v }
+  optional :password_confirmation, :string, virtual: true # TODO: not a database column — confirm the type
+  array :tag_names, of: :string # TODO: confirm the element type, and declare length: — an array without one is unbounded
+end
+```
+
+A scanned draft keeps the root its permit call names (a rootless `params.permit(...)` stays rootless). Only a draft with no permit call to scan — drafted from the columns alone — takes its root from the model: `User.model_name.param_key`, the key Rails forms submit under, so a namespaced `Blog::Post` is rooted at `:blog_post`.
+
+The generator's one rule is **draft, don't guess** — everything it cannot know for sure stays visible instead of silently decided:
+
+- Drafts come out in **monitor mode**, so pasting one changes nothing until you flip it.
+- A permitted key that isn't a column becomes `virtual: true` with a TODO; a PostgreSQL array column drafts as `array :tags, of: :string` with a `length:` TODO (an array of `json`/`jsonb` elements, which `of:` cannot express, is a TODO, and so is a `json`/`jsonb` column whose default is an array, since `:json` accepts only an object); a column type with no faithful representation (`binary`, geometry types) becomes a TODO comment; a permit argument the conservative parser can't read (`*dynamic_keys`) is kept verbatim in a TODO instead of dropped.
+- Drafted from the columns alone, `created_at`/`updated_at` and a primary key the database generates are left out: Rails or the database assigns them. A generated key is an auto-increment column (as the adapter reports it, even as one part of a composite key) or one with a default or default function, such as a uuid. A permit call that **lists** one keeps it, typed from its real column (`optional :created_at, :datetime`) and always `optional`, even though the column is NOT NULL — it is a column like any other, so the schema-drift guard stays on for it. A primary key the client must send is no such column: a natural key (`sku`, from `create_table :items, primary_key: :sku, id: :string`) or a part of a composite key that is not auto-increment is drafted like any other, `required` on `:create` when it is NOT NULL with no default.
+- **Comments are not code.** A commented-out `params.require(:admin).permit(:superuser)` kept for reference is skipped, so it can't contribute a root or a field to the draft. The source is tokenised with `Ripper` for this, because `#` is only sometimes a comment — a permit call inside `#{'#{...}'}` interpolation is live code and is still read, and quoted keys like `permit("name")` still work.
+- **Parentheses are optional.** A call is read with or without them (`permit :name, :email`, `expect user: [...]`), to the end of its statement, and a root spelled as a String (`require("user")`) is read like a Symbol.
+- NOT NULL is only true of a **create**. When a column makes a field `required`, the draft splits into a `:create` rule and an `:update` rule with every field optional, so a PATCH carrying only the edited field is not rejected for what it left out. With nothing required it stays one `:create, :update` rule. A default the **model** declares (`attribute :plan, default: "free"`, `enum ..., default: :pending`) keeps a NOT NULL column optional just as a database default does, and is shown as `# model default:`, written as declared rather than cast through the attribute type — a `Proc` default is named, never called.
+- A Rails `enum` drafts as the keys a form sends (`:string, in: User.statuses.keys`), not the integer it is stored as — and reads them from the model, so a new enum value cannot leave the contract behind. For an integer-backed enum, Rails also accepts the stored integer (`status: 1`), which JSON clients sometimes send; a TODO on the line says how to admit it.
+- The STI inheritance column (`type`, when the model actually uses STI) and the optimistic-locking column (`lock_version`, when `lock_optimistically` is on) are **not** drafted from the columns alone: assigning `type` changes the record's class. Each is named in a TODO saying why, so the omission is visible. When the controller's own permit call lists one, it **stays a field**, with a TODO — an edit form that round-trips `lock_version` is how Rails detects a stale update, and dropping it would switch that off the day the draft is enforced.
+- A database default is noted in a comment but **not** copied into `default:` — a contract default is injected on every request that omits the field, which would overwrite columns on partial updates. The database already handles creation.
+- `key: [:a, :b]` in a permit call drafts as a nested block, with a TODO noting it may be an array of hashes, unless it is a `has_many`'s nested attributes (`addresses_attributes: [...]` on a model whose `addresses` is a collection), which drafts as `array ... do`. In a `params.expect` call the two shapes are distinguishable — `key: [:a]` is a nested hash, `key: [[:a]]` is an array of hashes — so that draft carries no TODO at all.
+- A **word list** reads as the list it spells, as Rails reads it: `expect(user: %i[name email])` is the `user` envelope with two fields, `address: %w[city zip]` a nested hash, and `permit(%i[name email])` or `permit(*%i[name email])` two scalars (Rails flattens a list among the filters). `%I` and `%W` count, with any delimiter but a parenthesis or a comma. A list among other fields is flattened as Rails flattens it: `expect(user: [%i[name email], :age])` has three fields, and only `[[...]]` as the outer list's one element is an array of hashes. A word list holding anything but plain keys (`%i[first-name]`, an interpolation) is kept verbatim in a TODO, and as an `expect` envelope's value it still roots the draft.
+- **One contract, one envelope.** A contract has one `root:`, so the generator picks it from every call in the file before it drafts any field:
+  1. When the model is known and any call uses its envelope (`post` for `Post`), that envelope wins outright, even `require(:post).permit(*PERMITTED)`.
+  2. With no model known, an envelope beats the rootless calls if it has at least one **parsed** field (`*PERMITTED` counts for nothing). An envelope with no parsed field, such as `expect(search: FILTERS)`, beats only rootless calls with no parsed field either. Among the envelopes, the one with more parsed fields wins. Every envelope of an `expect(post: [...], comment: [...])` call counts, and so does one whose fields cannot be read, such as `expect(post: PERMITTED_PARAMS)` or `expect(post: permitted_keys)`.
+  3. With a model that no envelope matches, the rootless calls, taken together, compete too. An envelope wins a tie with them.
+
+  Remaining ties go to the first call in the source. A single-key `expect` lookup of `:id` or a `*_id` key, like a Rails 8 scaffold's `Post.find(params.expect(:id))`, is a route param. It never scores and is never drafted as a field. A single-key `params.permit(:group_id)` is mass assignment and is drafted as usual. Only the winner's calls become fields, and a key the winner drafts is never also a TODO. Everything else stays visible as a TODO that says why:
+  - `belongs to another envelope (search): params.require(:search).permit(:q)` for a losing envelope, quoted as the call (or, inside an `expect`, the argument) the source spells it with.
+  - `route or query param, not a body field: :id` for a route param, or a bare key beside the envelope in the same `expect` call.
+  - `outside the post envelope, so not in this contract: :page` for a rootless call's keys once an envelope wins, or an array or hash beside the envelope.
+
+  A file with only rootless calls drafts a rootless contract.
+- **A draft always declares a field, or there is no draft.** Sometimes no scanned line would declare a field: every call is `permit(*PERMITTED)`, or the only scanned key is a `binary` column, which has no contract type. A contract of only TODO lines would raise `a contract must declare at least one field` when pasted. So the columns are drafted instead, with the scan's TODOs underneath. Columns the TODOs say are not drafted (a route param, or a key permitted in shapes that accept different input) are left out. A rootless controller whose calls carried a body field gets a rootless draft, with the columns at the top level. A scan that found only a route-param lookup gets the model's root. If the columns cannot declare a field either, the next candidate root is tried — the model's envelope permitting only a `binary` column does not stop the file's other envelope from being drafted — and only when no candidate can be drafted is there no draft.
+- **A key permitted in two shapes is drafted once.** A contract rejects a field declared twice. A nested hash and an array of hashes merge into the array of hashes, keeping the sub-keys of both. An array of scalars (`tags: []`) and a hash shape (`tags: [:a]`) accept different input, so neither is drafted, and the TODO asks you to declare the shape the actions share. Otherwise the richer shape wins over a scalar. Every conflict is named in a TODO that lists each shape and what was drafted (`tags is permitted as both a scalar and an array — drafted as the array`). An empty list such as `meta: [[ ]]` is kept as a TODO, never drafted as an empty block.
+
+No Rails required for the core: `Permittable::Generator.draft(model: User)`, `.for_controller(controller, source: File.read(path))`, and `.scan(source, model: User)` are plain Ruby.
+
+---
+
+### Auditing coverage (`permittable:audit`)
+
+A controller declaring `permit_params :create` looks adopted. If it also answers `PATCH`, that action is validating **nothing** — and until now nothing in the gem said so. [`permittable:generate`](#generating-draft-contracts-permittablegenerate) only notices controllers with no contract at all, and the [OpenAPI export](#exporting-openapi-docs-that-cannot-drift) documents what exists rather than what is missing.
+
+The audit crosses the contract registry with the **route set**, so a half-covered controller is as visible as an uncovered one. It reads every controller a route can reach: `ActionController::Base` and `::API` subclasses, and bare `ActionController::Metal` ones such as a lean webhook endpoint. It also loads any autoloaded controller a route names (`Rails::HealthController` behind `/up`, which nothing has loaded yet), since the route's own controller is part of the app; a route whose controller constant does not exist is skipped, not raised on. A controller from a gem is still [ignored by default](#ignoring-controllers-and-actions). The export and the generator read the same list of loaded controllers; the audit also loads any autoloaded controller a route names.
+
+```sh
+bin/rails permittable:audit             # the table plus a summary
+bin/rails "permittable:audit[strict]"   # ...and exit 1 on any unguarded write action
+```
+
+```
+legacy/invoices
+  POST   /legacy/invoices                   create       no contract — ACCEPTS A BODY
+orders
+  POST   /orders                            create       enforce
+  DELETE /orders/{id}                       destroy      no contract — action not found
+  PUT    /orders/{id}                       update       no contract — ACCEPTS A BODY
+users
+  GET    /users                             index        no contract
+  POST   /users                             create       enforce  model: User  unknown: error
+  DELETE /users/{id}                        destroy      monitor
+  PATCH  /users/{id}                        update       enforce  model: User  unknown: error
+
+8 routed actions: 3 enforced, 1 in monitor mode, 3 without a contract, 1 not found (Rails 404s it)
+  2 of those accept a request body — untrusted input reaches the action unchecked
+  2 covered actions declare no model:, so no schema-drift guard runs for them
+
+Contracts declared for actions no route reaches or Rails would 404 (renamed or deleted?):
+  users#archive
+```
+
+Three things it tells you that nothing else does:
+
+- **Which write actions are unguarded.** A `GET` without a contract is usually fine; a `POST` without one is untrusted input reaching the action unchecked. That count is the number `[strict]` fails on, which makes the task a CI gate: *no new unguarded write endpoint*.
+- **Which contracts aren't enforcing yet.** The audit runs inside the app, so unlike the exported OpenAPI it resolves the **effective** mode — a rule's own `mode:` first, then your app-wide `Permittable.mode`. This is the [monitor-mode](#monitor-mode-roll-out-without-rejecting) rollout dashboard.
+- **Which contracts have gone stale.** A contract declared for an action no route reaches, or for a routed action Rails would 404, is a renamed or deleted action that left its contract behind. A contract on a shared base controller is stale only when no controller that inherits it reaches the action, and it is listed once, under the class that declares it.
+
+A contract that validates from the `before_action` (an `enforce: true` rule, or one in monitor mode) but whose callback was removed with a plain `skip_before_action :enforce_params_contract` reads `no contract — request not checked before the action: ...`, and counts against `[strict]` if it takes a body. `enforce: true` promises the check runs before the action whatever the action does, and the skip took that away. The note says the request is checked only if the action reads `permitted_params`: one that does is still validated there (rejected, or a monitor event), so the row can be a gap that is not one in practice. The audit does not read the action's code. To have such an action count as covered, declare its rule as a lazy one, neither `enforce: true` nor monitor mode (its own `mode:` or an app-wide `Permittable.mode = :monitor`, which makes every rule a monitor one): it validates when the action reads `permitted_params`, skip or not, and the audit reads it as covered. A subclass that skips what its parent declared is reported the same way, and so is a child's own `permit_params` under a parent that skipped it, since the callback is registered once per class tree and is not put back. A skip with `only:` or `except:` is read per action, the way Rails compares them (Symbols or Strings, one name or an Array): the actions it names read as above, the ones it spares stay covered. Skips in a row add up, and a subclass's skip never reaches its parent. A skip with `if:` or `unless:` cannot be evaluated without running your code, so every action it could reach reads `no contract — request may not be checked before the action: ... is conditional`, whether or not the condition holds at request time; an `only:` skip that also has `if:` is reported as skipped for the actions it names. Declaring `before_action :enforce_params_contract` again after a skip puts the check back, and the audit reads it as covered. The audit learns of a skip from the `skip_before_action` call itself (the gem wraps it on the controller once it registers its callback), so three things stay invisible: a skip made with `raise: false` on an ancestor that never included `Permittable` (it has nothing to skip itself, Rails rewrites the callback of the subclass that registered it, and nothing is recorded), a conditional skip made with `skip_callback(:process_action, :before, :enforce_params_contract, if: ...)` directly, and a `before_action :enforce_params_contract, only: ...` the app declares itself. All leave the action reported as covered; a skip made with `skip_callback` and no condition removes the callback and is reported. Check those with a request spec.
+
+A route that lists several verbs is audited once per verb. A `match ... via: :all` route is expanded into exactly GET, POST, PUT, PATCH and DELETE, and listed once for each. Rails sends a request to the first route that matches its path and verb, and the audit lists what Rails dispatches. With `get "hooks", to: "webhooks#index"` before `match "hooks", to: "webhooks#receive", via: :all`, `GET /hooks` is listed under `index` only, and `receive` gets the other four verbs. Turn the two around and the `get` route is never reached, so it is not listed, and a contract on `index` shows as stale. The same rule removes a route declared twice, and the OpenAPI export applies it too. Only an unconstrained route hides the routes behind it, and only on the identical path. A route with a constraint can pass a request on: a segment requirement (`id: /\d+/`), a subdomain or host, or a constraint object or lambda. So the routes after it stay listed, even when the constraint happens to admit every request. With `constraints(AdminConstraint) { post "settings", ... }` ahead of `post "settings", to: "settings#update"`, every non-admin `POST` reaches `settings#update`, so its row stays and `[strict]` still counts it. The audit errs towards an extra row rather than a hidden route. Paths that differ at all, even only in a variable's name (`users/:id` and `users/:slug`), are both listed. `resources` routes all seven actions whether or not they exist. A route that Rails would 404 reads `action not found`: no method (inherited ones count), no `action_missing`, and no template to render implicitly. It is not counted against `[strict]` or as coverage. It stays in the table rather than disappearing. The template check uses the class-level view paths and the default lookup details. So a template that is only found at request time reads `action not found`, for example one behind a `prepend_view_path` in a `before_action`, or one that exists only as a variant.
+
+A catch-all 404 route (`match "*path", to: "application#not_found", via: :all`) shows its POST, PUT and PATCH rows as accepting a body. They do accept one: every stray body reaches the controller. Route only GET to the controller (Rails answers HEAD from it). Send the other verbs to a plain Rack endpoint, which never parses the body and which the audit does not list:
+
+```ruby
+match "*path", to: "application#not_found", via: :get
+match "*path", to: ->(_env) { [404, { "content-type" => "text/plain" }, ["Not Found"]] }, via: :all
+```
+
+A `config.exceptions_app = routes` setup (`match "/404", to: "errors#not_found", via: :all`) shows the same rows. It needs only `via: :get`, because on 6.1 and later `ShowExceptions` re-dispatches the error request as a GET.
+
+Under `[strict]` the task aborts on these rows. Either route the catch-all GET-only, as above, or add `application#not_found` to the [ignore list](#ignoring-controllers-and-actions). Don't declare a contract on the catch-all to silence the gate. Under monitor mode it validates eagerly, so a malformed JSON POST answers 400 instead of 404. The OpenAPI export would also gain a fake `/{path}` endpoint.
+
+The table lists a row for every verb on every path; the summary counts routes. A route with an optional segment, such as anything under `scope "(:locale)"`, lists each path it expands to (`/users` and `/{locale}/users`), but it is one route, so one unguarded `POST` counts once and the summary line says `N routed actions in M rows`. Rows are collapsed by controller, action, route index and verb; the index is a position within one `rails_routes` call (a route reached through a mounted engine is `[mount, route]`; see below), so a caller that concatenates route lists itself should pass `engines: false` for each, and audit them separately or give them distinct `route:` values. Two separate routes to the same action (`post "/users"` and `post "/admin/users"`) count as two, because each one is a way in.
+
+Controllers that never included `Permittable` are audited too — those are the ones worth finding. Everything is plain Ruby over the frozen registry plus route descriptors, so `Permittable::Audit.entries(controllers:, routes:)` works without Rails. It takes `ignore:` and `root:` too, which default to `Permittable.audit_ignore` and `Rails.root` (see below).
+
+#### Ignoring controllers and actions
+
+Some routed endpoints are not yours to guard. Two are common enough to fail almost every `[strict]` run: ActiveStorage's direct uploads controller (a `POST` with no contract), and the catch-all 404 above, whose `via: :all` adds `POST`, `PUT` and `PATCH` rows. List them in an initializer:
+
+```ruby
+# config/initializers/permittable.rb
+Permittable.audit_ignore = [
+  "active_storage/direct_uploads", # every action of the controller
+  "application#not_found"          # one action, on every verb it is routed on
+]
+```
+
+An entry is a controller path the way Rails routes it (the controller half of `bin/rails routes`, such as `admin/users`), or `controller#action`. Entries must be strings, checked when you assign the list:
+
+- A class name raises `ArgumentError` naming the path you meant: `"ActiveStorage::DirectUploadsController"` → did you mean `"active_storage/direct_uploads"`?
+- A class raises too. Naming one in an initializer would autoload the controller during boot, which Zeitwerk refuses for a reloadable controller.
+- A `Regexp` raises. A pattern would also ignore controllers added after it, and catching a new unguarded endpoint is the point of the gate.
+
+Assign the whole list. It is frozen, so add to it with `Permittable.audit_ignore += ["webhooks#receive"]`, which is validated too.
+
+**Mounted engines are part of the app.** `mount Billing::Engine => "/billing"` makes every route the engine draws a URL of the app, so `rails_routes` follows each mounted Rails engine (nested ones too) and puts the mount's path in front of the engine's: an unguarded `POST /billing/refunds` fails `[strict]`, and a covered action in the engine is not reported as stale. A mount at a dynamic `at: ":tenant"`, or under `scope "(:locale)"` at `/blog`, joins like any other path. A mount whose path ends in an optional segment (`scope "(:locale)"` over a mount at `/`, or `at: "/m(/:slug)"`) lists the engine's routes with the segment only, as Rails does: it matches the mount's own path first, the segment present before absent, so `/posts` is the locale `posts` asking for the engine's root, and the engine's `/posts` is reached as `/{locale}/posts`. A constrained segment (`locale: /en|fr/`) keeps both. A mount's `via:` limits the verbs: `mount Shop::Engine, at: "/g", via: :get` leaves out the engine's `POST` routes, which answer 404. An engine mounted twice is two routes to its actions. Routes are judged in Rails' order with the mount standing where it is drawn: an app route ahead of the mount answers before the engine is asked, an engine route that matches answers and hides an app route behind the mount, and a request the engine has no route for goes on to the next route. A constrained mount, like any constrained route, hides no route behind it. A Rack mount that is not an engine (Sidekiq::Web, a lambda) has no routes to read and is skipped. `Permittable::OpenAPI.rails_routes(app, engines: false)` reads the app's own route set alone. One limit: a parameter name used by both the mount and an engine route (`/{id}/.../{id}`) is not renamed, so the template names it twice (`/t/{id}/{id}`) and the operation declares that one path parameter once.
+
+**Controllers outside `Rails.root` are ignored by default.** These are gems and engines installed as gems (an engine kept inside your app counts as yours): ActiveStorage, ActionMailbox, Devise, and Rails' own `rails/*` controllers. An app can't keep a contract in a gem's controller. The audit locates a controller by the file that defines its class (`Module#const_source_location`). A gem installed inside the app still counts as a gem; `bundle config path vendor/bundle` does this, and so do CI caches. A controller whose source can't be located is audited. To audit gem controllers like your own:
+
+```ruby
+Permittable.audit_ignore_outside_root = false
+```
+
+That default already covers ActiveStorage. Naming it, as above, keeps it ignored if you turn the default off. To put a gem's endpoint under the gate, subclass its controller in `app/controllers` (for Devise, `devise_for :users, controllers: { sessions: "users/sessions" }`). The subclass is the app's, so it is audited.
+
+Ignored endpoints leave the counts and never fail `[strict]`, but they stay in the report. Each reason gets its own section, with one line per action and the verbs it is routed on. An entry that matches no routed action (a typo, or a route since removed) is listed as well. Otherwise a typo would ignore nothing, and nothing would say so. With the initializer above plus a mistyped `"admin/report"`, the end of the report reads:
+
+```
+Ignored by Permittable.audit_ignore (left out of the counts above):
+  active_storage/direct_uploads#create  POST
+  application#not_found                 DELETE, GET, PATCH, POST, PUT
+
+Ignored as outside the app root (set Permittable.audit_ignore_outside_root = false to audit them):
+  active_storage/blobs/redirect#show  GET
+  active_storage/disk#show            GET
+  active_storage/disk#update          PUT
+  rails/health#show                   GET
+
+Permittable.audit_ignore entries that match no routed action (a typo, or a route since removed?):
+  admin/report
+```
+
+An unmatched entry is reported, not failed: a mistyped `application#not_foud` leaves the catch-all's rows in the count, so `[strict]` fails on those, and this list says why.
+
+`permittable:generate` honours the same list (see [generating draft contracts](#generating-draft-contracts-permittablegenerate)).
+
+---
+
+## Beyond the controller
+
+Because a contract is data, it has readers other than the request validator.
+
+### Testing contracts (RSpec matchers)
+
+A contract can be specified without dispatching a request. `require "permittable/rspec"` (in `spec_helper.rb`) auto-includes the matchers:
+
+```ruby
+RSpec.describe UsersController do
+  it "declares the create contract" do
+    expect(described_class).to permit_param(:email)
+      .for_action(:create).as(:string).matching(URI::MailTo::EMAIL_REGEXP).required
+    expect(described_class).to permit_param(:age).for_action(:create).as(:integer).within(18..120)
+    expect(described_class).to permit_param(:plan).for_action(:create).with_default("free")
+    expect(described_class).to permit_param(:tag_names).for_action(:create).as_array(of: :string)
+    expect(described_class).to permit_param("address.zip").for_action(:create).as(:string).optional
+    expect(described_class).not_to permit_param(:admin).for_action(:create)
+  end
+end
+```
+
+Chains: `for_action`, `as`, `as_array(of:)`, `required` / `optional`, `within` (`in:`, cast by the field's type just as the contract's list is, so `within(%i[draft published])` repeats the declaration as written), `matching` (`format:`), `with_length`, `with_default`, `virtual`, `sensitive`, `nullable`. Dotted paths walk nested blocks and array-of-hash blocks alike (`"line_items.sku"`).
+
+The negated form asserts one thing: **the contract does not declare the param**. It therefore takes no qualifiers — `not_to permit_param(:admin).required` would pass both when `:admin` is undeclared and when it is declared optional, a false positive in exactly the kind of assertion that guards a security property, so it raises and names the positive form to write instead (`to permit_param(:admin).for_action(:create).optional`). It needs a rule to check against: when no rule covers the action, it fails and says so rather than passing for any param whatsoever. `for_action` resolves exactly as a request would, though, so a mistyped `for_action(:craete)` is only caught when the controller has no catch-all: a rule declared with no actions (`permit_params { ... }`, including one inherited from a base controller) covers `#craete` too, and the assertion is then checked against that rule. A standalone `Permittable::Contract` covers every action. It also fails where the contract lets a key through without declaring it — a path running into an opaque `:json` field (`"meta.admin"` under `optional :meta, :json`), within the field's `max_depth:` — or where the path repeats the `root:` (`"user.email"` under `root: :user`; paths are relative to the root, so that one is `permit_param(:email)`). Paths may be written in the runtime's own violation form, `"line_items[0].sku"`. An `[n]` must index what the runtime indexes: an array field, once, since an array is one level deep. So `"address[0].zip"` on a nested `address` block fails, and its negated form passes, because the runtime refuses an Array there.
+
+It reads the contract, not the runtime mode. In enforce mode an undeclared key never reaches `permitted_params` — it is dropped from it, or the request is rejected under `unknown: :error` — so "not declared" means "not permitted" for code that reads `permitted_params`. The raw `params` still carries every key, as it always does. A rule in [monitor mode](#monitor-mode-roll-out-without-rejecting) is different: `permitted_params` hands back the raw params, so an undeclared `:admin` comes through it until the rule is switched to enforce. The matcher does not fail for that, because a monitor-mode rule is a rollout stage and the spec describes the contract being rolled out; the enforce switch is what makes the assertion hold at runtime.
+
+`for_action` picks the rule exactly like a request would (`permit_rule_for`), and may be omitted only when the controller declares a single contract — an ambiguous expectation raises instead of silently checking the wrong rule. Failure messages name what the contract actually declares.
+
+#### Asserting on behaviour, not just the declaration
+
+`permit_param` checks what a contract **says**. `accept_params` / `reject_params` check what it **does** — still without dispatching a request:
+
+```ruby
+expect(described_class).to accept_params(user: { name: "Jo", email: "a@b.co", age: "30" })
+  .for_action(:create)
+  .returning("name" => "Jo", "email" => "a@b.co", "age" => 30, "plan" => "free")
+
+expect(described_class).to reject_params(user: { name: "Jo", email: "nope" })
+  .for_action(:create).with_violation("user.email", :format)
+```
+
+`returning` asserts the **cast, defaulted, transformed** output — the part `permit_param` can't reach, since it only reads the declaration. `with_violation` is repeatable and its code is optional. Each belongs to one matcher: `returning` to `accept_params` and `with_violation` to `reject_params`, and chaining either onto the other raises `ArgumentError` rather than being silently ignored.
+
+Failure messages name what actually happened:
+
+```
+expected UsersController to accept those params, but it rejected them: user.email (missing)
+expected UsersController to reject those params, but it accepted them, returning {"name"=>"Jo", "email"=>"a@b.co"}
+expected UsersController to reject those params with user.age (inclusion), but the violations were: user.name (missing), user.email (missing)
+```
+
+Both work on a controller class, a controller instance, or a [standalone `Contract`](#standalone-contracts-no-controller), and both read the **contract** rather than the rollout mode — a [monitor-mode](#monitor-mode-roll-out-without-rejecting) rule still `reject_params`, because the question is what the contract says, not what the deploy currently does with it.
+
+The negated forms follow the same rules as `not_to permit_param`: `not_to accept_params(...)` passes only when the contract rejects the payload, and `not_to reject_params(...)` only when it accepts it. Neither takes a qualifier — `not_to accept_params(...).returning(x)` would pass both on a rejection and on an acceptance returning anything else, so it raises and names the positive form — and both fail, rather than passing, when no rule covers the action or the subject declares no contracts.
+
+The matchers run **without a request**, so they know the controller's settings but not its route. The CSRF parameter name set at class level with `request_forgery_protection_token` is exempt from `unknown: :error` as it is at runtime, but a per-instance override is not seen, and neither are a route's **path parameters**: a payload `id` on a member action under `unknown: :error` is reported `unknown`, although a real `PATCH /users/1` carries it in the URL and is accepted. Leave path parameters out of the payload you pass to `accept_params` / `reject_params`. On a controller the payload goes through the same normalization a request gets, so a `nil` array element is dropped as Rails drops it (unless the app turned `perform_deep_munge` off), and a Symbol value (`status: :active`) reads as the String a request carries; a standalone `Contract` gets the raw payload as given, with no deep munge and no Symbol-to-String conversion of values (a Symbol value there is still `invalid_type`), because `Contract#call` is fed by app code, not by a request. A failure message that echoes params (the returned hash, a `returning` expectation) redacts them like a request log: the names of `sensitive:` fields, plus the app's `config.filter_parameters` when a Rails application is booted. Matching is by substring, like Rails, so `sensitive: true` on `pin` also redacts `shipping`; when a `returning` mismatch is hidden by that, the message adds `differs at: pin, shipping`, names only. Under a `root:` contract the hash is filtered as the request logs it, under its root, so a scoped filter such as `"payment.number"` applies; the note stops at a redacted key and never names anything below it. They do not see a skipped `enforce_params_contract` callback either: `reject_params` still passes for an action whose real request is not checked before the action runs, because its callback was removed with `skip_before_action`. `permittable:audit` is what reports that.
+
+### Standalone contracts (no controller)
+
+The same DSL, callable on any Hash — webhook payloads, job arguments, service-object inputs, CSV rows:
+
+```ruby
+CreateUser = Permittable::Contract.define(root: :user) do
+  required :email, :string, format: URI::MailTo::EMAIL_REGEXP
+  optional :age,   :integer, in: 18..120
+  optional :plan,  :string, in: %w[free pro], default: "free"
+end
+
+result = CreateUser.call(payload)     # a Result — bad client input is a violation, not an exception
+result.valid?                          # => false
+result.violations                      # => [{ param: "user.age", code: "inclusion" }]
+result.params                          # validated HashWithIndifferentAccess; nil when invalid
+
+CreateUser.call!(payload)              # params, or raises Permittable::InvalidParameters
+CreateUser.json_schema                 # the contract as JSON Schema (draft 2020-12)
+CreateUser.rule                        # the frozen, introspectable rule data
+```
+
+Everything carries over — strict coercion, `""`/`nil` absence, defaults, `finalize` with `violate!`, `sensitive:` log-redaction registration, `invalid_parameters.permittable` instrumentation (with `payload[:controller]` `"Permittable::Contract"` and `payload[:action]` `"call"`), 400-vs-422 status semantics for a missing `root:`.
+
+**What `#call` still raises.** Client data never raises out of the gem's own checks. Wrong types, non-finite numbers, Strings in any encoding (valid or not) and undeclared keys in any encoding all come back as violations in the `Result`. Two things do raise, on purpose, because neither is the client's mistake. An input that is not a Hash, `nil` (read as `{}`) or an object answering `to_unsafe_h` (such as `ActionController::Parameters`) raises `ArgumentError`. `ActionController::Parameters` nested inside a Hash, as in `CreateUser.call(user: params[:user])`, are converted the same way. And an exception raised by your own code (a `validate:`, `transform:` or `normalize:` proc, or `finalize`) reaches the caller unchanged, since swallowing it would hide a bug. The one exception is a `normalize:` proc that raises `ArgumentError` or an encoding error on a String that is neither UTF-8 nor ASCII-only; that value is left as it is, like a preset's.
+
+**`unknown: :log` warns here too.** It writes through `Rails.logger` (read on every call, so a logger assigned after the contract's constant loaded is still found) or, with no Rails or no `Rails.logger`, to `$stderr`, so a plain script still hears about undeclared keys rather than having them dropped silently.
+
+Three differences from the controller concern, all deliberate:
+
+- **A `Contract` always enforces.** Monitor mode is a request-rollout switch; standalone callers read the `Result` instead, so the app-wide `Permittable.mode` is ignored here.
+- **No router-key exemption.** `unknown: :error` flags a stray `action` or `controller` key — standalone input has no router to excuse.
+- **No memoization.** Every `#call` validates fresh, so one frozen contract is safely reusable and shareable (assign it to a constant).
+
+### Exporting OpenAPI (docs that cannot drift)
+
+An exporter emits **OpenAPI 3.1** (whose request bodies are plain JSON Schema) from the same frozen data the server enforces. Like the drift guard pointed outward: the docs cannot lie.
+
+```sh
+bin/rails permittable:openapi                       # JSON to stdout
+bin/rails "permittable:openapi[openapi/api.json]"   # write to a file
+```
+
+The task eager-loads the app (also exercising the drift guard), collects every controller with contracts, and maps documented actions onto `paths` via the route set. Each path and verb is documented under the action Rails dispatches it to, which is the first route that matches. So an explicit `get` before a `via: :all` route on the same path keeps `GET`, and a route behind an earlier, unconstrained one with the same path and verb is not documented under that verb. A constrained route hides nothing ([the audit](#auditing-coverage-permittableaudit) explains why). When two routes then claim one path and verb, the second operation lands under `x-permittable-controllers`. Only OpenAPI's eight verbs are documented under `paths`: a route on another verb Rails accepts (`via: :report`, WebDAV's and CalDAV's) places nothing, since a Path Item has no field for it, and an operation reached only that way lands under `x-permittable-controllers` too. `OPENAPI_TITLE` / `OPENAPI_VERSION` override the `info` block. Pipe the output through Swagger UI, Redoc, Postman, or [`openapi-typescript`](https://github.com/openapi-ts/openapi-typescript) and your frontend gets compile-time types for every request body.
+
+Or build fragments programmatically — no Rails required:
+
+```ruby
+Permittable::JsonSchema.rule(UsersController.permit_rule_for(:create))  # request-body schema
+Permittable::OpenAPI.request_body_for(UsersController, :create)         # OpenAPI requestBody object
+Permittable::OpenAPI.operations_for(UsersController)                    # { action => operation }
+Permittable::OpenAPI.document(controllers: [...], info: { "title" => "My API" })
+```
+
+Every operation references shared components for the [error envelope](#violations-and-error-responses): a `422` response always, plus a `400` when the contract declares a `root:`. So consumers get typed *errors*, not just typed inputs.
+
+**What is honestly unrepresentable stays visible instead of guessed.** A `format:` regexp using a construct with no faithful ECMA-262 spelling is exported as `x-permittable-pattern` rather than a mistranslated `pattern`: a Ruby-only escape or flag, one ECMA-262 reads differently or refuses to compile at all (`{,3}`, `&&` in a class, a backreference, the word boundary `\b`), or one that cannot be carried once folded into the rest of its own character class (`\S` beside a member other than `\s`) — but **not** a hyphen right after a completed range (`[a-c-e]`), which both dialects read the same way and export unchanged. This also covers a regexp anchored with `^`/`$`, which in Ruby anchor a **line** and in ECMA-262 anchor the whole string, so `/^\d{5}$/` accepts `"evil\n12345"` and `"12345\n"` at runtime (the trailing newline too, not only in the export), and publishing that source would promise a stricter rule than the server enforces (use `\A`/`\z`, which translate exactly); `validate:`/`transform:` are flagged `x-permittable-custom-validation`/`x-permittable-transformed`, and a rule's `finalize` block `x-permittable-finalize` (on the rule's own object, inside the `root:` wrapper when there is one, and on the operation too, so the marker survives an operation that has no request body); actions covered only by a catch-all rule on a plain-Ruby host appear under `"*"` with `x-permittable-catch-all`; operations whose rule runs in [monitor mode](#monitor-mode-roll-out-without-rejecting) carry `x-permittable-mode: "monitor"`; operations with no matching route — or whose path-and-verb slot another controller already claimed, which one document cannot represent twice, or whose route an earlier one shadows (below) — land in `x-permittable-controllers` instead of being dropped. A templated path segment is declared as a path `parameter` of type `string` unless the contract says more, because the route set doesn't say what an `:id` is and the exporter won't invent it: a rootless contract's *scalar* field of the same name is that parameter's schema (see [Unknown parameters](#unknown-parameters) for what that does to the request body), minus any `default:` and `nullable:`, since the URL always supplies a non-null value. The schema documents the canonical JSON encoding — the runtime additionally accepts string-encoded scalars (`"42"`, `"true"`) for form/query payloads.
+
+**Mounted engines are documented under their mount point.** The task follows each `mount Billing::Engine => "/billing"` into the engine's routes, so an engine's operations land in `paths` as `/billing/...` (a dynamic mount point becomes a `{tenant}` template). A Rack mount that is not an engine is skipped. See [Auditing coverage](#auditing-coverage-permittableaudit) for the details and the one limit on shared parameter names.
+
+**Paths are the URLs Rails dispatches.** An optional segment expands into each path it stands for, read the way Rails matches it: present before absent, left to right, constraints included. So `get "x(/:a)(/new)"` documents no `/x/new`, because Rails reads that URL as `a = "new"`, unless a constraint on `:a` rejects `"new"`. Rails squeezes a run of slashes to one before it matches, so a variant an absent leading group leaves with two in a row is no URL: `get "(:locale)(/:theme)"` documents `/`, `/{locale}` and `/{locale}/{theme}`, never `//{theme}`, and `get "(:locale(/:region))"` documents no `/`, which Rails answers with a 404. OpenAPI forbids two paths that differ only in their variable names, and two routes can produce them: under `scope "(:locale)"` a root is `/{locale}` and a `get ":slug"` is `/{slug}`. Such paths are one path, spelled as the route Rails tries first spells it. A later route under another verb is placed there too, and carries its own spelling in `x-permittable-path`. One under the same verb is shadowed: Rails sends that URL to the earlier route, and reaches the later one only when the earlier route's constraints turn the request away. It is listed in the earlier operation's `x-permittable-shadows` instead of being emitted as a second path, and its operation lands in `x-permittable-controllers` if it has no other path. A variant of one route that a constraint keeps reachable is listed the same way: `x(/:a)(/:b)` with `a: /\d+/` sends `/x/foo` to `:b`, so `/x/{a}` lists `/x/{b}`.
+
+**Every `operationId` is unique across the document, and only a collision is ever renamed.** An operation's id is its controller path with `/` folded to `_`, then its action: `users_create`, `admin_users_index`. Client generators name a method after the id, so the scheme itself never changes. Where two places in the document would carry one id, the exporter renames all but one of them:
+
+| Collision | Ids |
+| --- | --- |
+| One operation under two verbs (the separate PATCH and PUT routes `resources` draws to `update`, or one `match ..., via: [:patch, :put]` route) | `users_update` on PATCH, `users_update_put` on PUT |
+| The pair again at a second path (`resources :orgs { resources :users }`) | `users_update_2` on the second PATCH, `users_update_3` on the second PUT |
+| One operation under every verb (with `via: :all` routes, which the exporter documents under each verb) | `webhooks_receive` on GET, then `webhooks_receive_post`, `_put`, `_patch`, `_delete` |
+| One operation at two paths under one verb (with the optional-segment expansion: `(/:locale)/posts` is documented at `/posts` and `/{locale}/posts`) | `posts_create` on the shallower path, `posts_create_2` on the other |
+| Two controllers that fold to one id (`admin/users` and `admin_users`, both GET) | `admin_users_index` on `admin/users`, whose controller path sorts first, and `admin_users_index_2` on `admin_users` |
+
+One place keeps the plain id. The exporter ranks the places by what they are, never by the order it finds them in. A routed operation comes before one under `x-permittable-controllers`, which takes part because it is in the same document. Then operations are ranked by controller path, then action, compared as strings, whatever their verbs. Within one operation, the shallowest path comes first (the fewest segments, then alphabetical order), then the verb: GET, POST, PATCH, PUT, DELETE. So PATCH comes before PUT whichever the route lists first, and `match via: [:put, :patch]` and `resources` name the PATCH method the same way. Every other place gets its verb appended when that verb differs from the plain id's verb and the result is free. Otherwise it gets the next free number in rank order, from `_2`. So a second PATCH is `users_update_2`, not `users_update_patch`, and a second POST is `posts_create_2`. A route declared twice is placed once, and a controller passed twice is documented once, so neither collides with itself.
+
+**The stability rules.** An id that only one operation would carry never changes, even when a suffix elsewhere would spell it; that suffix is numbered instead. Reordering `routes.rb`, or a controller that loads earlier, renames nothing, because the rank never reads that order. (The exception is two routes that answer the same path and verb. Their order decides which one Rails dispatches to, and the export follows Rails. When the first of them is constrained, both are kept, controller order picks which operation takes the slot, and the other lands under `x-permittable-controllers`.)
+
+**What can still rename a generated method: a change to a colliding group.** No scheme can keep every id when a new collider arrives, because one of them must take a suffix. A new route, action or controller whose id collides gets a suffix. If it ranks first, it takes the plain id from the place that had it instead. Every numbered place ranked after it moves along by one. Removing or renaming a collider moves the others the same way. Only the members of the colliding group can be renamed, never an id that stands alone. If a client must never change, remove the collision: give the operations distinct controller paths or action names.
+
+Output is deterministic (fixed key order, declaration-order properties), so the generated file can be committed and reviewed as a diff — a contract change shows up in the same PR as its documentation change.
+
+#### What the schema deliberately does not say
+
+`spec/schema_conformance_spec.rb` holds the "cannot drift" claim to account: it walks canonical JSON payloads through both the contract and its own exported schema and asserts the verdicts agree.
+
+Where they legitimately differ, the spec names the reason and asserts the **direction**, so a new divergence fails the suite instead of shipping quietly. Three cases go the safe way — the **server accepts what its docs reject**, leaving a client that follows the docs merely conservative:
+
+- **Non-canonical encodings.** Coercion accepts `"30"` for an `:integer` and `1` for a `:string`, because form and query payloads are all strings. The schema documents the canonical JSON encoding only.
+- **`null` as absence.** The runtime reads `{"age": null}` as `{}` ([absence](#absence-defaults-and-partial-updates)); JSON Schema cannot express that, so `type: integer` rejects a null the server would accept and ignore. A [`nullable:`](#explicit-nulls-nullable) field is not this case — there the null is a value, the exported `type` widens to say so, and the two agree.
+- **Padding that normalizes away.** `normalize:` runs before the checks, so under `normalize: :squish` and `length: 3..10` the server accepts `"  abcdefghij  "` — ten characters once squished — while the docs reject its fourteen.
+
+Two more go the same way but sit outside that spec's JSON-only harness (it has no multipart or Rails-parsing step), so they are documented here and not asserted there:
+
+- **Rails' `rows[][name]` naming.** The server accepts Rails' unindexed form naming in a multipart body; the export describes only the indexed `rows[0][name]` form.
+- **A dropped array element.** Rails' parameter parsing removes a `null` element before the contract runs, and the contract drops a blank one from a non-string array (`""` in an `:integer` array), while the schema's `items` refuses both. A standalone `Contract` still refuses `["a", null]`.
+
+Seven cases go the other way, and are worth knowing before you hand the document to a client. Each rule stays visible on its own field, and the spec asserts that as well as the direction:
+
+- **Bounds JSON Schema has no keyword for.** A `:json` field's `max_depth:` is enforced by the server but cannot be written as a JSON Schema keyword, so the published document is **looser** there and an over-nested payload still earns a 422. The bound is not dropped — it is exported as `x-permittable-max-depth` — so a generator or linter that wants it can read it.
+- **`normalize:` runs before the checks.** The server validates the *normalized* string, and JSON Schema has no keyword for "transform, then check". With `required :name, :string, length: 3..10, normalize: :squish`, `"   "` passes the docs' `minLength: 3` and then squishes to `""` — absent, so `missing` — and `" a  "` passes them and squishes to `"a"`, which is too short. The step is exported as `x-permittable-normalize` — the preset's name (`"squish"`, `"email"`, …), which a client can apply before validating, or `true` for a custom proc.
+- **A bounded `:decimal` sent as a string.** A `:decimal` is documented as `["string", "number"]`, because the string is its precision-safe encoding, but `minimum`/`maximum` constrain only numbers — so `"5000"` passes the docs for `in: BigDecimal("0.01")..BigDecimal("999.99")` and the server answers `inclusion`. The bound is still published, as a JSON number, for a client that parses the string first. (Numbers are published exactly as written, at any magnitude — `10**400` included, since a JSON integer has no size limit — but a client that reads the document back with ordinary double-precision floats, rather than the digits as sent, can still round a value across a boundary. That is inherent to parsing any JSON number as a double, not something this exporter controls.)
+- **A `validate:` proc.** It is opaque app code, so the schema can only flag it — `x-permittable-custom-validation` — never enforce what it checks. A value the proc refuses still passes the docs.
+- **A Range of non-numbers.** `in: "a".."m"` has no `minimum`/`maximum` equivalent (those constrain numbers only) and rides along as `x-permittable-range` instead. A value outside it still passes the docs.
+- **Strings whose validity is a `format`.** `:decimal`, `:date` and `:datetime` are sent as strings, and what makes such a string valid is its `format` (`"decimal"`, `"date"`, `"date-time"`) — which draft 2020-12 treats as an annotation unless a validator opts into asserting it. So `"abc"` or `"NaN"` for a `:decimal` and `"2026-02-30"` for a `:date` pass most validators and fail the server's cast with `invalid_type`.
+
+A `:file` field is looser in a way no JSON body can show: the JSON export accepts any string for it (`{"user":{"avatar":"abc"}}`), while the server takes only an upload object and refuses every JSON value. The schema describes the multipart part, and the field keeps `contentMediaType` to say so. It is a seventh case, asserted in the spec as `:file_upload`.
+
+A `format:` regexp that does not translate to ECMA-262 is looser in the same way — it publishes as `x-permittable-pattern` rather than a `pattern` that would enforce something else, so a value it refuses still passes the docs — but it is not one of the seven above: `spec/schema_conformance_spec.rb` does not yet assert a case for it, since the Ruby → ECMA-262 translation it would depend on is being reworked separately. A `finalize` block is looser too, and has no field to sit on: its `violate!` cross-field checks (`ends_on` before `starts_on`) run only once every field has passed, so a payload each field's schema accepts can still earn a 422. The rule's own object carries `x-permittable-finalize: true` to say the schema alone is not the whole verdict, and so does the operation, so the marker is still there when an operation has no request body to hold the schema. Everything else the exporter cannot translate stays visible as an `x-permittable-*` extension rather than being guessed at.
+
+<details>
+<summary><strong>How contracts map onto JSON Schema</strong></summary>
+
+<br>
+
+| Contract | Emitted schema |
+|---|---|
+| `required` / `optional` | the object's `required:` array; required strings, and the string encoding of a required `:decimal`/`:date`/`:datetime`, also get `minLength: 1` (`""` is absent; a `nullable:` `:decimal`/`:date`/`:datetime` reads it as a null, so it gets none) |
+| `:string` `:integer` `:float` `:boolean` | `string` / `integer` / `number` / `boolean` |
+| `:date` / `:datetime` | `string` + `format: date` / `date-time` |
+| `:file` | `string` + `contentMediaType: application/octet-stream` (the 3.1 spelling; `format: binary` is 3.0's). An operation whose contract has a `:file` field gets a `multipart/form-data` request body instead of `application/json` |
+| `:decimal` | `type: ["string", "number"]` + `format: decimal` (string is the precision-safe encoding) |
+| `in:` list / numeric Range | `enum` of the cast members (a `:datetime` member written as a String is published as written; a `:date` member, however written, as `YYYY-MM-DD`) / `minimum` + `maximum` (exclusive ends honoured). An `in:` object that only answers `include?` is flagged `x-permittable-custom-validation` |
+| `length:` | `minLength`/`maxLength` on strings, `minItems`/`maxItems` on arrays |
+| `format:` | `pattern`, valid under the `u` flag Ajv compiles with: `\A`/`\z` become `^`/`$`, `\s` and `.` are spelled out as the classes they are in Ruby (ECMA-262's `\s` also matches NBSP and U+2028; its `.` also stops at `\r`), and redundant escapes like `\-` and `\#` are written bare |
+| `default:` / `desc:` / `example:` | `default` / `description` / `examples` |
+| nested block / `array` | `object` + `properties` / `array` + `items` |
+| `unknown: :error` | `additionalProperties: false`, at every nesting level |
+| `root:` | the wrapping object, itself required |
+| `finalize` | `x-permittable-finalize: true` on the rule's object (inside the `root:` wrapper) and on the operation; the cross-field checks themselves are opaque |
+| `sensitive: true` | `writeOnly: true` (never echoed in responses); the field's own `default:`/`example:` are omitted rather than published, and so are those of an array that holds it at any depth, since they would carry its value, and so are its `in:` (list or Range) and a hand-written `format:` regexp, which would publish the secret itself. A field that declares either is flagged `x-permittable-custom-validation`, so the schema is looser than the server there; a `format:` preset such as `:email` is public and is still published |
+
+</details>
+
+---
+
+## Reference
+
+### API
+
+**Instance methods**
+
+| Method | Purpose |
+|---|---|
+| `permitted_params(action = action_name)` | The cast, validated, defaulted `HashWithIndifferentAccess`. Raises `InvalidParameters` on violation (in [monitor mode](#monitor-mode-roll-out-without-rejecting), returns the raw pass-through instead), or `ArgumentError` when no contract covers the action. **Memoized per action, outcome included** — a rejection is re-raised rather than revalidated, so a contract runs (and instruments) exactly once per action per request |
+| `permittable_violations(action = action_name)` | The violation details recorded by validating `action` — `[]` when clean. Triggers the same memoized validation; under enforce it swallows the raise, making "would this request fail?" a one-liner |
+| `enforce_params_contract` | The `before_action` entry point. Validates rules declared `enforce: true` and all [monitor-mode](#monitor-mode-roll-out-without-rejecting) rules. Public, so hosts can `skip_before_action` it |
+| `render_invalid_parameters(error)` | The `rescue_from` target. Renders via the host's `render_error` when defined, the inline envelope otherwise |
+
+**Class methods**
+
+| Method | Purpose |
+|---|---|
+| `permit_params(*actions, **opts, &contract)` | Declare a contract |
+| `permittable_contracts` | The frozen array of every declared rule — introspectable, testable |
+| `permit_rule_for(action)` | The last rule matching `action`, or `nil` |
+
+**Module**
+
+| Constant | Purpose |
+|---|---|
+| `Permittable.filter_parameter_registry` | The live registry of `sensitive:` field names |
+| `Permittable.filter_parameter_registry=` | Swap in your own duck-typed registry; entries already registered are carried across |
+| `Permittable.filter_parameter_proc` | The single proc `Permittable::Railtie` appends to `config.filter_parameters`; consults the current registry at filter time |
+| `Permittable.mode` / `Permittable.mode=` | App-wide default (`:enforce`) for rules that don't declare their own `mode:` |
+| `Permittable.error_format` / `=` | `:envelope` (default) or `:problem` — see [RFC 9457 problem+json](#rfc-9457-problemjson) |
+| `Permittable.problem_base_uri` / `=` | Base URI for problem `type` members |
+| `Permittable.check_column_types` / `=` | Opt in to the [type half of the drift guard](#checking-types-too-opt-in) (default `false`) |
+| `Permittable.audit_ignore` / `=` | Controller paths and `controller#action` strings the audit and the generator [leave out](#ignoring-controllers-and-actions) (default `[]`) |
+| `Permittable.audit_ignore_outside_root` / `=` | Also leave out controllers whose source is outside `Rails.root` (default `true`) |
+| `Permittable.fields(&block)` | A reusable [field group](#reusing-fields-permittablefields-and-use) — splice it into a contract with `use` |
+| `Permittable::InvalidParameters` | Raised on violation; carries `#details` and `#status` |
+| `Permittable::JsonSchema` | Contract data → JSON Schema fragments (`.rule`, `.object`, `.field`) |
+| `Permittable::OpenAPI` | OpenAPI 3.1 assembly (`.document`, `.operations_for`, `.request_body_for`, `.components`) |
+| `Permittable::Generator` | Contract drafting (`.draft`, `.for_controller`, `.scan`, `.targets`) — see [generating draft contracts](#generating-draft-contracts-permittablegenerate) |
+| `Permittable::Audit` | Coverage across the route set (`.entries`, `.summary`, `.stale`, `.format`, `.ignore_reason`, `.unmatched_ignores`) — see [auditing coverage](#auditing-coverage-permittableaudit) |
+| `Permittable::Contract` | [Standalone contracts](#standalone-contracts-no-controller) (`.define`, `#call`, `#call!`, `#json_schema`, `#rule`, `#fields`) |
+| `Permittable::FieldGroup` | A [reusable field list](#reusing-fields-permittablefields-and-use) (`#fields`, `#names`) — built by `Permittable.fields` |
+| `Permittable::Matchers` | RSpec matchers via `require "permittable/rspec"` — `permit_param` for the declaration, `accept_params`/`reject_params` for the behaviour. See [testing contracts](#testing-contracts-rspec-matchers) |
+
+### Errors caught at class load
+
+A bad contract is a programmer error, so it fails when the class loads — never at request time. Every message names the field and explains the fix.
+
+<details>
+<summary><strong>The full list</strong></summary>
+
+<br>
+
+- A field declared twice in one contract
+- An unknown option for the field's kind, listing what *is* allowed
+- An unknown type, listing the supported ones
+- An unknown `normalize:` or `format:` preset, listing the presets
+- A `format:` that is neither a `Regexp` nor a preset name
+- `format:`, `length:`, or `normalize:` on a non-`:string` field
+- `length:` that isn't a non-negative `Integer` or a `Range`, or a `Range` with a negative or fractional end (`..-1`, `-2..3`, `1.5..3.5`; a whole-number Float such as `1..10.0` is fine; leave an end off, or use `Float::INFINITY`, for no bound); an `in:` that is a `String` (`String#include?` would match any substring — `in: "free pro"` accepted `"e"`), or that is neither a `Range` nor answers `include?`
+- An `in:` member the field's own type can't cast (`in: %w[1 two]` on an `:integer`, `nil` on a field that isn't `nullable:`, or a `Time` on a `:date` field that isn't exactly midnight UTC), or an `in:` `Range` whose endpoints a value of the field's type can't be compared with (`in: "1".."5"` on an `:integer`) — either would reject every request as `inclusion`
+- A bound **no value could satisfy**: a reversed or empty `Range` (`in: 65..18`, `length: 5..2`, `length: 3...3`), an empty `in:` set, or a `length:` of 0 on a `required` field (where `""` already violates as `missing`)
+- A `Time` `in:` member, `default:` or `example:` on a `:datetime` field finer than a nanosecond (`Time.at(1.1)`, a third of a second): a request's fraction is a finite decimal and the export prints nine digits, so no request could equal the member, and a published default or example would be a different instant
+- `validate:` or `transform:` that isn't callable
+- A `default:` or `example:` that violates its own field's contract, or an array `default:`/`example:` whose elements violate `of:` — or, for an array declared with a **block**, an element that isn't a hash the block would accept
+- A `default: nil` or `example: nil` on a field that isn't `nullable:`
+- A `:json` field's `default:`/`example:` that isn't a Hash, or that its own `length:`/`max_depth:` would reject
+- A `max_depth:` that isn't a positive Integer
+- `required: true` combined with `default:`
+- A field given both a type and a nested block; an array given both `of:` and a block
+- An empty contract, or a nested block declaring no sub-fields
+- `finalize` declared twice, without a block, inside a nested block, or inside a field group
+- `use` given something that is not a field group, both `only:` and `except:`, a name the group doesn't declare, or a selection that keeps nothing
+- A field group with no fields, or `Permittable.fields` without a block
+- `permit_params` without a block, or an invalid `unknown:` mode
+- A `root:` that isn't a single key (several top-level envelopes are a rootless contract with one nested block per key)
+- An invalid `mode:` (and `Permittable.mode =` / `Permittable.error_format =` / `Permittable.check_column_types =` reject invalid values at assignment)
+- A field whose declared type disagrees with its column's, when `Permittable.check_column_types` is on
+- A `model:` that isn't an ActiveRecord class, or `model: true` that can't be inferred
+
+</details>
+
+### Compatibility
+
+| Requirement | Supported |
+|---|---|
+| Ruby | >= 3.2 |
+| Rails / ActiveSupport | >= 6.1, < 9 |
+| Required dependency | `activesupport` only |
+| Optional | `actionpack` (rendering, `before_action`), `activerecord` (drift guard) |
+
+`actionpack` and `activerecord` are optional because every touchpoint is guarded with `respond_to?`/`defined?` — your app brings whatever it already has. The concern works on a plain Ruby object that responds to `params`, which is what makes it straightforward to unit-test.
+
+Both claims are **tested rather than asserted**. CI runs the full suite against every ActiveSupport line in the range — 6.1, 7.0, 7.1, 7.2, 8.0, 8.1 — on every supported Ruby, 3.2 through 4.0 (see [`gemfiles/`](../gemfiles/README.md)), with Rails `main` and Ruby `head` as a non-blocking early warning, and a separate job installs the built gem with *nothing but activesupport* and exercises every controller-free surface, so "activesupport is the only runtime dependency" cannot quietly stop being true.
+
+The 6.1 floor isn't arbitrary. `class_attribute ... default:`, which declares the contract registry, arrived in Rails 5.2 — on 5.0 and 5.1 a contract cannot be declared at all — and 5.2/6.0 predate Ruby 3.x support, which this gem's own Ruby floor requires.
+
+Using [concerns_on_rails](https://github.com/VSN2015/concerns_on_rails)? `ConcernsOnRails::Controllers::Permittable` is an alias for this module, and `sensitive:` registrations pool into that gem's shared filter registry.
+

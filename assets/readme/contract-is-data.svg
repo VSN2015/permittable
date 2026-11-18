@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="450" viewBox="0 0 1200 450" role="img" aria-labelledby="title desc">
+  <title id="title">One contract, five readers</title>
+  <desc id="desc">A single frozen, class-level contract is read by five consumers: the validator (permitted_params) casts and checks values and returns a 422 naming the field; the drift guard (model: User) checks fields against database columns at class load; the OpenAPI 3.1 exporter documents what the server enforces; RSpec matchers (permit_param) assert the rule with no request; and Permittable::Contract applies the same DSL to any Hash.</desc>
+
+  <style>
+    .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  </style>
+
+  <rect width="1200" height="450" rx="24" fill="#F6F3EE"/>
+
+  <!-- the contract -->
+  <g id="contract" transform="translate(350 36)">
+    <rect width="500" height="146" rx="14" fill="#1B1A1F"/>
+    <g class="mono" font-size="20" fill="#F6F3EE">
+      <text x="24" y="40">permit_params <tspan fill="#F2C97D">:create</tspan>, model: User do</text>
+      <text x="48" y="70"><tspan fill="#FF9C8F">required</tspan> <tspan fill="#F2C97D">:email</tspan>, format: <tspan fill="#F2C97D">:email</tspan></text>
+      <text x="48" y="100"><tspan fill="#FF9C8F">optional</tspan> <tspan fill="#F2C97D">:age</tspan>, <tspan fill="#F2C97D">:integer</tspan>, in: 18..120</text>
+      <text x="24" y="130">end</text>
+    </g>
+  </g>
+  <text class="sans" x="600" y="214" font-size="18" fill="#6E6862" text-anchor="middle">one frozen, class-level contract</text>
+
+  <!-- fan-out -->
+  <g fill="none" stroke="#1B1A1F" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M600 226 V246 M152 270 V246 H1048 V270 M376 246 V270 M600 246 V270 M824 246 V270"/>
+  </g>
+
+  <g id="readers" class="sans">
+    <g transform="translate(48 270)">
+      <rect width="208" height="150" rx="14" fill="#FFFFFF" stroke="#1E7F55" stroke-width="2"/>
+      <text x="18" y="38" font-size="22" font-weight="700" fill="#1B1A1F">Validator</text>
+      <text class="mono" x="18" y="68" font-size="18" fill="#1E7F55">permitted_params</text>
+      <text x="18" y="102" font-size="18" fill="#6E6862">casts and checks;</text>
+      <text x="18" y="126" font-size="18" fill="#6E6862">a 422 names the field</text>
+    </g>
+    <g transform="translate(272 270)">
+      <rect width="208" height="150" rx="14" fill="#FFFFFF" stroke="#DDD6CC" stroke-width="2"/>
+      <text x="18" y="38" font-size="22" font-weight="700" fill="#1B1A1F">Drift guard</text>
+      <text class="mono" x="18" y="68" font-size="18" fill="#C2362F">model: User</text>
+      <text x="18" y="102" font-size="18" fill="#6E6862">a dropped column</text>
+      <text x="18" y="126" font-size="18" fill="#6E6862">fails the deploy</text>
+    </g>
+    <g transform="translate(496 270)">
+      <rect width="208" height="150" rx="14" fill="#FFFFFF" stroke="#DDD6CC" stroke-width="2"/>
+      <text x="18" y="38" font-size="22" font-weight="700" fill="#1B1A1F">OpenAPI 3.1</text>
+      <text class="mono" x="18" y="68" font-size="18" fill="#C2362F">OpenAPI.document</text>
+      <text x="18" y="102" font-size="18" fill="#6E6862">docs exported from</text>
+      <text x="18" y="126" font-size="18" fill="#6E6862">what is enforced</text>
+    </g>
+    <g transform="translate(720 270)">
+      <rect width="208" height="150" rx="14" fill="#FFFFFF" stroke="#DDD6CC" stroke-width="2"/>
+      <text x="18" y="38" font-size="22" font-weight="700" fill="#1B1A1F">RSpec matchers</text>
+      <text class="mono" x="18" y="68" font-size="18" fill="#C2362F">permit_param</text>
+      <text x="18" y="102" font-size="18" fill="#6E6862">assert the rule,</text>
+      <text x="18" y="126" font-size="18" fill="#6E6862">no request needed</text>
+    </g>
+    <g transform="translate(944 270)">
+      <rect width="208" height="150" rx="14" fill="#FFFFFF" stroke="#DDD6CC" stroke-width="2"/>
+      <text x="18" y="38" font-size="22" font-weight="700" fill="#1B1A1F">Contract</text>
+      <text class="mono" x="18" y="68" font-size="18" fill="#C2362F">Contract.define</text>
+      <text x="18" y="102" font-size="18" fill="#6E6862">the same DSL on</text>
+      <text x="18" y="126" font-size="18" fill="#6E6862">any Hash</text>
+    </g>
+  </g>
+</svg>

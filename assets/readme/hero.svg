@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
+  <title id="title">Permittable</title>
+  <desc id="desc">Strong parameters for Rails that also know types, bounds, and defaults. Client params arrive as strings; a contract declared on the controller normalizes the email, casts age to an integer, defaults plan to "free" and drops the undeclared admin key. Bad values are rejected with a 422 naming user.age invalid_type and user.plan inclusion.</desc>
+
+  <style>
+    .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  </style>
+
+  <!-- paper -->
+  <rect width="1200" height="620" rx="24" fill="#F6F3EE"/>
+
+  <g id="title-block">
+    <text class="mono" x="56" y="78" font-size="17" letter-spacing="2" fill="#6E6862">RUBY GEM · RAILS STRONG PARAMETERS</text>
+    <text class="sans" x="52" y="150" font-size="72" font-weight="800" fill="#1B1A1F" letter-spacing="-1.5">Permittable</text>
+    <text class="sans" x="56" y="198" font-size="27" fill="#1B1A1F">Strong parameters that also know <tspan fill="#C2362F" font-weight="700">types</tspan>, <tspan fill="#C2362F" font-weight="700">bounds</tspan>, and <tspan fill="#C2362F" font-weight="700">defaults</tspan>.</text>
+    <text class="mono" x="1144" y="78" font-size="17" fill="#6E6862" text-anchor="end">activesupport is the only dependency</text>
+  </g>
+
+  <!-- 1. what the client sent: every value is a String -->
+  <g id="params-in" transform="translate(56 244)">
+    <rect width="300" height="272" rx="14" fill="#FFFFFF" stroke="#DDD6CC" stroke-width="2"/>
+    <text class="sans" x="20" y="38" font-size="18" font-weight="600" fill="#6E6862">params from the client</text>
+    <g class="mono" font-size="20" fill="#1B1A1F">
+      <text x="20" y="96">email</text><text x="96" y="96" fill="#6E6862">" Ann@Shop.IO "</text>
+      <text x="20" y="140">age</text><text x="96" y="140" fill="#6E6862">"42"</text>
+      <text x="20" y="184">admin</text><text x="96" y="184" fill="#6E6862">"true"</text>
+      <text x="20" y="228">plan</text><text x="96" y="228" fill="#A8A19A" class="sans" font-style="italic">not sent</text>
+    </g>
+  </g>
+
+  <!-- gate arrows -->
+  <path d="M366 380 h16 m-8 -9 l9 9 l-9 9" fill="none" stroke="#1B1A1F" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M818 380 h16 m-8 -9 l9 9 l-9 9" fill="none" stroke="#1B1A1F" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- 2. the contract: class-level data on the controller -->
+  <g id="contract" transform="translate(392 244)">
+    <rect width="416" height="272" rx="14" fill="#1B1A1F"/>
+    <text class="mono" x="22" y="38" font-size="18" fill="#A8A19A">permit_params :create, root: :user</text>
+    <line x1="22" y1="54" x2="394" y2="54" stroke="#3A3840" stroke-width="2"/>
+    <g class="mono" font-size="20" fill="#F6F3EE">
+      <text x="22" y="88"><tspan fill="#FF9C8F">required</tspan> <tspan fill="#F2C97D">:email</tspan>,</text>
+      <text x="46" y="114">normalize: <tspan fill="#F2C97D">:email</tspan></text>
+      <text x="22" y="146"><tspan fill="#FF9C8F">optional</tspan> <tspan fill="#F2C97D">:age</tspan>, <tspan fill="#F2C97D">:integer</tspan>,</text>
+      <text x="46" y="172">in: 18..120</text>
+      <text x="22" y="204"><tspan fill="#FF9C8F">optional</tspan> <tspan fill="#F2C97D">:plan</tspan>,</text>
+      <text x="46" y="230">in: %w[free pro],</text>
+      <text x="46" y="256">default: <tspan fill="#9FD9B4">"free"</tspan></text>
+    </g>
+  </g>
+
+  <!-- 3. what the action reads -->
+  <g id="params-out" transform="translate(844 244)">
+    <rect width="300" height="272" rx="14" fill="#FFFFFF" stroke="#1E7F55" stroke-width="2"/>
+    <text class="mono" x="20" y="38" font-size="18" font-weight="600" fill="#1E7F55">permitted_params</text>
+    <g class="mono" font-size="20" fill="#1B1A1F">
+      <text x="20" y="96">email</text><text x="96" y="96" fill="#1E7F55">"ann@shop.io"</text>
+      <text x="20" y="140">age</text><text x="96" y="140" fill="#1E7F55" font-weight="700">42</text>
+      <text x="20" y="184" fill="#A8A19A">admin</text><text x="96" y="184" fill="#A8A19A" class="sans" font-style="italic">dropped</text>
+      <line x1="18" y1="177" x2="84" y2="177" stroke="#A8A19A" stroke-width="2"/>
+      <text x="20" y="228">plan</text><text x="96" y="228" fill="#1E7F55">"free"</text>
+    </g>
+  </g>
+
+  <!-- the same contract, bad values: a 422 that names the parameter -->
+  <g id="rejection" transform="translate(56 536)">
+    <rect width="1088" height="56" rx="12" fill="#FBEBE8" stroke="#E7B8B1" stroke-width="2"/>
+    <g class="mono" font-size="20"><text x="20" y="36" fill="#1B1A1F">age</text><text x="68" y="36" fill="#6E6862">"seventeen"</text><text x="224" y="36" fill="#1B1A1F">plan</text><text x="284" y="36" fill="#6E6862">"gold"</text></g>
+    <path d="M412 28 h16 m-8 -9 l9 9 l-9 9" fill="none" stroke="#C2362F" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    <text class="mono" x="452" y="36" font-size="20" fill="#C2362F"><tspan font-weight="800">422</tspan> user.age invalid_type · user.plan inclusion</text>
+  </g>
+</svg>
