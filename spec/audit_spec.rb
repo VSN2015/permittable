@@ -19,7 +19,7 @@ RSpec.describe Permittable::Audit do
 
   let(:users) do
     controller_class("users") do
-      permit_params :create, root: :user, model: nil do
+      permit_params :create, root: :user, model: nil, enforce: true do
         required :name, :string
       end
       permit_params :destroy, mode: :monitor do
@@ -203,7 +203,7 @@ RSpec.describe Permittable::Audit do
         report = described_class.format(found)
         expect(report).to match(%r{POST\s+/posts\s+create\s+no contract — action not found$})
         expect(report).not_to include("ACCEPTS A BODY")
-        expect(report).to include("4 routed actions: 0 enforced, 0 in monitor mode, 2 without a contract, " \
+        expect(report).to include("4 routed actions: 0 enforced, 0 lazy, 0 in monitor mode, 2 without a contract, " \
                                   "2 not found (Rails 404s them)")
         expect(report).to include("0 of those accept a request body")
       end
@@ -252,7 +252,8 @@ RSpec.describe Permittable::Audit do
         end
 
         it "shows the mode and that the action is not found" do
-          expect(described_class.format(found)).to match(%r{POST\s+/posts\s+create\s+enforce  action not found$})
+          expect(described_class.format(found))
+            .to match(%r{POST\s+/posts\s+create\s+lazy — checked only if the action reads permitted_params  action not found$})
         end
 
         # Out of every bucket, it would otherwise vanish from the report's
@@ -945,10 +946,51 @@ RSpec.describe Permittable::Audit do
     end
   end
 
+  # An enforce-mode rule without `enforce: true` is checked only when the
+  # action reads permitted_params, so the table must not call it enforced. It
+  # still counts as covered: [strict] fails on uncovered_with_body alone.
+  describe "a lazy rule" do
+    let(:lazy) do
+      controller_class("posts") { permit_params(:create, root: :post, model: nil) { required :title, :string } }
+    end
+    let(:eager) do
+      controller_class("posts") { permit_params(:create, root: :post, model: nil, enforce: true) { required :title, :string } }
+    end
+    let(:routes) { [{ controller: "posts", action: "create", verb: "post", path: "/posts" }] }
+
+    def audit(controller) = described_class.entries(controllers: [controller], routes: routes)
+
+    it "reads lazy, with the note, and is counted apart from enforced" do
+      found = audit(lazy)
+      expect(found.first.lazy?).to be(true)
+      expect(described_class.format(found)).to match(%r{POST\s+/posts\s+create\s+lazy — checked only if the action reads permitted_params$})
+      expect(described_class.format(found)).to include("1 routed action: 0 enforced, 1 lazy, 0 in monitor mode, 0 without a contract")
+      expect(described_class.summary(found)).to include(enforced: 0, lazy: 1)
+    end
+
+    it "stays covered for [strict]: no body gap is counted" do
+      expect(described_class.summary(audit(lazy))).to include(uncovered: 0, uncovered_with_body: 0)
+    end
+
+    it "leaves an enforce: true rule reading enforce" do
+      found = audit(eager)
+      expect(found.first.lazy?).to be(false)
+      expect(described_class.format(found)).to match(%r{POST\s+/posts\s+create\s+enforce$})
+      expect(described_class.summary(found)).to include(enforced: 1, lazy: 0)
+    end
+
+    it "reads a monitor rule as monitor, not lazy, with or without enforce: true" do
+      monitored = controller_class("posts") do
+        permit_params(:create, root: :post, model: nil, enforce: true, mode: :monitor) { required :title, :string }
+      end
+      expect(described_class.summary(audit(monitored))).to include(enforced: 0, lazy: 0, monitored: 1)
+    end
+  end
+
   describe ".summary" do
     it "counts coverage, with the body-accepting gap called out separately" do
       expect(described_class.summary(entries)).to eq(
-        actions: 5, enforced: 1, monitored: 1, uncovered: 3, uncovered_with_body: 2, unguarded_models: 2,
+        actions: 5, enforced: 1, lazy: 0, monitored: 1, uncovered: 3, uncovered_with_body: 2, unguarded_models: 2,
         missing_actions: 0
       )
     end
@@ -1215,7 +1257,7 @@ RSpec.describe Permittable::Audit do
         table = report.split("\n\n").first
         expect(table).not_to include("legacy")
         expect(table).not_to include("webhooks")
-        expect(report).to include("4 routed actions: 1 enforced, 1 in monitor mode, 2 without a contract")
+        expect(report).to include("4 routed actions: 1 enforced, 0 lazy, 1 in monitor mode, 2 without a contract")
         expect(described_class.summary(found)[:uncovered_with_body]).to eq(1)
         expect(report).to match(/1 of those accepts? a request body/)
       end
@@ -1418,7 +1460,7 @@ RSpec.describe Permittable::Audit do
     it "counts the engine's unguarded POST as a gap" do
       found = described_class.entries(controllers: controllers, routes: descriptors)
       expect(found.map(&:path)).to contain_exactly("/widgets", "/billing/invoices", "/billing/refunds")
-      expect(described_class.summary(found)).to include(actions: 3, enforced: 1, uncovered: 2, uncovered_with_body: 2)
+      expect(described_class.summary(found)).to include(actions: 3, enforced: 0, lazy: 1, uncovered: 2, uncovered_with_body: 2)
     end
 
     it "does not call a covered engine action stale" do

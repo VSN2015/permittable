@@ -2546,6 +2546,7 @@ module Permittable
       fields = builder.build(&block)
       raise ArgumentError, "#{LABEL}: a contract must declare at least one field" if fields.empty?
 
+      permittable_refuse_router_keys!(root, fields)
       model_class = resolve_permit_model(model)
       guard_contract_columns!(model_class, fields) if model_class
       register_sensitive_params(fields)
@@ -2567,6 +2568,23 @@ module Permittable
     end
 
     private
+
+    # Rails merges the route's `controller`, `action` and `format` into params
+    # and the router's value wins over the body's, so a rootless contract
+    # declaring one would silently read the router's, and the exports would
+    # still document a body property. A controller only: a standalone
+    # Contract has no router, so one may declare them.
+    def permittable_refuse_router_keys!(root, fields)
+      return unless defined?(::ActionController::Metal) && self < ::ActionController::Metal && !root
+
+      clash = fields.map { |f| f[:name].to_s } & ROUTING_KEYS
+      return if clash.empty?
+
+      raise ArgumentError,
+            "#{LABEL}: a rootless contract cannot declare #{clash.map { |n| ":#{n}" }.join(', ')}: Rails puts the " \
+            "route's #{clash.length == 1 ? 'value' : 'values'} there, never the client's. Wrap the fields in " \
+            "root: (the client sends them under that key), or rename the param"
+    end
 
     # Registers the rescue_from handler and the before_action the gem relies
     # on, each once per class, as soon as the class can take them. They used
