@@ -173,28 +173,35 @@ module Permittable
     # uncaught SystemStackError. An empty container is attached to its parent
     # before it is filled, so HWIA's own deep conversion never has anything
     # to walk.
+    #
+    # Each entry carries the ids of its ancestors, so a container that holds
+    # itself (`h["self"] = h`) is refused instead of copied for ever: the
+    # recursive walk this replaced ended in a SystemStackError at once, and an
+    # iterative one would otherwise grow without bound.
     def indifferent_copy(input)
       root = ActiveSupport::HashWithIndifferentAccess.new
-      pending = [[input, root]]
+      pending = [[input, root, [input.object_id]]]
       until pending.empty?
-        source, copy = pending.pop
+        source, copy, ancestors = pending.pop
         if source.is_a?(Hash)
-          source.each_pair { |key, value| copy[key] = container_for(value, pending) }
+          source.each_pair { |key, value| copy[key] = container_for(value, pending, ancestors) }
         else
-          source.each { |value| copy << container_for(value, pending) }
+          source.each { |value| copy << container_for(value, pending, ancestors) }
         end
       end
       root
     end
 
-    def container_for(value, pending)
+    def container_for(value, pending, ancestors)
       value = value.to_unsafe_h if value.respond_to?(:to_unsafe_h)
       copy = case value
              when Hash then ActiveSupport::HashWithIndifferentAccess.new
              when Array then []
              else return value
              end
-      pending << [value, copy]
+      raise ArgumentError, "#{LABEL}: Contract#call input contains itself (a cyclic Hash or Array)" if ancestors.include?(value.object_id)
+
+      pending << [value, copy, ancestors + [value.object_id]]
       copy
     end
   end

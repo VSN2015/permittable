@@ -86,6 +86,23 @@ RSpec.describe Permittable::Contract do
       expect(outcome).to eq([{ param: "meta", code: "depth" }])
     end
 
+    # The iterative copy has no stack to overflow, so a Hash holding itself
+    # would be copied for ever, with memory growing, unless it is refused.
+    it "refuses a Hash or Array that contains itself instead of copying it for ever" do
+      hash = { "n" => "x" }
+      hash["self"] = hash
+      list = []
+      list << list
+      contract = described_class.define { optional :n, :string }
+      [hash, { "n" => "x", "deep" => { "list" => list } }].each do |input|
+        expect { Timeout.timeout(5) { contract.call(input) } }
+          .to raise_error(ArgumentError, /contains itself/)
+      end
+      # One object reached twice is not a cycle.
+      shared = { "a" => 1 }
+      expect(described_class.define { optional :j, :json }.call("j" => { "x" => shared, "y" => shared })).to be_valid
+    end
+
     it "keeps calls independent — a contract instance is reusable" do
       expect(contract.call({})).to be_invalid
       expect(contract.call(user: { email: "a@b.c" })).to be_valid
