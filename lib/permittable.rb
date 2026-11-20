@@ -3116,7 +3116,12 @@ module Permittable
 
   def permittable_root_hash(rule, violations)
     raw = permittable_plain_params
-    return raw unless rule[:root]
+    unless rule[:root]
+      return raw unless permittable_non_object_body?(rule, raw)
+
+      violations << permittable_violation({}, NON_OBJECT_BODY, "invalid_type")
+      return nil
+    end
 
     key = rule[:root].to_s
     value = raw[key]
@@ -3134,6 +3139,25 @@ module Permittable
     code = permittable_absent?(value, raw, key) ? "missing" : "invalid_type"
     violations << permittable_violation({}, key, code)
     nil
+  end
+
+  # The param a non-object JSON body is reported under (see below).
+  NON_OBJECT_BODY = "(body)".freeze
+
+  # Rails parks a JSON body that is not an object (`[1]`, `5`, `"x"`) under
+  # `_json`, a key no client wrote. Under `unknown: :error` it was reported
+  # as an "unknown" `_json`; the body is malformed, as a rooted contract's
+  # non-object body is (a 400). Only where `_json` was already refused: an
+  # `unknown: :ignore` action may still read `params[:_json]` itself, and a
+  # contract that declares `_json` has asked for it. A request only — a
+  # standalone Contract has no body — and a JSON one: `_json` in a form is
+  # just an unknown field. A Hash under it is an object body that happens to
+  # use the name, since Rails never wraps one.
+  def permittable_non_object_body?(rule, raw)
+    rule[:unknown] == :error && raw.key?("_json") && !raw["_json"].is_a?(Hash) &&
+      rule[:fields].none? { |f| f[:name].to_s == "_json" } &&
+      respond_to?(:request) && request.respond_to?(:content_mime_type) &&
+      request.content_mime_type&.symbol == :json
   end
 
   # One plain HashWithIndifferentAccess view of `params`, whatever the

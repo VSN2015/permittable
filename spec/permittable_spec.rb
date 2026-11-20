@@ -6529,6 +6529,25 @@ RSpec.describe Permittable do
         expect(JSON.parse(result.body)).to eq("name" => "Jo")
       end
 
+      # Rails parks a JSON body that is not an object (`[1]`, `5`, `"x"`) under
+      # `_json`, a key no client wrote, so reporting it as an "unknown"
+      # parameter told the client nothing it could act on. It is the same
+      # malformed envelope as a rooted contract's non-object body: a 400.
+      it "reports a JSON body that is not an object as a malformed body, never as an unknown `_json`" do
+        controller = build_rootless_controller { optional :name, :string }
+        ["[1,2]", "5", '"x"'].each do |body|
+          result = IntegrationHarness.dispatch(controller, :create, method: "POST", raw_json: body)
+          expect(result.status).to eq(400), "for #{body}: #{result.body}"
+          expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "(body)", "code" => "invalid_type" }])
+        end
+        # A declared `_json`, a form field of that name, and ordinary bodies are untouched.
+        declared = build_rootless_controller { optional :_json, :json }
+        expect(IntegrationHarness.dispatch(declared, :create, method: "POST", raw_json: '{"_json":{"a":1}}').status).to eq(200)
+        expect(IntegrationHarness.dispatch(controller, :create, method: "POST", raw_json: '{"name":"x"}').status).to eq(200)
+        form = IntegrationHarness.dispatch(controller, :create, method: "POST", params: "_json=1")
+        expect(JSON.parse(form.body)["error"]["details"]).to eq([{ "param" => "_json", "code" => "unknown" }])
+      end
+
       # image_submit_tag renders <input type="image"> with no name, which a
       # browser submits as the click point `x=12&y=7`; named, as `save.x`.
       it "does not flag the click point of an image_submit_tag, which f.submit and f.button never send" do
