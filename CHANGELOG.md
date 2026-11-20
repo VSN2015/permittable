@@ -1,5 +1,11 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+<!-- title: GET, HEAD and DELETE operations exported with query parameters instead of a JSON body, and date_select parts accepted by a strict exported schema -->
+
+### Fixed
+- **`Permittable::OpenAPI.document` documents a GET, HEAD or DELETE contract as query parameters.** It exported the contract as a JSON `requestBody` for a verb whose request carries none, so a client generated for `GET /users` was handed a body parameter the server never read. The fields are now `in: query` parameters and the operation has no `requestBody`: a scalar as `name`, an array of scalars as `name[]` (Rails' spelling), a flat `root:` contract as one required `deepObject` parameter, and a field a path parameter or route default already took is not repeated. **A generated client for such an endpoint changes shape**: it takes arguments instead of a body, and `openapi-typescript` types change with it. A contract with a nested block, an array of hashes, a `:json` or `:file` field keeps its body and gains `x-permittable-query-unrepresentable: true`. POST, PUT and PATCH, `request_body_for` and `x-permittable-controllers` operations are unchanged. No request-time behaviour changes.
+
 ## 0.16.0 (2026-11-15)
 <!-- title: date and boolean strings held to what the parser read, an audit that stops counting skipped contracts, and 422 rendered as an Integer -->
 

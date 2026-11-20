@@ -407,7 +407,7 @@ RSpec.describe Permittable::OpenAPI do
       it "documents the body as multipart/form-data, and only for the operations that carry a file" do
         expect(multipart_schema(paths["/avatars"]["post"])).to be_a(Hash)
         expect(multipart_schema(paths["/avatars/{id}"]["patch"])).to be_a(Hash)
-        expect(paths["/avatars/{id}"]["delete"]["requestBody"]["content"].keys).to eq(["application/json"])
+        expect(paths["/avatars/{id}"]["delete"]).not_to have_key("requestBody")
       end
 
       it "names the parts the way Rails reads them: a rooted rule's brackets, [] for arrays, nesting in brackets" do
@@ -1028,11 +1028,10 @@ RSpec.describe Permittable::OpenAPI do
           "properties" => { "name" => { "type" => "string" } }.merge(form_keys).merge("id" => {}),
           "additionalProperties" => false
         )
-        expect(body_schema(paths["delete"])).to eq(
-          "type" => "object",
-          "properties" => { "name" => { "type" => "string" } }.merge(form_keys).merge("kind" => {}),
-          "additionalProperties" => false
-        )
+        # DELETE carries no body: the declared field is a query parameter, and
+        # an unlisted query name is never refused by the document.
+        expect(paths["delete"]).not_to have_key("requestBody")
+        expect(paths["delete"]["parameters"].map { |p| p.values_at("name", "in") }).to eq([%w[name query]])
         ok = IntegrationHarness.dispatch(controller, :update, method: "PATCH", path_params: { id: "5" },
                                                               json: { id: 500 })
         expect(ok.status).to eq(200)
@@ -1628,6 +1627,95 @@ RSpec.describe Permittable::OpenAPI do
                                      routes: [{ controller: "users", action: "create", verb: "post", path: "/users" }])
       expect(doc["info"]).to eq("title" => "Permittable contracts", "version" => Permittable::VERSION)
       expect(doc).not_to have_key("x-permittable-controllers")
+    end
+  end
+
+  # A GET, HEAD or DELETE request carries no body in practice (a client
+  # generated from a requestBody on GET either refuses or sends one nothing
+  # reads), and Rails reads the contract's fields from the query string.
+  describe "an operation under a verb that carries no body" do
+    def operation(klass, verb: "GET", path: "/users", action: "index")
+      doc = described_class.document(
+        controllers: [klass],
+        routes: [{ controller: klass.controller_path, action: action, verb: verb, path: path }]
+      )
+      doc["paths"][path][verb.downcase]
+    end
+
+    let(:index) do
+      controller_class do
+        permit_params(:index) do
+          required :q, :string
+          optional :page, :integer, in: 1..1000
+          array :tags, of: :string
+        end
+      end
+    end
+
+    it "documents the fields as query parameters and sends no requestBody" do
+      op = operation(index)
+      expect(op).not_to have_key("requestBody")
+      expect(op["parameters"]).to eq(
+        [
+          { "name" => "q", "in" => "query", "required" => true, "schema" => { "type" => "string", "minLength" => 1 } },
+          { "name" => "page", "in" => "query", "required" => false,
+            "schema" => { "type" => "integer", "minimum" => 1, "maximum" => 1000 } },
+          { "name" => "tags[]", "in" => "query", "required" => false,
+            "schema" => { "type" => "array", "items" => { "type" => "string" } } }
+        ]
+      )
+    end
+
+    it "does the same for HEAD and DELETE, and keeps POST on a body" do
+      %w[HEAD DELETE].each { |verb| expect(operation(index, verb: verb)).not_to have_key("requestBody") }
+      expect(operation(index, verb: "POST")).to have_key("requestBody")
+    end
+
+    it "leaves a field the route's path already carries out of the query" do
+      klass = controller_class do
+        permit_params(:show) do
+          required :id, :integer
+          optional :fields, :string
+        end
+      end
+      op = operation(klass, path: "/users/{id}", action: "show")
+      expect(op["parameters"].map { |p| [p["name"], p["in"]] }).to eq([%w[id path], %w[fields query]])
+    end
+
+    it "documents a flat rooted contract as one deepObject query parameter" do
+      klass = controller_class do
+        permit_params(:index, root: :filter) { optional :status, :string }
+      end
+      op = operation(klass)
+      expect(op).not_to have_key("requestBody")
+      expect(op["parameters"]).to eq(
+        [{ "name" => "filter", "in" => "query", "required" => true, "style" => "deepObject", "explode" => true,
+           "schema" => { "type" => "object", "properties" => { "status" => { "type" => "string" } } } }]
+      )
+    end
+
+    it "keeps today's body, flagged, when a field cannot be a query parameter" do
+      klass = controller_class do
+        permit_params(:index) do
+          optional :q, :string
+          optional(:range) { optional :from, :date }
+        end
+      end
+      op = operation(klass)
+      expect(op["x-permittable-query-unrepresentable"]).to be(true)
+      expect(op).to have_key("requestBody")
+      expect(op).not_to have_key("parameters")
+    end
+
+    it "emits no body when every field is the path's" do
+      klass = controller_class { permit_params(:show) { required :id, :integer } }
+      op = operation(klass, path: "/users/{id}", action: "show")
+      expect(op.keys).to eq(%w[operationId parameters responses])
+    end
+
+    it "leaves operations with no verb (x-permittable-controllers) as they were" do
+      doc = described_class.document(controllers: [index])
+      expect(doc["x-permittable-controllers"]["users"]["index"]).to have_key("requestBody")
     end
   end
 
@@ -2415,7 +2503,7 @@ RSpec.describe Permittable::OpenAPI do
           doc = described_class.document(controllers: [klass], routes: described_class.rails_routes(app))
           expect(doc["paths"].keys).to eq(["/t/{id}/{id}"])
           expect(doc["paths"]["/t/{id}/{id}"]["get"]["parameters"].map { |p| p.values_at("name", "in") })
-            .to eq([%w[id path]])
+            .to eq([%w[id path], %w[q query]])
         end
 
         it "declares each distinct name once, in the order the path names them" do
@@ -2423,7 +2511,8 @@ RSpec.describe Permittable::OpenAPI do
           klass = controller_class(path: "things") { permit_params(:show) { optional :q, :string } }
           app = rails_app { mount eng, at: "/t/:id" }
           doc = described_class.document(controllers: [klass], routes: described_class.rails_routes(app))
-          expect(doc["paths"]["/t/{id}/{id}/{other}"]["get"]["parameters"].map { |p| p["name"] }).to eq(%w[id other])
+          expect(doc["paths"]["/t/{id}/{id}/{other}"]["get"]["parameters"].map { |p| p["name"] })
+            .to eq(%w[id other q])
         end
       end
 

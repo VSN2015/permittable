@@ -599,7 +599,8 @@ module Permittable
         else
           free.each do |path, verb, template, defaults|
             holder = (paths[path] ||= {})
-            placed = with_path_parameters(operation, path, controller.permit_rule_for(action), controller, [template || path, defaults])
+            placed = with_path_parameters(operation, path, controller.permit_rule_for(action), controller,
+                                          [template || path, defaults, verb])
             holder[verb] = template ? placed.merge("x-permittable-path" => template) : placed
             slots << OperationSlot.new(holder, verb, verb, operation["operationId"], owner, path)
           end
@@ -718,7 +719,7 @@ module Permittable
     # otherwise: a rootless contract field named like one is that parameter's
     # schema (path_fields), and leaves the body schema.
     #
-    # `route` is `[own, defaults]`; `controller` supplies the keys the body
+    # `route` is `[own, defaults, verb]`; `controller` supplies the keys the body
     # exempts (see exempt_keys).
     #
     # `own` is the route's own spelling of the template, which differs
@@ -731,30 +732,77 @@ module Permittable
     # not carry them and they are no path parameter. A name the path
     # templates is that parameter instead: `get "o(/:id)", defaults:
     # { id: 5 }` is a parameter on `/o/{id}` and a default only on `/o`.
+    #
+    # `verb` is the slot's: under one that carries no body (BODYLESS_VERBS)
+    # the fields that stay become query parameters, see query_parameters.
     def with_path_parameters(operation, path, rule, controller, route)
-      own, defaults = route
+      own, defaults, verb = route
       # A name the path templates twice (a mount and an engine route both
       # name `:id`) is declared once: OpenAPI forbids two parameters with
       # one name and location.
       variables = path.scan(/\{(\w+)\}/).flatten.uniq
       own_names = own.scan(/\{(\w+)\}/).flatten
       supplied = Array(defaults) - own_names
-      return operation if variables.empty? && supplied.empty?
-
       fields = path_fields(rule, path.scan(/\{(\w+)\}/).flatten.zip(own_names).uniq(&:first))
       parameters = variables.map do |name|
         schema = fields[name] ? path_schema(fields[name]) : { "type" => "string" }
         { "name" => name, "in" => "path", "required" => true, "schema" => schema }
       end
+      moved = fields.values + default_fields(rule, supplied)
+      bodyless = BODYLESS_VERBS.include?(verb)
+      query = query_parameters(rule, moved) if bodyless
+      return operation if parameters.empty? && supplied.empty? && !bodyless
+
       # Inserted ahead of requestBody, where a reader of the document expects
       # it; emission stays deterministic either way.
       operation.each_with_object({}) do |(key, value), out|
         if key == "requestBody"
+          parameters += query if query
           out["parameters"] = parameters unless parameters.empty?
-          value = body_without(rule, controller, fields.values + default_fields(rule, supplied), own_names + supplied)
+          value = query ? nil : body_without(rule, controller, moved, own_names + supplied)
+          out["x-permittable-query-unrepresentable"] = true if bodyless && query.nil? && !value.nil?
         end
         out[key] = value unless value.nil?
       end
+    end
+
+    # The verbs whose request carries no body in practice. A contract under
+    # one is read from the query string, so its fields are documented there.
+    BODYLESS_VERBS = %w[get head delete].freeze
+
+    # The query parameters for `rule`'s fields that no path parameter or
+    # route default took; [] when none are left, nil when a field cannot be
+    # one and the operation keeps its JSON body (flagged
+    # x-permittable-query-unrepresentable, see with_path_parameters).
+    #
+    # A scalar is `name=value`. An array of scalars is Rails' `name[]=a&name[]=b`
+    # (style form, explode true, OpenAPI's default for a query parameter), so
+    # the parameter is named `name[]`. A flat rooted contract is one
+    # deepObject parameter, `root[field]=value`. What a query string has no
+    # faithful spelling for stays a body: nested blocks, arrays of hashes,
+    # :json and :file fields, and a rooted contract with any of them.
+    # A date_select's `field(1i)` parts are not listed here.
+    def query_parameters(rule, moved)
+      fields = rule[:fields] - moved
+      return unless fields.all? { |field| query_field?(field) }
+      return if rule[:root] && fields.any? { |field| field[:kind] != :scalar }
+
+      if rule[:root]
+        schema = JsonSchema.rule(rule)["properties"][rule[:root].to_s]
+        return [{ "name" => rule[:root].to_s, "in" => "query", "required" => true, "style" => "deepObject",
+                  "explode" => true, "schema" => schema }]
+      end
+
+      fields.map do |field|
+        name = field[:kind] == :array ? "#{field[:name]}[]" : field[:name].to_s
+        { "name" => name, "in" => "query", "required" => !!field[:required], "schema" => JsonSchema.field(field) }
+      end
+    end
+
+    def query_field?(field)
+      return field[:type] != :file if field[:kind] == :scalar
+
+      field[:kind] == :array && field[:fields].nil? && field[:of] != :file
     end
 
     # { path variable => the contract's field for it }. Rails merges the
