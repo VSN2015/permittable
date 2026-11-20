@@ -285,7 +285,7 @@ module Permittable
       if form_container?(schema, "object")
         form_group!(schema, path, required, form, skip_group)
         schema["properties"].each do |key, child|
-          flatten_form(child, path + [key], required && schema.fetch("required", []).include?(key), form,
+          flatten_form(child, path + [key], required && form_required(schema).include?(key), form,
                        skip_group: skip_group)
         end
       elsif form_container?(schema, "array") && form_container?(schema["items"], "object")
@@ -333,6 +333,15 @@ module Permittable
         form[:properties][name] = schema
         form[:required] << name if required
       end
+    end
+
+    # The keys a form part must carry: `required`, plus each date field whose
+    # requirement JsonSchema.object spells as an anyOf (its key or its parts).
+    # A form names parts as the form builder sends them, so the key is what
+    # the flat body lists as required.
+    def form_required(schema)
+      clauses = schema["allOf"] || [schema]
+      Array(schema["required"]) + clauses.filter_map { |clause| clause.dig("anyOf", 0, "required")&.first }
     end
 
     def form_name(path)

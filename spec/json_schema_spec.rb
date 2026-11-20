@@ -733,6 +733,38 @@ RSpec.describe Permittable::JsonSchema do
     end
   end
 
+  describe "date_select parts" do
+    it "meets a required :date with its key or all of (1i)-(3i)" do
+      schema = schema_for { required :on, :date }
+      expect(schema).not_to have_key("required")
+      expect(schema["anyOf"]).to eq([{ "required" => ["on"] }, { "required" => %w[on(1i) on(2i) on(3i)] }])
+      expect(schema["properties"].keys).to eq(["on"])
+    end
+
+    it "declares the parts, ties them together and refuses the key beside them under unknown: :error" do
+      schema = schema_for(unknown: :error) { required :at, :datetime }
+      expect(schema["properties"].keys).to eq(%w[at at(1i) at(2i) at(3i) at(4i) at(5i) at(6i)])
+      expect(schema["dependentRequired"]["at(5i)"]).to eq(%w[at(1i) at(2i) at(3i)])
+      expect(schema["allOf"].last).to eq("not" => { "required" => %w[at at(1i) at(2i) at(3i)] })
+      expect(schema["properties"]["at(2i)"]).to include("maximum" => 99, "pattern" => '^0*\d{1,2}$')
+    end
+
+    it "lets an optional field's parts be blank, as a select left on its prompt sends them" do
+      schema = schema_for(unknown: :error) { optional :on, :date }
+      expect(schema["properties"]["on(1i)"]).to include("pattern" => '^(\d+)?$', "type" => %w[string integer null])
+      expect(schema).not_to have_key("anyOf")
+    end
+
+    it "leaves a field alone when the contract declares one of its part names" do
+      schema = schema_for(unknown: :error) do
+        required :on, :date
+        optional :'on(1i)', :string
+      end
+      expect(schema["required"]).to eq(["on"])
+      expect(schema).not_to have_key("dependentRequired")
+    end
+  end
+
   describe "nullable:" do
     it "adds null to the declared type on every field kind" do
       props = schema_for do

@@ -98,14 +98,72 @@ module Permittable
 
     # Object schema for a field list; `unknown:` applies at every nesting
     # level, exactly like the runtime check.
+    #
+    # A :date or :datetime field is also read from the parts a Rails
+    # date_select sends (`starts_on(1i)`, `(2i)`, `(3i)`, and `(4i)`-`(6i)` for
+    # a :datetime) whenever its own key is absent, so a REQUIRED one is met by
+    # either its key or all of (1i)-(3i): an `anyOf` of the two `required`
+    # lists replaces the plain entry. Under `unknown: :error` the parts are
+    # also declared as properties (a String of digits or a non-negative
+    # Integer; blank only where the field may be blank), which
+    # `dependentRequired` ties together as the runtime does (a part with no
+    # sibling is invalid_type), and sending the key too is refused (`not`),
+    # since the runtime then flags the parts as unknown. Without
+    # `unknown: :error` the parts are undeclared keys the schema already
+    # allows, and only the required clause is needed. A contract that declares
+    # a part's name as a field of its own keeps that field, and the runtime
+    # reads no parts for it.
     def object(fields, unknown: :ignore)
+      dated = fields.select { |f| date_parts?(f, fields) }
       schema = {
         "type" => "object",
         "properties" => fields.to_h { |f| [f[:name].to_s, field(f, unknown: unknown)] }
       }
-      required = fields.select { |f| f[:required] }.map { |f| f[:name].to_s }
+      required = fields.select { |f| f[:required] && !dated.include?(f) }.map { |f| f[:name].to_s }
       schema["required"] = required unless required.empty?
+      date_parts_clauses!(schema, dated, unknown)
       schema["additionalProperties"] = false if unknown == :error
+      schema
+    end
+
+    def date_parts?(field, fields)
+      count = field[:kind] == :scalar && Permittable::DATE_PARTS[field[:type]]
+      count && !part_names(field, count).intersect?(fields.map { |f| f[:name].to_s })
+    end
+
+    def part_names(field, count = Permittable::DATE_PARTS.fetch(field[:type]))
+      Array.new(count) { |index| "#{field[:name]}(#{index + 1}i)" }
+    end
+
+    def date_parts_clauses!(schema, dated, unknown)
+      clauses = []
+      dated.each do |field|
+        key = field[:name].to_s
+        names = part_names(field)
+        clauses << { "anyOf" => [{ "required" => [key] }, { "required" => names.first(3) }] } if field[:required]
+        next unless unknown == :error
+
+        names.each_with_index { |name, index| schema["properties"][name] = date_part_schema(field, index) }
+        schema["dependentRequired"] = (schema["dependentRequired"] || {}).merge(
+          names.to_h { |name| [name, names.first(3) - [name]] }
+        )
+        clauses << { "not" => { "required" => [key, *names.first(3)] } }
+      end
+      return if clauses.empty?
+
+      clauses.one? ? schema.merge!(clauses.first) : schema["allOf"] = clauses
+    end
+
+    # One part as a select sends it (see Permittable#permittable_date_part):
+    # digits, leading zeros allowed, and past the year at most two significant
+    # ones. The Integer form is the JSON body's. A blank part reads the field
+    # as sent empty, so it is allowed wherever the field may be blank.
+    def date_part_schema(field, index)
+      blank = blank_floor?(field)
+      digits = index.zero? ? '\d+' : '0*\d{1,2}'
+      schema = { "type" => %w[string integer], "pattern" => blank ? "^#{digits}$" : "^(#{digits})?$", "minimum" => 0 }
+      schema["maximum"] = 99 unless index.zero?
+      schema["type"] << "null" unless blank
       schema
     end
 

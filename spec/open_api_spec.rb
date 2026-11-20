@@ -404,6 +404,21 @@ RSpec.describe Permittable::OpenAPI do
         content["multipart/form-data"]["schema"]
       end
 
+      it "keeps a required date field required in the flat body, and lists its date_select parts under unknown: :error" do
+        klass = controller_class(path: "avatars") do
+          permit_params(:create, unknown: :error) do
+            required :taken_on, :date
+            optional :photo, :file
+          end
+        end
+        doc = described_class.document(
+          controllers: [klass], routes: [{ controller: "avatars", action: "create", verb: "POST", path: "/avatars" }]
+        )
+        schema = doc["paths"]["/avatars"]["post"]["requestBody"]["content"]["multipart/form-data"]["schema"]
+        expect(schema["required"]).to eq(["taken_on"])
+        expect(schema["properties"].keys).to include("taken_on(1i)", "taken_on(2i)", "taken_on(3i)")
+      end
+
       it "documents the body as multipart/form-data, and only for the operations that carry a file" do
         expect(multipart_schema(paths["/avatars"]["post"])).to be_a(Hash)
         expect(multipart_schema(paths["/avatars/{id}"]["patch"])).to be_a(Hash)

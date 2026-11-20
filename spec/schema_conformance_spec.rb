@@ -164,6 +164,48 @@ module SchemaConformance
         [{ "at" => "2026-09-05T10:00:00Z" }, :agree]
       ]
     },
+    # A date_select sends the date as `on(1i)`-`on(3i)`, which the runtime
+    # reads as `on` while `on` itself is absent; the schema must take them.
+    "a required :date under unknown: :error, sent whole or as date_select parts" => {
+      unknown: :error,
+      contract: proc { required :on, :date },
+      payloads: [
+        [{ "on" => "2026-10-17" }, :agree],
+        [{ "on(1i)" => "2026", "on(2i)" => "10", "on(3i)" => "17" }, :agree],
+        [{ "on(1i)" => 2026, "on(2i)" => 10, "on(3i)" => 17 }, :agree],
+        [{ "on(1i)" => "2026", "on(2i)" => "010", "on(3i)" => "07" }, :agree],
+        [{ "on(1i)" => "2026", "on(2i)" => "10" }, :agree],
+        [{ "on(1i)" => "2026", "on(2i)" => "", "on(3i)" => "17" }, :agree],
+        [{ "on(1i)" => "2026", "on(2i)" => "100", "on(3i)" => "17" }, :agree],
+        [{ "on(1i)" => "2026", "on(2i)" => "Oct", "on(3i)" => "17" }, :agree],
+        [{ "on(1i)" => "2026", "on(2i)" => "-1", "on(3i)" => "17" }, :agree],
+        [{ "on" => "2026-10-17", "on(1i)" => "2026", "on(2i)" => "10", "on(3i)" => "17" }, :agree],
+        [{ "on(1i)" => "2026", "on(2i)" => "10", "on(3i)" => "17", "on(4i)" => "9" }, :agree],
+        [{}, :agree]
+      ]
+    },
+    "an optional :datetime under unknown: :error, sent whole or as parts" => {
+      unknown: :error,
+      contract: proc { optional :at, :datetime },
+      payloads: [
+        [{ "at" => "2026-10-17T09:30:00Z" }, :agree],
+        [{ "at(1i)" => "2026", "at(2i)" => "10", "at(3i)" => "17" }, :agree],
+        [{ "at(1i)" => "2026", "at(2i)" => "10", "at(3i)" => "17", "at(4i)" => "9", "at(5i)" => "30" }, :agree],
+        [{ "at(4i)" => "9", "at(5i)" => "30" }, :agree],
+        [{ "at(1i)" => "2026", "at(2i)" => "10" }, :agree],
+        [{ "at(1i)" => "", "at(2i)" => "", "at(3i)" => "" }, :agree],
+        [{}, :agree]
+      ]
+    },
+    "a required :date under the default unknown: :ignore, sent as parts" => {
+      contract: proc { required :on, :date },
+      payloads: [
+        [{ "on(1i)" => "2026", "on(2i)" => "10", "on(3i)" => "17" }, :agree],
+        [{ "on(1i)" => "2026", "on(2i)" => "10" }, :agree],
+        [{ "on" => "2026-10-17" }, :agree],
+        [{}, :agree]
+      ]
+    },
     "an exclusive range" => {
       contract: proc { optional :pct, :integer, in: 0...100 },
       payloads: [[{ "pct" => 0 }, :agree], [{ "pct" => 99 }, :agree], [{ "pct" => 100 }, :agree]]
@@ -467,7 +509,7 @@ RSpec.describe "the exported schema against what the contract enforces" do
     unchecked = emitted - annotations - %w[
       type enum minimum maximum exclusiveMaximum minLength maxLength pattern
       required properties additionalProperties items minItems maxItems
-      minProperties maxProperties
+      minProperties maxProperties anyOf allOf not dependentRequired
     ]
     expect(unchecked.grep_v(/\Ax-permittable-/)).to be_empty,
                                                     "the exporter emits #{unchecked.inspect}, which TinyJsonSchema does not check"
@@ -492,6 +534,15 @@ RSpec.describe "the exported schema against what the contract enforces" do
   def keywords_in(node)
     return [] unless node.is_a?(Hash)
 
-    node.keys + node.flat_map { |key, value| key == "properties" ? value.values.flat_map { |v| keywords_in(v) } : keywords_in(value) }
+    # `properties` and `dependentRequired` are maps keyed by field names, not
+    # keywords: only the schemas under `properties` are descended into.
+    own = node.keys.grep_v(/\(\di\)\z/)
+    own + node.flat_map do |key, value|
+      case key
+      when "properties" then value.values.flat_map { |v| keywords_in(v) }
+      when "dependentRequired" then []
+      else keywords_in(value)
+      end
+    end
   end
 end

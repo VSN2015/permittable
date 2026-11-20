@@ -27,6 +27,21 @@ module TinyJsonSchema
     out.concat(number_errors(schema, value, path)) if number?(value)
     out.concat(object_errors(schema, value, path)) if value.is_a?(Hash)
     out.concat(array_errors(schema, value, path)) if value.is_a?(Array)
+    out.concat(combinator_errors(schema, value, path))
+  end
+
+  # anyOf, allOf and not, which JsonSchema.object uses for a date field's
+  # parts; dependentRequired likewise (a part asks for its siblings).
+  def combinator_errors(schema, value, path)
+    out = []
+    out << "#{path}: anyOf" if schema["anyOf"] && schema["anyOf"].none? { |sub| valid?(sub, value) }
+    out.concat(Array(schema["allOf"]).flat_map { |sub| errors(sub, value, path) })
+    out << "#{path}: not" if schema["not"] && valid?(schema["not"], value)
+    (schema["dependentRequired"] || {}).each do |key, others|
+      next unless value.is_a?(Hash) && value.key?(key)
+
+      out.concat(others.reject { |other| value.key?(other) }.map { |other| "#{path}/#{other}: dependentRequired" })
+    end
     out
   end
 
