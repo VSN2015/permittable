@@ -257,6 +257,8 @@ module Permittable
   # asymmetry between them is the deliberate point, so spell it once here
   # rather than leaving a bare ROUTING_KEYS to read like an oversight.
   UNCHECKED_TOP_LEVEL_KEYS = (ROUTING_KEYS + FORM_KEYS).freeze
+  # The param a non-object JSON body is reported under (see permittable_non_object_body?).
+  NON_OBJECT_BODY = "(body)".freeze
   MONITOR_DROPPED_KEYS = ROUTING_KEYS
   # Rails' date_select, datetime_select and time_select submit ONE value as
   # several keys, each named for its position: `starts_on(1i)` the year,
@@ -603,9 +605,27 @@ module Permittable
     # { param:, code: } shape, so nothing changes for apps that don't opt
     # in. Only a String translation counts; anything else (a nested Hash, a
     # missing-translation object) is ignored rather than leaked to clients.
-    def default_message_for(code)
+    #
+    # The copy may use `%{param}` (the violation's path, as in `user.email`)
+    # and `%{code}`. The translation is read uninterpolated and filled in
+    # here, so the client-controlled param is only ever a VALUE, never part
+    # of the format string. A placeholder with no value (`%{field}`) is left
+    # as written. `memo:` is a Hash that keeps the lookup per locale and code
+    # for as long as the caller holds it: 200,000 `unknown` violations in one
+    # request asked I18n for the same String 200,000 times (34 seconds).
+    def default_message_for(code, param: nil, memo: nil)
       return nil unless defined?(::I18n) && ::I18n.respond_to?(:t)
 
+      key = [::I18n.locale, code.to_s]
+      message = memo ? memo.fetch(key) { memo[key] = default_translation(code) } : default_translation(code)
+      return message unless message&.include?("%")
+
+      ::I18n.interpolate(message, param: param.to_s, code: code.to_s)
+    rescue ::I18n::MissingInterpolationArgument
+      message
+    end
+
+    def default_translation(code)
       message = ::I18n.t("permittable.errors.#{code}", default: nil)
       message.is_a?(String) ? message : nil
     end
@@ -806,17 +826,18 @@ module Permittable
       # params builder guards a controller; a standalone Contract#call on a
       # webhook payload has nothing in front of it, so `"caf\xC3"` was a 500.
       return [:error, "invalid_type"] unless value.valid_encoding?
-      # A :string is handed back exactly as it arrived, in its own encoding.
-      # `skip_parameter_encoding` / `param_encoding` send a controller binary
-      # or Shift_JIS text ON PURPOSE, and converting it would hand the app
-      # something other than what it asked Rails for.
-      # A NUL is no text either: PostgreSQL refuses a string holding U+0000
-      # ("string contains null byte"), so keeping it was a 500 at the INSERT.
-      # Read as UTF-8, so a UTF-16 String's own zero bytes are not mistaken
-      # for one; text with no UTF-8 reading is left to the checks it fails.
+
       if type == :string
+        # A NUL is no text either: PostgreSQL refuses a string holding U+0000
+        # ("string contains null byte"), so keeping it was a 500 at the INSERT.
+        # Read as UTF-8, so a UTF-16 String's own zero bytes are not mistaken
+        # for one; text with no UTF-8 reading is left to the checks it fails.
         return [:error, "invalid_type"] if utf8_text(value)&.include?("\u0000")
 
+        # A :string is handed back exactly as it arrived, in its own encoding.
+        # `skip_parameter_encoding` / `param_encoding` send a controller binary
+        # or Shift_JIS text ON PURPOSE, and converting it would hand the app
+        # something other than what it asked Rails for.
         return cast_string(value)
       end
 
@@ -2503,7 +2524,7 @@ module Permittable
       entry = { param: param.to_s, code: code.to_s }
       # Same resolution order as field violations: explicit message, then
       # the app's I18n copy for the code, then the bare shape.
-      resolved = message ? message.to_s : Permittable.default_message_for(code)
+      resolved = message ? message.to_s : Permittable.default_message_for(code, param: entry[:param])
       entry[:message] = resolved if resolved
       @violations << entry
       throw :permittable_finalize_halt
@@ -2902,6 +2923,7 @@ module Permittable
   end
 
   def validate_params_contract!(rule, action)
+    @permittable_message_memo = {} # one I18n lookup per code for this validation (see default_message_for)
     violations = []
     source = permittable_root_hash(rule, violations)
     result = ActiveSupport::HashWithIndifferentAccess.new
@@ -3084,7 +3106,7 @@ module Permittable
   # the bare { param:, code: } shape, so existing consumers see no change.
   def permittable_violation(field, param, code)
     entry = { param: param, code: code.to_s }
-    message = permittable_message_for(field, code)
+    message = permittable_message_for(field, code, param)
     entry[:message] = message if message
     entry
   end
@@ -3092,11 +3114,11 @@ module Permittable
   # Resolution order: the field's own `message:` (String, or Hash entry for
   # this code), then the app's I18n copy (permittable.errors.<code>), then
   # nothing — the bare { param:, code: } shape.
-  def permittable_message_for(field, code)
+  def permittable_message_for(field, code, param)
     spec = field[:message]
     return spec if spec.is_a?(String)
 
-    (spec && spec[code.to_sym]) || Permittable.default_message_for(code)
+    (spec && spec[code.to_sym]) || Permittable.default_message_for(code, param: param, memo: @permittable_message_memo)
   end
 
   def permittable_run_finalize(finalizer, result, violations)
@@ -3140,9 +3162,6 @@ module Permittable
     violations << permittable_violation({}, key, code)
     nil
   end
-
-  # The param a non-object JSON body is reported under (see below).
-  NON_OBJECT_BODY = "(body)".freeze
 
   # Rails parks a JSON body that is not an object (`[1]`, `5`, `"x"`) under
   # `_json`, a key no client wrote. Under `unknown: :error` it was reported
