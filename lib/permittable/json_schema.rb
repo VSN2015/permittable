@@ -156,10 +156,11 @@ module Permittable
 
     # One part as a select sends it (see Permittable#permittable_date_part):
     # digits, leading zeros allowed, and past the year at most two significant
-    # ones. The Integer form is the JSON body's. A blank part reads the field
-    # as sent empty, so it is allowed wherever the field may be blank.
+    # ones. The Integer form is the JSON body's. A blank (1i)-(3i) reads the
+    # field as sent empty, so it is allowed wherever the field may be blank; a
+    # blank, missing or null (4i)-(6i) is 00 whatever the field is.
     def date_part_schema(field, index)
-      blank = blank_floor?(field)
+      blank = index < 3 && blank_floor?(field)
       digits = index.zero? ? '\d+' : '0*\d{1,2}'
       schema = { "type" => %w[string integer], "pattern" => blank ? "^#{digits}$" : "^(#{digits})?$", "minimum" => 0 }
       schema["maximum"] = 99 unless index.zero?

@@ -404,7 +404,7 @@ RSpec.describe Permittable::OpenAPI do
         content["multipart/form-data"]["schema"]
       end
 
-      it "keeps a required date field required in the flat body, and lists its date_select parts under unknown: :error" do
+      it "leaves a required date field out of the flat body's required list, and lists its parts under unknown: :error" do
         klass = controller_class(path: "avatars") do
           permit_params(:create, unknown: :error) do
             required :taken_on, :date
@@ -415,7 +415,9 @@ RSpec.describe Permittable::OpenAPI do
           controllers: [klass], routes: [{ controller: "avatars", action: "create", verb: "POST", path: "/avatars" }]
         )
         schema = doc["paths"]["/avatars"]["post"]["requestBody"]["content"]["multipart/form-data"]["schema"]
-        expect(schema["required"]).to eq(["taken_on"])
+        # A date_select upload sends the parts, never the key, so the flat
+        # body cannot ask for the key.
+        expect(schema).not_to have_key("required")
         expect(schema["properties"].keys).to include("taken_on(1i)", "taken_on(2i)", "taken_on(3i)")
       end
 
@@ -1679,6 +1681,11 @@ RSpec.describe Permittable::OpenAPI do
             "schema" => { "type" => "array", "items" => { "type" => "string" } } }
         ]
       )
+    end
+
+    it "does not require a date query parameter, which a date_select's parts also meet" do
+      klass = controller_class { permit_params(:index) { required :on, :date } }
+      expect(operation(klass)["parameters"].first).to include("name" => "on", "required" => false)
     end
 
     it "does the same for HEAD and DELETE, and keeps POST on a body" do

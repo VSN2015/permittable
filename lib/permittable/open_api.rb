@@ -285,7 +285,7 @@ module Permittable
       if form_container?(schema, "object")
         form_group!(schema, path, required, form, skip_group)
         schema["properties"].each do |key, child|
-          flatten_form(child, path + [key], required && form_required(schema).include?(key), form,
+          flatten_form(child, path + [key], required && schema.fetch("required", []).include?(key), form,
                        skip_group: skip_group)
         end
       elsif form_container?(schema, "array") && form_container?(schema["items"], "object")
@@ -333,15 +333,6 @@ module Permittable
         form[:properties][name] = schema
         form[:required] << name if required
       end
-    end
-
-    # The keys a form part must carry: `required`, plus each date field whose
-    # requirement JsonSchema.object spells as an anyOf (its key or its parts).
-    # A form names parts as the form builder sends them, so the key is what
-    # the flat body lists as required.
-    def form_required(schema)
-      clauses = schema["allOf"] || [schema]
-      Array(schema["required"]) + clauses.filter_map { |clause| clause.dig("anyOf", 0, "required")&.first }
     end
 
     def form_name(path)
@@ -804,7 +795,10 @@ module Permittable
 
       fields.map do |field|
         name = field[:kind] == :array ? "#{field[:name]}[]" : field[:name].to_s
-        { "name" => name, "in" => "query", "required" => !!field[:required], "schema" => JsonSchema.field(field) }
+        # A date_select's parts meet a required :date or :datetime, so the
+        # parameter named for the key alone is never required.
+        required = field[:required] && !Permittable::DATE_PARTS.key?(field[:type])
+        { "name" => name, "in" => "query", "required" => !!required, "schema" => JsonSchema.field(field) }
       end
     end
 

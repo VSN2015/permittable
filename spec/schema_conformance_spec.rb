@@ -197,6 +197,26 @@ module SchemaConformance
         [{}, :agree]
       ]
     },
+    # The runtime reads a blank, missing or null (4i)-(6i) as 00 whatever the
+    # field's own required: and nullable:, so the time parts are always blankable.
+    "a required :datetime under a root, with blank or null time parts" => {
+      root: :e,
+      unknown: :error,
+      contract: proc { required :at, :datetime },
+      payloads: [
+        [{ "e" => { "at(1i)" => "2026", "at(2i)" => "10", "at(3i)" => "17", "at(4i)" => "", "at(5i)" => "" } }, :agree],
+        [{ "e" => { "at(1i)" => "2026", "at(2i)" => "10", "at(3i)" => "17", "at(4i)" => nil } }, :agree],
+        [{ "e" => { "at(1i)" => "2026", "at(2i)" => "10", "at(3i)" => "17", "at(6i)" => "" } }, :agree],
+        [{ "e" => { "at(1i)" => "", "at(2i)" => "10", "at(3i)" => "17" } }, :agree]
+      ]
+    },
+    "a required :datetime in an array of hashes, with blank time parts" => {
+      unknown: :error,
+      contract: proc { array(:items, required: true) { required :at, :datetime } },
+      payloads: [
+        [{ "items" => [{ "at(1i)" => "2026", "at(2i)" => "10", "at(3i)" => "17", "at(4i)" => "", "at(5i)" => "" }] }, :agree]
+      ]
+    },
     "a required :date under the default unknown: :ignore, sent as parts" => {
       contract: proc { required :on, :date },
       payloads: [
