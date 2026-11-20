@@ -242,10 +242,9 @@ module Permittable
   # <button name="button">, so a browser sends `button=` even with no
   # value). Without this `unknown: :error` was unusable outside a JSON API:
   # every browser form failed on the framework's own keys rather than on
-  # anything the client got wrong. Exempt from the CHECK only: unlike the
-  # routing keys these are NOT stripped from monitor mode's raw
-  # pass-through, where handing back an untouched params hash is the whole
-  # promise and a legacy action may well read `_method` itself.
+  # anything the client got wrong. Exempt from the CHECK only: monitor mode's
+  # pass-through keeps declared keys alone, so it carries none of them (a
+  # legacy action may still read `_method` from `params`).
   #
   # The click point of an image submit (image_submit_tag, which has no name
   # of its own to exempt) is a form key too, but not a fixed one: `x` and `y`,
@@ -2941,9 +2940,11 @@ module Permittable
   # path's result: `params.permit` hands its Strings back by reference too,
   # and the values are the client's own. A field's date_select parts
   # (`on(1i)`) ride along, as permit(:on) lets them. A value whose shape does
-  # not fit its declaration is kept only if it is a scalar (monitor reports
-  # the wrong type, it does not hide it): a Hash or an Array of the wrong kind
-  # could carry undeclared keys, e.g. into an `*_attributes` writer.
+  # not fit its declaration is dropped, as permit drops it, unless it is a
+  # scalar sent to a scalar field (monitor reports the wrong type, it does
+  # not hide it): a Hash or an Array of the wrong kind could carry undeclared
+  # keys, e.g. into an `*_attributes` writer. Only a :json field's value, and
+  # an upload, which is a scalar, stay whole.
   def permittable_monitor_filter(fields, hash)
     result = ActiveSupport::HashWithIndifferentAccess.new
     fields.each do |field|
@@ -2962,18 +2963,21 @@ module Permittable
   end
 
   def permittable_monitor_value(field, value)
-    return value if field[:kind] == :json || field[:type] == FILE_TYPE
+    return value if field[:kind] == :json
 
     fields = field[:fields]
-    if fields && field[:kind] == :nested && value.is_a?(Hash)
-      permittable_monitor_filter(fields, value)
-    elsif fields && permittable_fields_for_records?(field, value)
-      value.transform_values { |record| permittable_monitor_filter(fields, record) }
-    elsif fields && field[:kind] == :array && value.is_a?(Array)
-      value.grep_v(Array)
-           .map { |element| element.is_a?(Hash) ? permittable_monitor_filter(fields, element) : element }
+    if fields
+      if value.is_a?(Hash) && field[:kind] == :nested
+        permittable_monitor_filter(fields, value)
+      elsif permittable_fields_for_records?(field, value)
+        value.transform_values { |record| permittable_monitor_filter(fields, record) }
+      elsif value.is_a?(Array) && field[:kind] == :array
+        value.grep(Hash).map { |element| permittable_monitor_filter(fields, element) }
+      else
+        MONITOR_DROP
+      end
     elsif permittable_monitor_scalar?(value) ||
-          (field[:kind] == :array && !fields && value.is_a?(Array) && value.all? { |e| permittable_monitor_scalar?(e) })
+          (field[:kind] == :array && value.is_a?(Array) && value.all? { |e| permittable_monitor_scalar?(e) })
       value
     else
       MONITOR_DROP

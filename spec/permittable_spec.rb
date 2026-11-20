@@ -4981,7 +4981,45 @@ RSpec.describe Permittable do
         expect(body["permitted"]).to eq("ok" => "x", "n" => "bad")
       end
 
-      it "keeps a scalar sent where a nested block was declared, and drops an array" do
+      it "keeps only the Hash elements of an array of hashes" do
+        items = [nil, "s", 3, [{ admin: true }], { label: "a", admin: true }]
+        body = monitored_permitted({ user: { name: "x", items: items } }) do
+          required :name, :integer
+          array(:items) { optional :label, :string }
+        end
+        expect(body["permitted"]).to eq("name" => "x", "items" => [{ "label" => "a" }])
+      end
+
+      it "drops a Hash or an array of Hashes sent to a :file field" do
+        [{ avatar: { admin: true, key: "k" } }, { avatar: [{ admin: true }] }, { docs: [{ admin: true }] }].each do |sent|
+          body = monitored_permitted({ user: { name: "x", **sent } }) do
+            required :name, :integer
+            optional :avatar, :file
+            array :docs, of: :file
+          end
+          expect(body["permitted"]).to eq("name" => "x")
+        end
+      end
+
+      it "keeps a real upload sent to a :file field" do
+        controller = IntegrationHarness.build_controller do
+          include Permittable
+
+          permit_params :create, root: :user, mode: :monitor do
+            required :name, :integer
+            optional :avatar, :file
+          end
+
+          def create
+            render json: { keys: permitted_params.keys, avatar: permitted_params[:avatar].class.name }
+          end
+        end
+        parts = [["user[name]", "x"], ["user[avatar]", "hi", "a.txt"], ["user[admin]", "1"]]
+        result = IntegrationHarness.dispatch(controller, :create, method: "POST", multipart: parts)
+        expect(JSON.parse(result.body)).to eq("keys" => %w[name avatar], "avatar" => "ActionDispatch::Http::UploadedFile")
+      end
+
+      it "drops a scalar or an array sent where a nested block was declared, as params.permit does" do
         body = monitored_permitted({ user: { name: "x", address: "home", tags: "t", other: [1, 2] } }) do
           required :name, :integer
           optional :address do
@@ -4992,7 +5030,7 @@ RSpec.describe Permittable do
             optional :city, :string
           end
         end
-        expect(body["permitted"]).to eq("name" => "x", "address" => "home", "tags" => "t")
+        expect(body["permitted"]).to eq("name" => "x")
       end
 
       it "keeps a :json field's raw hash, as the enforce path does" do
