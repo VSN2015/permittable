@@ -4325,6 +4325,84 @@ RSpec.describe Permittable do
     end
   end
 
+  # Rails merges the route's controller, action and format into params, over
+  # the body's. A rootless contract declaring one would read the route's value
+  # while the exports documented a body property, so permit_params refuses it.
+  describe "router keys as field names", :integration do
+    let(:routed) { { "controller" => "x", "action" => "create", "format" => "json" } }
+
+    %w[action controller].each do |key|
+      it "refuses a rootless :#{key} field at class load, naming the fix" do
+        expect do
+          IntegrationHarness.build_controller do
+            include Permittable
+
+            permit_params(:create, enforce: true) { optional key.to_sym, :string }
+          end
+        end.to raise_error(ArgumentError, /rootless contract cannot declare :#{key}.*Wrap the fields in root:.*rename the param/)
+      end
+    end
+
+    it "refuses one pulled in by a field group, and names every clash" do
+      group = Permittable.fields { optional :controller, :string }
+      expect do
+        IntegrationHarness.build_controller do
+          include Permittable
+
+          permit_params(:create) do
+            use group
+            optional :action, :string
+          end
+        end
+      end.to raise_error(ArgumentError, /cannot declare :controller, :action|cannot declare :action, :controller/)
+    end
+
+    # The route's format (the URL extension, or a route's format: default)
+    # fills it; the OpenAPI export documents that, so it is not refused.
+    it "accepts a rootless :format field, which reads the route's format and not the body's" do
+      formatted = IntegrationHarness.build_controller do
+        include Permittable
+
+        permit_params(:create, enforce: true) { optional :format, :string }
+        def create = render(json: permitted_params)
+      end
+      reply = IntegrationHarness.dispatch(formatted, :create, method: "POST", path_params: routed, json: { format: "client-fmt" })
+      expect([reply.status, JSON.parse(reply.body)]).to eq([200, { "format" => "json" }])
+    end
+
+    it "accepts the client's value under a root" do
+      rooted = IntegrationHarness.build_controller do
+        include Permittable
+
+        permit_params(:create, root: :job, enforce: true) do
+          optional :action, :string
+          optional :format, :string
+        end
+        def create = render(json: permitted_params)
+      end
+      reply = IntegrationHarness.dispatch(rooted, :create, method: "POST", path_params: routed,
+                                                           json: { job: { action: "client-action", format: "client-fmt" } })
+      expect([reply.status, JSON.parse(reply.body)]).to eq([200, { "action" => "client-action", "format" => "client-fmt" }])
+    end
+
+    it "accepts the client's value in a nested field" do
+      nested = IntegrationHarness.build_controller do
+        include Permittable
+
+        permit_params(:create, enforce: true) { optional(:step) { optional :action, :string } }
+        def create = render(json: permitted_params)
+      end
+      reply = IntegrationHarness.dispatch(nested, :create, method: "POST", path_params: routed,
+                                                           json: { step: { action: "client-action" } })
+      expect([reply.status, JSON.parse(reply.body)]).to eq([200, { "step" => { "action" => "client-action" } }])
+    end
+
+    it "leaves a standalone Contract, which has no router, free to declare one" do
+      contract = Permittable::Contract.new { optional :action, :string }
+      expect(contract.call("action" => "client-action").params).to eq("action" => "client-action")
+    end
+  end
+
   describe "delegating to the host's render_error" do
     def rejected(klass)
       c = controller(klass, params: {})

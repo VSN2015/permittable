@@ -401,9 +401,54 @@ RSpec.describe Permittable::Generator do
     let(:draft) { described_class.draft(model: GenArticle) }
 
     it "wraps the fields in monitor-mode permit_params calls with root and model" do
-      expect(draft).to include("permit_params :create, root: :gen_article, model: GenArticle, mode: :monitor do")
-      expect(draft).to include("permit_params :update, root: :gen_article, model: GenArticle, mode: :monitor do")
+      expect(draft).to include("permit_params :create, root: :gen_article, model: GenArticle, enforce: true, mode: :monitor do")
+      expect(draft).to include("permit_params :update, root: :gen_article, model: GenArticle, enforce: true, mode: :monitor do")
       expect(draft).to end_with("end\n")
+    end
+
+    # Changing `mode: :monitor` to `mode: :enforce` is the whole flip, under
+    # any app-wide mode. Without `enforce: true` the rule would be lazy: a
+    # legacy action that never reads permitted_params validated nothing, while
+    # the audit called it enforced.
+    it "carries enforce: true, so the flipped draft validates before a legacy action" do
+      flipped = draft[/permit_params :create.*?^end/m].sub("mode: :monitor", "mode: :enforce")
+      expect(flipped).to include("enforce: true, mode: :enforce do")
+      legacy = IntegrationHarness.build_controller do
+        include Permittable
+
+        class_eval(flipped)
+        def create = render(json: params.require(:gen_article).permit(:title, :views).to_h)
+      end
+      bad = IntegrationHarness.dispatch(legacy, :create, method: "POST", json: { gen_article: { title: "t", views: "x" } })
+      missing = IntegrationHarness.dispatch(legacy, :create, method: "POST", json: { gen_article: { views: 1 } })
+      expect([bad.status, missing.status]).to eq([422, 422])
+    end
+
+    it "enforces after the flip even when the app runs Permittable.mode = :monitor" do
+      flipped = draft[/permit_params :create.*?^end/m].sub("mode: :monitor", "mode: :enforce")
+      legacy = IntegrationHarness.build_controller do
+        include Permittable
+
+        class_eval(flipped)
+        def create = render(json: params.require(:gen_article).permit(:title, :views).to_h)
+      end
+      Permittable.mode = :monitor
+      reply = IntegrationHarness.dispatch(legacy, :create, method: "POST", json: { gen_article: { title: "t", views: "x" } })
+      expect(reply.status).to eq(422)
+    ensure
+      Permittable.mode = :enforce
+    end
+
+    it "behaves as a monitor rule until the flip: a bad request still reaches the action" do
+      drafted = draft[/permit_params :create.*?^end/m]
+      monitor = IntegrationHarness.build_controller do
+        include Permittable
+
+        class_eval(drafted)
+        def create = render(json: params.require(:gen_article).permit(:title, :views).to_h)
+      end
+      reply = IntegrationHarness.dispatch(monitor, :create, method: "POST", json: { gen_article: { views: "x" } })
+      expect(reply.status).to eq(200)
     end
 
     it "maps every column type onto the matching contract type" do
@@ -1312,11 +1357,43 @@ RSpec.describe Permittable::Generator do
     let(:draft) { described_class.draft(scan: scan) }
 
     it "stays rootless, omits model:, and asks for type confirmation" do
-      expect(draft).to include("permit_params :create, :update, mode: :monitor do")
+      expect(draft).to include("permit_params :create, :update, enforce: true, mode: :monitor do")
       expect(draft).not_to include("root:")
       expect(draft).not_to include("model:")
       expect(draft).to match(/optional :q, :string\s+# TODO: confirm the type/)
       expect(draft).to match(/optional :page, :string\s+# TODO: confirm the type/)
+    end
+  end
+
+  # permit_params refuses a rootless router key at class load, so a draft
+  # that declared one would raise the moment it was pasted.
+  describe ".draft of a rootless scan that permits a router key" do
+    let(:scan) { described_class.scan("params.permit(:name, :controller, :action, :format)") }
+    let(:draft) { described_class.draft(scan: scan) }
+
+    it "drafts them as TODOs, and the draft loads in a controller" do
+      expect(draft).to include("# TODO: controller is a router key", "# TODO: action is a router key")
+      expect(draft).not_to match(/^\s*(?:required|optional|array) :(?:controller|action)/)
+      expect(draft).to include("optional :format, :string")
+      expect(draft).to include("optional :name, :string")
+      drafted = draft
+      expect { IntegrationHarness.build_controller { include(Permittable).then { class_eval(drafted) } } }.not_to raise_error
+    end
+
+    it "drafts a router key permitted as a nested hash as a TODO, dropping the block and its end" do
+      %w[action controller].each do |key|
+        nested = described_class.draft(scan: described_class.scan("params.permit(:name, #{key}: [:kind, :step])"))
+        expect(nested).to include("# TODO: #{key} is a router key")
+        expect(nested).not_to match(/#{key}.*\bdo\b/)
+        expect(nested).not_to include(":kind")
+        drafted = nested
+        expect { IntegrationHarness.build_controller { include(Permittable).then { class_eval(drafted) } } }.not_to raise_error
+      end
+    end
+
+    it "keeps one under a root, where the client sends it" do
+      rooted = described_class.draft(scan: described_class.scan("params.require(:job).permit(:name, :action)"))
+      expect(rooted).to include("optional :action, :string")
     end
   end
 
@@ -1596,8 +1673,8 @@ RSpec.describe Permittable::Generator do
       draft = described_class.draft(model: GenNote, scan: described_class.scan("params.permit(*KEYS)"))
       # title is NOT NULL, so the fallback splits into :create and :update
       # like any column draft — both rootless.
-      expect(draft).to include("permit_params :create, model: GenNote, mode: :monitor do")
-      expect(draft).to include("permit_params :update, model: GenNote, mode: :monitor do")
+      expect(draft).to include("permit_params :create, model: GenNote, enforce: true, mode: :monitor do")
+      expect(draft).to include("permit_params :update, model: GenNote, enforce: true, mode: :monitor do")
       rule = load_draft(draft)
       expect(rule[:root]).to be(false) # a rule stores "no envelope" as root: false
       expect(rule[:fields].map { |f| f[:name] }).to eq(%i[title body])
@@ -1862,7 +1939,7 @@ RSpec.describe Permittable::Generator do
     it "does not declare a column whose shape the scan could not decide" do
       scan = described_class.scan("params.permit(tags: [])\nparams.permit(tags: [:a])")
       draft = described_class.draft(model: GenTask, scan: scan)
-      expect(draft).to include("permit_params :create, :update, model: GenTask, mode: :monitor do")
+      expect(draft).to include("permit_params :create, :update, model: GenTask, enforce: true, mode: :monitor do")
       expect(draft).to include("# TODO: tags is permitted as both an array and a nested hash")
       expect(draft).not_to include("optional :tags")
       expect(load_draft(draft)[:fields].map { |f| f[:name] }).to eq(%i[title project_id])
@@ -1934,7 +2011,7 @@ RSpec.describe Permittable::Generator do
 
       it "drafts the rootless calls instead of nothing" do
         draft = described_class.for_controller(controller, source: "params.permit(:page)\nparams.require(:gen_blob).permit(:data)")
-        expect(draft).to include("permit_params :create, :update, model: GenBlob, mode: :monitor do")
+        expect(draft).to include("permit_params :create, :update, model: GenBlob, enforce: true, mode: :monitor do")
         expect(load_draft(draft)[:fields].map { |f| f[:name] }).to eq(%i[page])
       end
 
@@ -2042,7 +2119,7 @@ RSpec.describe Permittable::Generator do
       it "narrows a shared rule to the action left" do
         rootless = Class.new { def self.controller_name = "no_such_things" }
         draft = described_class.for_controller(rootless, source: "params.permit(:q)", except: [:create])
-        expect(draft).to include("permit_params :update, mode: :monitor do")
+        expect(draft).to include("permit_params :update, enforce: true, mode: :monitor do")
       end
 
       it "drafts nothing when every action is excepted" do

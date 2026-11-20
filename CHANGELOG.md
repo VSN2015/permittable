@@ -1,5 +1,17 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+<!-- title: a rootless contract refuses the router's keys, and the audit stops calling a lazy rule enforced -->
+
+Two fixes. A rootless controller contract that declares `action` or `controller` now fails at class load, because the router's value was read where the client's was documented (`format` is still allowed: it reads the route's format). `permittable:audit` labels a rule that nothing runs before the action `lazy` instead of `enforce`, and `permittable:generate` drafts carry `enforce: true`, so changing `mode: :monitor` to `mode: :enforce` enforces.
+
+A boot can now fail: a controller whose rootless `permit_params` declares a top-level `action` or `controller` field raises `ArgumentError`. The audit's table and summary line change: a rule with neither `enforce: true` nor monitor mode reads `lazy — checked only if the action reads permitted_params` where it read `enforce`, and the summary reads `N enforced, M lazy, K in monitor mode, ...`. A script that matches the old summary text needs the new one; the `[strict]` exit status is unchanged.
+
+### Fixed
+- **A rootless contract cannot declare `action` or `controller`.** Rails merges the route's values into `params` over the body's, so `permitted_params` returned `"create"` for a field the client sent as `"client-action"`, while the JSON Schema and OpenAPI exports documented it as a body property. `permit_params` now raises `ArgumentError` at class load, naming the field and the fix: wrap the fields in `root:` or rename the param. A `root:` contract, a nested field of that name, a rootless `format` field (it reads the route's format, as since 0.15.1) and a standalone `Permittable::Contract` (no router) are unchanged. `permittable:generate` drafts such a key as a `# TODO` in a rootless draft instead of a field.
+- **`permittable:audit` no longer reports a lazy rule as `enforce`.** A rule declared without `enforce: true` and not in monitor mode has no `before_action`, so an action that reads `params` directly is checked by nothing, yet the table printed `enforce` and the summary counted it enforced. It now reads `lazy — checked only if the action reads permitted_params` and is counted in its own `lazy` bucket (`Audit.summary` gains `lazy:`, `Audit::Entry#lazy?` is new). `Audit.summary[:enforced]` no longer counts lazy rules: they moved to `:lazy`, so a caller that read `enforced` as "covered and enforcing" now sees a smaller number. A lazy rule still counts as covered, so `[strict]` passes and fails exactly as before.
+- **A `permittable:generate` draft enforces when its mode is flipped.** A draft was `permit_params ..., mode: :monitor do`, and removing the mode left a lazy rule that a legacy action never ran. Drafts are now `permit_params ..., enforce: true, mode: :monitor do`, which behaves as monitor mode until `mode: :monitor` becomes `mode: :enforce` (which holds under any app-wide `Permittable.mode`). The draft's header comment and the guide say so.
+
 ## 0.16.0 (2026-11-15)
 <!-- title: date and boolean strings held to what the parser read, an audit that stops counting skipped contracts, and 422 rendered as an Integer -->
 
