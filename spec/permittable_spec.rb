@@ -1781,6 +1781,27 @@ RSpec.describe Permittable do
     # byte of "é". A literal, so its encoding is UTF-8 and it is not valid.
     let(:malformed) { "caf\xC3" }
 
+    # PostgreSQL refuses a text value holding U+0000 ("string contains null
+    # byte"), so one kept by :string was a 500 at the INSERT.
+    it "refuses a String holding a NUL byte as invalid_type, for :string and what builds on it" do
+      decl = proc do
+        permit_params(:create) do
+          optional :s, :string
+          optional :e, :string, format: :email
+          optional :q, :string, normalize: :squish
+          optional :j, :json
+          array :tags, of: :string
+        end
+      end
+      expect(violations_for({ s: "a\u0000b", e: "a\u0000@b.com", q: "a\u0000b", tags: %W[ok a\u0000] }, &decl).details)
+        .to contain_exactly({ param: "s", code: "invalid_type" }, { param: "e", code: "invalid_type" },
+                            { param: "q", code: "invalid_type" }, { param: "tags[1]", code: "invalid_type" })
+      expect(violations_for({ s: "a\u0000".encode("UTF-16LE") }, &decl).details)
+        .to eq([{ param: "s", code: "invalid_type" }])
+      # :json is the app's own opaque data; a NUL inside it is left alone.
+      expect(permit({ j: { "a" => "b\u0000" }, s: "ok" }, &decl)[:j]).to eq({ "a" => "b\u0000" })
+    end
+
     it "does not run an array's validate: over the nils of elements that failed to cast" do
       decl = proc { permit_params(:create) { array :ids, of: :integer, validate: ->(a) { a.sum < 100 } } }
       expect(violations_for({ ids: ["x", 2] }, &decl).details).to eq([{ param: "ids[0]", code: "invalid_type" }])

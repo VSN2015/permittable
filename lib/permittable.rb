@@ -810,7 +810,15 @@ module Permittable
       # `skip_parameter_encoding` / `param_encoding` send a controller binary
       # or Shift_JIS text ON PURPOSE, and converting it would hand the app
       # something other than what it asked Rails for.
-      return cast_string(value) if type == :string
+      # A NUL is no text either: PostgreSQL refuses a string holding U+0000
+      # ("string contains null byte"), so keeping it was a 500 at the INSERT.
+      # Read as UTF-8, so a UTF-16 String's own zero bytes are not mistaken
+      # for one; text with no UTF-8 reading is left to the checks it fails.
+      if type == :string
+        return [:error, "invalid_type"] if utf8_text(value)&.include?("\u0000")
+
+        return cast_string(value)
+      end
 
       # A UTF-8 String IS already its own inspection copy — the check just
       # above already scanned it — so utf8_text would only scan the same

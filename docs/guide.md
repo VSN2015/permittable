@@ -521,7 +521,7 @@ Coercion is **deliberately strict**, and deliberately *not* `ActiveModel::Type`.
 
 | Type | Accepts | Rejects (`invalid_type`) |
 |---|---|---|
-| `:string` | `String`, returned in the encoding it arrived in; `Numeric`/`true`/`false` are stringified | Arrays, hashes, a `String` whose bytes are invalid in its own encoding (`"caf\xC3"`) |
+| `:string` | `String`, returned in the encoding it arrived in; `Numeric`/`true`/`false` are stringified | Arrays, hashes, a `String` whose bytes are invalid in its own encoding (`"caf\xC3"`), a `String` containing a NUL character (`"a\u0000b"`, which PostgreSQL refuses to store; every `format:` and `normalize:` on the field inherits this) |
 | `:integer` | `Integer`; whole `Float`s (`4.0`); canonical base-10 numeric strings (`"-12"`, `"007"`) | `"4.5"`, `"abc"`, `"1_8"`, `" 99 "`, `4.5`, NaN/Infinity |
 | `:float` | a real `Numeric`; a canonical numeric string (`"1.5"`, `".5"`, `"-2e3"`) | `"abc"`, `"1_8.5"`, `" 1.5 "`, and any number outside a Float's range, as a `Numeric` or a string alike (`BigDecimal("1e-400")`, `"1e400"`), a `Complex` (even `Complex(1, 0)`), a `Numeric` that cannot be converted |
 | `:decimal` | a real `Numeric`, or a canonical numeric string → `BigDecimal`; a `Rational` whose decimal expansion is exact (`Rational(1, 2)`, `3r`) | Unparseable strings, `"1_000"`, `" 1.5 "`, a `Complex`, a `Rational` no decimal holds exactly (`Rational(1, 3)`), a `Numeric` that cannot be converted |
