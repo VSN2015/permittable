@@ -5296,9 +5296,17 @@ RSpec.describe Permittable do
 
           # `ghost` is declared through the attribute API with an enum over it,
           # so assignment takes it as it takes any attribute (see below).
-          it "treats an enum over an attribute-API attribute as existing" do
+          # ... and is held to the same in: rule as an enum over a column:
+          # `ghost: "bogus"` and `ghost: 5` raise ArgumentError on assignment.
+          it "holds an enum over an attribute-API attribute to the enum's in: rule" do
             m = enum_model
             expect(&declaring(m) { optional :ghost, :string, in: m.ghosts.keys }).not_to raise_error
+            expect(&declaring(m) { optional :ghost, :integer, in: m.ghosts.values }).not_to raise_error
+            expect(&declaring(m) { optional :ghost, :string })
+              .to raise_error(ArgumentError, /'ghost' is an enum on EnumThing, declared :string without an in:/)
+            expect(&declaring(m) { optional :ghost, :integer })
+              .to raise_error(ArgumentError, /declared :integer without an in:/)
+            expect(&declaring(m) { optional :ghost, :integer, in: [0, 5] }).to raise_error(ArgumentError, /would refuse: 5/)
           end
 
           it "is not consulted with the check off" do

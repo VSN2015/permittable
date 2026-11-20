@@ -177,7 +177,9 @@ module Permittable
       declared = types.is_a?(Hash) ? types[field.to_sym] : types
       target = resolve_alias(klass, field)
       column = klass.columns_hash[target]
-      return ensure_attribute_type!(label, klass, field, declared, target) if declared && column.nil?
+      if declared && column.nil?
+        return ensure_attribute_type!(label, klass, field, declared, target, allowed: allowed, transformed: transformed)
+      end
       return unless declared && column
 
       ensure_not_array_column!(label, klass, field, declared, column)
@@ -222,11 +224,20 @@ module Permittable
     # `attribute :vip, :boolean` over no column: Rails assigns it like any
     # attribute, so it exists, and its type is the one the contract is compared
     # against, by the same groups. A store accessor or an attribute declared
-    # without a type has none to compare, and an enum is the enum rule's
-    # business (and, with no column, never checked).
-    def ensure_attribute_type!(label, klass, field, declared, target)
+    # without a type has none to compare. An enum over one is held to the same
+    # in: rule as an enum over a column (see ensure_enum_contract!): assignment
+    # refuses a value it does not map either way.
+    def ensure_attribute_type!(label, klass, field, declared, target, allowed: nil, transformed: nil)
+      enum_name = [field.to_s, target].find { |name| enum_attribute?(klass, name) }
+      if enum_name
+        return unless TYPE_GROUPS[declared.to_sym] == :text || integer_enum_declaration?(klass, enum_name, declared)
+
+        return ensure_enum_contract!(label, klass, enum_name, declared, allowed && allowed[field.to_sym],
+                                     transformed: Array(transformed).include?(field.to_sym), shown: field.to_s)
+      end
+
       actual_type = attribute_declared?(klass, target) && klass.attribute_types[target].type
-      return if !actual_type || enum_attribute?(klass, target)
+      return unless actual_type
 
       wanted = TYPE_GROUPS[declared.to_sym]
       actual = TYPE_GROUPS[actual_type.to_sym]
