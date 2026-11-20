@@ -1,5 +1,19 @@
 <!-- CHANGELOG.md -->
 
+## Unreleased
+<!-- title: NUL bytes refused, integer enums held to an in:, translations that interpolate, and a Contract that survives a Thread's stack -->
+
+Seven fixes to inputs and declarations that ended in a 500, an uncaught `SystemStackError`, or a message the client could not read. Each can make something that passes today fail. A request can now be refused: a `:string` (or an `array of: :string` element, or a field with a `format:` or `normalize:`) holding a NUL character, which was kept and then raised at the PostgreSQL INSERT, and a JSON body that is not an object sent to a rootless `unknown: :error` contract, which was a 422 `unknown` and is now a 400. A boot can now fail: an `:integer` field over an integer-backed Rails `enum` with no `in:`, with a Range, or with an `in:` listing an integer the enum does not map, when `Permittable.check_column_types` is on.
+
+### Fixed
+- **`Contract#call` raised an uncaught `SystemStackError` inside a thread.** A `:json` value nested 62 levels deep, well under the 100 `JSON.parse` accepts, overflowed a thread's stack (a Puma request thread, a job runner) because the input was copied through `HashWithIndifferentAccess`'s recursive conversion. The copy is now iterative, so any depth `JSON.parse` takes by default is processed, or refused with `max_depth:` as the usual `depth` violation. A controller was not affected: Rails hands it parameters already converted.
+- **An `:integer` declaration over an integer-backed `enum` passed the drift guard with no `in:`.** `optional :role, :integer` (or `in: [0, 1, 2]`, or `in: 0..9`) passed, and `role: 5` was cast and then raised `ArgumentError: '5' is not a valid role` on assignment. It is now held to the rule a text declaration already was, with the enum's stored integers as the list: `in: User.roles.values`.
+- **A `:string` accepted a NUL character.** `"a\u0000b"` was kept, and PostgreSQL refuses it. It is now `invalid_type`, as is the same text under `format:` or in an `array of: :string`; `:json` contents and `:file` are unchanged. A `normalize:` that strips edge whitespace (`:squish`, `:strip`) still removes a leading or trailing NUL before the check, so only a NUL left inside the value is refused.
+- **A JSON body that is not an object was reported as an unknown `_json`.** Rails parks `[1]`, `5` or `"x"` under `_json`; a rootless `unknown: :error` contract now answers `400` with `{ param: "(body)", code: "invalid_type" }`. A contract that declares `_json`, `unknown: :ignore`, a form field named `_json` and a standalone `Contract` are unchanged. An object body whose only key is `{"_json": 1}` is indistinguishable from a wrapped scalar and gets the same answer.
+- **`permittable.errors.*` translations were not interpolated.** `invalid_type: "%{param} type"` shipped the literal `%{param}`. `%{param}` (the violation's path) and `%{code}` are now filled in, as values only, so a client-controlled key containing `%{` cannot alter the message. A translation with no placeholders is used as written, and a placeholder with no value here is left as written.
+- **`unknown: :error` looked its translation up once per violation.** The lookup is now made once per locale and code for each validation; 20,000 undeclared keys took 2.9s and take 1.2s.
+- **An attribute declared with `attribute :vip, :boolean` was reported as "does not exist in the database".** It now exists for the guard, with no `virtual: true`, and with `check_column_types` on it is compared against the attribute's own type. An enum over such an attribute with no column is accepted as well, where it used to be reported missing. `items_attributes` is still reported.
+
 ## 0.16.0 (2026-11-15)
 <!-- title: date and boolean strings held to what the parser read, an audit that stops counting skipped contracts, and 422 rendered as an Integer -->
 
