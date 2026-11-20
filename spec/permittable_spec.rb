@@ -5231,7 +5231,32 @@ RSpec.describe Permittable do
               .to raise_error(ArgumentError, /in: EnumThing.tiers.keys/)
           end
 
-          it "still accepts the column's own group" do
+          # `status: 5` on an `:integer` field passed the contract and then
+          # raised ArgumentError ("'5' is not a valid status") on assignment:
+          # an integer declaration over an integer-backed enum is held to the
+          # same rule as the text one, with its stored integers as the list.
+          it "holds an :integer declaration over an integer-backed enum to an in: of its stored integers" do
+            m = enum_model
+            expect(&declaring(m) { optional :status, :integer, in: [0, 1] }).not_to raise_error
+            expect(&declaring(m) { optional :status, :integer, in: [1] }).not_to raise_error
+            expect(&declaring(m) { optional :status, :integer, in: m.statuses.values }).not_to raise_error
+          end
+
+          it "refuses an :integer declaration with no in:, a Range, or an in: past the stored integers" do
+            m = enum_model
+            expect(&declaring(m) { optional :status, :integer }).to raise_error(ArgumentError) do |e|
+              expect(e.message).to match(/'status' is an enum on EnumThing, declared :integer without an in:/)
+              expect(e.message).to include("in: EnumThing.statuses.values")
+              expect(e.message).not_to match(/virtual: true/)
+            end
+            expect(&declaring(m) { optional :status, :integer, in: 0..9 })
+              .to raise_error(ArgumentError, /does not list its values/)
+            expect(&declaring(m) { optional :status, :integer, in: [0, 1, 2] })
+              .to raise_error(ArgumentError, /would refuse: 2/)
+          end
+
+          it "leaves an :integer declaration alone with the check off" do
+            Permittable.check_column_types = false
             expect(&declaring(enum_model) { optional :status, :integer }).not_to raise_error
           end
 
