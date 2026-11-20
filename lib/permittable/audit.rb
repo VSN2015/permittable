@@ -537,11 +537,17 @@ module Permittable
     def status(entry)
       return ["no contract", uncovered_note(entry)].compact.join(" — ") unless entry.covered?
 
-      parts = [entry.lazy? ? LAZY_NOTE : entry.mode.to_s]
+      parts = [entry.lazy? ? lazy_label(entry) : entry.mode.to_s]
       parts << "model: #{entry.model.name}" if entry.model.respond_to?(:name) && entry.model.name
       parts << "unknown: #{entry.unknown}" unless entry.unknown == :ignore
       parts << not_found_note(entry)
       parts.compact.join("  ")
+    end
+
+    # The note says what a lazy rule's row is worth; an action Rails would 404
+    # has no check to describe.
+    def lazy_label(entry)
+      entry.missing_action? ? "lazy" : LAZY_NOTE
     end
 
     def uncovered_note(entry)

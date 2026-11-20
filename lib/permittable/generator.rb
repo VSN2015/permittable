@@ -1070,8 +1070,9 @@ module Permittable
       parts = ["permit_params #{actions.map(&:inspect).join(', ')}"]
       parts << "root: :#{root}" if root
       parts << "model: #{model.name}" if model
-      # enforce: true rides along so that deleting `mode: :monitor` — the whole
-      # flip — lands in enforce, not in a lazy rule that no before_action runs.
+      # enforce: true rides along so that the flip (`mode: :enforce`, or deleting
+      # the mode when the app is not monitoring) never leaves a lazy rule that
+      # no before_action runs.
       parts << "enforce: true"
       parts << "mode: :monitor do"
       parts.join(", ")
@@ -1313,7 +1314,7 @@ module Permittable
 
     HEADER = "# Drafted by permittable:generate — review the TODOs, then deploy: monitor\n" \
              "# mode reports violations (instrumentation + log) without rejecting requests.\n" \
-             "# To enforce, delete `mode: :monitor` — nothing else.\n".freeze
+             "# To enforce, change `mode: :monitor` to `mode: :enforce`.\n".freeze
 
     UPDATE_NOTE = "# :update has nothing required — a PATCH sends only the fields it changes.\n".freeze
 
@@ -1357,9 +1358,10 @@ module Permittable
 
     # A rootless contract cannot declare the router's keys (permit_params
     # raises at class load: Rails puts the route's value there, never the
-    # client's), so a top-level `format` column or permitted `action` key
-    # becomes a TODO, with the block it opens, rather than a draft that
-    # raises when pasted.
+    # client's), so a top-level `action` or `controller` column or permitted
+    # key becomes a TODO, with the block it opens (a nested opener may carry
+    # a trailing TODO comment), rather than a draft that raises when pasted.
+    # `format` is not refused, so it stays a field.
     ROUTER_KEY_LINE = /\A\w+ :"?(#{Permittable::REFUSED_ROOTLESS_KEYS.join('|')})"?(?=[ ,]|\z)/
 
     def without_router_keys(body)
@@ -1372,7 +1374,7 @@ module Permittable
         match = ROUTER_KEY_LINE.match(line)
         next line unless match
 
-        skipping = line.end_with?(" do")
+        skipping = line.match?(/\sdo(?:\s+#.*)?\z/)
         "# TODO: #{match[1]} is a router key — a rootless contract cannot declare it; " \
           "wrap the fields in root: or rename the param"
       end

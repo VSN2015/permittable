@@ -406,12 +406,13 @@ RSpec.describe Permittable::Generator do
       expect(draft).to end_with("end\n")
     end
 
-    # Deleting `mode: :monitor` is the whole flip. Without `enforce: true`
-    # the rule is lazy: a legacy action that never reads permitted_params
-    # validated nothing, while the audit called it enforced.
-    it "carries enforce: true, so deleting mode: :monitor lands in enforce and not in a lazy rule" do
-      flipped = draft[/permit_params :create.*?^end/m].sub(", mode: :monitor", "")
-      expect(flipped).to include("enforce: true do")
+    # Changing `mode: :monitor` to `mode: :enforce` is the whole flip, under
+    # any app-wide mode. Without `enforce: true` the rule would be lazy: a
+    # legacy action that never reads permitted_params validated nothing, while
+    # the audit called it enforced.
+    it "carries enforce: true, so the flipped draft validates before a legacy action" do
+      flipped = draft[/permit_params :create.*?^end/m].sub("mode: :monitor", "mode: :enforce")
+      expect(flipped).to include("enforce: true, mode: :enforce do")
       legacy = IntegrationHarness.build_controller do
         include Permittable
 
@@ -421,6 +422,21 @@ RSpec.describe Permittable::Generator do
       bad = IntegrationHarness.dispatch(legacy, :create, method: "POST", json: { gen_article: { title: "t", views: "x" } })
       missing = IntegrationHarness.dispatch(legacy, :create, method: "POST", json: { gen_article: { views: 1 } })
       expect([bad.status, missing.status]).to eq([422, 422])
+    end
+
+    it "enforces after the flip even when the app runs Permittable.mode = :monitor" do
+      flipped = draft[/permit_params :create.*?^end/m].sub("mode: :monitor", "mode: :enforce")
+      legacy = IntegrationHarness.build_controller do
+        include Permittable
+
+        class_eval(flipped)
+        def create = render(json: params.require(:gen_article).permit(:title, :views).to_h)
+      end
+      Permittable.mode = :monitor
+      reply = IntegrationHarness.dispatch(legacy, :create, method: "POST", json: { gen_article: { title: "t", views: "x" } })
+      expect(reply.status).to eq(422)
+    ensure
+      Permittable.mode = :enforce
     end
 
     it "behaves as a monitor rule until the flip: a bad request still reaches the action" do
@@ -1362,6 +1378,17 @@ RSpec.describe Permittable::Generator do
       expect(draft).to include("optional :name, :string")
       drafted = draft
       expect { IntegrationHarness.build_controller { include(Permittable).then { class_eval(drafted) } } }.not_to raise_error
+    end
+
+    it "drafts a router key permitted as a nested hash as a TODO, dropping the block and its end" do
+      %w[action controller].each do |key|
+        nested = described_class.draft(scan: described_class.scan("params.permit(:name, #{key}: [:kind, :step])"))
+        expect(nested).to include("# TODO: #{key} is a router key")
+        expect(nested).not_to match(/#{key}.*\bdo\b/)
+        expect(nested).not_to include(":kind")
+        drafted = nested
+        expect { IntegrationHarness.build_controller { include(Permittable).then { class_eval(drafted) } } }.not_to raise_error
+      end
     end
 
     it "keeps one under a root, where the client sends it" do

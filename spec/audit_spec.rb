@@ -253,7 +253,7 @@ RSpec.describe Permittable::Audit do
 
         it "shows the mode and that the action is not found" do
           expect(described_class.format(found))
-            .to match(%r{POST\s+/posts\s+create\s+lazy — checked only if the action reads permitted_params  action not found$})
+            .to match(%r{POST\s+/posts\s+create\s+lazy  action not found$})
         end
 
         # Out of every bucket, it would otherwise vanish from the report's

@@ -1048,7 +1048,7 @@ For each controller the task infers the model from `controller_name` (columns gi
 ```ruby
 # Drafted by permittable:generate — review the TODOs, then deploy: monitor
 # mode reports violations (instrumentation + log) without rejecting requests.
-# To enforce, delete `mode: :monitor` — nothing else.
+# To enforce, change `mode: :monitor` to `mode: :enforce`.
 permit_params :create, root: :user, model: User, enforce: true, mode: :monitor do
   required :name, :string
   optional :age, :integer
@@ -1071,7 +1071,7 @@ A scanned draft keeps the root its permit call names (a rootless `params.permit(
 
 The generator's one rule is **draft, don't guess** — everything it cannot know for sure stays visible instead of silently decided:
 
-- Drafts come out in **monitor mode**, so pasting one changes nothing until you flip it. Every draft also carries `enforce: true`, so the flip is to **delete `mode: :monitor`** and nothing else: the rule then validates in the `before_action`, whatever the action reads. Without `enforce: true` a rule is [lazy](#auditing-coverage-permittableaudit): a legacy action that reads `params` directly would be checked by nothing.
+- Drafts come out in **monitor mode**, so pasting one changes nothing until you flip it. Every draft also carries `enforce: true`, so the flip is to **change `mode: :monitor` to `mode: :enforce`**, which holds whatever `Permittable.mode` the app runs: the rule then validates in the `before_action`, whatever the action reads. (Deleting `mode: :monitor` also enforces, but not under an app-wide `Permittable.mode = :monitor`, where the rule would inherit monitor.) Without `enforce: true` a rule is [lazy](#auditing-coverage-permittableaudit): a legacy action that reads `params` directly would be checked by nothing.
 - A permitted key that isn't a column becomes `virtual: true` with a TODO; a PostgreSQL array column drafts as `array :tags, of: :string` with a `length:` TODO (an array of `json`/`jsonb` elements, which `of:` cannot express, is a TODO, and so is a `json`/`jsonb` column whose default is an array, since `:json` accepts only an object); a column type with no faithful representation (`binary`, geometry types) becomes a TODO comment; a permit argument the conservative parser can't read (`*dynamic_keys`) is kept verbatim in a TODO instead of dropped.
 - Drafted from the columns alone, `created_at`/`updated_at` and a primary key the database generates are left out: Rails or the database assigns them. A generated key is an auto-increment column (as the adapter reports it, even as one part of a composite key) or one with a default or default function, such as a uuid. A permit call that **lists** one keeps it, typed from its real column (`optional :created_at, :datetime`) and always `optional`, even though the column is NOT NULL — it is a column like any other, so the schema-drift guard stays on for it. A primary key the client must send is no such column: a natural key (`sku`, from `create_table :items, primary_key: :sku, id: :string`) or a part of a composite key that is not auto-increment is drafted like any other, `required` on `:create` when it is NOT NULL with no default.
 - **Comments are not code.** A commented-out `params.require(:admin).permit(:superuser)` kept for reference is skipped, so it can't contribute a root or a field to the draft. The source is tokenised with `Ripper` for this, because `#` is only sometimes a comment — a permit call inside `#{'#{...}'}` interpolation is live code and is still read, and quoted keys like `permit("name")` still work.
