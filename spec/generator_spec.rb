@@ -1352,20 +1352,21 @@ RSpec.describe Permittable::Generator do
   # permit_params refuses a rootless router key at class load, so a draft
   # that declared one would raise the moment it was pasted.
   describe ".draft of a rootless scan that permits a router key" do
-    let(:scan) { described_class.scan("params.permit(:name, :format, :action)") }
+    let(:scan) { described_class.scan("params.permit(:name, :controller, :action, :format)") }
     let(:draft) { described_class.draft(scan: scan) }
 
     it "drafts them as TODOs, and the draft loads in a controller" do
-      expect(draft).to include("# TODO: format is a router key", "# TODO: action is a router key")
-      expect(draft).not_to match(/^\s*(?:required|optional|array) :(?:format|action)/)
+      expect(draft).to include("# TODO: controller is a router key", "# TODO: action is a router key")
+      expect(draft).not_to match(/^\s*(?:required|optional|array) :(?:controller|action)/)
+      expect(draft).to include("optional :format, :string")
       expect(draft).to include("optional :name, :string")
       drafted = draft
       expect { IntegrationHarness.build_controller { include(Permittable).then { class_eval(drafted) } } }.not_to raise_error
     end
 
     it "keeps one under a root, where the client sends it" do
-      rooted = described_class.draft(scan: described_class.scan("params.require(:job).permit(:name, :format)"))
-      expect(rooted).to include("optional :format, :string")
+      rooted = described_class.draft(scan: described_class.scan("params.require(:job).permit(:name, :action)"))
+      expect(rooted).to include("optional :action, :string")
     end
   end
 

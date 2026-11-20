@@ -1094,6 +1094,33 @@ RSpec.describe Permittable::OpenAPI do
         expect(body["required"]).to eq(%w[kind])
       end
 
+      it "treats a route's format: default like any other default: the field leaves the body and its required list" do
+        formatted = IntegrationHarness.build_controller do
+          include Permittable
+
+          def self.controller_path = "widgets"
+          permit_params(:create, unknown: :error) do
+            required :format, :string
+            optional :name, :string
+          end
+          def create = render(json: permitted_params)
+        end
+        post = widgets_document(formatted) do
+          post "w/special", to: "widgets#create", defaults: { format: "json" }
+          post "dup", to: "widgets#create", defaults: { format: "json" }, constraints: ->(r) { r.headers["X-L"] }
+          post "dup", to: "widgets#create"
+        end["paths"]
+        schema = body_schema(post["/w/special"]["post"])
+        expect(schema["properties"]["format"]).to eq({})
+        expect(schema).not_to have_key("required")
+        # What the runtime does: the default fills `format`, so a body without it is accepted.
+        reply = IntegrationHarness.dispatch(formatted, :create, method: "POST", path_params: { format: "json" },
+                                                                json: { name: "x" })
+        expect([reply.status, JSON.parse(reply.body)]).to eq([200, { "format" => "json", "name" => "x" }])
+        # A route sharing the slot that leaves it to the client keeps it required.
+        expect(body_schema(post["/dup"]["post"])["required"]).to eq(%w[format])
+      end
+
       it "names the defaults on the descriptor, leaving controller and action out" do
         route_set = ActionDispatch::Routing::RouteSet.new.tap do |routes|
           routes.draw do

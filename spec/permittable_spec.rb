@@ -4331,7 +4331,7 @@ RSpec.describe Permittable do
   describe "router keys as field names", :integration do
     let(:routed) { { "controller" => "x", "action" => "create", "format" => "json" } }
 
-    %w[action controller format].each do |key|
+    %w[action controller].each do |key|
       it "refuses a rootless :#{key} field at class load, naming the fix" do
         expect do
           IntegrationHarness.build_controller do
@@ -4344,7 +4344,7 @@ RSpec.describe Permittable do
     end
 
     it "refuses one pulled in by a field group, and names every clash" do
-      group = Permittable.fields { optional :format, :string }
+      group = Permittable.fields { optional :controller, :string }
       expect do
         IntegrationHarness.build_controller do
           include Permittable
@@ -4354,7 +4354,20 @@ RSpec.describe Permittable do
             optional :action, :string
           end
         end
-      end.to raise_error(ArgumentError, /cannot declare :format, :action|cannot declare :action, :format/)
+      end.to raise_error(ArgumentError, /cannot declare :controller, :action|cannot declare :action, :controller/)
+    end
+
+    # The route's format (the URL extension, or a route's format: default)
+    # fills it; the OpenAPI export documents that, so it is not refused.
+    it "accepts a rootless :format field, which reads the route's format and not the body's" do
+      formatted = IntegrationHarness.build_controller do
+        include Permittable
+
+        permit_params(:create, enforce: true) { optional :format, :string }
+        def create = render(json: permitted_params)
+      end
+      reply = IntegrationHarness.dispatch(formatted, :create, method: "POST", path_params: routed, json: { format: "client-fmt" })
+      expect([reply.status, JSON.parse(reply.body)]).to eq([200, { "format" => "json" }])
     end
 
     it "accepts the client's value under a root" do

@@ -1360,7 +1360,7 @@ module Permittable
     # client's), so a top-level `format` column or permitted `action` key
     # becomes a TODO, with the block it opens, rather than a draft that
     # raises when pasted.
-    ROUTER_KEY_LINE = /\A\w+ :"?(#{Permittable::ROUTING_KEYS.join('|')})"?(?=[ ,]|\z)/
+    ROUTER_KEY_LINE = /\A\w+ :"?(#{Permittable::REFUSED_ROOTLESS_KEYS.join('|')})"?(?=[ ,]|\z)/
 
     def without_router_keys(body)
       skipping = false

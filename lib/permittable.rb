@@ -257,6 +257,10 @@ module Permittable
   # asymmetry between them is the deliberate point, so spell it once here
   # rather than leaving a bare ROUTING_KEYS to read like an oversight.
   UNCHECKED_TOP_LEVEL_KEYS = (ROUTING_KEYS + FORM_KEYS).freeze
+  # What a rootless controller contract may not declare: the route's value
+  # always replaces the client's. `format` is left out on purpose: a route's
+  # `format:` default fills such a field, which the OpenAPI export documents.
+  REFUSED_ROOTLESS_KEYS = %w[controller action].freeze
   MONITOR_DROPPED_KEYS = ROUTING_KEYS
   # Rails' date_select, datetime_select and time_select submit ONE value as
   # several keys, each named for its position: `starts_on(1i)` the year,
@@ -2569,15 +2573,15 @@ module Permittable
 
     private
 
-    # Rails merges the route's `controller`, `action` and `format` into params
-    # and the router's value wins over the body's, so a rootless contract
-    # declaring one would silently read the router's, and the exports would
-    # still document a body property. A controller only: a standalone
+    # Rails merges the route's `controller` and `action` into params, and the
+    # router's value wins over the body's, so a rootless contract declaring
+    # one would silently read the router's, and the exports would still
+    # document a body property. A controller only: a standalone
     # Contract has no router, so one may declare them.
     def permittable_refuse_router_keys!(root, fields)
       return unless defined?(::ActionController::Metal) && self < ::ActionController::Metal && !root
 
-      clash = fields.map { |f| f[:name].to_s } & ROUTING_KEYS
+      clash = fields.map { |f| f[:name].to_s } & REFUSED_ROOTLESS_KEYS
       return if clash.empty?
 
       raise ArgumentError,
