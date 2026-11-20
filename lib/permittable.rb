@@ -3170,10 +3170,14 @@ module Permittable
   # `unknown: :ignore` action may still read `params[:_json]` itself, and a
   # contract that declares `_json` has asked for it. A request only — a
   # standalone Contract has no body — and a JSON one: `_json` in a form is
-  # just an unknown field. A Hash under it is an object body that happens to
-  # use the name, since Rails never wraps one.
+  # just an unknown field. An object body that happens to use the name is
+  # not that: Rails never wraps one, so `_json` must be the only key the
+  # client sent (the router's, the path's and ParamsWrapper's keys are not
+  # the client's) and not itself a Hash.
   def permittable_non_object_body?(rule, raw)
-    rule[:unknown] == :error && raw.key?("_json") && !raw["_json"].is_a?(Hash) &&
+    sent = raw.keys - UNCHECKED_TOP_LEVEL_KEYS - permittable_request_supplied_keys -
+           [@permittable_wrapper_key, permittable_configured_csrf_key]
+    rule[:unknown] == :error && sent == ["_json"] && !raw["_json"].is_a?(Hash) &&
       rule[:fields].none? { |f| f[:name].to_s == "_json" } &&
       respond_to?(:request) && request.respond_to?(:content_mime_type) &&
       request.content_mime_type&.symbol == :json

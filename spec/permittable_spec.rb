@@ -6566,6 +6566,13 @@ RSpec.describe Permittable do
           expect(result.status).to eq(400), "for #{body}: #{result.body}"
           expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "(body)", "code" => "invalid_type" }])
         end
+        # A JSON null body is no object either.
+        expect(IntegrationHarness.dispatch(controller, :create, method: "POST", raw_json: "null").status).to eq(400)
+        # A real object that also carries other keys is an object: `_json` is
+        # then just a key it sent, unknown like any other.
+        mixed = IntegrationHarness.dispatch(controller, :create, method: "POST", raw_json: '{"_json":[1],"name":"ok"}')
+        expect([mixed.status, JSON.parse(mixed.body)["error"]["details"]])
+          .to eq([422, [{ "param" => "_json", "code" => "unknown" }]])
         # A declared `_json`, a form field of that name, and ordinary bodies are untouched.
         declared = build_rootless_controller { optional :_json, :json }
         expect(IntegrationHarness.dispatch(declared, :create, method: "POST", raw_json: '{"_json":{"a":1}}').status).to eq(200)
