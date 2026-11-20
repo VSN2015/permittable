@@ -147,10 +147,24 @@ RSpec.describe "I18n violation messages" do
       expect(details).to eq([{ param: "%{code}%<x>d%s%%", code: "unknown", message: "%{code}%<x>d%s%% is not recognized" }])
     end
 
-    it "keeps a placeholder it has no value for as written instead of raising" do
-      store(missing: "%{field} is required")
+    it "keeps a placeholder it has no value for as written, and still fills the others" do
+      store(missing: "%{field} is required", invalid_type: "%{param} needs %{field}")
+      details = violations_for({ age: "x" }) do
+        permit_params(:create) do
+          required :name, :string
+          optional :age, :integer
+        end
+      end
+      expect(details).to contain_exactly(
+        { param: "name", code: "missing", message: "%{field} is required" },
+        { param: "age", code: "invalid_type", message: "age needs %{field}" }
+      )
+    end
+
+    it "leaves % escapes and format directives in the copy as written" do
+      store(missing: "100%% of %<x>s, %{param}")
       details = violations_for({}) { permit_params(:create) { required :name, :string } }
-      expect(details).to eq([{ param: "name", code: "missing", message: "%{field} is required" }])
+      expect(details).to eq([{ param: "name", code: "missing", message: "100%% of %<x>s, name" }])
     end
 
     it "interpolates a violate! message too" do

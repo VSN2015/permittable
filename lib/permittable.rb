@@ -609,8 +609,10 @@ module Permittable
     # The copy may use `%{param}` (the violation's path, as in `user.email`)
     # and `%{code}`. The translation is read uninterpolated and filled in
     # here, so the client-controlled param is only ever a VALUE, never part
-    # of the format string. A placeholder with no value (`%{field}`) is left
-    # as written. `memo:` is a Hash that keeps the lookup per locale and code
+    # of the format string. Only `%{name}` is read, one placeholder at a time:
+    # one with no value here (`%{field}`) is left as written beside the ones
+    # that have, and `%%` or `%<x>s` stay as the translator wrote them, as
+    # they did before there was interpolation. `memo:` is a Hash that keeps the lookup per locale and code
     # for as long as the caller holds it: 200,000 `unknown` violations in one
     # request asked I18n for the same String 200,000 times (34 seconds).
     def default_message_for(code, param: nil, memo: nil)
@@ -620,9 +622,8 @@ module Permittable
       message = memo ? memo.fetch(key) { memo[key] = default_translation(code) } : default_translation(code)
       return message unless message&.include?("%")
 
-      ::I18n.interpolate(message, param: param.to_s, code: code.to_s)
-    rescue ::I18n::MissingInterpolationArgument
-      message
+      values = { param: param.to_s, code: code.to_s }
+      message.gsub(/%\{(\w+)\}/) { values.fetch(Regexp.last_match(1).to_sym, Regexp.last_match(0)) }
     end
 
     def default_translation(code)
