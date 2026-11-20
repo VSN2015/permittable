@@ -49,7 +49,7 @@ module Permittable
 
       fields.flatten.compact.each do |field|
         column = backing_column(klass, field)
-        unless klass.column_names.include?(column)
+        unless klass.column_names.include?(column) || attribute_declared?(klass, column)
           raise ArgumentError, ignored_column_message(label, klass, column) if ignored_column?(klass, column)
 
           raise ArgumentError, missing_column_message(label, klass, field, column, types)
@@ -177,6 +177,7 @@ module Permittable
       declared = types.is_a?(Hash) ? types[field.to_sym] : types
       target = resolve_alias(klass, field)
       column = klass.columns_hash[target]
+      return ensure_attribute_type!(label, klass, field, declared, target) if declared && column.nil?
       return unless declared && column
 
       ensure_not_array_column!(label, klass, field, declared, column)
@@ -216,6 +217,32 @@ module Permittable
       raise ArgumentError,
             "#{label}: '#{field}' is declared :#{declared} but the column is :#{column.type} " \
             "(table: #{klass.table_name}). #{fix}"
+    end
+
+    # `attribute :vip, :boolean` over no column: Rails assigns it like any
+    # attribute, so it exists, and its type is the one the contract is compared
+    # against, by the same groups. A store accessor or an attribute declared
+    # without a type has none to compare, and an enum is the enum rule's
+    # business (and, with no column, never checked).
+    def ensure_attribute_type!(label, klass, field, declared, target)
+      actual_type = attribute_declared?(klass, target) && klass.attribute_types[target].type
+      return if !actual_type || enum_attribute?(klass, target)
+
+      wanted = TYPE_GROUPS[declared.to_sym]
+      actual = TYPE_GROUPS[actual_type.to_sym]
+      return if wanted.nil? || actual.nil? || wanted == actual
+
+      raise ArgumentError,
+            "#{label}: '#{field}' is declared :#{declared} but the attribute is :#{actual_type} " \
+            "(attribute :#{target} on #{model_expr(klass)}). Change the contract to match the attribute, " \
+            "or declare the field virtual: true if it is not backed by it."
+    end
+
+    # Whether `name` is declared through the attribute API (`attribute :vip,
+    # :boolean`) rather than a column. A duck-typed model has no
+    # attribute_types, and a column is checked by its own path.
+    def attribute_declared?(klass, name)
+      klass.respond_to?(:attribute_types) && klass.attribute_types.key?(name.to_s)
     end
 
     # A PostgreSQL array column reports its ELEMENT type as `type`, so

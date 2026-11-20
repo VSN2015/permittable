@@ -5294,10 +5294,11 @@ RSpec.describe Permittable do
               .to raise_error(ArgumentError, /'status' is declared :string but the column is :integer/)
           end
 
-          it "does not loosen the existence check for an enum with no column" do
+          # `ghost` is declared through the attribute API with an enum over it,
+          # so assignment takes it as it takes any attribute (see below).
+          it "treats an enum over an attribute-API attribute as existing" do
             m = enum_model
-            expect(&declaring(m) { optional :ghost, :string, in: m.ghosts.keys })
-              .to raise_error(ArgumentError, /'ghost' does not exist in the database/)
+            expect(&declaring(m) { optional :ghost, :string, in: m.ghosts.keys }).not_to raise_error
           end
 
           it "is not consulted with the check off" do
@@ -5366,6 +5367,23 @@ RSpec.describe Permittable do
 
           it "still reports an alias whose target is no column as missing" do
             expect(&declaring(aliased) { optional :ghost_alias, :string }).to raise_error(ArgumentError, /does not exist/)
+          end
+
+          # `attribute :vip, :boolean` has no column but is a real attribute:
+          # assignment takes it, so the guard told the app it "does not exist
+          # in the database" and to add virtual: true to something that does.
+          it "accepts an attribute-API attribute with no column, type-checked against the attribute's type" do
+            api = Class.new(TestModel) do
+              self.table_name = "typed_things"
+              attribute :vip, :boolean
+              attribute :untyped
+            end
+            expect(&declaring(api) { optional :vip, :boolean }).not_to raise_error
+            expect(&declaring(api) { optional :vip, :integer }).not_to raise_error # same numeric group as a column
+            expect(&declaring(api) { optional :vip, :string })
+              .to raise_error(ArgumentError, /'vip' is declared :string but the attribute is :boolean/)
+            expect(&declaring(api) { optional :untyped, :string }).not_to raise_error
+            expect(&declaring(api) { optional :nope, :string }).to raise_error(ArgumentError, /'nope' does not exist/)
           end
 
           it "accepts a store_accessor, which lives in its store's column, without a type to compare" do
