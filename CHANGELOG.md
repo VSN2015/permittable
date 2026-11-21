@@ -9,6 +9,7 @@
 ### Changed
 - **`permittable:audit` labels a lazy rule `lazy` instead of `enforce`.** Such a rule checks only actions that read `permitted_params`. The summary adds "N lazy", `summary[:enforced]` no longer counts lazy rules, and `[strict]` is unchanged. (#187)
 - **`permittable:generate` drafts carry `enforce: true`.** Changing `mode: :monitor` to `mode: :enforce` now enforces; deleting the mode used to leave a lazy rule that checked nothing. (#187)
+- **OpenAPI documents GET, HEAD and DELETE contracts as query parameters instead of a JSON body.** A client generated for those endpoints changes shape. A `sensitive:` field there ends up in URLs, so keep such fields in a POST body. (#189)
 
 ### Fixed
 - **A `:string` refuses an inner NUL character as `invalid_type`.** `"a\u0000b"` was accepted, and PostgreSQL cannot store it. (#188)
@@ -17,6 +18,7 @@
 - **`Contract#call` no longer overflows a thread's stack on a deep `:json` value.** Input is copied iteratively at any depth, and a self-referencing Hash raises `ArgumentError`. (#188)
 - **`unknown: :error` is faster with many unknown keys.** 20,000 keys took 2.9s and now take 1.2s. (#188)
 - **The column guard accepts attributes declared with `attribute`.** It no longer asks for `virtual: true` there, and still checks their type. (#188)
+- **The exported schema accepts the `date_select` parts the server accepts.** That covers `starts_on(1i)`…`(3i)` in place of `starts_on`, and blank hour or minute parts. (#189)
 
 ## 0.16.1 (2026-11-21)
 <!-- title: monitor mode stops passing undeclared keys to permitted_params -->
