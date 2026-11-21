@@ -1781,6 +1781,27 @@ RSpec.describe Permittable do
     # byte of "é". A literal, so its encoding is UTF-8 and it is not valid.
     let(:malformed) { "caf\xC3" }
 
+    # PostgreSQL refuses a text value holding U+0000 ("string contains null
+    # byte"), so one kept by :string was a 500 at the INSERT.
+    it "refuses a String holding a NUL byte as invalid_type, for :string and what builds on it" do
+      decl = proc do
+        permit_params(:create) do
+          optional :s, :string
+          optional :e, :string, format: :email
+          optional :q, :string, normalize: :squish
+          optional :j, :json
+          array :tags, of: :string
+        end
+      end
+      expect(violations_for({ s: "a\u0000b", e: "a\u0000@b.com", q: "a\u0000b", tags: %W[ok a\u0000] }, &decl).details)
+        .to contain_exactly({ param: "s", code: "invalid_type" }, { param: "e", code: "invalid_type" },
+                            { param: "q", code: "invalid_type" }, { param: "tags[1]", code: "invalid_type" })
+      expect(violations_for({ s: "a\u0000".encode("UTF-16LE") }, &decl).details)
+        .to eq([{ param: "s", code: "invalid_type" }])
+      # :json is the app's own opaque data; a NUL inside it is left alone.
+      expect(permit({ j: { "a" => "b\u0000" }, s: "ok" }, &decl)[:j]).to eq({ "a" => "b\u0000" })
+    end
+
     it "does not run an array's validate: over the nils of elements that failed to cast" do
       decl = proc { permit_params(:create) { array :ids, of: :integer, validate: ->(a) { a.sum < 100 } } }
       expect(violations_for({ ids: ["x", 2] }, &decl).details).to eq([{ param: "ids[0]", code: "invalid_type" }])
@@ -2916,7 +2937,7 @@ RSpec.describe Permittable do
     it "copies a :json value only once it is within its bounds, so a rejected payload is never copied" do
       copies = 0
       leaf = Object.new
-      leaf.define_singleton_method(:deep_dup) { (copies += 1) && self }
+      leaf.define_singleton_method(:dup) { (copies += 1) && self }
       decl = proc { permit_params(:create) { optional :meta, :json, length: 0..1 } }
 
       expect(violations_for({ meta: { "a" => leaf, "b" => 1 } }, &decl).details)
@@ -5231,7 +5252,32 @@ RSpec.describe Permittable do
               .to raise_error(ArgumentError, /in: EnumThing.tiers.keys/)
           end
 
-          it "still accepts the column's own group" do
+          # `status: 5` on an `:integer` field passed the contract and then
+          # raised ArgumentError ("'5' is not a valid status") on assignment:
+          # an integer declaration over an integer-backed enum is held to the
+          # same rule as the text one, with its stored integers as the list.
+          it "holds an :integer declaration over an integer-backed enum to an in: of its stored integers" do
+            m = enum_model
+            expect(&declaring(m) { optional :status, :integer, in: [0, 1] }).not_to raise_error
+            expect(&declaring(m) { optional :status, :integer, in: [1] }).not_to raise_error
+            expect(&declaring(m) { optional :status, :integer, in: m.statuses.values }).not_to raise_error
+          end
+
+          it "refuses an :integer declaration with no in:, a Range, or an in: past the stored integers" do
+            m = enum_model
+            expect(&declaring(m) { optional :status, :integer }).to raise_error(ArgumentError) do |e|
+              expect(e.message).to match(/'status' is an enum on EnumThing, declared :integer without an in:/)
+              expect(e.message).to include("in: EnumThing.statuses.values")
+              expect(e.message).not_to match(/virtual: true/)
+            end
+            expect(&declaring(m) { optional :status, :integer, in: 0..9 })
+              .to raise_error(ArgumentError, /does not list its values/)
+            expect(&declaring(m) { optional :status, :integer, in: [0, 1, 2] })
+              .to raise_error(ArgumentError, /would refuse: 2/)
+          end
+
+          it "leaves an :integer declaration alone with the check off" do
+            Permittable.check_column_types = false
             expect(&declaring(enum_model) { optional :status, :integer }).not_to raise_error
           end
 
@@ -5248,10 +5294,19 @@ RSpec.describe Permittable do
               .to raise_error(ArgumentError, /'status' is declared :string but the column is :integer/)
           end
 
-          it "does not loosen the existence check for an enum with no column" do
+          # `ghost` is declared through the attribute API with an enum over it,
+          # so assignment takes it as it takes any attribute (see below).
+          # ... and is held to the same in: rule as an enum over a column:
+          # `ghost: "bogus"` and `ghost: 5` raise ArgumentError on assignment.
+          it "holds an enum over an attribute-API attribute to the enum's in: rule" do
             m = enum_model
-            expect(&declaring(m) { optional :ghost, :string, in: m.ghosts.keys })
-              .to raise_error(ArgumentError, /'ghost' does not exist in the database/)
+            expect(&declaring(m) { optional :ghost, :string, in: m.ghosts.keys }).not_to raise_error
+            expect(&declaring(m) { optional :ghost, :integer, in: m.ghosts.values }).not_to raise_error
+            expect(&declaring(m) { optional :ghost, :string })
+              .to raise_error(ArgumentError, /'ghost' is an enum on EnumThing, declared :string without an in:/)
+            expect(&declaring(m) { optional :ghost, :integer })
+              .to raise_error(ArgumentError, /declared :integer without an in:/)
+            expect(&declaring(m) { optional :ghost, :integer, in: [0, 5] }).to raise_error(ArgumentError, /would refuse: 5/)
           end
 
           it "is not consulted with the check off" do
@@ -5320,6 +5375,23 @@ RSpec.describe Permittable do
 
           it "still reports an alias whose target is no column as missing" do
             expect(&declaring(aliased) { optional :ghost_alias, :string }).to raise_error(ArgumentError, /does not exist/)
+          end
+
+          # `attribute :vip, :boolean` has no column but is a real attribute:
+          # assignment takes it, so the guard told the app it "does not exist
+          # in the database" and to add virtual: true to something that does.
+          it "accepts an attribute-API attribute with no column, type-checked against the attribute's type" do
+            api = Class.new(TestModel) do
+              self.table_name = "typed_things"
+              attribute :vip, :boolean
+              attribute :untyped
+            end
+            expect(&declaring(api) { optional :vip, :boolean }).not_to raise_error
+            expect(&declaring(api) { optional :vip, :integer }).not_to raise_error # same numeric group as a column
+            expect(&declaring(api) { optional :vip, :string })
+              .to raise_error(ArgumentError, /'vip' is declared :string but the attribute is :boolean/)
+            expect(&declaring(api) { optional :untyped, :string }).not_to raise_error
+            expect(&declaring(api) { optional :nope, :string }).to raise_error(ArgumentError, /'nope' does not exist/)
           end
 
           it "accepts a store_accessor, which lives in its store's column, without a type to compare" do
@@ -6481,6 +6553,32 @@ RSpec.describe Permittable do
                                                                   path_params: { id: "1" })
         expect(result.status).to eq(200)
         expect(JSON.parse(result.body)).to eq("name" => "Jo")
+      end
+
+      # Rails parks a JSON body that is not an object (`[1]`, `5`, `"x"`) under
+      # `_json`, a key no client wrote, so reporting it as an "unknown"
+      # parameter told the client nothing it could act on. It is the same
+      # malformed envelope as a rooted contract's non-object body: a 400.
+      it "reports a JSON body that is not an object as a malformed body, never as an unknown `_json`" do
+        controller = build_rootless_controller { optional :name, :string }
+        ["[1,2]", "5", '"x"'].each do |body|
+          result = IntegrationHarness.dispatch(controller, :create, method: "POST", raw_json: body)
+          expect(result.status).to eq(400), "for #{body}: #{result.body}"
+          expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "(body)", "code" => "invalid_type" }])
+        end
+        # A JSON null body is no object either.
+        expect(IntegrationHarness.dispatch(controller, :create, method: "POST", raw_json: "null").status).to eq(400)
+        # A real object that also carries other keys is an object: `_json` is
+        # then just a key it sent, unknown like any other.
+        mixed = IntegrationHarness.dispatch(controller, :create, method: "POST", raw_json: '{"_json":[1],"name":"ok"}')
+        expect([mixed.status, JSON.parse(mixed.body)["error"]["details"]])
+          .to eq([422, [{ "param" => "_json", "code" => "unknown" }]])
+        # A declared `_json`, a form field of that name, and ordinary bodies are untouched.
+        declared = build_rootless_controller { optional :_json, :json }
+        expect(IntegrationHarness.dispatch(declared, :create, method: "POST", raw_json: '{"_json":{"a":1}}').status).to eq(200)
+        expect(IntegrationHarness.dispatch(controller, :create, method: "POST", raw_json: '{"name":"x"}').status).to eq(200)
+        form = IntegrationHarness.dispatch(controller, :create, method: "POST", params: "_json=1")
+        expect(JSON.parse(form.body)["error"]["details"]).to eq([{ "param" => "_json", "code" => "unknown" }])
       end
 
       # image_submit_tag renders <input type="image"> with no name, which a

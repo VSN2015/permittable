@@ -49,7 +49,7 @@ module Permittable
 
       fields.flatten.compact.each do |field|
         column = backing_column(klass, field)
-        unless klass.column_names.include?(column)
+        unless klass.column_names.include?(column) || attribute_declared?(klass, column)
           raise ArgumentError, ignored_column_message(label, klass, column) if ignored_column?(klass, column)
 
           raise ArgumentError, missing_column_message(label, klass, field, column, types)
@@ -177,6 +177,9 @@ module Permittable
       declared = types.is_a?(Hash) ? types[field.to_sym] : types
       target = resolve_alias(klass, field)
       column = klass.columns_hash[target]
+      if declared && column.nil?
+        return ensure_attribute_type!(label, klass, field, declared, target, allowed: allowed, transformed: transformed)
+      end
       return unless declared && column
 
       ensure_not_array_column!(label, klass, field, declared, column)
@@ -189,7 +192,7 @@ module Permittable
       enum = !enum_name.nil?
       # Checked before the column's type, which an enum's contract does not
       # depend on: see ensure_enum_contract!.
-      if enum && wanted == :text
+      if enum && (wanted == :text || integer_enum_declaration?(klass, enum_name, declared))
         return ensure_enum_contract!(label, klass, enum_name, declared, allowed && allowed[field.to_sym],
                                      transformed: Array(transformed).include?(field.to_sym), shown: field.to_s)
       end
@@ -216,6 +219,41 @@ module Permittable
       raise ArgumentError,
             "#{label}: '#{field}' is declared :#{declared} but the column is :#{column.type} " \
             "(table: #{klass.table_name}). #{fix}"
+    end
+
+    # `attribute :vip, :boolean` over no column: Rails assigns it like any
+    # attribute, so it exists, and its type is the one the contract is compared
+    # against, by the same groups. A store accessor or an attribute declared
+    # without a type has none to compare. An enum over one is held to the same
+    # in: rule as an enum over a column (see ensure_enum_contract!): assignment
+    # refuses a value it does not map either way.
+    def ensure_attribute_type!(label, klass, field, declared, target, allowed: nil, transformed: nil)
+      enum_name = [field.to_s, target].find { |name| enum_attribute?(klass, name) }
+      if enum_name
+        return unless TYPE_GROUPS[declared.to_sym] == :text || integer_enum_declaration?(klass, enum_name, declared)
+
+        return ensure_enum_contract!(label, klass, enum_name, declared, allowed && allowed[field.to_sym],
+                                     transformed: Array(transformed).include?(field.to_sym), shown: field.to_s)
+      end
+
+      actual_type = attribute_declared?(klass, target) && klass.attribute_types[target].type
+      return unless actual_type
+
+      wanted = TYPE_GROUPS[declared.to_sym]
+      actual = TYPE_GROUPS[actual_type.to_sym]
+      return if wanted.nil? || actual.nil? || wanted == actual
+
+      raise ArgumentError,
+            "#{label}: '#{field}' is declared :#{declared} but the attribute is :#{actual_type} " \
+            "(attribute :#{target} on #{model_expr(klass)}). Change the contract to match the attribute, " \
+            "or declare the field virtual: true if it is not backed by it."
+    end
+
+    # Whether `name` is declared through the attribute API (`attribute :vip,
+    # :boolean`) rather than a column. A duck-typed model has no
+    # attribute_types, and a column is checked by its own path.
+    def attribute_declared?(klass, name)
+      klass.respond_to?(:attribute_types) && klass.attribute_types.key?(name.to_s)
     end
 
     # A PostgreSQL array column reports its ELEMENT type as `type`, so
@@ -248,9 +286,11 @@ module Permittable
     # assignment raises ArgumentError for anything else, so without one
     # `status: "bogus"` passes the contract and becomes a 500 in the action.
     # A string-backed enum is held to the same rule even though its column
-    # group already matched — the 500 is identical. Any other declaration on
-    # an enum is still held to the column's own group (`:integer` on an
-    # integer-backed enum passes, `:datetime` does not).
+    # group already matched — the 500 is identical. So is an `:integer`
+    # declaration over an integer-backed enum, whose `status: 5` is cast and
+    # then refused on assignment the same way; its list is the stored integers
+    # (`Order.statuses.values`). Any other declaration on an enum is still
+    # held to the column's own group (`:datetime` fails).
     #
     # Accepted means what the enum's cast accepts: every name, plus every
     # stored value that is a String (a string-backed enum takes `"p"` for
@@ -267,14 +307,15 @@ module Permittable
     # an enum's mapping says exactly which strings are valid, an attribute
     # override says nothing a contract could be checked against.
     def ensure_enum_contract!(label, klass, field, declared, listed, transformed: false, shown: field)
+      integer = integer_enum_declaration?(klass, field, declared)
       problem =
         if listed.nil?
           "declared :#{declared} without an in:"
         elsif listed.is_a?(Range) || !listed.respond_to?(:to_a)
           "declared :#{declared} with an in: that does not list its values"
         else
-          accepted = enum_values(klass, field)
-          accepted += stored_integers(klass, field) if transformed
+          accepted = integer ? klass.defined_enums[field.to_s].values : enum_values(klass, field)
+          accepted += stored_integers(klass, field) if transformed && !integer
           stray = listed.to_a - accepted
           return if stray.empty?
 
@@ -285,7 +326,13 @@ module Permittable
       raise ArgumentError,
             "#{label}: #{enum_subject(field, shown)} is an enum on #{model_expr(klass)}, #{problem} (table: #{klass.table_name}). " \
             "A value outside the enum would pass the contract and then raise on assignment. " \
-            "Declare it with in: #{enum_keys_expr(klass, field)}."
+            "Declare it with in: #{enum_keys_expr(klass, field, integer ? :values : :keys)}."
+    end
+
+    # `:integer` over an enum whose stored values are all integers: the request
+    # carries one, and assignment accepts only the ones the enum maps.
+    def integer_enum_declaration?(klass, field, declared)
+      declared.to_sym == :integer && klass.defined_enums[field.to_s].values.all?(Integer)
     end
 
     # The field as an enum error names it: `'phase'`, or `'state' (an alias of
@@ -314,12 +361,12 @@ module Permittable
     # `Order.statuses.keys` when the enum's plural reader exists, and the
     # always-valid `defined_enums["..."]` spelling when it does not (a name
     # that is not a Ruby identifier, a duck-typed model).
-    def enum_keys_expr(klass, field)
+    def enum_keys_expr(klass, field, members = :keys)
       reader = field.to_s.pluralize
       if reader.match?(/\A[a-z_][a-zA-Z0-9_]*\z/) && klass.respond_to?(reader)
-        "#{model_expr(klass)}.#{reader}.keys"
+        "#{model_expr(klass)}.#{reader}.#{members}"
       else
-        "#{model_expr(klass)}.defined_enums[#{field.to_s.inspect}].keys"
+        "#{model_expr(klass)}.defined_enums[#{field.to_s.inspect}].#{members}"
       end
     end
 
