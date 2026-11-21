@@ -58,6 +58,72 @@ RSpec.describe Permittable::Contract do
       expect { contract.call("payload") }.to raise_error(ArgumentError, /expects a Hash/)
     end
 
+    # A Thread's stack is far shallower than the main thread's (a Puma request
+    # thread, a job runner), and the recursive HashWithIndifferentAccess
+    # conversion overflowed it near depth 62 — inside a Contract, which takes
+    # a plain Hash, though JSON.parse accepts nesting up to 100.
+    it "processes a JSON-deep :json value inside a Thread, never a SystemStackError" do
+      deep = JSON.parse("#{'{"a":' * 100}1#{"}" * 100}")
+      meta = described_class.define { optional :meta, :json }
+      outcome = Thread.new do
+        meta.call("meta" => deep).then { |r| [:ok, r.valid?, r.params["meta"].equal?(deep)] }
+      rescue SystemStackError => e
+        [:overflow, e.class]
+      end.value
+
+      expect(outcome).to eq([:ok, true, false])
+    end
+
+    # Past JSON.parse's own limit of 100 only a program can build the input,
+    # but a Contract takes any Hash: the accepted value is copied before app
+    # code sees it, and ActiveSupport's recursive deep_dup overflowed the
+    # thread's stack from about 120 levels.
+    it "processes a :json value nested 3000 deep inside a Thread, copying it before the app sees it" do
+      deep = {}
+      3000.times { deep = { "a" => deep } }
+      leaf = "text"
+      deep = { "leaf" => leaf, "deep" => deep }
+      meta = described_class.define { optional :meta, :json }
+      outcome = Thread.new do
+        result = meta.call("meta" => deep)
+        copied = result.params["meta"]
+        [:ok, result.valid?, copied.equal?(deep), copied["leaf"].equal?(leaf), copied["leaf"] == leaf]
+      rescue SystemStackError => e
+        [:overflow, e.class]
+      end.value
+
+      expect(outcome).to eq([:ok, true, false, false, true])
+    end
+
+    it "refuses a JSON-deep value past max_depth: as a violation inside a Thread" do
+      deep = JSON.parse("#{'[{"a":' * 50}1#{"}]" * 50}")
+      meta = described_class.define { optional :meta, :json, max_depth: 5 }
+      outcome = Thread.new do
+        meta.call("meta" => { "a" => deep }).violations
+      rescue SystemStackError => e
+        [e.class]
+      end.value
+
+      expect(outcome).to eq([{ param: "meta", code: "depth" }])
+    end
+
+    # The iterative copy has no stack to overflow, so a Hash holding itself
+    # would be copied for ever, with memory growing, unless it is refused.
+    it "refuses a Hash or Array that contains itself instead of copying it for ever" do
+      hash = { "n" => "x" }
+      hash["self"] = hash
+      list = []
+      list << list
+      contract = described_class.define { optional :n, :string }
+      [hash, { "n" => "x", "deep" => { "list" => list } }].each do |input|
+        expect { Timeout.timeout(5) { contract.call(input) } }
+          .to raise_error(ArgumentError, /contains itself/)
+      end
+      # One object reached twice is not a cycle.
+      shared = { "a" => 1 }
+      expect(described_class.define { optional :j, :json }.call("j" => { "x" => shared, "y" => shared })).to be_valid
+    end
+
     it "keeps calls independent — a contract instance is reusable" do
       expect(contract.call({})).to be_invalid
       expect(contract.call(user: { email: "a@b.c" })).to be_valid

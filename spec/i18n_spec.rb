@@ -1,5 +1,8 @@
 require "i18n"
 
+# I18n's own placeholder syntax is %{name}; these specs are about it.
+# rubocop:disable Style/FormatStringToken
+
 RSpec.describe "I18n violation messages" do
   def permittable_class(&declaration)
     Class.new(FakeController) do
@@ -121,6 +124,132 @@ RSpec.describe "I18n violation messages" do
     expect(details).to eq([{ param: "name", code: "missing" }])
   end
 
+  # A translation written `"%{param} is required"` shipped its literal
+  # placeholder: the lookup passed I18n no values, so it never interpolated.
+  describe "interpolation" do
+    it "fills %{param} and %{code} from the violation" do
+      store(missing: "%{param} is required (%{code})", invalid_type: "no placeholders")
+      details = violations_for({ user: { age: "x" } }) do
+        permit_params(:create, root: :user) do
+          required :name, :string
+          optional :age, :integer
+        end
+      end
+      expect(details).to contain_exactly(
+        { param: "user.name", code: "missing", message: "user.name is required (missing)" },
+        { param: "user.age", code: "invalid_type", message: "no placeholders" }
+      )
+    end
+
+    it "cannot be broken by a client-controlled param containing a placeholder or a format directive" do
+      store(unknown: "%{param} is not recognized")
+      details = violations_for({ "%{code}%<x>d%s%%" => 1 }) { permit_params(:create, unknown: :error) { optional :a, :string } }
+      expect(details).to eq([{ param: "%{code}%<x>d%s%%", code: "unknown", message: "%{code}%<x>d%s%% is not recognized" }])
+    end
+
+    it "keeps a placeholder it has no value for as written, and still fills the others" do
+      store(missing: "%{field} is required", invalid_type: "%{param} needs %{field}")
+      details = violations_for({ age: "x" }) do
+        permit_params(:create) do
+          required :name, :string
+          optional :age, :integer
+        end
+      end
+      expect(details).to contain_exactly(
+        { param: "name", code: "missing", message: "%{field} is required" },
+        { param: "age", code: "invalid_type", message: "age needs %{field}" }
+      )
+    end
+
+    it "leaves % escapes and format directives in the copy as written" do
+      store(missing: "100%% of %<x>s, %{param}")
+      details = violations_for({}) { permit_params(:create) { required :name, :string } }
+      expect(details).to eq([{ param: "name", code: "missing", message: "100%% of %<x>s, name" }])
+    end
+
+    it "interpolates a violate! message too" do
+      store(too_big: "%{param} is too big")
+      details = violations_for({ n: "3" }) do
+        permit_params(:create) do
+          required :n, :integer
+          finalize { |p| violate!(:n, :too_big) && p }
+        end
+      end
+      expect(details).to eq([{ param: "n", code: "too_big", message: "n is too big" }])
+    end
+  end
+
+  # The summary names each violation by its param and then its message. A
+  # translation that spells the param itself (`%{param} is missing`) already
+  # does, and the summary read `user.name user.name is missing (missing)`.
+  describe "the prose summary" do
+    def summary_of(klass, params)
+      c = klass.new(params: params)
+      c.define_singleton_method(:action_name) { "create" }
+      c.permitted_params
+    rescue Permittable::InvalidParameters => e
+      e.message
+    end
+
+    let(:klass) do
+      permittable_class do
+        permit_params(:create, root: :user) do
+          required :name, :string
+          required :age, :integer, message: "must be a number"
+          optional :nick, :string, in: %w[a b]
+          finalize { |p| violate!(:name, :too_long) && p }
+        end
+      end
+    end
+
+    it "does not repeat the param before a translation that already names it" do
+      store(missing: "%{param} is missing (%{code})")
+      expect(summary_of(klass, { user: { age: "x" } }))
+        .to eq("Invalid parameters: user.name is missing (missing), user.age must be a number")
+    end
+
+    it "keeps the param prefix for a translation without %{param} and for a field's own message:" do
+      store(missing: "is missing", inclusion: "is not allowed")
+      expect(summary_of(klass, { user: { age: "x", nick: "z" } }))
+        .to eq("Invalid parameters: user.name is missing, user.age must be a number, user.nick is not allowed")
+    end
+
+    it "agrees for a violate! code in finalize, and for a Contract's raised message" do
+      store(too_long: "%{param} is too long")
+      c = Permittable::Contract.define(root: :user) do
+        required :name, :string
+        finalize { |p| violate!("user.name", :too_long) && p }
+      end
+      expect { c.call!("user" => { "name" => "x" }) }
+        .to raise_error(Permittable::InvalidParameters, "Invalid parameters: user.name is too long")
+    end
+
+    it "agrees in the monitor-mode log line" do
+      store(missing: "%{param} is missing")
+      klass = permittable_class { permit_params(:create, mode: :monitor) { required :name, :string } }
+      c = klass.new(params: {})
+      c.define_singleton_method(:action_name) { "create" }
+      messages = []
+      logger = Object.new
+      logger.define_singleton_method(:warn) { |msg| messages << msg }
+      c.define_singleton_method(:logger) { logger }
+      c.permitted_params
+      expect(messages.join).to include("would have been rejected: name is missing").and(satisfy { !_1.include?("name name") })
+    end
+  end
+
+  # With `unknown: :error`, every undeclared key is a violation, and each one
+  # used to ask I18n for the same copy again: 200,000 keys took 34 seconds.
+  it "looks a code's translation up once per validation, not once per violation" do
+    store(unknown: "is not recognized")
+    extra = (1..500).to_h { |i| ["k#{i}", 1] }
+    klass = permittable_class { permit_params(:create, unknown: :error) { optional :a, :string } }
+    c = klass.new(params: extra)
+    c.define_singleton_method(:action_name) { "create" }
+    expect(I18n).to receive(:t).with("permittable.errors.unknown", default: nil).once.and_call_original
+    expect(c.permittable_violations.map { _1[:message] }.uniq).to eq(["is not recognized"])
+  end
+
   # The Rails i18n guide's per-request locale switch. `enforce: true` and
   # monitor-mode rules validate in a before_action registered by
   # `include Permittable`, so that check sits in the callback chain exactly
@@ -208,3 +337,5 @@ RSpec.describe "I18n violation messages" do
     end
   end
 end
+
+# rubocop:enable Style/FormatStringToken

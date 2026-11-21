@@ -4,10 +4,19 @@
 
 ### Breaking
 - **A rootless contract can no longer declare `action` or `controller`.** Rails fills them with the route's values, never the client's, so `permit_params` now raises `ArgumentError` at class load. Wrap the fields in `root:` or rename them; `format` is still allowed. (#187)
+- **An `:integer` field over an integer-backed enum needs an `in:` of its values when `check_column_types` is on.** `role: 5` passed the contract and then raised on assignment (a 500). Declare `in: Model.roles.values`. (#188)
 
 ### Changed
 - **`permittable:audit` labels a lazy rule `lazy` instead of `enforce`.** Such a rule checks only actions that read `permitted_params`. The summary adds "N lazy", `summary[:enforced]` no longer counts lazy rules, and `[strict]` is unchanged. (#187)
 - **`permittable:generate` drafts carry `enforce: true`.** Changing `mode: :monitor` to `mode: :enforce` now enforces; deleting the mode used to leave a lazy rule that checked nothing. (#187)
+
+### Fixed
+- **A `:string` refuses an inner NUL character as `invalid_type`.** `"a\u0000b"` was accepted, and PostgreSQL cannot store it. (#188)
+- **A JSON body that is not an object answers 400 instead of reporting an unknown `_json`.** It applies to `[1,2]`, `5` or `null` sent to a rootless `unknown: :error` contract; the param is `(body)`. (#188)
+- **`permittable.errors.*` translations fill `%{param}` and `%{code}`.** They were shipped as written. The prose summary no longer repeats the param before such a translation. (#188)
+- **`Contract#call` no longer overflows a thread's stack on a deep `:json` value.** Input is copied iteratively at any depth, and a self-referencing Hash raises `ArgumentError`. (#188)
+- **`unknown: :error` is faster with many unknown keys.** 20,000 keys took 2.9s and now take 1.2s. (#188)
+- **The column guard accepts attributes declared with `attribute`.** It no longer asks for `virtual: true` there, and still checks their type. (#188)
 
 ## 0.16.1 (2026-11-21)
 <!-- title: monitor mode stops passing undeclared keys to permitted_params -->
