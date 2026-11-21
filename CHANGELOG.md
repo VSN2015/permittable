@@ -1,16 +1,21 @@
-<!-- CHANGELOG.md -->
+<!-- CHANGELOG.md — format: docs/changelog-format.md -->
 
 ## Unreleased
-<!-- title: a rootless contract refuses the router's keys, and the audit stops calling a lazy rule enforced -->
 
-Two fixes. A rootless controller contract that declares `action` or `controller` now fails at class load, because the router's value was read where the client's was documented (`format` is still allowed: it reads the route's format). `permittable:audit` labels a rule that nothing runs before the action `lazy` instead of `enforce`, and `permittable:generate` drafts carry `enforce: true`, so changing `mode: :monitor` to `mode: :enforce` enforces.
+### Breaking
+- **A rootless contract can no longer declare `action` or `controller`.** Rails fills them with the route's values, never the client's, so `permit_params` now raises `ArgumentError` at class load. Wrap the fields in `root:` or rename them; `format` is still allowed. (#187)
 
-A boot can now fail: a controller whose rootless `permit_params` declares a top-level `action` or `controller` field raises `ArgumentError`. The audit's table and summary line change: a rule with neither `enforce: true` nor monitor mode reads `lazy — checked only if the action reads permitted_params` where it read `enforce`, and the summary reads `N enforced, M lazy, K in monitor mode, ...`. A script that matches the old summary text needs the new one; the `[strict]` exit status is unchanged.
+### Changed
+- **`permittable:audit` labels a lazy rule `lazy` instead of `enforce`.** Such a rule checks only actions that read `permitted_params`. The summary adds "N lazy", `summary[:enforced]` no longer counts lazy rules, and `[strict]` is unchanged. (#187)
+- **`permittable:generate` drafts carry `enforce: true`.** Changing `mode: :monitor` to `mode: :enforce` now enforces; deleting the mode used to leave a lazy rule that checked nothing. (#187)
 
-### Fixed
-- **A rootless contract cannot declare `action` or `controller`.** Rails merges the route's values into `params` over the body's, so `permitted_params` returned `"create"` for a field the client sent as `"client-action"`, while the JSON Schema and OpenAPI exports documented it as a body property. `permit_params` now raises `ArgumentError` at class load, naming the field and the fix: wrap the fields in `root:` or rename the param. A `root:` contract, a nested field of that name, a rootless `format` field (it reads the route's format, as since 0.15.1) and a standalone `Permittable::Contract` (no router) are unchanged. `permittable:generate` drafts such a key as a `# TODO` in a rootless draft instead of a field.
-- **`permittable:audit` no longer reports a lazy rule as `enforce`.** A rule declared without `enforce: true` and not in monitor mode has no `before_action`, so an action that reads `params` directly is checked by nothing, yet the table printed `enforce` and the summary counted it enforced. It now reads `lazy — checked only if the action reads permitted_params` and is counted in its own `lazy` bucket (`Audit.summary` gains `lazy:`, `Audit::Entry#lazy?` is new). `Audit.summary[:enforced]` no longer counts lazy rules: they moved to `:lazy`, so a caller that read `enforced` as "covered and enforcing" now sees a smaller number. A lazy rule still counts as covered, so `[strict]` passes and fails exactly as before.
-- **A `permittable:generate` draft enforces when its mode is flipped.** A draft was `permit_params ..., mode: :monitor do`, and removing the mode left a lazy rule that a legacy action never ran. Drafts are now `permit_params ..., enforce: true, mode: :monitor do`, which behaves as monitor mode until `mode: :monitor` becomes `mode: :enforce` (which holds under any app-wide `Permittable.mode`). The draft's header comment and the guide say so.
+## 0.16.1 (2026-11-21)
+<!-- title: monitor mode stops passing undeclared keys to permitted_params -->
+
+**Upgrade:** drop-in, unless monitor-mode code reads an undeclared key from `permitted_params` on a rejected request. Read it from `params` instead.
+
+### Security
+- **Monitor mode no longer lets a rejected request mass-assign undeclared keys.** `permitted_params` returned the whole payload when a request violated the contract, so `{"user":{"age":"x","admin":true}}` reached `User.create!(permitted_params)` with `admin: true`. It now keeps only the declared keys at every depth, as `params.permit` does. Values stay uncast, and the request is still not rejected. (#186)
 
 ## 0.16.0 (2026-11-15)
 <!-- title: date and boolean strings held to what the parser read, an audit that stops counting skipped contracts, and 422 rendered as an Integer -->
