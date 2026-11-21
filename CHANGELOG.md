@@ -1,6 +1,13 @@
 <!-- CHANGELOG.md — format: docs/changelog-format.md -->
 
-## Unreleased
+## 0.17.0 (2026-11-22)
+<!-- title: rootless contracts refuse router keys, stricter strings and integer enums, and GET contracts exported as query parameters -->
+
+**Upgrade:** minor release. Boot the app with eager loading in CI first (`bin/rails runner 'Rails.application.eager_load!'`) to catch the two boot errors:
+- Boot: a rootless `permit_params` that declares `action` or `controller` raises `ArgumentError`. Fix: wrap the fields in `root:` or rename them.
+- Boot, only with `check_column_types`: an `:integer` field over an integer-backed enum without `in:` raises. Fix: `in: Model.roles.values`.
+- Requests: a `:string` with an inner NUL is 422; a non-object JSON body to a rootless `unknown: :error` contract is 400.
+- Tooling: the audit summary adds "N lazy" and `summary[:enforced]` no longer counts lazy rules; OpenAPI GET/HEAD/DELETE operations use query parameters.
 
 ### Breaking
 - **A rootless contract can no longer declare `action` or `controller`.** Rails fills them with the route's values, never the client's, so `permit_params` now raises `ArgumentError` at class load. Wrap the fields in `root:` or rename them; `format` is still allowed. (#187)
