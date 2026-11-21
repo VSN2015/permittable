@@ -33,6 +33,7 @@ require "uri" # URI::MailTo::EMAIL_REGEXP backs the :email format preset
 
 require "permittable/version"
 require "permittable/error_envelope"
+require "permittable/deep_copy"
 require "permittable/column_guard"
 require "permittable/filter_parameter_registry"
 
@@ -98,10 +99,10 @@ require "permittable/filter_parameter_registry"
 # `Permittable.mode = :monitor` app-wide; a rule's own mode: wins) runs the
 # full pipeline but REPORTS violations instead of rejecting: the same
 # "invalid_parameters.permittable" event fires (payload mode: :monitor),
-# the logger warns, and permitted_params returns the raw params passed
-# through untouched — no casts, no defaults, no transforms — so behaviour
-# is identical to the pre-contract app (a missing root: passes an empty
-# hash; a rootless contract drops only the router's bookkeeping keys).
+# the logger warns, and permitted_params returns the client's values as
+# sent — no casts, no defaults, no transforms — but only under the keys the
+# contract declares, so a violation cannot unlock an undeclared column (a
+# missing root: passes an empty hash).
 # Monitor rules validate eagerly in the before_action regardless of
 # enforce:, because telemetry must not depend on the action calling
 # permitted_params — legacy actions still reading `params` directly are
@@ -242,22 +243,27 @@ module Permittable
   # <button name="button">, so a browser sends `button=` even with no
   # value). Without this `unknown: :error` was unusable outside a JSON API:
   # every browser form failed on the framework's own keys rather than on
-  # anything the client got wrong. Exempt from the CHECK only: unlike the
-  # routing keys these are NOT stripped from monitor mode's raw
-  # pass-through, where handing back an untouched params hash is the whole
-  # promise and a legacy action may well read `_method` itself.
+  # anything the client got wrong. Exempt from the CHECK only: monitor mode's
+  # pass-through keeps declared keys alone, so it carries none of them (a
+  # legacy action may still read `_method` from `params`).
   #
   # The click point of an image submit (image_submit_tag, which has no name
   # of its own to exempt) is a form key too, but not a fixed one: `x` and `y`,
   # or `<name>.x` and `<name>.y`, as a PAIR of digits. See
   # permittable_image_submit_keys.
   FORM_KEYS = %w[authenticity_token _method utf8 commit button].freeze
-  # ROUTING_KEYS/FORM_KEYS name where the keys come FROM; these two name what
-  # is DECIDED with them, which is what the call sites care about — and the
-  # asymmetry between them is the deliberate point, so spell it once here
-  # rather than leaving a bare ROUTING_KEYS to read like an oversight.
+  # ROUTING_KEYS/FORM_KEYS name where the keys come FROM; this names what is
+  # DECIDED with them, which is what the call sites care about.
   UNCHECKED_TOP_LEVEL_KEYS = (ROUTING_KEYS + FORM_KEYS).freeze
-  MONITOR_DROPPED_KEYS = ROUTING_KEYS
+  # Monitor mode's filter returns this for a value it leaves out (nil is a
+  # value it keeps).
+  MONITOR_DROP = Object.new.freeze
+  # What a rootless controller contract may not declare: the route's value
+  # always replaces the client's. `format` is left out on purpose: a route's
+  # `format:` default fills such a field, which the OpenAPI export documents.
+  REFUSED_ROOTLESS_KEYS = %w[controller action].freeze
+  # The param a non-object JSON body is reported under (see permittable_non_object_body?).
+  NON_OBJECT_BODY = "(body)".freeze
   # Rails' date_select, datetime_select and time_select submit ONE value as
   # several keys, each named for its position: `starts_on(1i)` the year,
   # `(2i)` the month, `(3i)` the day, `(4i)` the hour, `(5i)` the minute and
@@ -481,8 +487,8 @@ module Permittable
     # App-wide default for rules that don't declare their own mode:.
     # :enforce (the default) rejects violating requests; :monitor reports
     # them — same instrumentation event with payload mode: :monitor, plus a
-    # logger.warn — and lets the request proceed with the raw params passed
-    # through. This is the rollout switch for brownfield adoption: set it
+    # logger.warn — and lets the request proceed with the client's values
+    # (uncast, declared keys only). This is the rollout switch for brownfield adoption: set it
     # from an initializer (Permittable.mode =
     # ENV.fetch("PERMITTABLE_MODE", "enforce").to_sym) and flip controllers
     # to their final mode one at a time, since a rule's own mode: always
@@ -603,9 +609,36 @@ module Permittable
     # { param:, code: } shape, so nothing changes for apps that don't opt
     # in. Only a String translation counts; anything else (a nested Hash, a
     # missing-translation object) is ignored rather than leaked to clients.
-    def default_message_for(code)
-      return nil unless defined?(::I18n) && ::I18n.respond_to?(:t)
+    #
+    # The copy may use `%{param}` (the violation's path, as in `user.email`)
+    # and `%{code}`. The translation is read uninterpolated and filled in
+    # here, so the client-controlled param is only ever a VALUE, never part
+    # of the format string. Only `%{name}` is read, one placeholder at a time:
+    # one with no value here (`%{field}`) is left as written beside the ones
+    # that have, and `%%` or `%<x>s` stay as the translator wrote them, as
+    # they did before there was interpolation. `memo:` is a Hash that keeps the lookup per locale and code
+    # for as long as the caller holds it: 200,000 `unknown` violations in one
+    # request asked I18n for the same String 200,000 times (34 seconds).
+    def default_message_for(code, param: nil, memo: nil)
+      default_message_and_param_use(code, param: param, memo: memo).first
+    end
 
+    # [message, whether the copy spells `%{param}` itself]. The prose summary
+    # names each violation by its param and then its message, so it must not
+    # name the param again when the message already does.
+    def default_message_and_param_use(code, param: nil, memo: nil)
+      return [nil, false] unless defined?(::I18n) && ::I18n.respond_to?(:t)
+
+      key = [::I18n.locale, code.to_s]
+      message = memo ? memo.fetch(key) { memo[key] = default_translation(code) } : default_translation(code)
+      return [message, false] unless message&.include?("%")
+
+      values = { param: param.to_s, code: code.to_s }
+      [message.gsub(/%\{(\w+)\}/) { values.fetch(Regexp.last_match(1).to_sym, Regexp.last_match(0)) },
+       message.match?(/%\{param\}/)]
+    end
+
+    def default_translation(code)
       message = ::I18n.t("permittable.errors.#{code}", default: nil)
       message.is_a?(String) ? message : nil
     end
@@ -806,11 +839,20 @@ module Permittable
       # params builder guards a controller; a standalone Contract#call on a
       # webhook payload has nothing in front of it, so `"caf\xC3"` was a 500.
       return [:error, "invalid_type"] unless value.valid_encoding?
-      # A :string is handed back exactly as it arrived, in its own encoding.
-      # `skip_parameter_encoding` / `param_encoding` send a controller binary
-      # or Shift_JIS text ON PURPOSE, and converting it would hand the app
-      # something other than what it asked Rails for.
-      return cast_string(value) if type == :string
+
+      if type == :string
+        # A NUL is no text either: PostgreSQL refuses a string holding U+0000
+        # ("string contains null byte"), so keeping it was a 500 at the INSERT.
+        # Read as UTF-8, so a UTF-16 String's own zero bytes are not mistaken
+        # for one; text with no UTF-8 reading is left to the checks it fails.
+        return [:error, "invalid_type"] if utf8_text(value)&.include?("\u0000")
+
+        # A :string is handed back exactly as it arrived, in its own encoding.
+        # `skip_parameter_encoding` / `param_encoding` send a controller binary
+        # or Shift_JIS text ON PURPOSE, and converting it would hand the app
+        # something other than what it asked Rails for.
+        return cast_string(value)
+      end
 
       # A UTF-8 String IS already its own inspection copy — the check just
       # above already scanned it — so utf8_text would only scan the same
@@ -2482,8 +2524,11 @@ module Permittable
   # delegation — so a contract cannot grow request-state dependencies; its
   # whole vocabulary is the hash it receives plus `violate!`.
   class FinalizeRunner
-    def initialize(violations)
+    # `param_messages` is the host's identity-keyed record of the violations
+    # whose message spells the param itself (see permittable_violation_summary).
+    def initialize(violations, param_messages = nil)
       @violations = violations
+      @param_messages = param_messages
     end
 
     # Records ONE violation and halts the finalize block immediately (the
@@ -2495,8 +2540,9 @@ module Permittable
       entry = { param: param.to_s, code: code.to_s }
       # Same resolution order as field violations: explicit message, then
       # the app's I18n copy for the code, then the bare shape.
-      resolved = message ? message.to_s : Permittable.default_message_for(code)
+      resolved, names_param = message ? [message.to_s, false] : Permittable.default_message_and_param_use(code, param: entry[:param])
       entry[:message] = resolved if resolved
+      @param_messages[entry] = true if names_param && @param_messages
       @violations << entry
       throw :permittable_finalize_halt
     end
@@ -2522,8 +2568,8 @@ module Permittable
     #            permitted_params call; true validates in a before_action.
     #   mode:    nil (default) follows Permittable.mode; :enforce rejects
     #            violating requests; :monitor reports them and passes the
-    #            raw params through (see MONITOR MODE in the module
-    #            comment).
+    #            uncast, declared-keys-only params through (see MONITOR MODE
+    #            in the module comment).
     #   desc:    documentation only — carried on the rule for exporters
     #            (Permittable::OpenAPI); the runtime never reads it.
     def permit_params(*actions, root: false, model: nil, unknown: :ignore, enforce: false, mode: nil, desc: nil, &block)
@@ -2546,6 +2592,7 @@ module Permittable
       fields = builder.build(&block)
       raise ArgumentError, "#{LABEL}: a contract must declare at least one field" if fields.empty?
 
+      permittable_refuse_router_keys!(root, fields)
       model_class = resolve_permit_model(model)
       guard_contract_columns!(model_class, fields) if model_class
       register_sensitive_params(fields)
@@ -2567,6 +2614,23 @@ module Permittable
     end
 
     private
+
+    # Rails merges the route's `controller` and `action` into params, and the
+    # router's value wins over the body's, so a rootless contract declaring
+    # one would silently read the router's, and the exports would still
+    # document a body property. A controller only: a standalone
+    # Contract has no router, so one may declare them.
+    def permittable_refuse_router_keys!(root, fields)
+      return unless defined?(::ActionController::Metal) && self < ::ActionController::Metal && !root
+
+      clash = fields.map { |f| f[:name].to_s } & REFUSED_ROOTLESS_KEYS
+      return if clash.empty?
+
+      raise ArgumentError,
+            "#{LABEL}: a rootless contract cannot declare #{clash.map { |n| ":#{n}" }.join(', ')}: Rails puts the " \
+            "route's #{clash.length == 1 ? 'value' : 'values'} there, never the client's. Wrap the fields in " \
+            "root: (the client sends them under that key), or rename the param"
+    end
 
     # Registers the rescue_from handler and the before_action the gem relies
     # on, each once per class, as soon as the class can take them. They used
@@ -2894,6 +2958,7 @@ module Permittable
   end
 
   def validate_params_contract!(rule, action)
+    @permittable_message_memo = {} # one I18n lookup per code for this validation (see default_message_for)
     violations = []
     source = permittable_root_hash(rule, violations)
     result = ActiveSupport::HashWithIndifferentAccess.new
@@ -2919,11 +2984,12 @@ module Permittable
 
   # Monitor mode's violation path: emit the same instrumentation event the
   # enforce path does (payload mode: :monitor) plus a warn line, then hand
-  # back exactly what the client sent — no casts, no defaults, no
-  # transforms — so behaviour is identical to the pre-contract app. A
-  # missing root: passes an empty hash through (the envelope you asked for
-  # isn't there); a rootless contract drops only the router's bookkeeping
-  # keys, mirroring their exemption from the unknown-keys check.
+  # back what the client sent — no casts, no defaults, no transforms — but
+  # only under the keys the contract declares. A violation must not unlock
+  # the undeclared ones: `User.create!(permitted_params)` would assign
+  # `admin` because `age` was a String. A missing root: passes an empty hash
+  # (the envelope you asked for isn't there); a rootless contract also loses
+  # the router's bookkeeping keys, which no contract declares.
   def permittable_monitor_pass_through(rule, source, violations)
     permittable_instrument_violations(violations, mode: :monitor)
     if respond_to?(:logger) && logger
@@ -2932,12 +2998,60 @@ module Permittable
     end
     return ActiveSupport::HashWithIndifferentAccess.new unless source
 
-    # Deliberately NOT deep-copied, unlike the enforce path's result: this is
-    # the pre-contract app's own params, and `params.permit` hands its Strings
-    # back by reference too — copying here would change behaviour in the one
-    # mode whose promise is that nothing changes.
-    passed = ActiveSupport::HashWithIndifferentAccess.new(source)
-    rule[:root] ? passed : passed.except(*MONITOR_DROPPED_KEYS)
+    permittable_monitor_filter(rule[:fields], source)
+  end
+
+  # What `params.permit` would have kept of `hash`: declared keys, recursively,
+  # values as sent. Scalars are deliberately NOT copied, unlike the enforce
+  # path's result: `params.permit` hands its Strings back by reference too,
+  # and the values are the client's own. A field's date_select parts
+  # (`on(1i)`) ride along, as permit(:on) lets them. A value whose shape does
+  # not fit its declaration is dropped, as permit drops it, unless it is a
+  # scalar sent to a scalar field (monitor reports the wrong type, it does
+  # not hide it): a Hash or an Array of the wrong kind could carry undeclared
+  # keys, e.g. into an `*_attributes` writer. Only a :json field's value, and
+  # an upload, which is a scalar, stay whole.
+  def permittable_monitor_filter(fields, hash)
+    result = ActiveSupport::HashWithIndifferentAccess.new
+    fields.each do |field|
+      key = field[:name].to_s
+      if hash.key?(key)
+        value = permittable_monitor_value(field, hash[key])
+        result[key] = value unless value.equal?(MONITOR_DROP)
+      end
+      count = (field[:kind] == :scalar && DATE_PARTS[field[:type]]) || 0
+      (1..count).each do |position|
+        part = "#{key}(#{position}i)"
+        result[part] = hash[part] if hash.key?(part) && permittable_monitor_scalar?(hash[part])
+      end
+    end
+    result
+  end
+
+  def permittable_monitor_value(field, value)
+    return value if field[:kind] == :json
+
+    fields = field[:fields]
+    if fields
+      if value.is_a?(Hash) && field[:kind] == :nested
+        permittable_monitor_filter(fields, value)
+      elsif permittable_fields_for_records?(field, value)
+        value.transform_values { |record| permittable_monitor_filter(fields, record) }
+      elsif value.is_a?(Array) && field[:kind] == :array
+        value.grep(Hash).map { |element| permittable_monitor_filter(fields, element) }
+      else
+        MONITOR_DROP
+      end
+    elsif permittable_monitor_scalar?(value) ||
+          (field[:kind] == :array && value.is_a?(Array) && value.all? { |e| permittable_monitor_scalar?(e) })
+      value
+    else
+      MONITOR_DROP
+    end
+  end
+
+  def permittable_monitor_scalar?(value)
+    !value.is_a?(Hash) && !value.is_a?(Array)
   end
 
   def raise_invalid_parameters!(violations, status:)
@@ -2967,6 +3081,11 @@ module Permittable
     # saved (see permittable_unknown_key_violation), and falls back to the
     # param for any other violation.
     permittable_prose_list(violations) do |v|
+      # The copy already names the param (`%{param} is missing`), so naming
+      # it first would print it twice. Not routed through the name's
+      # quoting: it is the translator's sentence, as a suffix always was.
+      next ["", v[:message]] if @permittable_param_messages&.key?(v)
+
       name = @permittable_unknown_key_raw&.[](v) || v[:param].to_s
       [name, v[:message] ? " #{v[:message]}" : " (#{v[:code]})"]
     end
@@ -3076,23 +3195,32 @@ module Permittable
   # the bare { param:, code: } shape, so existing consumers see no change.
   def permittable_violation(field, param, code)
     entry = { param: param, code: code.to_s }
-    message = permittable_message_for(field, code)
+    message, names_param = permittable_message_for(field, code, param)
     entry[:message] = message if message
+    permittable_param_messages[entry] = true if names_param
     entry
+  end
+
+  # The violations whose message spells the param itself, by identity.
+  def permittable_param_messages
+    @permittable_param_messages ||= {}.compare_by_identity
   end
 
   # Resolution order: the field's own `message:` (String, or Hash entry for
   # this code), then the app's I18n copy (permittable.errors.<code>), then
   # nothing — the bare { param:, code: } shape.
-  def permittable_message_for(field, code)
+  def permittable_message_for(field, code, param)
     spec = field[:message]
-    return spec if spec.is_a?(String)
+    return [spec, false] if spec.is_a?(String)
 
-    (spec && spec[code.to_sym]) || Permittable.default_message_for(code)
+    own = spec && spec[code.to_sym]
+    return [own, false] if own
+
+    Permittable.default_message_and_param_use(code, param: param, memo: @permittable_message_memo)
   end
 
   def permittable_run_finalize(finalizer, result, violations)
-    runner = FinalizeRunner.new(violations)
+    runner = FinalizeRunner.new(violations, permittable_param_messages)
     finalized = catch(:permittable_finalize_halt) do
       runner.instance_exec(result, &finalizer)
     end
@@ -3108,7 +3236,12 @@ module Permittable
 
   def permittable_root_hash(rule, violations)
     raw = permittable_plain_params
-    return raw unless rule[:root]
+    unless rule[:root]
+      return raw unless permittable_non_object_body?(rule, raw)
+
+      violations << permittable_violation({}, NON_OBJECT_BODY, "invalid_type")
+      return nil
+    end
 
     key = rule[:root].to_s
     value = raw[key]
@@ -3126,6 +3259,26 @@ module Permittable
     code = permittable_absent?(value, raw, key) ? "missing" : "invalid_type"
     violations << permittable_violation({}, key, code)
     nil
+  end
+
+  # Rails parks a JSON body that is not an object (`[1]`, `5`, `"x"`) under
+  # `_json`, a key no client wrote. Under `unknown: :error` it was reported
+  # as an "unknown" `_json`; the body is malformed, as a rooted contract's
+  # non-object body is (a 400). Only where `_json` was already refused: an
+  # `unknown: :ignore` action may still read `params[:_json]` itself, and a
+  # contract that declares `_json` has asked for it. A request only — a
+  # standalone Contract has no body — and a JSON one: `_json` in a form is
+  # just an unknown field. An object body that happens to use the name is
+  # not that: Rails never wraps one, so `_json` must be the only key the
+  # client sent (the router's, the path's and ParamsWrapper's keys are not
+  # the client's) and not itself a Hash.
+  def permittable_non_object_body?(rule, raw)
+    sent = raw.keys - UNCHECKED_TOP_LEVEL_KEYS - permittable_request_supplied_keys -
+           [@permittable_wrapper_key, permittable_configured_csrf_key]
+    rule[:unknown] == :error && sent == ["_json"] && !raw["_json"].is_a?(Hash) &&
+      rule[:fields].none? { |f| f[:name].to_s == "_json" } &&
+      respond_to?(:request) && request.respond_to?(:content_mime_type) &&
+      request.content_mime_type&.symbol == :json
   end
 
   # One plain HashWithIndifferentAccess view of `params`, whatever the
@@ -3325,7 +3478,8 @@ module Permittable
     status, code = Coercion.check_json_bounds(field, value)
     return [status, code] unless status == :ok
 
-    Coercion.check_custom(field[:validate], value.deep_dup)
+    # Not deep_dup, which recurses (see DeepCopy).
+    Coercion.check_custom(field[:validate], DeepCopy.call(value, dup_leaves: true))
   end
 
   # The shared tail of the two kinds whose entire value is checked in one
@@ -3577,9 +3731,8 @@ module Permittable
   # wrapper's name (`optional :feedback, :string` on FeedbackController)
   # would otherwise validate Rails' copy of the whole body as that field — a
   # false 422 invalid_type for a well-formed request. Top level only, where
-  # the copy lives. What is checked changes, not what monitor mode hands
-  # back: its raw pass-through still carries the copy, as the pre-contract
-  # app's params did.
+  # the copy lives. Only what is checked changes: monitor mode's
+  # pass-through never carries the copy, which no contract declared.
   def permittable_without_wrapper_copy(rule, source)
     key = @permittable_wrapper_key
     key && permittable_drops_wrapper_copy?(rule, key) ? source.except(key) : source

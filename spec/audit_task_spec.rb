@@ -420,7 +420,7 @@ RSpec.describe "permittable:audit and permittable:openapi with a mounted engine"
 
     it "lists the engine's covered action under its mounted path, not as stale" do
       out = results["audit"]["out"]
-      expect(out).to match(%r{POST\s+/billing/invoices\s+create\s+enforce})
+      expect(out).to match(%r{POST\s+/billing/invoices\s+create\s+lazy})
       expect(out).not_to include("no route reaches")
     end
   end

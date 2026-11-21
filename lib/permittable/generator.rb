@@ -1070,6 +1070,10 @@ module Permittable
       parts = ["permit_params #{actions.map(&:inspect).join(', ')}"]
       parts << "root: :#{root}" if root
       parts << "model: #{model.name}" if model
+      # enforce: true rides along so that the flip (`mode: :enforce`, or deleting
+      # the mode when the app is not monitoring) never leaves a lazy rule that
+      # no before_action runs.
+      parts << "enforce: true"
       parts << "mode: :monitor do"
       parts.join(", ")
     end
@@ -1309,7 +1313,8 @@ module Permittable
     end
 
     HEADER = "# Drafted by permittable:generate — review the TODOs, then deploy: monitor\n" \
-             "# mode reports violations (instrumentation + log) without rejecting requests.\n".freeze
+             "# mode reports violations (instrumentation + log) without rejecting requests.\n" \
+             "# To enforce, change `mode: :monitor` to `mode: :enforce`.\n".freeze
 
     UPDATE_NOTE = "# :update has nothing required — a PATCH sends only the fields it changes.\n".freeze
 
@@ -1333,7 +1338,8 @@ module Permittable
     # An action in `except` is dropped from the rule that declares it, and a
     # rule left with no action is dropped: excepting :create from a split
     # draft leaves the :update rule as drafted, with nothing required.
-    def render(root:, model:, except: [], &lines)
+    def render(root:, model:, except: [], &drafted)
+      lines = ->(rule) { root ? drafted.call(rule) : without_router_keys(drafted.call(rule)) }
       shared = lines.call(:shared)
       return nil if shared.all? { |line| line.start_with?("#") }
 
@@ -1348,6 +1354,30 @@ module Permittable
           "#{body.map { |line| "  #{one_line(line)}\n" }.join}end\n"
       end
       HEADER + bodies.join("\n#{UPDATE_NOTE}")
+    end
+
+    # A rootless contract cannot declare the router's keys (permit_params
+    # raises at class load: Rails puts the route's value there, never the
+    # client's), so a top-level `action` or `controller` column or permitted
+    # key becomes a TODO, with the block it opens (a nested opener may carry
+    # a trailing TODO comment), rather than a draft that raises when pasted.
+    # `format` is not refused, so it stays a field.
+    ROUTER_KEY_LINE = /\A\w+ :"?(#{Permittable::REFUSED_ROOTLESS_KEYS.join('|')})"?(?=[ ,]|\z)/
+
+    def without_router_keys(body)
+      skipping = false
+      body.filter_map do |line|
+        if skipping
+          skipping = line != "end"
+          next
+        end
+        match = ROUTER_KEY_LINE.match(line)
+        next line unless match
+
+        skipping = line.match?(/\sdo(?:\s+#.*)?\z/)
+        "# TODO: #{match[1]} is a router key — a rootless contract cannot declare it; " \
+          "wrap the fields in root: or rename the param"
+      end
     end
 
     # Every drafted line passes through here, the one place text from the

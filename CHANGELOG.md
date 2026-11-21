@@ -1,11 +1,32 @@
-<!-- CHANGELOG.md -->
+<!-- CHANGELOG.md — format: docs/changelog-format.md -->
 
 ## Unreleased
-<!-- title: GET, HEAD and DELETE operations exported with query parameters instead of a JSON body, and date_select parts accepted by a strict exported schema -->
+
+### Breaking
+- **A rootless contract can no longer declare `action` or `controller`.** Rails fills them with the route's values, never the client's, so `permit_params` now raises `ArgumentError` at class load. Wrap the fields in `root:` or rename them; `format` is still allowed. (#187)
+- **An `:integer` field over an integer-backed enum needs an `in:` of its values when `check_column_types` is on.** `role: 5` passed the contract and then raised on assignment (a 500). Declare `in: Model.roles.values`. (#188)
+
+### Changed
+- **`permittable:audit` labels a lazy rule `lazy` instead of `enforce`.** Such a rule checks only actions that read `permitted_params`. The summary adds "N lazy", `summary[:enforced]` no longer counts lazy rules, and `[strict]` is unchanged. (#187)
+- **`permittable:generate` drafts carry `enforce: true`.** Changing `mode: :monitor` to `mode: :enforce` now enforces; deleting the mode used to leave a lazy rule that checked nothing. (#187)
+- **OpenAPI documents GET, HEAD and DELETE contracts as query parameters instead of a JSON body.** A client generated for those endpoints changes shape. A `sensitive:` field there ends up in URLs, so keep such fields in a POST body. (#189)
 
 ### Fixed
-- **`Permittable::OpenAPI.document` documents a GET, HEAD or DELETE contract as query parameters.** It exported the contract as a JSON `requestBody` for a verb whose request carries none, so a client generated for `GET /users` was handed a body parameter the server never read. The fields are now `in: query` parameters and the operation has no `requestBody`: a scalar as `name`, an array of scalars as `name[]` (Rails' spelling), a flat `root:` contract as one required `deepObject` parameter, and a field a path parameter or route default already took is not repeated. **A generated client for such an endpoint changes shape**: it takes arguments instead of a body, and `openapi-typescript` types change with it. A contract with a nested block, an array of hashes, a `:json` or `:file` field keeps its body and gains `x-permittable-query-unrepresentable: true`. POST, PUT and PATCH, `request_body_for` and `x-permittable-controllers` operations are unchanged. A required `:date` or `:datetime` is listed `required: false`, since its `date_select` parts meet it. A `sensitive: true` field exported as a query parameter puts the secret in URLs and access logs; take it in a POST body. No request-time behaviour changes.
-- **The exported schema accepts the `date_select` parts the server accepts.** A required `:date` or `:datetime` field was exported as `required: ["starts_on"]`, and under `unknown: :error` the object had `additionalProperties: false`, so a schema-validating tool refused `event[starts_on(1i)]=2026&event[starts_on(2i)]=10&event[starts_on(3i)]=17`, which the server reads as the date. The requirement is now `anyOf` the key or all of `(1i)`–`(3i)`; under `unknown: :error` the parts are declared (digits or a non-negative Integer), tied together, and refused beside the key, as the server does. `JsonSchema.rule`, `Contract#json_schema` and the document share it, so a generated validator gains `anyOf`, `dependentRequired` and `not`, and a type generator gains the optional `starts_on(1i)` properties. No request-time behaviour changes.
+- **A `:string` refuses an inner NUL character as `invalid_type`.** `"a\u0000b"` was accepted, and PostgreSQL cannot store it. (#188)
+- **A JSON body that is not an object answers 400 instead of reporting an unknown `_json`.** It applies to `[1,2]`, `5` or `null` sent to a rootless `unknown: :error` contract; the param is `(body)`. (#188)
+- **`permittable.errors.*` translations fill `%{param}` and `%{code}`.** They were shipped as written. The prose summary no longer repeats the param before such a translation. (#188)
+- **`Contract#call` no longer overflows a thread's stack on a deep `:json` value.** Input is copied iteratively at any depth, and a self-referencing Hash raises `ArgumentError`. (#188)
+- **`unknown: :error` is faster with many unknown keys.** 20,000 keys took 2.9s and now take 1.2s. (#188)
+- **The column guard accepts attributes declared with `attribute`.** It no longer asks for `virtual: true` there, and still checks their type. (#188)
+- **The exported schema accepts the `date_select` parts the server accepts.** That covers `starts_on(1i)`…`(3i)` in place of `starts_on`, and blank hour or minute parts. (#189)
+
+## 0.16.1 (2026-11-21)
+<!-- title: monitor mode stops passing undeclared keys to permitted_params -->
+
+**Upgrade:** drop-in, unless monitor-mode code reads an undeclared key from `permitted_params` on a rejected request. Read it from `params` instead.
+
+### Security
+- **Monitor mode no longer lets a rejected request mass-assign undeclared keys.** `permitted_params` returned the whole payload when a request violated the contract, so `{"user":{"age":"x","admin":true}}` reached `User.create!(permitted_params)` with `admin: true`. It now keeps only the declared keys at every depth, as `params.permit` does. Values stay uncast, and the request is still not rejected. (#186)
 
 ## 0.16.0 (2026-11-15)
 <!-- title: date and boolean strings held to what the parser read, an audit that stops counting skipped contracts, and 422 rendered as an Integer -->
