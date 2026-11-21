@@ -1,10 +1,12 @@
-<!-- CHANGELOG.md -->
+<!-- CHANGELOG.md — format: docs/changelog-format.md -->
 
-## Unreleased
-<!-- title: monitor mode stops handing undeclared keys to permitted_params on a violating request -->
+## 0.16.1 (2026-11-21)
+<!-- title: monitor mode stops passing undeclared keys to permitted_params -->
+
+**Upgrade:** drop-in, unless monitor-mode code reads an undeclared key from `permitted_params` on a rejected request. Read it from `params` instead.
 
 ### Security
-- **Monitor mode no longer leaks undeclared keys through `permitted_params`.** On a violating request a rule in monitor mode (its own `mode: :monitor`, or any rule without a `mode:` under `Permittable.mode = :monitor`) returned the client's whole payload, so `{"user":{"name":"a","age":"notint","admin":true}}` reached `User.create!(permitted_params)` with `admin` in it: one wrong-typed field was enough to mass-assign any column, and `ForbiddenAttributesError` never fired because the result is a `HashWithIndifferentAccess`. It now returns the values as sent, still uncast, undefaulted and untransformed, but only under the keys the contract declares, at every depth and inside each element of an array of hashes, as `params.permit` would. A Hash (or an array of Hashes) sent where a scalar or a `:file` was declared is dropped, a scalar sent where a nested block was declared is dropped, and an array of hashes keeps only its Hash elements; a `:json` field keeps its value whole and an upload is kept. Clean requests, enforce mode, the event and the warn line are unchanged. An app that relied on an undeclared key (a path parameter, a form key, the wrapper's copy) reaching `permitted_params` in monitor mode must read `params` for it instead.
+- **Monitor mode no longer lets a rejected request mass-assign undeclared keys.** `permitted_params` returned the whole payload when a request violated the contract, so `{"user":{"age":"x","admin":true}}` reached `User.create!(permitted_params)` with `admin: true`. It now keeps only the declared keys at every depth, as `params.permit` does. Values stay uncast, and the request is still not rejected. (#186)
 
 ## 0.16.0 (2026-11-15)
 <!-- title: date and boolean strings held to what the parser read, an audit that stops counting skipped contracts, and 422 rendered as an Integer -->
