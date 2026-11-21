@@ -385,6 +385,10 @@ permit_params(*actions, root: false, model: nil, unknown: :ignore, enforce: fals
 | `mode:` | `nil` | `nil` follows `Permittable.mode`; `:monitor` reports violations instead of rejecting — see [monitor mode](#monitor-mode-roll-out-without-rejecting) |
 | `desc:` | `nil` | Documentation only — becomes the operation description in [exported OpenAPI](#exporting-openapi-docs-that-cannot-drift) |
 
+A **rootless** contract cannot declare a top-level field named `action` or `controller`: `permit_params` raises `ArgumentError` at class load. Rails merges the route's values for those two into `params`, over the body's, so the field would read the router's value (`"create"`) and never the client's, while the exported JSON Schema and OpenAPI would document it as an ordinary body property. Wrap the fields in `root:` (the client sends them under that key) or rename the param. A nested field named `action`, a `root:` contract, and a standalone `Permittable::Contract` (which has no router) are unaffected.
+
+A rootless field named `format` is allowed, but it reads the **route's** format (the URL extension, as in `/things.json`, or a route's `format:` default), not a body value, so a client's body `format` is ignored there. The OpenAPI export documents a route `format:` default that way. To take `format` from the body, declare it under `root:`.
+
 `permit_params` is **repeatable**, and **the last matching rule wins**. Contracts behave like configuration: a base controller declares a catch-all, and a subclass overrides it for specific actions.
 
 ```ruby
@@ -1044,7 +1048,8 @@ For each controller the task infers the model from `controller_name` (columns gi
 ```ruby
 # Drafted by permittable:generate — review the TODOs, then deploy: monitor
 # mode reports violations (instrumentation + log) without rejecting requests.
-permit_params :create, root: :user, model: User, mode: :monitor do
+# To enforce, change `mode: :monitor` to `mode: :enforce`.
+permit_params :create, root: :user, model: User, enforce: true, mode: :monitor do
   required :name, :string
   optional :age, :integer
   optional :status, :string, in: User.statuses.keys # database default: "active"; TODO: Rails also assigns the stored integers (status: 1) — if API clients send them, add User.statuses.values.map(&:to_s) to in: and map them back to keys with transform: ->(v) { User.statuses.key(Integer(v, exception: false)) || v }
@@ -1053,7 +1058,7 @@ permit_params :create, root: :user, model: User, mode: :monitor do
 end
 
 # :update has nothing required — a PATCH sends only the fields it changes.
-permit_params :update, root: :user, model: User, mode: :monitor do
+permit_params :update, root: :user, model: User, enforce: true, mode: :monitor do
   optional :name, :string
   optional :age, :integer
   optional :status, :string, in: User.statuses.keys # database default: "active"; TODO: Rails also assigns the stored integers (status: 1) — if API clients send them, add User.statuses.values.map(&:to_s) to in: and map them back to keys with transform: ->(v) { User.statuses.key(Integer(v, exception: false)) || v }
@@ -1066,7 +1071,7 @@ A scanned draft keeps the root its permit call names (a rootless `params.permit(
 
 The generator's one rule is **draft, don't guess** — everything it cannot know for sure stays visible instead of silently decided:
 
-- Drafts come out in **monitor mode**, so pasting one changes nothing until you flip it.
+- Drafts come out in **monitor mode**, so pasting one changes nothing until you flip it. Every draft also carries `enforce: true`, so the flip is to **change `mode: :monitor` to `mode: :enforce`**, which holds whatever `Permittable.mode` the app runs: the rule then validates in the `before_action`, whatever the action reads. (Deleting `mode: :monitor` also enforces, but not under an app-wide `Permittable.mode = :monitor`, where the rule would inherit monitor.) Without `enforce: true` a rule is [lazy](#auditing-coverage-permittableaudit): a legacy action that reads `params` directly would be checked by nothing.
 - A permitted key that isn't a column becomes `virtual: true` with a TODO; a PostgreSQL array column drafts as `array :tags, of: :string` with a `length:` TODO (an array of `json`/`jsonb` elements, which `of:` cannot express, is a TODO, and so is a `json`/`jsonb` column whose default is an array, since `:json` accepts only an object); a column type with no faithful representation (`binary`, geometry types) becomes a TODO comment; a permit argument the conservative parser can't read (`*dynamic_keys`) is kept verbatim in a TODO instead of dropped.
 - Drafted from the columns alone, `created_at`/`updated_at` and a primary key the database generates are left out: Rails or the database assigns them. A generated key is an auto-increment column (as the adapter reports it, even as one part of a composite key) or one with a default or default function, such as a uuid. A permit call that **lists** one keeps it, typed from its real column (`optional :created_at, :datetime`) and always `optional`, even though the column is NOT NULL — it is a column like any other, so the schema-drift guard stays on for it. A primary key the client must send is no such column: a natural key (`sku`, from `create_table :items, primary_key: :sku, id: :string`) or a part of a composite key that is not auto-increment is drafted like any other, `required` on `:create` when it is NOT NULL with no default.
 - **Comments are not code.** A commented-out `params.require(:admin).permit(:superuser)` kept for reference is skipped, so it can't contribute a root or a field to the draft. The source is tokenised with `Ripper` for this, because `#` is only sometimes a comment — a permit call inside `#{'#{...}'}` interpolation is live code and is still read, and quoted keys like `permit("name")` still work.
@@ -1119,7 +1124,7 @@ users
   DELETE /users/{id}                        destroy      monitor
   PATCH  /users/{id}                        update       enforce  model: User  unknown: error
 
-8 routed actions: 3 enforced, 1 in monitor mode, 3 without a contract, 1 not found (Rails 404s it)
+8 routed actions: 3 enforced, 0 lazy, 1 in monitor mode, 3 without a contract, 1 not found (Rails 404s it)
   2 of those accept a request body — untrusted input reaches the action unchecked
   2 covered actions declare no model:, so no schema-drift guard runs for them
 
@@ -1131,6 +1136,7 @@ Three things it tells you that nothing else does:
 
 - **Which write actions are unguarded.** A `GET` without a contract is usually fine; a `POST` without one is untrusted input reaching the action unchecked. That count is the number `[strict]` fails on, which makes the task a CI gate: *no new unguarded write endpoint*.
 - **Which contracts aren't enforcing yet.** The audit runs inside the app, so unlike the exported OpenAPI it resolves the **effective** mode — a rule's own `mode:` first, then your app-wide `Permittable.mode`. This is the [monitor-mode](#monitor-mode-roll-out-without-rejecting) rollout dashboard.
+- **Which contracts are lazy.** A rule with neither `enforce: true` nor monitor mode has no `before_action`: it validates only when the action reads `permitted_params`. The audit reads it as `lazy — checked only if the action reads permitted_params` and counts it apart from `enforced` (`3 enforced, 1 lazy, ...`), because an action that still reads `params` directly is checked by nothing. A lazy rule is still **covered**: `[strict]` counts only write actions with no contract at all, so a lazy one does not fail it. Add `enforce: true` to make the check run before the action.
 - **Which contracts have gone stale.** A contract declared for an action no route reaches, or for a routed action Rails would 404, is a renamed or deleted action that left its contract behind. A contract on a shared base controller is stale only when no controller that inherits it reaches the action, and it is listed once, under the class that declares it.
 
 A contract that validates from the `before_action` (an `enforce: true` rule, or one in monitor mode) but whose callback was removed with a plain `skip_before_action :enforce_params_contract` reads `no contract — request not checked before the action: ...`, and counts against `[strict]` if it takes a body. `enforce: true` promises the check runs before the action whatever the action does, and the skip took that away. The note says the request is checked only if the action reads `permitted_params`: one that does is still validated there (rejected, or a monitor event), so the row can be a gap that is not one in practice. The audit does not read the action's code. To have such an action count as covered, declare its rule as a lazy one, neither `enforce: true` nor monitor mode (its own `mode:` or an app-wide `Permittable.mode = :monitor`, which makes every rule a monitor one): it validates when the action reads `permitted_params`, skip or not, and the audit reads it as covered. A subclass that skips what its parent declared is reported the same way, and so is a child's own `permit_params` under a parent that skipped it, since the callback is registered once per class tree and is not put back. A skip with `only:` or `except:` is read per action, the way Rails compares them (Symbols or Strings, one name or an Array): the actions it names read as above, the ones it spares stay covered. Skips in a row add up, and a subclass's skip never reaches its parent. A skip with `if:` or `unless:` cannot be evaluated without running your code, so every action it could reach reads `no contract — request may not be checked before the action: ... is conditional`, whether or not the condition holds at request time; an `only:` skip that also has `if:` is reported as skipped for the actions it names. Declaring `before_action :enforce_params_contract` again after a skip puts the check back, and the audit reads it as covered. The audit learns of a skip from the `skip_before_action` call itself (the gem wraps it on the controller once it registers its callback), so three things stay invisible: a skip made with `raise: false` on an ancestor that never included `Permittable` (it has nothing to skip itself, Rails rewrites the callback of the subclass that registered it, and nothing is recorded), a conditional skip made with `skip_callback(:process_action, :before, :enforce_params_contract, if: ...)` directly, and a `before_action :enforce_params_contract, only: ...` the app declares itself. All leave the action reported as covered; a skip made with `skip_callback` and no condition removes the callback and is reported. Check those with a request spec.

@@ -1,5 +1,14 @@
 <!-- CHANGELOG.md — format: docs/changelog-format.md -->
 
+## Unreleased
+
+### Breaking
+- **A rootless contract can no longer declare `action` or `controller`.** Rails fills them with the route's values, never the client's, so `permit_params` now raises `ArgumentError` at class load. Wrap the fields in `root:` or rename them; `format` is still allowed. (#187)
+
+### Changed
+- **`permittable:audit` labels a lazy rule `lazy` instead of `enforce`.** Such a rule checks only actions that read `permitted_params`. The summary adds "N lazy", `summary[:enforced]` no longer counts lazy rules, and `[strict]` is unchanged. (#187)
+- **`permittable:generate` drafts carry `enforce: true`.** Changing `mode: :monitor` to `mode: :enforce` now enforces; deleting the mode used to leave a lazy rule that checked nothing. (#187)
+
 ## 0.16.1 (2026-11-21)
 <!-- title: monitor mode stops passing undeclared keys to permitted_params -->
 
