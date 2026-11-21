@@ -33,6 +33,7 @@ require "uri" # URI::MailTo::EMAIL_REGEXP backs the :email format preset
 
 require "permittable/version"
 require "permittable/error_envelope"
+require "permittable/deep_copy"
 require "permittable/column_guard"
 require "permittable/filter_parameter_registry"
 
@@ -3381,7 +3382,8 @@ module Permittable
     status, code = Coercion.check_json_bounds(field, value)
     return [status, code] unless status == :ok
 
-    Coercion.check_custom(field[:validate], value.deep_dup)
+    # Not deep_dup, which recurses (see DeepCopy).
+    Coercion.check_custom(field[:validate], DeepCopy.call(value, dup_leaves: true))
   end
 
   # The shared tail of the two kinds whose entire value is checked in one

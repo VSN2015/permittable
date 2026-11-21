@@ -2937,7 +2937,7 @@ RSpec.describe Permittable do
     it "copies a :json value only once it is within its bounds, so a rejected payload is never copied" do
       copies = 0
       leaf = Object.new
-      leaf.define_singleton_method(:deep_dup) { (copies += 1) && self }
+      leaf.define_singleton_method(:dup) { (copies += 1) && self }
       decl = proc { permit_params(:create) { optional :meta, :json, length: 0..1 } }
 
       expect(violations_for({ meta: { "a" => leaf, "b" => 1 } }, &decl).details)

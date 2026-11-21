@@ -555,7 +555,7 @@ permit_params :create, root: :user, model: User do
 end
 ```
 
-The hash passes through **untouched** — keys are neither filtered nor cast, nested arrays and mixed scalars survive, and `unknown:` does not descend into it. `{}` is a value, not an absence. Anything that is not a hash (an array, a string, a number) is `invalid_type`.
+The hash passes through **untouched** — keys are neither filtered nor cast, nested arrays and mixed scalars survive, and `unknown:` does not descend into it. `{}` is a value, not an absence. Anything that is not a hash (an array, a string, a number) is `invalid_type`. The value is copied before `validate:` sees it, and the copy does not recurse, so no nesting depth overflows the stack, including in a thread (a Puma request thread, a job): a [`Contract`](#standalone-contracts-no-controller) given a Hash 20,000 levels deep still answers. Bound it with `max_depth:` if the application should refuse it.
 
 What you give up is the shape. What you keep:
 

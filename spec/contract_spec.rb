@@ -74,6 +74,27 @@ RSpec.describe Permittable::Contract do
       expect(outcome).to eq([:ok, true, false])
     end
 
+    # Past JSON.parse's own limit of 100 only a program can build the input,
+    # but a Contract takes any Hash: the accepted value is copied before app
+    # code sees it, and ActiveSupport's recursive deep_dup overflowed the
+    # thread's stack from about 120 levels.
+    it "processes a :json value nested 3000 deep inside a Thread, copying it before the app sees it" do
+      deep = {}
+      3000.times { deep = { "a" => deep } }
+      leaf = "text"
+      deep = { "leaf" => leaf, "deep" => deep }
+      meta = described_class.define { optional :meta, :json }
+      outcome = Thread.new do
+        result = meta.call("meta" => deep)
+        copied = result.params["meta"]
+        [:ok, result.valid?, copied.equal?(deep), copied["leaf"].equal?(leaf), copied["leaf"] == leaf]
+      rescue SystemStackError => e
+        [:overflow, e.class]
+      end.value
+
+      expect(outcome).to eq([:ok, true, false, false, true])
+    end
+
     it "refuses a JSON-deep value past max_depth: as a violation inside a Thread" do
       deep = JSON.parse("#{'[{"a":' * 50}1#{"}]" * 50}")
       meta = described_class.define { optional :meta, :json, max_depth: 5 }

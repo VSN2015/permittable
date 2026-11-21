@@ -153,56 +153,14 @@ module Permittable
     def normalize_input(input)
       return {} if input.nil?
       return input if input.respond_to?(:to_unsafe_h)
-      return indifferent_copy(input) if input.is_a?(Hash)
+      # A service object is usually handed a slice of params inside a plain
+      # Hash — `CreateUser.call(user: params[:user])` — and a Parameters value
+      # is not a Hash, so a root read it as invalid_type (400), a nested block
+      # or :json field likewise (422); DeepCopy converts each one, the way
+      # to_unsafe_h converts the whole, without recursing (a thread's stack).
+      return DeepCopy.call(input) if input.is_a?(Hash)
 
       raise ArgumentError, "#{LABEL}: Contract#call expects a Hash (got #{input.class})"
-    end
-
-    # The input as the HashWithIndifferentAccess the concern validates, with
-    # every nested Hash and Array copied and every ActionController::Parameters
-    # converted. A service object is usually handed a slice of params inside a
-    # plain Hash — `CreateUser.call(user: params[:user])` — and a Parameters
-    # value is not a Hash, so a root read it as invalid_type (400), a nested
-    # block or :json field likewise (422); each one is converted here, the way
-    # to_unsafe_h converts the whole.
-    #
-    # Iterative on purpose. HashWithIndifferentAccess.new, like any recursive
-    # walk, spends several frames a level, and a Thread's stack (a Puma
-    # request thread, a job runner) holds about 60 levels of it: a :json
-    # value nested 62 deep, which JSON.parse accepts up to 100, raised an
-    # uncaught SystemStackError. An empty container is attached to its parent
-    # before it is filled, so HWIA's own deep conversion never has anything
-    # to walk.
-    #
-    # Each entry carries the ids of its ancestors, so a container that holds
-    # itself (`h["self"] = h`) is refused instead of copied for ever: the
-    # recursive walk this replaced ended in a SystemStackError at once, and an
-    # iterative one would otherwise grow without bound.
-    def indifferent_copy(input)
-      root = ActiveSupport::HashWithIndifferentAccess.new
-      pending = [[input, root, [input.object_id]]]
-      until pending.empty?
-        source, copy, ancestors = pending.pop
-        if source.is_a?(Hash)
-          source.each_pair { |key, value| copy[key] = container_for(value, pending, ancestors) }
-        else
-          source.each { |value| copy << container_for(value, pending, ancestors) }
-        end
-      end
-      root
-    end
-
-    def container_for(value, pending, ancestors)
-      value = value.to_unsafe_h if value.respond_to?(:to_unsafe_h)
-      copy = case value
-             when Hash then ActiveSupport::HashWithIndifferentAccess.new
-             when Array then []
-             else return value
-             end
-      raise ArgumentError, "#{LABEL}: Contract#call input contains itself (a cyclic Hash or Array)" if ancestors.include?(value.object_id)
-
-      pending << [value, copy, ancestors + [value.object_id]]
-      copy
     end
   end
 end
