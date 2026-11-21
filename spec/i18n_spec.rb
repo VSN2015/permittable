@@ -179,6 +179,65 @@ RSpec.describe "I18n violation messages" do
     end
   end
 
+  # The summary names each violation by its param and then its message. A
+  # translation that spells the param itself (`%{param} is missing`) already
+  # does, and the summary read `user.name user.name is missing (missing)`.
+  describe "the prose summary" do
+    def summary_of(klass, params)
+      c = klass.new(params: params)
+      c.define_singleton_method(:action_name) { "create" }
+      c.permitted_params
+    rescue Permittable::InvalidParameters => e
+      e.message
+    end
+
+    let(:klass) do
+      permittable_class do
+        permit_params(:create, root: :user) do
+          required :name, :string
+          required :age, :integer, message: "must be a number"
+          optional :nick, :string, in: %w[a b]
+          finalize { |p| violate!(:name, :too_long) && p }
+        end
+      end
+    end
+
+    it "does not repeat the param before a translation that already names it" do
+      store(missing: "%{param} is missing (%{code})")
+      expect(summary_of(klass, { user: { age: "x" } }))
+        .to eq("Invalid parameters: user.name is missing (missing), user.age must be a number")
+    end
+
+    it "keeps the param prefix for a translation without %{param} and for a field's own message:" do
+      store(missing: "is missing", inclusion: "is not allowed")
+      expect(summary_of(klass, { user: { age: "x", nick: "z" } }))
+        .to eq("Invalid parameters: user.name is missing, user.age must be a number, user.nick is not allowed")
+    end
+
+    it "agrees for a violate! code in finalize, and for a Contract's raised message" do
+      store(too_long: "%{param} is too long")
+      c = Permittable::Contract.define(root: :user) do
+        required :name, :string
+        finalize { |p| violate!("user.name", :too_long) && p }
+      end
+      expect { c.call!("user" => { "name" => "x" }) }
+        .to raise_error(Permittable::InvalidParameters, "Invalid parameters: user.name is too long")
+    end
+
+    it "agrees in the monitor-mode log line" do
+      store(missing: "%{param} is missing")
+      klass = permittable_class { permit_params(:create, mode: :monitor) { required :name, :string } }
+      c = klass.new(params: {})
+      c.define_singleton_method(:action_name) { "create" }
+      messages = []
+      logger = Object.new
+      logger.define_singleton_method(:warn) { |msg| messages << msg }
+      c.define_singleton_method(:logger) { logger }
+      c.permitted_params
+      expect(messages.join).to include("would have been rejected: name is missing").and(satisfy { !_1.include?("name name") })
+    end
+  end
+
   # With `unknown: :error`, every undeclared key is a violation, and each one
   # used to ask I18n for the same copy again: 200,000 keys took 34 seconds.
   it "looks a code's translation up once per validation, not once per violation" do
