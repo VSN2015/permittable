@@ -53,6 +53,10 @@ module Permittable
                    "(checked only if the action reads permitted_params)"
     }.freeze
 
+    # A lazy rule is covered (it counts for [strict]) but nothing runs it
+    # before the action, so the table must not call it `enforce`.
+    LAZY_NOTE = "lazy — checked only if the action reads permitted_params".freeze
+
     # One routed action, paired with the rule a request for it would resolve
     # through (nil when nothing covers it — including when the controller
     # never included the concern, which is exactly the case worth finding).
@@ -86,6 +90,12 @@ module Permittable
       # first and the app-wide default behind it.
       def mode
         rule && (rule[:mode] || Permittable.mode)
+      end
+
+      # An enforce-mode rule without `enforce: true`: no before_action checks
+      # it, so it validates only when the action reads permitted_params.
+      def lazy?
+        covered? && mode == :enforce && !rule[:enforce]
       end
 
       def model
@@ -471,7 +481,8 @@ module Permittable
       found, missing = entries.partition { |e| !e.missing_action? }
       {
         actions: entries.length,
-        enforced: found.count { |e| e.mode == :enforce },
+        enforced: found.count { |e| e.mode == :enforce && !e.lazy? },
+        lazy: found.count(&:lazy?),
         monitored: found.count { |e| e.mode == :monitor },
         uncovered: found.count { |e| !e.covered? },
         uncovered_with_body: found.count { |e| !e.covered? && e.body? },
@@ -526,11 +537,17 @@ module Permittable
     def status(entry)
       return ["no contract", uncovered_note(entry)].compact.join(" — ") unless entry.covered?
 
-      parts = [entry.mode.to_s]
+      parts = [entry.lazy? ? lazy_label(entry) : entry.mode.to_s]
       parts << "model: #{entry.model.name}" if entry.model.respond_to?(:name) && entry.model.name
       parts << "unknown: #{entry.unknown}" unless entry.unknown == :ignore
       parts << not_found_note(entry)
       parts.compact.join("  ")
+    end
+
+    # The note says what a lazy rule's row is worth; an action Rails would 404
+    # has no check to describe.
+    def lazy_label(entry)
+      entry.missing_action? ? "lazy" : LAZY_NOTE
     end
 
     def uncovered_note(entry)
@@ -570,7 +587,7 @@ module Permittable
       [
         "",
         "#{counts[:actions]} routed action#{'s' unless counts[:actions] == 1}#{listed}: " \
-        "#{counts[:enforced]} enforced, #{counts[:monitored]} in monitor mode, " \
+        "#{counts[:enforced]} enforced, #{counts[:lazy]} lazy, #{counts[:monitored]} in monitor mode, " \
         "#{counts[:uncovered]} without a contract#{not_found}",
         "  #{body} of those accept#{'s' if body == 1} a request body" \
         "#{' — untrusted input reaches the action unchecked' unless body.zero?}",

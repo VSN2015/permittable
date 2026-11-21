@@ -99,10 +99,10 @@ require "permittable/filter_parameter_registry"
 # `Permittable.mode = :monitor` app-wide; a rule's own mode: wins) runs the
 # full pipeline but REPORTS violations instead of rejecting: the same
 # "invalid_parameters.permittable" event fires (payload mode: :monitor),
-# the logger warns, and permitted_params returns the raw params passed
-# through untouched — no casts, no defaults, no transforms — so behaviour
-# is identical to the pre-contract app (a missing root: passes an empty
-# hash; a rootless contract drops only the router's bookkeeping keys).
+# the logger warns, and permitted_params returns the client's values as
+# sent — no casts, no defaults, no transforms — but only under the keys the
+# contract declares, so a violation cannot unlock an undeclared column (a
+# missing root: passes an empty hash).
 # Monitor rules validate eagerly in the before_action regardless of
 # enforce:, because telemetry must not depend on the action calling
 # permitted_params — legacy actions still reading `params` directly are
@@ -243,24 +243,27 @@ module Permittable
   # <button name="button">, so a browser sends `button=` even with no
   # value). Without this `unknown: :error` was unusable outside a JSON API:
   # every browser form failed on the framework's own keys rather than on
-  # anything the client got wrong. Exempt from the CHECK only: unlike the
-  # routing keys these are NOT stripped from monitor mode's raw
-  # pass-through, where handing back an untouched params hash is the whole
-  # promise and a legacy action may well read `_method` itself.
+  # anything the client got wrong. Exempt from the CHECK only: monitor mode's
+  # pass-through keeps declared keys alone, so it carries none of them (a
+  # legacy action may still read `_method` from `params`).
   #
   # The click point of an image submit (image_submit_tag, which has no name
   # of its own to exempt) is a form key too, but not a fixed one: `x` and `y`,
   # or `<name>.x` and `<name>.y`, as a PAIR of digits. See
   # permittable_image_submit_keys.
   FORM_KEYS = %w[authenticity_token _method utf8 commit button].freeze
-  # ROUTING_KEYS/FORM_KEYS name where the keys come FROM; these two name what
-  # is DECIDED with them, which is what the call sites care about — and the
-  # asymmetry between them is the deliberate point, so spell it once here
-  # rather than leaving a bare ROUTING_KEYS to read like an oversight.
+  # ROUTING_KEYS/FORM_KEYS name where the keys come FROM; this names what is
+  # DECIDED with them, which is what the call sites care about.
   UNCHECKED_TOP_LEVEL_KEYS = (ROUTING_KEYS + FORM_KEYS).freeze
+  # Monitor mode's filter returns this for a value it leaves out (nil is a
+  # value it keeps).
+  MONITOR_DROP = Object.new.freeze
+  # What a rootless controller contract may not declare: the route's value
+  # always replaces the client's. `format` is left out on purpose: a route's
+  # `format:` default fills such a field, which the OpenAPI export documents.
+  REFUSED_ROOTLESS_KEYS = %w[controller action].freeze
   # The param a non-object JSON body is reported under (see permittable_non_object_body?).
   NON_OBJECT_BODY = "(body)".freeze
-  MONITOR_DROPPED_KEYS = ROUTING_KEYS
   # Rails' date_select, datetime_select and time_select submit ONE value as
   # several keys, each named for its position: `starts_on(1i)` the year,
   # `(2i)` the month, `(3i)` the day, `(4i)` the hour, `(5i)` the minute and
@@ -484,8 +487,8 @@ module Permittable
     # App-wide default for rules that don't declare their own mode:.
     # :enforce (the default) rejects violating requests; :monitor reports
     # them — same instrumentation event with payload mode: :monitor, plus a
-    # logger.warn — and lets the request proceed with the raw params passed
-    # through. This is the rollout switch for brownfield adoption: set it
+    # logger.warn — and lets the request proceed with the client's values
+    # (uncast, declared keys only). This is the rollout switch for brownfield adoption: set it
     # from an initializer (Permittable.mode =
     # ENV.fetch("PERMITTABLE_MODE", "enforce").to_sym) and flip controllers
     # to their final mode one at a time, since a rule's own mode: always
@@ -2565,8 +2568,8 @@ module Permittable
     #            permitted_params call; true validates in a before_action.
     #   mode:    nil (default) follows Permittable.mode; :enforce rejects
     #            violating requests; :monitor reports them and passes the
-    #            raw params through (see MONITOR MODE in the module
-    #            comment).
+    #            uncast, declared-keys-only params through (see MONITOR MODE
+    #            in the module comment).
     #   desc:    documentation only — carried on the rule for exporters
     #            (Permittable::OpenAPI); the runtime never reads it.
     def permit_params(*actions, root: false, model: nil, unknown: :ignore, enforce: false, mode: nil, desc: nil, &block)
@@ -2589,6 +2592,7 @@ module Permittable
       fields = builder.build(&block)
       raise ArgumentError, "#{LABEL}: a contract must declare at least one field" if fields.empty?
 
+      permittable_refuse_router_keys!(root, fields)
       model_class = resolve_permit_model(model)
       guard_contract_columns!(model_class, fields) if model_class
       register_sensitive_params(fields)
@@ -2610,6 +2614,23 @@ module Permittable
     end
 
     private
+
+    # Rails merges the route's `controller` and `action` into params, and the
+    # router's value wins over the body's, so a rootless contract declaring
+    # one would silently read the router's, and the exports would still
+    # document a body property. A controller only: a standalone
+    # Contract has no router, so one may declare them.
+    def permittable_refuse_router_keys!(root, fields)
+      return unless defined?(::ActionController::Metal) && self < ::ActionController::Metal && !root
+
+      clash = fields.map { |f| f[:name].to_s } & REFUSED_ROOTLESS_KEYS
+      return if clash.empty?
+
+      raise ArgumentError,
+            "#{LABEL}: a rootless contract cannot declare #{clash.map { |n| ":#{n}" }.join(', ')}: Rails puts the " \
+            "route's #{clash.length == 1 ? 'value' : 'values'} there, never the client's. Wrap the fields in " \
+            "root: (the client sends them under that key), or rename the param"
+    end
 
     # Registers the rescue_from handler and the before_action the gem relies
     # on, each once per class, as soon as the class can take them. They used
@@ -2963,11 +2984,12 @@ module Permittable
 
   # Monitor mode's violation path: emit the same instrumentation event the
   # enforce path does (payload mode: :monitor) plus a warn line, then hand
-  # back exactly what the client sent — no casts, no defaults, no
-  # transforms — so behaviour is identical to the pre-contract app. A
-  # missing root: passes an empty hash through (the envelope you asked for
-  # isn't there); a rootless contract drops only the router's bookkeeping
-  # keys, mirroring their exemption from the unknown-keys check.
+  # back what the client sent — no casts, no defaults, no transforms — but
+  # only under the keys the contract declares. A violation must not unlock
+  # the undeclared ones: `User.create!(permitted_params)` would assign
+  # `admin` because `age` was a String. A missing root: passes an empty hash
+  # (the envelope you asked for isn't there); a rootless contract also loses
+  # the router's bookkeeping keys, which no contract declares.
   def permittable_monitor_pass_through(rule, source, violations)
     permittable_instrument_violations(violations, mode: :monitor)
     if respond_to?(:logger) && logger
@@ -2976,12 +2998,60 @@ module Permittable
     end
     return ActiveSupport::HashWithIndifferentAccess.new unless source
 
-    # Deliberately NOT deep-copied, unlike the enforce path's result: this is
-    # the pre-contract app's own params, and `params.permit` hands its Strings
-    # back by reference too — copying here would change behaviour in the one
-    # mode whose promise is that nothing changes.
-    passed = ActiveSupport::HashWithIndifferentAccess.new(source)
-    rule[:root] ? passed : passed.except(*MONITOR_DROPPED_KEYS)
+    permittable_monitor_filter(rule[:fields], source)
+  end
+
+  # What `params.permit` would have kept of `hash`: declared keys, recursively,
+  # values as sent. Scalars are deliberately NOT copied, unlike the enforce
+  # path's result: `params.permit` hands its Strings back by reference too,
+  # and the values are the client's own. A field's date_select parts
+  # (`on(1i)`) ride along, as permit(:on) lets them. A value whose shape does
+  # not fit its declaration is dropped, as permit drops it, unless it is a
+  # scalar sent to a scalar field (monitor reports the wrong type, it does
+  # not hide it): a Hash or an Array of the wrong kind could carry undeclared
+  # keys, e.g. into an `*_attributes` writer. Only a :json field's value, and
+  # an upload, which is a scalar, stay whole.
+  def permittable_monitor_filter(fields, hash)
+    result = ActiveSupport::HashWithIndifferentAccess.new
+    fields.each do |field|
+      key = field[:name].to_s
+      if hash.key?(key)
+        value = permittable_monitor_value(field, hash[key])
+        result[key] = value unless value.equal?(MONITOR_DROP)
+      end
+      count = (field[:kind] == :scalar && DATE_PARTS[field[:type]]) || 0
+      (1..count).each do |position|
+        part = "#{key}(#{position}i)"
+        result[part] = hash[part] if hash.key?(part) && permittable_monitor_scalar?(hash[part])
+      end
+    end
+    result
+  end
+
+  def permittable_monitor_value(field, value)
+    return value if field[:kind] == :json
+
+    fields = field[:fields]
+    if fields
+      if value.is_a?(Hash) && field[:kind] == :nested
+        permittable_monitor_filter(fields, value)
+      elsif permittable_fields_for_records?(field, value)
+        value.transform_values { |record| permittable_monitor_filter(fields, record) }
+      elsif value.is_a?(Array) && field[:kind] == :array
+        value.grep(Hash).map { |element| permittable_monitor_filter(fields, element) }
+      else
+        MONITOR_DROP
+      end
+    elsif permittable_monitor_scalar?(value) ||
+          (field[:kind] == :array && value.is_a?(Array) && value.all? { |e| permittable_monitor_scalar?(e) })
+      value
+    else
+      MONITOR_DROP
+    end
+  end
+
+  def permittable_monitor_scalar?(value)
+    !value.is_a?(Hash) && !value.is_a?(Array)
   end
 
   def raise_invalid_parameters!(violations, status:)
@@ -3661,9 +3731,8 @@ module Permittable
   # wrapper's name (`optional :feedback, :string` on FeedbackController)
   # would otherwise validate Rails' copy of the whole body as that field — a
   # false 422 invalid_type for a well-formed request. Top level only, where
-  # the copy lives. What is checked changes, not what monitor mode hands
-  # back: its raw pass-through still carries the copy, as the pre-contract
-  # app's params did.
+  # the copy lives. Only what is checked changes: monitor mode's
+  # pass-through never carries the copy, which no contract declared.
   def permittable_without_wrapper_copy(rule, source)
     key = @permittable_wrapper_key
     key && permittable_drops_wrapper_copy?(rule, key) ? source.except(key) : source

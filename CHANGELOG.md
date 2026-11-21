@@ -1,18 +1,30 @@
-<!-- CHANGELOG.md -->
+<!-- CHANGELOG.md — format: docs/changelog-format.md -->
 
 ## Unreleased
-<!-- title: NUL bytes refused, integer enums held to an in:, translations that interpolate, and a Contract that survives a Thread's stack -->
 
-Seven fixes to inputs and declarations that ended in a 500, an uncaught `SystemStackError`, or a message the client could not read. Each can make something that passes today fail. A request can now be refused: a `:string` (or an `array of: :string` element, or a field with a `format:` or `normalize:`) holding a NUL character, which was kept and then raised at the PostgreSQL INSERT, and a JSON body that is not an object sent to a rootless `unknown: :error` contract, which was a 422 `unknown` and is now a 400. A boot can now fail: an `:integer` field over an integer-backed Rails `enum` with no `in:`, with a Range, or with an `in:` listing an integer the enum does not map, when `Permittable.check_column_types` is on.
+### Breaking
+- **A rootless contract can no longer declare `action` or `controller`.** Rails fills them with the route's values, never the client's, so `permit_params` now raises `ArgumentError` at class load. Wrap the fields in `root:` or rename them; `format` is still allowed. (#187)
+- **An `:integer` field over an integer-backed enum needs an `in:` of its values when `check_column_types` is on.** `role: 5` passed the contract and then raised on assignment (a 500). Declare `in: Model.roles.values`. (#188)
+
+### Changed
+- **`permittable:audit` labels a lazy rule `lazy` instead of `enforce`.** Such a rule checks only actions that read `permitted_params`. The summary adds "N lazy", `summary[:enforced]` no longer counts lazy rules, and `[strict]` is unchanged. (#187)
+- **`permittable:generate` drafts carry `enforce: true`.** Changing `mode: :monitor` to `mode: :enforce` now enforces; deleting the mode used to leave a lazy rule that checked nothing. (#187)
 
 ### Fixed
-- **`Contract#call` raised an uncaught `SystemStackError` inside a thread.** A `:json` value nested 62 levels deep, well under the 100 `JSON.parse` accepts, overflowed a thread's stack (a Puma request thread, a job runner) because the input was copied through `HashWithIndifferentAccess`'s recursive conversion. The copy is now iterative, so any depth `JSON.parse` takes by default is processed, or refused with `max_depth:` as the usual `depth` violation. The copy an accepted `:json` value gets before `validate:` sees it was ActiveSupport's recursive `deep_dup`, which overflowed a thread from about 120 levels; it is iterative too, so no depth overflows (a program can build a Hash far deeper than `JSON.parse` reads; 20,000 levels are processed in a thread). A controller was not affected below `JSON.parse`'s limit: Rails hands it parameters already converted. A Hash or Array that contains itself (`h["self"] = h`) is refused with an `ArgumentError`, where the recursive copy used to end in a `SystemStackError`.
-- **An `:integer` declaration over an integer-backed `enum` passed the drift guard with no `in:`.** `optional :role, :integer` (or `in: [0, 1, 2]`, or `in: 0..9`) passed, and `role: 5` was cast and then raised `ArgumentError: '5' is not a valid role` on assignment. It is now held to the rule a text declaration already was, with the enum's stored integers as the list: `in: User.roles.values`.
-- **A `:string` accepted a NUL character.** `"a\u0000b"` was kept, and PostgreSQL refuses it. It is now `invalid_type`, as is the same text under `format:` or in an `array of: :string`; `:json` contents and `:file` are unchanged. A `normalize:` that strips edge whitespace (`:squish`, `:strip`) still removes a leading or trailing NUL before the check, so only a NUL left inside the value is refused.
-- **A JSON body that is not an object was reported as an unknown `_json`.** Rails parks `[1]`, `5`, `"x"` or `null` under `_json`; a rootless `unknown: :error` contract now answers `400` with `{ param: "(body)", code: "invalid_type" }`, so a JSON `null` body is a 400 too. It applies only when `_json` is the only key the client sent: `{"_json":[1],"name":"ok"}` is an object and still reports `_json` as unknown. A contract that declares `_json`, `unknown: :ignore`, a form field named `_json` and a standalone `Contract` are unchanged. An object body whose only key is `{"_json": 1}` is indistinguishable from a wrapped scalar and gets the same answer.
-- **`permittable.errors.*` translations were not interpolated.** `invalid_type: "%{param} type"` shipped the literal `%{param}`. `%{param}` (the violation's path) and `%{code}` are now filled in, as values only, so a client-controlled key containing `%{` cannot alter the message. Placeholders are filled one at a time: a translation with no placeholders is used as written, a placeholder with no value here (`%{field}`) is left as written beside the ones that have, and `%%` or `%<x>s` stay as typed. A field's own `message:` is not interpolated. The `InvalidParameters` message and the monitor-mode log line name each violation by its param and then its message; they no longer repeat the param before a translation that spells `%{param}` itself (`Invalid parameters: user.name is missing`, not `user.name user.name is missing`).
-- **`unknown: :error` looked its translation up once per violation.** The lookup is now made once per locale and code for each validation; 20,000 undeclared keys took 2.9s and take 1.2s.
-- **An attribute declared with `attribute :vip, :boolean` was reported as "does not exist in the database".** It now exists for the guard, with no `virtual: true`, and with `check_column_types` on it is compared against the attribute's own type. An `enum` over such an attribute with no column exists too, and is held to the same `in:` rule as an enum over a column (`optional :level, :string` with no `in:` fails at boot, since `level: "bogus"` would raise on assignment). `items_attributes` is still reported.
+- **A `:string` refuses an inner NUL character as `invalid_type`.** `"a\u0000b"` was accepted, and PostgreSQL cannot store it. (#188)
+- **A JSON body that is not an object answers 400 instead of reporting an unknown `_json`.** It applies to `[1,2]`, `5` or `null` sent to a rootless `unknown: :error` contract; the param is `(body)`. (#188)
+- **`permittable.errors.*` translations fill `%{param}` and `%{code}`.** They were shipped as written. The prose summary no longer repeats the param before such a translation. (#188)
+- **`Contract#call` no longer overflows a thread's stack on a deep `:json` value.** Input is copied iteratively at any depth, and a self-referencing Hash raises `ArgumentError`. (#188)
+- **`unknown: :error` is faster with many unknown keys.** 20,000 keys took 2.9s and now take 1.2s. (#188)
+- **The column guard accepts attributes declared with `attribute`.** It no longer asks for `virtual: true` there, and still checks their type. (#188)
+
+## 0.16.1 (2026-11-21)
+<!-- title: monitor mode stops passing undeclared keys to permitted_params -->
+
+**Upgrade:** drop-in, unless monitor-mode code reads an undeclared key from `permitted_params` on a rejected request. Read it from `params` instead.
+
+### Security
+- **Monitor mode no longer lets a rejected request mass-assign undeclared keys.** `permitted_params` returned the whole payload when a request violated the contract, so `{"user":{"age":"x","admin":true}}` reached `User.create!(permitted_params)` with `admin: true`. It now keeps only the declared keys at every depth, as `params.permit` does. Values stay uncast, and the request is still not rejected. (#186)
 
 ## 0.16.0 (2026-11-15)
 <!-- title: date and boolean strings held to what the parser read, an audit that stops counting skipped contracts, and 422 rendered as an Integer -->

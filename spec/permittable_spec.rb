@@ -3205,10 +3205,10 @@ RSpec.describe Permittable do
       expect(e.details).to eq([{ param: "user.authenticity_token", code: "unknown" }])
     end
 
-    it "passes the form keys through in monitor mode — only the router's own keys are dropped" do
+    it "does not pass the form keys through in monitor mode — only declared keys come back" do
       klass = permittable_class { permit_params(:create, mode: :monitor) { required :n, :integer } }
       passed = controller(klass, params: { n: "x", _method: "patch", controller: "users" }).permitted_params
-      expect(passed.to_h).to eq("n" => "x", "_method" => "patch")
+      expect(passed.to_h).to eq("n" => "x")
     end
 
     it "flags undeclared keys inside root and nested hashes (routing keys are only top-level)" do
@@ -3225,7 +3225,7 @@ RSpec.describe Permittable do
       expect(c.permitted_params.to_h).to eq("name" => "a")
       expect(c.permittable_violations).to eq([])
 
-      # Monitor's raw pass-through is the unwrapped envelope, siblings dropped too.
+      # Monitor's pass-through is the unwrapped envelope, siblings dropped too.
       monitored = permittable_class { permit_params(:create, root: :user, mode: :monitor) { required :name, :integer } }
       expect(controller(monitored, params: params).permitted_params.to_h).to eq("name" => "a")
     end
@@ -4346,6 +4346,84 @@ RSpec.describe Permittable do
     end
   end
 
+  # Rails merges the route's controller, action and format into params, over
+  # the body's. A rootless contract declaring one would read the route's value
+  # while the exports documented a body property, so permit_params refuses it.
+  describe "router keys as field names", :integration do
+    let(:routed) { { "controller" => "x", "action" => "create", "format" => "json" } }
+
+    %w[action controller].each do |key|
+      it "refuses a rootless :#{key} field at class load, naming the fix" do
+        expect do
+          IntegrationHarness.build_controller do
+            include Permittable
+
+            permit_params(:create, enforce: true) { optional key.to_sym, :string }
+          end
+        end.to raise_error(ArgumentError, /rootless contract cannot declare :#{key}.*Wrap the fields in root:.*rename the param/)
+      end
+    end
+
+    it "refuses one pulled in by a field group, and names every clash" do
+      group = Permittable.fields { optional :controller, :string }
+      expect do
+        IntegrationHarness.build_controller do
+          include Permittable
+
+          permit_params(:create) do
+            use group
+            optional :action, :string
+          end
+        end
+      end.to raise_error(ArgumentError, /cannot declare :controller, :action|cannot declare :action, :controller/)
+    end
+
+    # The route's format (the URL extension, or a route's format: default)
+    # fills it; the OpenAPI export documents that, so it is not refused.
+    it "accepts a rootless :format field, which reads the route's format and not the body's" do
+      formatted = IntegrationHarness.build_controller do
+        include Permittable
+
+        permit_params(:create, enforce: true) { optional :format, :string }
+        def create = render(json: permitted_params)
+      end
+      reply = IntegrationHarness.dispatch(formatted, :create, method: "POST", path_params: routed, json: { format: "client-fmt" })
+      expect([reply.status, JSON.parse(reply.body)]).to eq([200, { "format" => "json" }])
+    end
+
+    it "accepts the client's value under a root" do
+      rooted = IntegrationHarness.build_controller do
+        include Permittable
+
+        permit_params(:create, root: :job, enforce: true) do
+          optional :action, :string
+          optional :format, :string
+        end
+        def create = render(json: permitted_params)
+      end
+      reply = IntegrationHarness.dispatch(rooted, :create, method: "POST", path_params: routed,
+                                                           json: { job: { action: "client-action", format: "client-fmt" } })
+      expect([reply.status, JSON.parse(reply.body)]).to eq([200, { "action" => "client-action", "format" => "client-fmt" }])
+    end
+
+    it "accepts the client's value in a nested field" do
+      nested = IntegrationHarness.build_controller do
+        include Permittable
+
+        permit_params(:create, enforce: true) { optional(:step) { optional :action, :string } }
+        def create = render(json: permitted_params)
+      end
+      reply = IntegrationHarness.dispatch(nested, :create, method: "POST", path_params: routed,
+                                                           json: { step: { action: "client-action" } })
+      expect([reply.status, JSON.parse(reply.body)]).to eq([200, { "step" => { "action" => "client-action" } }])
+    end
+
+    it "leaves a standalone Contract, which has no router, free to declare one" do
+      contract = Permittable::Contract.new { optional :action, :string }
+      expect(contract.call("action" => "client-action").params).to eq("action" => "client-action")
+    end
+  end
+
   describe "delegating to the host's render_error" do
     def rejected(klass)
       c = controller(klass, params: {})
@@ -4879,10 +4957,10 @@ RSpec.describe Permittable do
       expect(c.permittable_violations).to eq([{ param: "user", code: "missing" }])
     end
 
-    it "drops only the router's bookkeeping keys from a rootless pass-through" do
+    it "drops the router's bookkeeping keys and every undeclared key from a rootless pass-through" do
       klass = permittable_class { permit_params(:create, mode: :monitor) { required :name, :string } }
-      c = controller(klass, params: { controller: "users", action: "create", extra: "kept" })
-      expect(c.permitted_params.to_h).to eq("extra" => "kept")
+      c = controller(klass, params: { controller: "users", action: "create", extra: "dropped" })
+      expect(c.permitted_params.to_h).to eq({})
     end
 
     it "follows Permittable.mode when the rule declares no mode, and a rule's own mode: wins both ways" do
@@ -4929,6 +5007,178 @@ RSpec.describe Permittable do
       expect { c.permitted_params }.not_to raise_error
       expect(c.permittable_violations).to eq([{ param: "ends_on", code: "before_start" }])
       expect(c.permitted_params.to_h).to eq("starts_on" => "2026-08-24", "ends_on" => "2026-08-01")
+    end
+
+    # A violating request in monitor mode hands back the client's values
+    # uncast, but only under keys the contract declares: an undeclared key
+    # must not reach Model.create!(permitted_params) just because another
+    # field was wrong.
+    describe "on a violating request, through a real request" do
+      def monitored_permitted(body, mode: :monitor, root: :user, &fields)
+        controller = IntegrationHarness.build_controller do
+          include Permittable
+
+          permit_params(:create, root: root, mode: mode, &fields)
+
+          def create
+            render json: { permitted: permitted_params, klass: permitted_params.class.name,
+                           violations: permittable_violations }
+          end
+        end
+        result = IntegrationHarness.dispatch(controller, :create, method: "POST", json: body)
+        expect(result.status).to eq(200)
+        JSON.parse(result.body)
+      end
+
+      it "drops an undeclared top-level key sent beside a type violation" do
+        body = monitored_permitted({ user: { name: "a", age: "notint", admin: true } }) do
+          required :name, :string
+          optional :age, :integer
+        end
+        expect(body["permitted"]).to eq("name" => "a", "age" => "notint")
+        expect(body["klass"]).to eq("ActiveSupport::HashWithIndifferentAccess")
+        expect(body["violations"]).to eq([{ "param" => "user.age", "code" => "invalid_type" }])
+      end
+
+      it "drops an undeclared key inside a nested block" do
+        body = monitored_permitted({ user: { name: "x", address: { city: "Hue", role: "root" } } }) do
+          required :name, :integer
+          required :address do
+            optional :city, :string
+          end
+        end
+        expect(body["permitted"]).to eq("name" => "x", "address" => { "city" => "Hue" })
+      end
+
+      it "drops an undeclared key inside each element of an array of hashes" do
+        body = monitored_permitted({ user: { name: "x", tags: [{ label: "a", admin: true }, { label: "b" }] } }) do
+          required :name, :integer
+          array :tags do
+            optional :label, :string
+          end
+        end
+        expect(body["permitted"]).to eq("name" => "x", "tags" => [{ "label" => "a" }, { "label" => "b" }])
+      end
+
+      it "filters fields_for style records and keeps their keys" do
+        body = monitored_permitted({ user: { name: "x", tags: { "0" => { label: "a", admin: true } } } }) do
+          required :name, :integer
+          array :tags do
+            optional :label, :string
+          end
+        end
+        expect(body["permitted"]).to eq("name" => "x", "tags" => { "0" => { "label" => "a" } })
+      end
+
+      it "drops a Hash sent to a scalar field, and an array of hashes sent to a scalar array" do
+        body = monitored_permitted({ user: { name: { admin: true }, ids: [{ admin: true }], ok: "x", n: "bad" } }) do
+          required :name, :integer
+          array :ids, of: :integer
+          optional :ok, :string
+          optional :n, :integer
+        end
+        expect(body["permitted"]).to eq("ok" => "x", "n" => "bad")
+      end
+
+      it "keeps only the Hash elements of an array of hashes" do
+        items = [nil, "s", 3, [{ admin: true }], { label: "a", admin: true }]
+        body = monitored_permitted({ user: { name: "x", items: items } }) do
+          required :name, :integer
+          array(:items) { optional :label, :string }
+        end
+        expect(body["permitted"]).to eq("name" => "x", "items" => [{ "label" => "a" }])
+      end
+
+      it "drops a Hash or an array of Hashes sent to a :file field" do
+        [{ avatar: { admin: true, key: "k" } }, { avatar: [{ admin: true }] }, { docs: [{ admin: true }] }].each do |sent|
+          body = monitored_permitted({ user: { name: "x", **sent } }) do
+            required :name, :integer
+            optional :avatar, :file
+            array :docs, of: :file
+          end
+          expect(body["permitted"]).to eq("name" => "x")
+        end
+      end
+
+      it "keeps a real upload sent to a :file field" do
+        controller = IntegrationHarness.build_controller do
+          include Permittable
+
+          permit_params :create, root: :user, mode: :monitor do
+            required :name, :integer
+            optional :avatar, :file
+          end
+
+          def create
+            render json: { keys: permitted_params.keys, avatar: permitted_params[:avatar].class.name }
+          end
+        end
+        parts = [["user[name]", "x"], ["user[avatar]", "hi", "a.txt"], ["user[admin]", "1"]]
+        result = IntegrationHarness.dispatch(controller, :create, method: "POST", multipart: parts)
+        expect(JSON.parse(result.body)).to eq("keys" => %w[name avatar], "avatar" => "ActionDispatch::Http::UploadedFile")
+      end
+
+      it "drops a scalar or an array sent where a nested block was declared, as params.permit does" do
+        body = monitored_permitted({ user: { name: "x", address: "home", tags: "t", other: [1, 2] } }) do
+          required :name, :integer
+          optional :address do
+            optional :city, :string
+          end
+          array(:tags) { optional :label, :string }
+          optional :other do
+            optional :city, :string
+          end
+        end
+        expect(body["permitted"]).to eq("name" => "x")
+      end
+
+      it "keeps a :json field's raw hash, as the enforce path does" do
+        body = monitored_permitted({ user: { name: "x", meta: { anything: { goes: [1, { x: 2 }] } } } }) do
+          required :name, :integer
+          optional :meta, :json
+        end
+        expect(body["permitted"]).to eq("name" => "x", "meta" => { "anything" => { "goes" => [1, { "x" => 2 }] } })
+      end
+
+      it "keeps wrong-typed scalars and arrays of scalars as sent, uncast" do
+        body = monitored_permitted({ user: { name: "a", age: "7", ids: %w[1 x], on: "nope", plan: nil } }) do
+          required :name, :integer
+          optional :age, :integer, in: 18..120
+          array :ids, of: :integer
+          optional :on, :date
+          optional :plan, :string, default: "free"
+        end
+        expect(body["permitted"]).to eq("name" => "a", "age" => "7", "ids" => %w[1 x], "on" => "nope", "plan" => nil)
+      end
+
+      it "keeps the raw parts a :date field reads, as params.permit would" do
+        body = monitored_permitted({ user: { name: "x", "on(1i)" => "2026", "on(2i)" => "13", "on(3i)" => "1", "x(1i)" => "9" } }) do
+          required :name, :integer
+          optional :on, :date
+        end
+        expect(body["permitted"]).to eq("name" => "x", "on(1i)" => "2026", "on(2i)" => "13", "on(3i)" => "1")
+      end
+
+      it "filters a rootless contract and still drops the routing keys" do
+        body = monitored_permitted({ name: "x", admin: true, _method: "patch" }, root: nil) do
+          required :name, :integer
+        end
+        expect(body["permitted"]).to eq("name" => "x")
+      end
+
+      it "filters under the app-wide Permittable.mode = :monitor for a rule without mode:" do
+        Permittable.mode = :monitor
+        body = monitored_permitted({ user: { name: "a", age: "notint", admin: true } }, mode: nil) do
+          required :name, :integer
+          optional :age, :integer
+        end
+        expect(body["permitted"]).to eq("name" => "a", "age" => "notint")
+      end
+
+      it "still passes an empty hash when the root is missing" do
+        body = monitored_permitted({ admin: true }) { required :name, :integer }
+        expect(body["permitted"]).to eq({})
+      end
     end
 
     it "permittable_violations returns [] for a clean request, and details under enforce without re-raising" do
@@ -6720,16 +6970,14 @@ RSpec.describe Permittable do
         expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "id", "code" => "invalid_type" }])
       end
 
-      it "leaves the path parameters and the wrapper's copy in monitor mode's pass-through" do
-        # Only the CHECK changes: a legacy action being monitored still reads
-        # params[:id] and params[:user] exactly as before the contract.
+      it "leaves the path parameters and the wrapper's copy out of monitor mode's pass-through" do
+        # permitted_params carries only declared keys; a legacy action being
+        # monitored still reads params[:id] and params[:user] from params.
         controller = build_rootless_controller(wrap: "user", mode: :monitor) { optional :name, :string }
         result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "Jo", rogue: 1 },
                                                                   path_params: { id: "1" })
         expect(result.status).to eq(200)
-        expect(JSON.parse(result.body)).to eq(
-          "name" => "Jo", "rogue" => 1, "id" => "1", "user" => { "name" => "Jo", "rogue" => 1 }
-        )
+        expect(JSON.parse(result.body)).to eq("name" => "Jo")
       end
 
       # Rails' own stack puts ParamsWrapper in ActionController::Base, behind
