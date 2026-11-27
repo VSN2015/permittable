@@ -66,16 +66,17 @@ module Permittable
       end
     end
 
-    # `render json:`, or — for a bare ActionController::Metal that never
-    # included ActionController::Rendering, and so has no `render` — the same
-    # response written through Metal's own status=, content_type= and
-    # response_body=. `render json:` calls `to_json` on a Hash, so the bytes
-    # are the same. A controller with `render` always takes the first path.
+    # `render json:`, or — for a bare ActionController::Metal with no `render`,
+    # or whose `render` has no :json renderer (ActionController::Rendering
+    # without Renderers::All answers 200 " ") — the same response written
+    # through Metal's own status=, content_type= and response_body=.
+    # `render json:` calls `to_json` on a Hash, so the bytes are the same. A
+    # controller that can `render json:` always takes the first path.
     def render_json(controller, payload, status:, content_type: nil)
       # The number, not the symbol: Rack >= 3.1 deprecates :unprocessable_entity
       # (:unprocessable_content there) and Rails 7.1 passes it to Rack as is.
       status = status_code(status) || status
-      if !controller.respond_to?(:render) && controller.respond_to?(:response_body=)
+      if !renders_json?(controller) && controller.respond_to?(:response_body=)
         controller.status = status
         controller.content_type = content_type if content_type
         controller.response_body = [payload.to_json]
@@ -85,6 +86,14 @@ module Permittable
       options = { json: payload, status: status }
       options[:content_type] = content_type if content_type
       controller.render(**options)
+    end
+
+    # A `render` that can answer `json:`. A controller class without the
+    # Renderers module has no `_renderers` at all.
+    def renders_json?(controller)
+      return false unless controller.respond_to?(:render)
+
+      controller.class.respond_to?(:_renderers) && controller.class._renderers.include?(:json)
     end
 
     # The media type (no parameters) the response already carries, or nil when

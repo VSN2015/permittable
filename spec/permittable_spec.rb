@@ -6128,6 +6128,7 @@ RSpec.describe Permittable do
     # InvalidParameters. They are now registered at the first `permit_params`.
     describe "on a bare ActionController::Metal controller, whatever the include order" do
       # `order` lists the modules to include; :permittable marks where.
+      # `rendering: :no_renderers` includes Rendering but not Renderers::All.
       def build_metal(order, rendering: true, &body)
         modules = { callbacks: AbstractController::Callbacks, rescue: ActionController::Rescue,
                     permittable: Permittable }
@@ -6135,8 +6136,8 @@ RSpec.describe Permittable do
           # One at a time, in Rails' own order: `include a, b` puts a in front.
           stack = [ActionController::Head, ActionController::StrongParameters]
           if rendering
-            stack = [AbstractController::Rendering, ActionController::Rendering,
-                     ActionController::Renderers::All] + stack
+            renderers = rendering == :no_renderers ? [] : [ActionController::Renderers::All]
+            stack = [AbstractController::Rendering, ActionController::Rendering, *renderers] + stack
           end
           stack.each { |mod| klass.include mod }
           klass.define_singleton_method(:controller_path) { "metal_order" }
@@ -6381,6 +6382,23 @@ RSpec.describe Permittable do
             expect(status).to eq(422)
             expect(type).to start_with("application/problem+json")
             expect(JSON.parse(body)).to include("title" => "Invalid parameters", "status" => 422)
+          end
+
+          # ActionController::Rendering defines `render`, but without
+          # Renderers::All it has no :json renderer: `render json:` answered
+          # 200 text/plain " " and the rejected request looked like a success.
+          { envelope: "application/json", problem: "application/problem+json" }.each do |format, media|
+            it "answers 422 under error_format :#{format} with Rendering but no Renderers::All" do
+              Permittable.error_format = format
+              controller = build_metal(order, rendering: :no_renderers) do
+                permit_params(:create, root: :user, enforce: true) { required :name, :string }
+                def create = head(:accepted)
+              end
+              status, type, body = dispatch_create(controller, json: { user: { nme: "x" } })
+              expect(status).to eq(422)
+              expect(type).to start_with(media)
+              expect(JSON.parse(body)).to include(format == :problem ? { "status" => 422 } : { "success" => false })
+            end
           end
 
           it "delegates to a private render_error defined below permit_params" do
