@@ -450,7 +450,7 @@ optional :avatar, :string # direct upload: a signed blob id
 
 Arrays are **optional unless `required: true`**, and `length:` on an array constrains the element **count**.
 
-An array of hashes also accepts the shape Rails' `fields_for` sends for nested attributes: `user[addresses_attributes][0][city]` reaches the params as a Hash keyed `"0"`, `"1"`, … and is read as the records it encodes, in the order sent, exactly as strong params and `accepts_nested_attributes_for` read it. Only that shape qualifies: every key an integer and every value a hash.
+An array of hashes also accepts the shape Rails' `fields_for` sends for nested attributes: `user[addresses_attributes][0][city]` reaches the params as a Hash keyed `"0"`, `"1"`, … and is read as the records it encodes, in the order sent, exactly as strong params and `accepts_nested_attributes_for` read it. Only that shape qualifies: every key an integer and every value a hash. An empty Hash is that shape with no records and reads as `[]`.
 
 `length:` is a **bound, not a report**: an array outside it is rejected without its elements being examined at all. A 200,000-element payload against `length: 0..10` is refused by its first check, so it costs one violation and a 40-byte body instead of 200,001 violations and several megabytes — milliseconds of contract work instead of seconds. There is **no default cap**: an array with no `length:` is unbounded, and every element of it is cast and checked however many arrive. Declare `length:` on every array you accept.
 
