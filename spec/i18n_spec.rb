@@ -167,6 +167,12 @@ RSpec.describe "I18n violation messages" do
       expect(details).to eq([{ param: "name", code: "missing", message: "100%% of %<x>s, name" }])
     end
 
+    it "does not read %{param} after a %% escape as a placeholder" do
+      store(invalid_type: "%%{param} 100%% %{param}")
+      details = violations_for({ age: "x" }) { permit_params(:create) { optional :age, :integer } }
+      expect(details).to eq([{ param: "age", code: "invalid_type", message: "%%{param} 100%% age" }])
+    end
+
     it "interpolates a violate! message too" do
       store(too_big: "%{param} is too big")
       details = violations_for({ n: "3" }) do

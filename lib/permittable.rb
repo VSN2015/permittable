@@ -634,7 +634,7 @@ module Permittable
       return [message, false] unless message&.include?("%")
 
       values = { param: param.to_s, code: code.to_s }
-      [message.gsub(/%\{(\w+)\}/) { values.fetch(Regexp.last_match(1).to_sym, Regexp.last_match(0)) },
+      [message.gsub(/%%|%\{(\w+)\}/) { Regexp.last_match(1) ? values.fetch(Regexp.last_match(1).to_sym, Regexp.last_match(0)) : "%%" },
        message.match?(/%\{param\}/)]
     end
 
