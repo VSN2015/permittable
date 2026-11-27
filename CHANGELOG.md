@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Fixed
-- **A translation's `%%` escape is left as written, so `"%%{param} %{param}"` gives `"%%{param} age"`.** It was `"%age"`, because the `%` of `%%` was read as the start of `%{param}`.
+- **A translation's `%%` escape is left as written, so `"%%{param} %{param}"` gives `"%%{param} age"`.** It was `"%age"`, because the `%` of `%%` was read as the start of `%{param}`. (#191)
 
 ## 0.17.0 (2026-11-22)
 <!-- title: rootless contracts refuse router keys, stricter strings and integer enums, and GET contracts exported as query parameters -->
