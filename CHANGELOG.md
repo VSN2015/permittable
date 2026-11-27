@@ -1,5 +1,10 @@
 <!-- CHANGELOG.md — format: docs/changelog-format.md -->
 
+## Unreleased
+
+### Fixed
+- **The concern's public methods were routable actions.** A `post "users/:action"` route answered `/users/enforce_params_contract` with 204 and `/users/permitted_params` with a 500; they are now `ActionNotFound` and no longer in `action_methods`.
+
 ## 0.17.0 (2026-11-22)
 <!-- title: rootless contracts refuse router keys, stricter strings and integer enums, and GET contracts exported as query parameters -->
 
