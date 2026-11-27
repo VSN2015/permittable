@@ -167,6 +167,12 @@ RSpec.describe "I18n violation messages" do
       expect(details).to eq([{ param: "name", code: "missing", message: "100%% of %<x>s, name" }])
     end
 
+    it "does not read %{param} after a %% escape as a placeholder" do
+      store(invalid_type: "%%{param} 100%% %{param}")
+      details = violations_for({ age: "x" }) { permit_params(:create) { optional :age, :integer } }
+      expect(details).to eq([{ param: "age", code: "invalid_type", message: "%%{param} 100%% age" }])
+    end
+
     it "interpolates a violate! message too" do
       store(too_big: "%{param} is too big")
       details = violations_for({ n: "3" }) do
@@ -212,6 +218,16 @@ RSpec.describe "I18n violation messages" do
       store(missing: "is missing", inclusion: "is not allowed")
       expect(summary_of(klass, { user: { age: "x", nick: "z" } }))
         .to eq("Invalid parameters: user.name is missing, user.age must be a number, user.nick is not allowed")
+    end
+
+    it "still prefixes the param when the only %{param} is escaped" do
+      c = Permittable::Contract.define(root: :user) { required :name, :string }
+      store(missing: "%%{param} is bad")
+      expect { c.call!("user" => {}) }
+        .to raise_error(Permittable::InvalidParameters, "Invalid parameters: user.name %%{param} is bad")
+      store(missing: "%%%%{param} x")
+      expect { c.call!("user" => {}) }
+        .to raise_error(Permittable::InvalidParameters, "Invalid parameters: user.name %%%%{param} x")
     end
 
     it "agrees for a violate! code in finalize, and for a Contract's raised message" do
