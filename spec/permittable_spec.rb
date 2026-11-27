@@ -7028,9 +7028,10 @@ RSpec.describe Permittable do
       end
 
       # The probe is a content-type lookup and a params read, and only a
-      # contract that reads its input without the copy acts on its answer.
-      # ParamsWrapper asks `_wrapper_enabled?` once itself, on every request,
-      # so any second ask is the probe's.
+      # contract that reads its input without the copy, or is rooted at the
+      # wrapper key (a non-object body must not pass as its root), acts on
+      # its answer. ParamsWrapper asks `_wrapper_enabled?` once itself, on
+      # every request, so any second ask is the probe's.
       describe "probing the request for the wrapper's copy" do
         def dispatch_counting_probes(controller, action, **request)
           instance = controller.new
@@ -7048,7 +7049,7 @@ RSpec.describe Permittable do
             include Permittable
 
             wrap_parameters :user, format: [:json]
-            permit_params(:create, root: :user, unknown: :error) { required :name, :string }
+            permit_params(:create, root: :account, unknown: :error) { required :name, :string }
             permit_params(:update, unknown: :ignore) { optional :name, :string }
 
             def create
@@ -7059,7 +7060,7 @@ RSpec.describe Permittable do
               render json: permitted_params
             end
           end
-          result, asked = dispatch_counting_probes(controller, :create, method: "POST", json: { name: "Jo" })
+          result, asked = dispatch_counting_probes(controller, :create, method: "POST", json: { account: { name: "Jo" } })
           expect(result.status).to eq(200)
           expect(asked).to eq(1)
 
@@ -7120,6 +7121,85 @@ RSpec.describe Permittable do
           expect(result.status).to eq(200)
           expect(JSON.parse(result.body)).to eq("name" => "Jo")
           expect(asked).to eq(2)
+        end
+      end
+    end
+
+    # With Rails' default `wrap_parameters format: [:json]`, ParamsWrapper copies
+    # a non-object JSON body under the wrapper key (`user: {}` with a model,
+    # `user: {_json: ..}` without). A `root: :user` contract took that copy for
+    # the client's envelope: a silent 200 with nothing permitted (or a 422 for
+    # an `unknown` `_json` the client never sent), where the same request
+    # without the wrapper is a 400 `user` missing.
+    describe "a root: contract whose root is the wrapper key, sent a JSON body that is not an object" do
+      before do
+        ActiveRecord::Schema.define do
+          create_table(:wrap_root_users) do |t|
+            t.string :name
+            t.integer :age
+          end
+        end
+      end
+
+      after { ActiveRecord::Base.connection.drop_table(:wrap_root_users, if_exists: true) }
+
+      def build_wrapped_controller(base, model:, wrapped: true, **rule)
+        stub_const("User", Class.new(ActiveRecord::Base) { self.table_name = "wrap_root_users" }) if model
+        controller = Class.new(base) do
+          include Permittable
+
+          def self.controller_path
+            "users"
+          end
+
+          wrap_parameters format: [:json] if wrapped
+          permit_params(:update, root: :user, **rule) do
+            optional :name, :string
+            optional :age, :integer
+          end
+
+          def update
+            render json: { permitted: permitted_params, violations: permittable_violations }
+          end
+        end
+        stub_const("UsersController", controller)
+      end
+
+      [ActionController::Base, ActionController::API].each do |base|
+        [true, false].each do |model|
+          context "on #{base} #{model ? 'with' : 'without'} a model" do
+            ['[{"name":"x"}]', '"x"', "5", "null"].each do |body|
+              it "answers #{body} as the missing envelope it is in enforce mode, as without the wrapper" do
+                controller = build_wrapped_controller(base, model: model, unknown: :error, enforce: true)
+                result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", raw_json: body)
+                expect(result.status).to eq(400), result.body
+                expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "user", "code" => "missing" }])
+
+                bare = build_wrapped_controller(base, model: model, wrapped: false, unknown: :error, enforce: true)
+                expect(IntegrationHarness.dispatch(bare, :update, method: "PATCH", raw_json: body).body).to eq(result.body)
+              end
+
+              it "records #{body} as a violation in monitor mode, and refuses it under unknown: :ignore" do
+                monitored = build_wrapped_controller(base, model: model, unknown: :error, mode: :monitor)
+                result = IntegrationHarness.dispatch(monitored, :update, method: "PATCH", raw_json: body)
+                expect(result.status).to eq(200)
+                expect(JSON.parse(result.body)["violations"]).to eq([{ "param" => "user", "code" => "missing" }])
+
+                ignoring = build_wrapped_controller(base, model: model, unknown: :ignore, enforce: true)
+                expect(IntegrationHarness.dispatch(ignoring, :update, method: "PATCH", raw_json: body).status).to eq(400)
+              end
+            end
+
+            it "still accepts the client's own envelope, a plain object body and a form post" do
+              controller = build_wrapped_controller(base, model: model, unknown: :error, enforce: true)
+              envelope = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { user: { name: "x" } })
+              expect([envelope.status, JSON.parse(envelope.body)["permitted"]]).to eq([200, { "name" => "x" }])
+              plain = IntegrationHarness.dispatch(controller, :update, method: "PATCH", json: { name: "x" })
+              expect([plain.status, JSON.parse(plain.body)["permitted"]]).to eq([200, { "name" => "x" }])
+              form = IntegrationHarness.dispatch(controller, :update, method: "PATCH", params: "user[name]=x")
+              expect([form.status, JSON.parse(form.body)["permitted"]]).to eq([200, { "name" => "x" }])
+            end
+          end
         end
       end
     end

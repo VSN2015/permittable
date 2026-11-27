@@ -2914,9 +2914,10 @@ module Permittable
   #
   # The request is asked only when the answer can matter. A controller none
   # of whose contracts reads its input without the copy (see
-  # permittable_drops_wrapper_copy?) — only rooted contracts, say, or the
-  # default `unknown: :ignore` with no field of the wrapper's name — paid a
-  # content-type lookup and a params read on every request for nothing.
+  # permittable_reads_wrapper_copy?) — only rooted contracts of another name,
+  # say, or the default `unknown: :ignore` with no field of the wrapper's
+  # name — paid a content-type lookup and a params read on every request for
+  # nothing.
   # Everything the gate reads is class-level (the wrapper's formats and name,
   # and the contracts), so a skipped probe touches nothing of the request.
   # The formats come first, in ParamsWrapper's own order: with none it never
@@ -2938,7 +2939,7 @@ module Permittable
     return if _wrapper_formats.empty?
 
     key = _wrapper_key&.to_s
-    return unless key && self.class.permittable_contracts.any? { |rule| permittable_drops_wrapper_copy?(rule, key) }
+    return unless key && self.class.permittable_contracts.any? { |rule| permittable_reads_wrapper_copy?(rule, key) }
     return unless _wrapper_enabled?
 
     key unless request.parameters.key?(key)
@@ -3245,6 +3246,10 @@ module Permittable
 
     key = rule[:root].to_s
     value = raw[key]
+    # ParamsWrapper copies a non-object body under its key too (`user: {}`
+    # with a model, `user: {_json: ..}` without), which would pass as the
+    # client's envelope. The client sent no root, so it is missing.
+    value = nil if key == @permittable_wrapper_key && permittable_json_scalar_body?(raw)
     return value if value.is_a?(Hash)
 
     # A root that is absent and a root sent with the wrong shape
@@ -3273,10 +3278,14 @@ module Permittable
   # client sent (the router's, the path's and ParamsWrapper's keys are not
   # the client's) and not itself a Hash.
   def permittable_non_object_body?(rule, raw)
+    rule[:unknown] == :error && rule[:fields].none? { |f| f[:name].to_s == "_json" } &&
+      permittable_json_scalar_body?(raw)
+  end
+
+  def permittable_json_scalar_body?(raw)
     sent = raw.keys - UNCHECKED_TOP_LEVEL_KEYS - permittable_request_supplied_keys -
            [@permittable_wrapper_key, permittable_configured_csrf_key]
-    rule[:unknown] == :error && sent == ["_json"] && !raw["_json"].is_a?(Hash) &&
-      rule[:fields].none? { |f| f[:name].to_s == "_json" } &&
+    sent == ["_json"] && !raw["_json"].is_a?(Hash) &&
       respond_to?(:request) && request.respond_to?(:content_mime_type) &&
       request.content_mime_type&.symbol == :json
   end
@@ -3738,11 +3747,18 @@ module Permittable
     key && permittable_drops_wrapper_copy?(rule, key) ? source.except(key) : source
   end
 
+  # Whether the probe's answer matters to `rule`: it drops the copy, or its
+  # root is the copy's key and a non-object body must not pass as that root.
+  def permittable_reads_wrapper_copy?(rule, key)
+    rule[:root] ? rule[:root].to_s == key : permittable_drops_wrapper_copy?(rule, key)
+  end
+
   # Whether `rule` reads its input without ParamsWrapper's copy under `key`
   # — and so whether the probe's answer changes anything for it, which is
   # why permittable_wrapper_copy_key asks this too before touching the
   # request. Not for a rooted contract: it reads the copy as its root, which
-  # is exactly what ParamsWrapper is for. Not for a rootless one declaring
+  # is exactly what ParamsWrapper is for (a non-object body's copy is not a
+  # root: see permittable_root_hash). Not for a rootless one declaring
   # `key` as a hash container (a nested block or :json) either: that
   # contract is reading the copy ON PURPOSE, a root: spelled as a field, and
   # it worked that way before the copy was ever dropped — dropping it would
