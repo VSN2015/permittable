@@ -7070,6 +7070,22 @@ RSpec.describe Permittable do
           expect(asked).to eq(1)
         end
 
+        it "runs for a root: contract at the wrapper key, where a non-object body must not pass as the root" do
+          controller = IntegrationHarness.build_controller do
+            include Permittable
+
+            wrap_parameters :user, format: [:json]
+            permit_params(:create, root: :user, unknown: :error) { required :name, :string }
+
+            def create
+              render json: permitted_params
+            end
+          end
+          result, asked = dispatch_counting_probes(controller, :create, method: "POST", json: { user: { name: "Jo" } })
+          expect(result.status).to eq(200)
+          expect(asked).to eq(2)
+        end
+
         # An unconfigured wrapper has no formats and so never wraps, and its
         # options carry no controller to derive a name from: asking for its
         # key raised, which ParamsWrapper itself never does with no formats.
@@ -7188,6 +7204,50 @@ RSpec.describe Permittable do
                 ignoring = build_wrapped_controller(base, model: model, unknown: :ignore, enforce: true)
                 expect(IntegrationHarness.dispatch(ignoring, :update, method: "PATCH", raw_json: body).status).to eq(400)
               end
+            end
+
+            # A query string or a path parameter lands in `params` beside `_json`,
+            # but it is not part of the body: the body is still no object.
+            it "answers a non-object body as missing with a query string or path parameter beside it" do
+              controller = build_wrapped_controller(base, model: model, unknown: :error, enforce: true)
+              [{ query: "locale=en" }, { path_params: { id: "1" } }, { query: "locale=en", path_params: { id: "1" } }].each do |extra|
+                result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", raw_json: "5", **extra)
+                expect(result.status).to eq(400), "for #{extra}: #{result.body}"
+                expect(JSON.parse(result.body)["error"]["details"]).to eq([{ "param" => "user", "code" => "missing" }])
+              end
+            end
+
+            it "answers under error_format :problem with the problem document" do
+              Permittable.error_format = :problem
+              controller = build_wrapped_controller(base, model: model, unknown: :error, enforce: true)
+              result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", raw_json: "5")
+              expect(result.status).to eq(400)
+              expect(result.header("Content-Type")).to start_with("application/problem+json")
+              expect(JSON.parse(result.body)).to include("title" => "Malformed request", "status" => 400)
+            ensure
+              Permittable.error_format = :envelope
+            end
+
+            it "leaves a root block that declares `_json` reading it, as a rootless contract does" do
+              stub_const("User", Class.new(ActiveRecord::Base) { self.table_name = "wrap_root_users" }) if model
+              controller = Class.new(base) do
+                include Permittable
+
+                def self.controller_path
+                  "users"
+                end
+
+                wrap_parameters format: [:json]
+                permit_params(:update, root: :user, unknown: :error, enforce: true) { optional :_json, :string }
+
+                def update
+                  render json: permitted_params
+                end
+              end
+              stub_const("UsersController", controller)
+              result = IntegrationHarness.dispatch(controller, :update, method: "PATCH", raw_json: '"x"')
+              expect(result.status).to eq(200), result.body
+              expect(JSON.parse(result.body)).to eq(model ? {} : { "_json" => "x" })
             end
 
             it "still accepts the client's own envelope, a plain object body and a form post" do

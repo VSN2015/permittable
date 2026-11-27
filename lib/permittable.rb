@@ -3248,8 +3248,12 @@ module Permittable
     value = raw[key]
     # ParamsWrapper copies a non-object body under its key too (`user: {}`
     # with a model, `user: {_json: ..}` without), which would pass as the
-    # client's envelope. The client sent no root, so it is missing.
-    value = nil if key == @permittable_wrapper_key && permittable_json_scalar_body?(raw)
+    # client's envelope. The client sent no root, so it is missing. Judged
+    # by the body's own keys: a query string or path parameter beside `_json`
+    # is no object body either. A root block declaring `_json` reads it on
+    # purpose, as a rootless contract's declared `_json` does.
+    value = nil if key == @permittable_wrapper_key && rule[:fields].none? { |f| f[:name].to_s == "_json" } &&
+                   permittable_json_scalar_body?(raw, request.request_parameters.keys - [key])
     return value if value.is_a?(Hash)
 
     # A root that is absent and a root sent with the wrong shape
@@ -3279,12 +3283,11 @@ module Permittable
   # the client's) and not itself a Hash.
   def permittable_non_object_body?(rule, raw)
     rule[:unknown] == :error && rule[:fields].none? { |f| f[:name].to_s == "_json" } &&
-      permittable_json_scalar_body?(raw)
+      permittable_json_scalar_body?(raw, raw.keys - UNCHECKED_TOP_LEVEL_KEYS - permittable_request_supplied_keys -
+                                         [@permittable_wrapper_key, permittable_configured_csrf_key])
   end
 
-  def permittable_json_scalar_body?(raw)
-    sent = raw.keys - UNCHECKED_TOP_LEVEL_KEYS - permittable_request_supplied_keys -
-           [@permittable_wrapper_key, permittable_configured_csrf_key]
+  def permittable_json_scalar_body?(raw, sent)
     sent == ["_json"] && !raw["_json"].is_a?(Hash) &&
       respond_to?(:request) && request.respond_to?(:content_mime_type) &&
       request.content_mime_type&.symbol == :json
