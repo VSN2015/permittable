@@ -3460,10 +3460,11 @@ module Permittable
   # fields_for_style?: every key an integer, every value a hash) and
   # accepts_nested_attributes_for reads its values in order, so an
   # `array ... do` field reads them as its elements. Paths then count the
-  # records in the order sent. An empty Hash, or one of scalars, is not this
+  # records in the order sent. An empty Hash is that shape with no records (as
+  # strong params permits it) and reads as []; a Hash of scalars is not this
   # shape and stays invalid_type.
   def permittable_fields_for_records?(field, value)
-    field[:fields] && value.is_a?(Hash) && !value.empty? &&
+    field[:fields] && value.is_a?(Hash) &&
       value.all? { |key, record| key.to_s.match?(/\A-?\d+\z/) && record.is_a?(Hash) }
   end
 

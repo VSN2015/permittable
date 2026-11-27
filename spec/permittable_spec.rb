@@ -3634,10 +3634,19 @@ RSpec.describe Permittable do
     end
 
     it "still refuses any other Hash, as strong params would not read it as records either" do
-      [{ "city" => "Paris" }, { "0" => "Paris" }, { "a" => { "city" => "Paris" } }, {}].each do |value|
+      [{ "city" => "Paris" }, { "0" => "Paris" }, { "a" => { "city" => "Paris" } }].each do |value|
         expect(violations_for({ user: { name: "Jo", addresses_attributes: value } }, &decl).details)
           .to eq([{ param: "user.addresses_attributes", code: "invalid_type" }]), "for #{value.inspect}"
       end
+    end
+
+    it "reads an empty Hash as the empty array, which strong params also permits" do
+      expect(permit({ user: { name: "Jo", addresses_attributes: {} } }) do
+        permit_params(:create, root: :user) { array(:addresses_attributes) { required :city, :string } }
+      end[:addresses_attributes]).to eq([])
+      # length: sees it as [] too
+      expect(violations_for({ user: { name: "Jo", addresses_attributes: {} } }, &decl).details)
+        .to eq([{ param: "user.addresses_attributes", code: "length" }])
     end
 
     it "leaves a scalar array alone: an index-keyed Hash of scalars is not fields_for's shape" do
@@ -5068,6 +5077,16 @@ RSpec.describe Permittable do
           end
         end
         expect(body["permitted"]).to eq("name" => "x", "tags" => { "0" => { "label" => "a" } })
+      end
+
+      it "keeps an empty fields_for Hash, as strong params permits it" do
+        body = monitored_permitted({ user: { name: "x", tags: {} } }) do
+          required :name, :integer
+          array :tags do
+            optional :label, :string
+          end
+        end
+        expect(body["permitted"]).to eq("name" => "x", "tags" => {})
       end
 
       it "drops a Hash sent to a scalar field, and an array of hashes sent to a scalar array" do
