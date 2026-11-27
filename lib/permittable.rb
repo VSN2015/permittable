@@ -721,7 +721,21 @@ module Permittable
     end
   end
 
+  # The concern's own methods are public (hosts and the RSpec helpers call
+  # them), but Rails only treats a method of an abstract ancestor as internal,
+  # so they would be routable actions: POST /users/:action named
+  # enforce_params_contract answered 204 running no action. Extended only
+  # where action_methods exists (not on a plain-Ruby params host). Rails
+  # memoizes in @action_methods and clears it in clear_action_methods!, so
+  # this reuses that ivar rather than keeping its own.
+  module ActionMethods
+    def action_methods
+      @action_methods ||= super - Permittable.public_instance_methods(false).map!(&:to_s)
+    end
+  end
+
   included do
+    extend ActionMethods if respond_to?(:action_methods)
     class_attribute :permittable_contracts, instance_accessor: false, default: []
     # The skips of enforce_params_contract SkipRecorder saw (see Audit).
     class_attribute :permittable_skips, instance_accessor: false, default: nil

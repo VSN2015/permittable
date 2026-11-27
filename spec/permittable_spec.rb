@@ -7027,6 +7027,48 @@ RSpec.describe Permittable do
         expect(metal.action_methods).not_to include("process")
       end
 
+      describe "the concern's public methods" do
+        let(:gem_methods) { Permittable.public_instance_methods(false).map(&:to_s) }
+        let(:api) { Class.new(ActionController::API) { include Permittable } }
+
+        it "are never actions, on Base, API and Metal controllers and their subclasses" do
+          metal = Class.new(ActionController::Metal) { include Permittable }
+          base = build_rootless_controller { optional :name, :string }
+          expect(gem_methods).to include("permitted_params", "enforce_params_contract")
+
+          [base, Class.new(base), api, Class.new(api), metal, Class.new(metal)].each do |klass|
+            expect(klass.action_methods.map(&:to_s) & gem_methods).to eq([])
+          end
+        end
+
+        it "are not dispatched by a route naming them" do
+          controller = build_rootless_controller { optional :name, :string }
+
+          %i[enforce_params_contract permitted_params permittable_violations render_invalid_parameters].each do |action|
+            expect { IntegrationHarness.dispatch(controller, action, method: "POST", params: { name: "x" }) }
+              .to raise_error(AbstractController::ActionNotFound)
+          end
+        end
+
+        it "keep the host's own actions, and the memo clears when one is added" do
+          controller = build_rootless_controller { optional :name, :string }
+          expect(controller.action_methods).to include("create", "update")
+
+          controller.define_method(:later) { head :ok }
+          expect(controller.action_methods).to include("later")
+          expect(controller.action_methods.map(&:to_s) & gem_methods).to eq([])
+        end
+
+        it "can still be skipped and called by the host" do
+          controller = build_rootless_controller { optional :name, :string }
+          skipping = Class.new(controller) { skip_before_action :enforce_params_contract }
+
+          expect(controller.public_method_defined?(:permitted_params)).to be(true)
+          result = IntegrationHarness.dispatch(skipping, :create, method: "POST", params: { name: "x" })
+          expect(result.status).to eq(200)
+        end
+      end
+
       # The probe is a content-type lookup and a params read, and only a
       # contract that reads its input without the copy acts on its answer.
       # ParamsWrapper asks `_wrapper_enabled?` once itself, on every request,

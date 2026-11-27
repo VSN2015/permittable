@@ -1423,7 +1423,7 @@ A `format:` regexp that does not translate to ECMA-262 is looser in the same way
 |---|---|
 | `permitted_params(action = action_name)` | The cast, validated, defaulted `HashWithIndifferentAccess`. Raises `InvalidParameters` on violation (in [monitor mode](#monitor-mode-roll-out-without-rejecting), returns the uncast, declared-keys-only pass-through instead), or `ArgumentError` when no contract covers the action. **Memoized per action, outcome included** — a rejection is re-raised rather than revalidated, so a contract runs (and instruments) exactly once per action per request |
 | `permittable_violations(action = action_name)` | The violation details recorded by validating `action` — `[]` when clean. Triggers the same memoized validation; under enforce it swallows the raise, making "would this request fail?" a one-liner |
-| `enforce_params_contract` | The `before_action` entry point. Validates rules declared `enforce: true` and all [monitor-mode](#monitor-mode-roll-out-without-rejecting) rules. Public, so hosts can `skip_before_action` it |
+| `enforce_params_contract` | The `before_action` entry point. Validates rules declared `enforce: true` and all [monitor-mode](#monitor-mode-roll-out-without-rejecting) rules. Hosts can `skip_before_action` it |
 | `render_invalid_parameters(error)` | The `rescue_from` target. Renders via the host's `render_error` when defined, the inline envelope otherwise |
 
 **Class methods**
