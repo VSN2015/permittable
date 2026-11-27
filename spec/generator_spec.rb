@@ -157,9 +157,16 @@ RSpec.describe Permittable::Generator do
       expect([scan.root, scan.scalars]).to eq([:user, %i[name age]])
     end
 
-    it "still skips a paren-less call whose arguments hold a method call, rather than half-reading it" do
+    it "keeps a paren-less call whose arguments hold a method call as a TODO, rather than half-reading it" do
       scan = described_class.scan("params.require(:user).permit :name, *policy(record).extra")
-      expect(scan.calls).to eq(0)
+      expect([scan.calls, scan.root, scan.scalars, scan.unparsed]).to eq([1, :user, %i[name], ["*policy(record).extra"]])
+    end
+
+    it "keeps a parenthesised call whose arguments hold a method call, over several lines too" do
+      scan = described_class.scan("def p = params.require(:user).permit(:name, *policy(a, b).keys)")
+      expect([scan.scalars, scan.unparsed]).to eq([%i[name], ["*policy(a, b).keys"]])
+      scan = described_class.scan("params.permit(\n  :q,\n  *filters(x)\n)\nputs 1")
+      expect([scan.scalars, scan.unparsed]).to eq([%i[q], ["*filters(x)"]])
     end
   end
 
@@ -184,6 +191,35 @@ RSpec.describe Permittable::Generator do
         scan = described_class.scan(source)
         expect([scan.calls, scan.root, scan.scalars]).to eq([1, :user, %i[name age]])
       end
+    end
+
+    it "gives [] and require no comma tail, as a fetch default has" do
+      expect(described_class.scan("params[:user, :x].permit(:name)").calls).to eq(0)
+      expect(described_class.scan("params.require(:user, :profile).permit(:name)").calls).to eq(0)
+      expect(described_class.scan("foo(params[:a, b], c).permit(:x)").calls).to eq(0)
+    end
+
+    it "does not close a [ lookup with a parenthesis" do
+      expect(described_class.scan("params[:user).permit(:name)").calls).to eq(0)
+    end
+
+    it "scans many unclosed lookups and unreadable calls in near-linear time" do
+      ["params[:a, b] ", "params.permit :a, f(x) ", "params.permit(x(", "params.permit(x(1)) "].each do |piece|
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        described_class.scan(piece * 3500)
+        expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be < 3
+      end
+    end
+
+    it "skips an unreadable call too long to quote, and one that never closes" do
+      expect(described_class.scan("params.permit(#{'a(1), ' * 300}b)").calls).to eq(0)
+      expect(described_class.scan("params.permit(a(1)\nx").calls).to eq(0)
+    end
+
+    it "notes that a fetch with a default answered a request without the root" do
+      expect(described_class.scan("params.fetch(:user, {}).permit(:name)").default_roots).to eq([:user])
+      expect(described_class.scan("params.fetch(:user).permit(:name)").default_roots).to eq([])
+      expect(described_class.scan("params.require(:user).permit(:name)").default_roots).to eq([])
     end
 
     it "keeps permit! visible as an unreadable argument, never as a field list" do
@@ -713,6 +749,11 @@ RSpec.describe Permittable::Generator do
       expect(draft).not_to include("nested block")
     ensure
       ActiveRecord::Base.connection.drop_table(:gen_shifts, if_exists: true)
+    end
+
+    it "drafts a TODO when the legacy fetch default accepted a request without the root" do
+      draft = described_class.draft(model: GenArticle, scan: described_class.scan("params.fetch(:gen_article, {}).permit(:title)"))
+      expect(draft).to include("# TODO: legacy accepted a request without `gen_article`")
     end
 
     it "drafts a TODO, with the columns, for permit!, which names no fields" do

@@ -78,9 +78,10 @@ module Permittable
     # `rootless` holds the keys of the rootless calls once an envelope won —
     # a filter or a body, the scan cannot tell; `other_envelopes` maps each
     # losing root onto its calls, spelled as the source spells them. `calls`
-    # counts the params calls found.
+    # counts the params calls found, and `default_roots` lists the chosen
+    # root when a `params.fetch(root, default)` answered requests without it.
     Scan = Struct.new(:root, :scalars, :arrays, :nested, :nested_arrays, :unparsed, :conflicts, :undecided,
-                      :route_params, :rootless, :other_envelopes, :calls, keyword_init: true) do
+                      :route_params, :rootless, :other_envelopes, :calls, :default_roots, keyword_init: true) do
       def found?
         calls.positive?
       end
@@ -102,19 +103,20 @@ module Permittable
     PARAMS = /(?<![\w@$])(?:@_)?params/
 
     # One permit call, with an optional leading root lookup — `.require(:root)`,
-    # `[:root]` or `.fetch(:root, default)`, the old scaffold's spelling, all
-    # read as the same root — the root spelled `:user`, `"user"` or `'user'`
-    # (groups 1-3; a String root's content is masked, so it is read back by
-    # offset like any argument). The permit may be called with `&.`. The args
-    # capture (group 4) tolerates brackets and newlines but not parentheses —
-    # a call whose arguments contain a method call is skipped entirely rather
-    # than half-read. Without parentheses (`permit :name, :email`, common in
-    # older controllers) group 4 is empty and the arguments run to the end of
-    # the statement: see call_args. `permit!` (group 5) has no arguments to
-    # read at all: see permit_call.
-    PERMIT_CALL = /#{PARAMS}\s*(?:(?:\.\s*require\(|\[|\.\s*fetch\()\s*
-                   (?::(\w+)|"([^"\n]*)"|'([^'\n]*)')\s*(?:,[^()]*)?[)\]])?\s*&?\.\s*
-                   permit(?:\(([^()]*)\)|[ \t]+(?=[^\s(])|(!))/mx
+    # `[:root]` or the old scaffold's `.fetch(:root, default)`, read as the
+    # same root — the root spelled `:user`, `"user"` or `'user'` (ROOT; groups
+    # 1-3, 4-6 and 7-9 for the three lookups. A String root's content is
+    # masked, so it is read back by offset like any argument). Each lookup
+    # closes its own way: only `fetch` takes a default. The permit may be
+    # called with `&.`. The args capture (group 10) tolerates brackets and
+    # newlines but not parentheses. Without parentheses (`permit :name,
+    # :email`, common in older controllers) it is empty and the arguments run
+    # to the end of the statement: see call_args. `permit!` (group 11) has no
+    # arguments to read, and an opening parenthesis (group 12) means a method
+    # call in the arguments: see permit_args.
+    ROOT = /\s*(?::(\w+)|"([^"\n]*)"|'([^'\n]*)')\s*/
+    PERMIT_CALL = /#{PARAMS}\s*(?:\.\s*require\(#{ROOT}\)|\[#{ROOT}\]|\.\s*fetch\(#{ROOT}(?:,[^()]*)?\))?\s*&?\.\s*
+                   permit(?:\(([^()]*)\)|[ \t]+(?=[^\s(])|(!)|(\())/mx
 
     # A trailing `if`/`unless`/`rescue` modifier on a paren-less call, which
     # is not one of its arguments.
@@ -191,7 +193,7 @@ module Permittable
     # the arguments an expect call spells beside its envelope, and the key of
     # a single-key route-param lookup (ROUTE_PARAM_KEY). `spelling` is how an
     # envelope's TODO quotes it if it loses.
-    Call = Struct.new(:position, :root, :fields, :route_params, :spelling)
+    Call = Struct.new(:position, :root, :fields, :route_params, :spelling, :default_root)
     private_constant :Call
 
     # Comment tokens. Ripper (stdlib) is used rather than a regexp because `#`
@@ -217,6 +219,8 @@ module Permittable
     AS_TEXT_ADVICE = "declare it by hand; a client sends it as text, so `:string` with a `format:` fits".freeze
     TEXT_ARRAY_ADVICE = "declare it by hand; its elements are sent as text, so `array ..., of: :string` fits".freeze
     DOCUMENT_ARRAY_ADVICE = "declare it as an `array ... do` block of documents".freeze
+
+    MAX_UNREADABLE_ARGS = 1000
 
     module_function
 
@@ -320,11 +324,13 @@ module Permittable
     # may not be chosen — see for_controller.
     def scan(source, model: nil, exclude: [])
       result = Scan.new(root: nil, scalars: [], arrays: [], nested: {}, nested_arrays: {}, unparsed: [],
-                        conflicts: [], undecided: [], route_params: [], rootless: [], other_envelopes: {}, calls: 0)
+                        conflicts: [], undecided: [], route_params: [], rootless: [], other_envelopes: {}, calls: 0,
+                        default_roots: [])
       raw = source.to_s
       source = executable_source(raw)
       masked = masked_source(raw)
-      permits = matches(masked, PERMIT_CALL).filter_map { |match| permit_call(source, masked, match) }
+      pairs = paren_pairs(masked)
+      permits = matches(masked, PERMIT_CALL).filter_map { |match| permit_call(source, masked, match, pairs) }
       expects = matches(masked, EXPECT_CALL).filter_map do |match|
         args, = call_args(source, masked, match, 1)
         expect_calls(match.begin(0), split_args(args)) if args
@@ -751,8 +757,8 @@ module Permittable
       parts = [+""]
       depth = 0
       args.scan(/%[iIwW],[^,]*,|./m) do |token|
-        depth += 1 if token.size == 1 && "[{".include?(token)
-        depth -= 1 if token.size == 1 && "]}".include?(token)
+        depth += 1 if token.size == 1 && "[{(".include?(token)
+        depth -= 1 if token.size == 1 && "]})".include?(token)
         next parts << +"" if token == "," && depth.zero?
 
         parts.last << token
@@ -822,16 +828,68 @@ module Permittable
     # `source` by position instead of off `match` directly.
     # nil when the call cannot be read: a paren-less one whose arguments
     # hold a method call, or a String root that is not a plain key.
-    def permit_call(source, masked, match)
-      args, finish = match.begin(5) ? ["permit!", match.end(0)] : call_args(source, masked, match, 4)
+    def permit_call(source, masked, match, pairs)
+      args, finish = permit_args(source, masked, match, pairs)
       return nil unless args
 
-      root = [1, 2, 3].filter_map { |index| group(source, match, index) }.first
+      root = (1..9).filter_map { |index| group(source, match, index) }.first
       return Call.new(match.begin(0), nil, split_args(args), []) unless root
       return nil unless root.match?(/\A\w+\z/)
 
       spelling = unparsed_arg(source[match.begin(0)...finish]).gsub(/\(\s+/, "(").gsub(/\s+\)/, ")")
-      Call.new(match.begin(0), root.to_sym, split_args(args), [], spelling)
+      Call.new(match.begin(0), root.to_sym, split_args(args), [], spelling, fetch_default?(masked, match))
+    end
+
+    # The permit call's argument text and where the call ends. What cannot be
+    # read is kept as text rather than skipped, so the draft shows it in a
+    # TODO: `permit!` names no keys, and a method call in the arguments
+    # (`permit(*policy.keys)`) cannot be evaluated.
+    def permit_args(source, masked, match, pairs)
+      return ["permit!", match.end(0)] if match.begin(11)
+      return unreadable_args(source, masked, match.end(0), pairs[match.begin(12)]) if match.begin(12)
+
+      args = call_args(source, masked, match, 10)
+      return args if args || match.begin(10) || bare_args_end(masked, match.end(0))
+
+      unreadable_args(source, masked, match.end(0), nil)
+    end
+
+    # The arguments up to `close`, the offset of the closing parenthesis, or
+    # to the end of the line for a call with no parentheses, less a trailing
+    # modifier. Nil when nothing follows, for an opening parenthesis that never
+    # closes (a syntax error), and for more than MAX_UNREADABLE_ARGS characters.
+    # shortcut: such a call is skipped silently, as it always was; quoting
+    # nested or repeated ones whole is quadratic, so lift the cap only with a
+    # linear reader.
+    def unreadable_args(source, masked, start, close)
+      return if close.nil? && masked[start - 1] == "("
+
+      finish = close || masked.index("\n", start) || masked.length
+      return if finish - start > MAX_UNREADABLE_ARGS
+
+      args = source[start...finish].sub(BARE_MODIFIER, "").rstrip
+      [args, start + args.length] unless args.empty?
+    end
+
+    # Where each parenthesis of `masked` closes, by the offset of its opener,
+    # in one pass: an opener with no closer has no entry. Parentheses inside
+    # a string literal are kept by masked_source and count here.
+    def paren_pairs(masked)
+      open = []
+      masked.each_char.with_index.with_object({}) do |(char, index), pairs|
+        if char == "("
+          open << index
+        elsif char == ")" && !open.empty?
+          pairs[open.pop] = index
+        end
+      end
+    end
+
+    # Whether a root lookup is a `fetch` with a default: one the legacy call
+    # answered for a request without the root.
+    def fetch_default?(masked, match)
+      index = [7, 8, 9].find { |group| match.begin(group) }
+      index && masked[match.end(index)...match.end(0)].match?(/\A\s*,/)
     end
 
     # A call's argument text and where the call ends, or nil when it cannot
@@ -939,6 +997,7 @@ module Permittable
     # belong rather than that they could not be read.
     def merge_call(result, call)
       if call.root == result.root
+        result.default_roots |= [call.root] if call.default_root
         call.fields.each { |arg| classify_arg(result, arg) }
       elsif call.root
         result.other_envelopes[call.root] = (result.other_envelopes[call.root] || []) | [call.spelling]
@@ -1263,11 +1322,19 @@ module Permittable
       # Array()/to_h: a Scan built by hand before these members existed leaves them nil.
       Array(scan.conflicts).map { |conflict| "# TODO: #{conflict}" } +
         scan.unparsed.map { |arg| "# TODO: could not parse from the permit call: #{arg}" } +
+        Array(scan.default_roots).map { |root| default_root_todo(root) } +
         scan.other_envelopes.to_h.flat_map do |root, spellings|
           spellings.map { |spelling| "# TODO: belongs to another envelope (#{root}): #{spelling}" }
         end +
         Array(scan.route_params).map { |arg| route_param_todo(scan, arg) } +
         Array(scan.rootless).map { |arg| "# TODO: outside the #{scan.root} envelope, so not in this contract: #{arg}" }
+    end
+
+    # `params.fetch(:user, {}).permit(...)` answers a request with no `user`
+    # key, which a contract with a root cannot.
+    def default_root_todo(root)
+      "# TODO: legacy accepted a request without `#{root}` (params.fetch with a default); " \
+        "a root: contract answers 400 for it"
     end
 
     # Only a bare key is a route or query param; an array or hash an expect
