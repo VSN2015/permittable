@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Fixed
-- **`check_column_types` refuses `:date` over a `time` column or `attribute :x, :time`.** Every value was cast to `NULL` and stored as nothing, so `optional :opens_at, :date` now raises `ArgumentError` at class load. Declare it `:datetime` (keeps the time of day) or migrate the column. (#PR)
+- **`check_column_types` refuses `:date` over a `time` column or an `attribute :x, :time` with no column.** Every value was cast to `NULL` and stored as nothing, so `optional :opens_at, :date` now raises `ArgumentError` at class load. Declare it `:datetime` (keeps the time of day) or migrate the column. (#PR)
 - **The enum `in:` refusal no longer says assignment raises for a Rails 7.1+ `validate:` enum.** It says the value fails the model's enum validation. (#PR)
 
 ## 0.17.0 (2026-11-22)

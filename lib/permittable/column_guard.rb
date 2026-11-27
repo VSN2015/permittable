@@ -345,12 +345,16 @@ module Permittable
     # its type answers assert_valid_value without raising. Older Rails, and a
     # duck-typed model, always raise.
     def enum_failure(klass, field)
-      type = klass.respond_to?(:attribute_types) && klass.attribute_types[field.to_s]
-      return "raise on assignment" unless type.respond_to?(:assert_valid_value)
+      # Only a registered type: on Rails 7+ the EnumType of an enum declared on
+      # an alias sits under the alias's target, and attribute_types answers the
+      # alias with a default no-op type.
+      types = klass.respond_to?(:attribute_types) ? klass.attribute_types : {}
+      name = [field.to_s, resolve_alias(klass, field)].find { |n| types.key?(n) }
+      return "raise on assignment" unless name && types[name].respond_to?(:assert_valid_value)
 
-      type.assert_valid_value("permittable-not-an-enum-value")
+      types[name].assert_valid_value("permittable-not-an-enum-value")
       "fail the model's enum validation"
-    rescue ArgumentError
+    rescue StandardError
       "raise on assignment"
     end
 

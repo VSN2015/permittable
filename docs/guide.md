@@ -907,7 +907,7 @@ When enabled it compares **groups**, not exact types, so it fires on a genuine c
 | numeric | `integer`, `bigint`, `float`, `decimal`, **`boolean`** |
 | temporal | `date`, `datetime`, `time`, `timestamp`, `timestamptz` |
 
-`boolean` sits with the numerics because a boolean stored as an integer `0`/`1` is a real legacy pattern and ActiveRecord casts cleanly between them; the temporal types are one group because a `:date` contract on a `datetime` column is a narrowing, not drift. The one exception is `:date` over a `time` column or `attribute :x, :time`: a time has no date part, so every value casts to `NULL`, and that declaration fails at class load. `:datetime` over a `time` column keeps the time of day and is accepted.
+`boolean` sits with the numerics because a boolean stored as an integer `0`/`1` is a real legacy pattern and ActiveRecord casts cleanly between them; the temporal types are one group because a `:date` contract on a `datetime` column is a narrowing, not drift. The one exception is `:date` over a `time` column, or over `attribute :x, :time` with no column: a time has no date part, so every value casts to `NULL`, and that declaration fails at class load. `:datetime` over a `time` column keeps the time of day and is accepted.
 
 Any column type **not** in that table — `json`, `jsonb`, `binary`, an adapter's own `inet` or `money` — is never checked. A contract has no faithful type for those, so whatever you improvised is left alone rather than guessed about.
 

@@ -5729,6 +5729,8 @@ RSpec.describe Permittable do
             stub_const("PhaseThing", on_alias)
             expect(&declaring(on_alias) { optional :phase, :string })
               .to raise_error(ArgumentError, /'phase' is an enum on PhaseThing.*in: PhaseThing\.phases\.keys/m)
+            # The EnumType sits under the alias's target on Rails 7+; a plain enum still raises on assignment.
+            expect(&declaring(on_alias) { optional :phase, :string }).to raise_error(ArgumentError, /then raise on assignment\./)
             expect(&declaring(on_alias) { optional :phase, :string, in: %w[pending shipped] }).not_to raise_error
           end
 
