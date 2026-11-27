@@ -220,6 +220,16 @@ RSpec.describe "I18n violation messages" do
         .to eq("Invalid parameters: user.name is missing, user.age must be a number, user.nick is not allowed")
     end
 
+    it "still prefixes the param when the only %{param} is escaped" do
+      c = Permittable::Contract.define(root: :user) { required :name, :string }
+      store(missing: "%%{param} is bad")
+      expect { c.call!("user" => {}) }
+        .to raise_error(Permittable::InvalidParameters, "Invalid parameters: user.name %%{param} is bad")
+      store(missing: "%%%%{param} x")
+      expect { c.call!("user" => {}) }
+        .to raise_error(Permittable::InvalidParameters, "Invalid parameters: user.name %%%%{param} x")
+    end
+
     it "agrees for a violate! code in finalize, and for a Contract's raised message" do
       store(too_long: "%{param} is too long")
       c = Permittable::Contract.define(root: :user) do

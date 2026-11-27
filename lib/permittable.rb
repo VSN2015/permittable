@@ -634,8 +634,15 @@ module Permittable
       return [message, false] unless message&.include?("%")
 
       values = { param: param.to_s, code: code.to_s }
-      [message.gsub(/%%|%\{(\w+)\}/) { Regexp.last_match(1) ? values.fetch(Regexp.last_match(1).to_sym, Regexp.last_match(0)) : "%%" },
-       message.match?(/%\{param\}/)]
+      names_param = false
+      text = message.gsub(/%%|%\{(\w+)\}/) do
+        name = Regexp.last_match(1)
+        next "%%" unless name
+
+        names_param = true if name == "param"
+        values.fetch(name.to_sym, Regexp.last_match(0))
+      end
+      [text, names_param]
     end
 
     def default_translation(code)
