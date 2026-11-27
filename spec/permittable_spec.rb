@@ -5302,6 +5302,7 @@ RSpec.describe Permittable do
             t.boolean  :active
             t.datetime :starts_at
             t.date     :on
+            t.time     :opens_at
             t.json     :payload
             t.binary   :blob
             t.integer  :status
@@ -5338,6 +5339,23 @@ RSpec.describe Permittable do
         it "catches the drift that matters: a column retyped out from under a contract" do
           expect(&declaring(typed) { required :starts_at, :string }).to raise_error(ArgumentError, /:string but the column is :datetime/)
           expect(&declaring(typed) { required :count, :datetime }).to raise_error(ArgumentError, /:datetime but the column is :integer/)
+        end
+
+        # A time column has no date part: a :date value is cast and stored as NULL.
+        it "refuses :date over a time column or attribute, which would store every value as NULL" do
+          expect(&declaring(typed) { optional :opens_at, :date })
+            .to raise_error(ArgumentError, /'opens_at' is declared :date but the column is :time/)
+          api = Class.new(TestModel) do
+            self.table_name = "typed_things"
+            attribute :closes_at, :time
+          end
+          expect(&declaring(api) { optional :closes_at, :date })
+            .to raise_error(ArgumentError, /'closes_at' is declared :date but the attribute is :time/)
+        end
+
+        it "still accepts :datetime over a time column, which keeps the time of day, and :date over a datetime column" do
+          expect(&declaring(typed) { optional :opens_at, :datetime }).not_to raise_error
+          expect(&declaring(typed) { optional :starts_at, :date }).not_to raise_error
         end
 
         it "accepts every declaration that matches" do
@@ -5458,6 +5476,21 @@ RSpec.describe Permittable do
               expect(e.message).to match(/'status' is an enum on EnumThing/)
               expect(e.message).to include("in: EnumThing.statuses.keys")
               expect(e.message).not_to match(/virtual: true/)
+            end
+          end
+
+          it "says a model-level validate: enum fails validation instead of raising, and a plain one raises" do
+            expect(&declaring(enum_model) { optional :status, :string }).to raise_error(ArgumentError, /and then raise on assignment\./)
+            skip "enum validate: needs Rails 7.1" if ActiveRecord.version < Gem::Version.new("7.1")
+
+            validated = stub_const("ValidatedEnumThing", Class.new(TestModel) do
+              self.table_name = "typed_things"
+              enum :tier, { free: "f", pro: "p" }, validate: { allow_nil: true }
+            end)
+            expect(&declaring(validated) { optional :tier, :string }).to raise_error(ArgumentError) do |e|
+              expect(e.message).to include("and then fail the model's enum validation.")
+              expect(e.message).not_to include("raise on assignment")
+              expect(e.message).to include("in: ValidatedEnumThing.tiers.keys")
             end
           end
 
@@ -5696,6 +5729,8 @@ RSpec.describe Permittable do
             stub_const("PhaseThing", on_alias)
             expect(&declaring(on_alias) { optional :phase, :string })
               .to raise_error(ArgumentError, /'phase' is an enum on PhaseThing.*in: PhaseThing\.phases\.keys/m)
+            # The EnumType sits under the alias's target on Rails 7+; a plain enum still raises on assignment.
+            expect(&declaring(on_alias) { optional :phase, :string }).to raise_error(ArgumentError, /then raise on assignment\./)
             expect(&declaring(on_alias) { optional :phase, :string, in: %w[pending shipped] }).not_to raise_error
           end
 
