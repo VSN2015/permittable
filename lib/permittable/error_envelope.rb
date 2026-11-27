@@ -66,16 +66,17 @@ module Permittable
       end
     end
 
-    # `render json:`, or — for a bare ActionController::Metal that never
-    # included ActionController::Rendering, and so has no `render` — the same
-    # response written through Metal's own status=, content_type= and
-    # response_body=. `render json:` calls `to_json` on a Hash, so the bytes
-    # are the same. A controller with `render` always takes the first path.
+    # `render json:`, or — for a bare ActionController::Metal with no `render`,
+    # or only Rails' stock `render` and no :json renderer (Rendering without
+    # Renderers::All answers 200 " ") — the same response written through
+    # Metal's own status=, content_type= and response_body=. `render json:`
+    # calls `to_json` on a Hash, so the bytes are the same. A controller that
+    # can `render json:` always takes the first path.
     def render_json(controller, payload, status:, content_type: nil)
       # The number, not the symbol: Rack >= 3.1 deprecates :unprocessable_entity
       # (:unprocessable_content there) and Rails 7.1 passes it to Rack as is.
       status = status_code(status) || status
-      if !controller.respond_to?(:render) && controller.respond_to?(:response_body=)
+      if !renders_json?(controller) && controller.respond_to?(:response_body=)
         controller.status = status
         controller.content_type = content_type if content_type
         controller.response_body = [payload.to_json]
@@ -85,6 +86,33 @@ module Permittable
       options = { json: payload, status: status }
       options[:content_type] = content_type if content_type
       controller.render(**options)
+    end
+
+    # Whether `render json:` will answer: the class has a :json renderer (a
+    # class without the Renderers module has no `_renderers` at all), or a
+    # `render` the host wrote, which is the host's to answer with. Only the
+    # stock render of Rails (Rendering, Instrumentation) with no :json renderer
+    # falls back to " ".
+    def renders_json?(controller)
+      return false unless controller.respond_to?(:render)
+      return true if renderer_names(controller).include?(:json)
+
+      method = controller.method(:render)
+      while method
+        return true unless method.owner.name.to_s.start_with?("ActionController::", "AbstractController::")
+
+        method = method.super_method
+      end
+      false
+    end
+
+    # The renderers `render` consults. Rails main leaves `_renderers` empty
+    # under Renderers::All and adds the built-in ones in `_all_renderers`.
+    def renderer_names(controller)
+      return controller.send(:_all_renderers) if controller.respond_to?(:_all_renderers, true)
+      return controller.class._renderers if controller.class.respond_to?(:_renderers)
+
+      []
     end
 
     # The media type (no parameters) the response already carries, or nil when
