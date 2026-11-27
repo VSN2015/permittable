@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Fixed
-- **A `root:` contract whose root is the wrapper key no longer accepts a non-object JSON body.** With Rails' default `wrap_parameters`, `[{"name":"x"}]`, `"x"`, `5` or `null` was a 200 with nothing permitted (or a 422 for an `unknown` `_json`); it is now the 400 `user` missing a request without the wrapper gets.
+- **A `root:` contract whose root is the wrapper key no longer accepts a non-object JSON body.** With Rails' default `wrap_parameters`, `[{"name":"x"}]`, `"x"`, `5` or `null` was a 200 with nothing permitted (or a 422 for an `unknown` `_json`); it is now the 400 `user` missing a request without the wrapper gets. (#196)
 
 ## 0.17.0 (2026-11-22)
 <!-- title: rootless contracts refuse router keys, stricter strings and integer enums, and GET contracts exported as query parameters -->
