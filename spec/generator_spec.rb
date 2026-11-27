@@ -173,6 +173,25 @@ RSpec.describe Permittable::Generator do
     end
   end
 
+  describe ".scan of a root looked up without require" do
+    {
+      "[]" => "params[:user].permit(:name, :age)",
+      "fetch with a default" => "params.fetch(:user, {}).permit(:name, :age)",
+      "fetch" => "params.fetch(:user).permit(:name, :age)",
+      "a safe-navigated permit" => "params.require(:user)&.permit(:name, :age)"
+    }.each do |label, source|
+      it "reads #{label} as the same root and fields as require(:user).permit" do
+        scan = described_class.scan(source)
+        expect([scan.calls, scan.root, scan.scalars]).to eq([1, :user, %i[name age]])
+      end
+    end
+
+    it "keeps permit! visible as an unreadable argument, never as a field list" do
+      scan = described_class.scan("params.require(:user).permit!")
+      expect([scan.calls, scan.root, scan.scalars, scan.unparsed]).to eq([1, :user, [], ["permit!"]])
+    end
+  end
+
   describe ".scan of a receiver that only ends in `params`" do
     it "does not read user_params.permit as a rootless params.permit" do
       scan = described_class.scan(<<~RUBY)
@@ -677,6 +696,11 @@ RSpec.describe Permittable::Generator do
 
     it "leaves a TODO comment for columns with no contract type at all" do
       expect(draft).to match(/# TODO: thumbnail \(binary\) has no contract type/)
+    end
+
+    it "drafts a TODO, with the columns, for permit!, which names no fields" do
+      draft = described_class.draft(model: GenArticle, scan: described_class.scan("params.require(:gen_article).permit!"))
+      expect(draft).to include("root: :gen_article").and include("# TODO: could not parse from the permit call: permit!")
     end
 
     it "produces a draft that loads as a real contract and validates a request" do

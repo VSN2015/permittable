@@ -1,5 +1,10 @@
 <!-- CHANGELOG.md — format: docs/changelog-format.md -->
 
+## Unreleased
+
+### Fixed
+- **`permittable:generate` reads `params[:user].permit(...)`, `params.fetch(:user, {}).permit(...)` and `&.permit(...)` like `require(:user).permit(...)`.** They were not scanned, so the draft fell back to every column, `admin` included. `permit!` now leaves a TODO instead of a silent fallback.
+
 ## 0.17.0 (2026-11-22)
 <!-- title: rootless contracts refuse router keys, stricter strings and integer enums, and GET contracts exported as query parameters -->
 

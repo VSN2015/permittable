@@ -101,16 +101,20 @@ module Permittable
     # real thing.
     PARAMS = /(?<![\w@$])(?:@_)?params/
 
-    # One permit call, with an optional leading `.require(:root)` — the root
-    # spelled `:user`, `"user"` or `'user'` (groups 1-3; a String root's
-    # content is masked, so it is read back by offset like any argument).
-    # The args capture (group 4) tolerates brackets and newlines but not
-    # parentheses — a call whose arguments contain a method call is skipped
-    # entirely rather than half-read. Without parentheses (`permit :name,
-    # :email`, common in older controllers) group 4 is empty and the
-    # arguments run to the end of the statement: see call_args.
-    PERMIT_CALL = /#{PARAMS}\s*(?:\.\s*require\(\s*(?::(\w+)|"([^"\n]*)"|'([^'\n]*)')\s*\))?\s*\.\s*
-                   permit(?:\(([^()]*)\)|[ \t]+(?=[^\s(]))/mx
+    # One permit call, with an optional leading root lookup — `.require(:root)`,
+    # `[:root]` or `.fetch(:root, default)`, the old scaffold's spelling, all
+    # read as the same root — the root spelled `:user`, `"user"` or `'user'`
+    # (groups 1-3; a String root's content is masked, so it is read back by
+    # offset like any argument). The permit may be called with `&.`. The args
+    # capture (group 4) tolerates brackets and newlines but not parentheses —
+    # a call whose arguments contain a method call is skipped entirely rather
+    # than half-read. Without parentheses (`permit :name, :email`, common in
+    # older controllers) group 4 is empty and the arguments run to the end of
+    # the statement: see call_args. `permit!` (group 5) has no arguments to
+    # read at all: see permit_call.
+    PERMIT_CALL = /#{PARAMS}\s*(?:(?:\.\s*require\(|\[|\.\s*fetch\()\s*
+                   (?::(\w+)|"([^"\n]*)"|'([^'\n]*)')\s*(?:,[^()]*)?[)\]])?\s*&?\.\s*
+                   permit(?:\(([^()]*)\)|[ \t]+(?=[^\s(])|(!))/mx
 
     # A trailing `if`/`unless`/`rescue` modifier on a paren-less call, which
     # is not one of its arguments.
@@ -812,7 +816,7 @@ module Permittable
     # nil when the call cannot be read: a paren-less one whose arguments
     # hold a method call, or a String root that is not a plain key.
     def permit_call(source, masked, match)
-      args, finish = call_args(source, masked, match, 4)
+      args, finish = match.begin(5) ? ["permit!", match.end(0)] : call_args(source, masked, match, 4)
       return nil unless args
 
       root = [1, 2, 3].filter_map { |index| group(source, match, index) }.first
