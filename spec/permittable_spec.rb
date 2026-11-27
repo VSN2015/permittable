@@ -5479,6 +5479,21 @@ RSpec.describe Permittable do
             end
           end
 
+          it "says a model-level validate: enum fails validation instead of raising, and a plain one raises" do
+            expect(&declaring(enum_model) { optional :status, :string }).to raise_error(ArgumentError, /and then raise on assignment\./)
+            skip "enum validate: needs Rails 7.1" if ActiveRecord.version < Gem::Version.new("7.1")
+
+            validated = stub_const("ValidatedEnumThing", Class.new(TestModel) do
+              self.table_name = "typed_things"
+              enum :tier, { free: "f", pro: "p" }, validate: { allow_nil: true }
+            end)
+            expect(&declaring(validated) { optional :tier, :string }).to raise_error(ArgumentError) do |e|
+              expect(e.message).to include("and then fail the model's enum validation.")
+              expect(e.message).not_to include("raise on assignment")
+              expect(e.message).to include("in: ValidatedEnumThing.tiers.keys")
+            end
+          end
+
           it "rejects an in: listing anything the enum would refuse, naming it" do
             m = enum_model
             expect(&declaring(m) { optional :status, :string, in: %w[pending bogus] })

@@ -336,8 +336,22 @@ module Permittable
 
       raise ArgumentError,
             "#{label}: #{enum_subject(field, shown)} is an enum on #{model_expr(klass)}, #{problem} (table: #{klass.table_name}). " \
-            "A value outside the enum would pass the contract and then raise on assignment. " \
+            "A value outside the enum would pass the contract and then #{enum_failure(klass, field)}. " \
             "Declare it with in: #{enum_keys_expr(klass, field, integer ? :values : :keys)}."
+    end
+
+    # What assignment does with a value the enum does not map. Rails 7.1's
+    # `enum ..., validate: true` records a validation error instead of raising;
+    # its type answers assert_valid_value without raising. Older Rails, and a
+    # duck-typed model, always raise.
+    def enum_failure(klass, field)
+      type = klass.respond_to?(:attribute_types) && klass.attribute_types[field.to_s]
+      return "raise on assignment" unless type.respond_to?(:assert_valid_value)
+
+      type.assert_valid_value("permittable-not-an-enum-value")
+      "fail the model's enum validation"
+    rescue ArgumentError
+      "raise on assignment"
     end
 
     # `:integer` over an enum whose stored values are all integers: the request
