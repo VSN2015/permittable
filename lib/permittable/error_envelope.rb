@@ -95,7 +95,7 @@ module Permittable
     # falls back to " ".
     def renders_json?(controller)
       return false unless controller.respond_to?(:render)
-      return true if controller.class.respond_to?(:_renderers) && controller.class._renderers.include?(:json)
+      return true if renderer_names(controller).include?(:json)
 
       method = controller.method(:render)
       while method
@@ -104,6 +104,15 @@ module Permittable
         method = method.super_method
       end
       false
+    end
+
+    # The renderers `render` consults. Rails main leaves `_renderers` empty
+    # under Renderers::All and adds the built-in ones in `_all_renderers`.
+    def renderer_names(controller)
+      return controller.send(:_all_renderers) if controller.respond_to?(:_all_renderers, true)
+      return controller.class._renderers if controller.class.respond_to?(:_renderers)
+
+      []
     end
 
     # The media type (no parameters) the response already carries, or nil when
