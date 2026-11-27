@@ -18,6 +18,8 @@ module Permittable
     # an integer 0/1 is a real legacy pattern, and ActiveRecord casts cleanly
     # between all of them. The temporal group is one group for the same
     # reason: a :date contract on a datetime column is a narrowing, not drift.
+    # The exception is :date over a time column, which keeps no value (see
+    # type_mismatch?).
     #
     # Anything absent here — :json, :jsonb, :binary, an adapter's own :inet or
     # :money — is NOT checked. A contract has no faithful type for those, so
@@ -204,8 +206,7 @@ module Permittable
       # NoMethodError out of a controller's class body.
       return unless column.type
 
-      actual = TYPE_GROUPS[column.type.to_sym]
-      return if wanted.nil? || actual.nil? || wanted == actual
+      return unless type_mismatch?(declared, column.type)
 
       # On an enum, `virtual: true` would be the wrong advice: it switches
       # off the existence check too, and the field IS backed by this column.
@@ -239,14 +240,24 @@ module Permittable
       actual_type = attribute_declared?(klass, target) && klass.attribute_types[target].type
       return unless actual_type
 
-      wanted = TYPE_GROUPS[declared.to_sym]
-      actual = TYPE_GROUPS[actual_type.to_sym]
-      return if wanted.nil? || actual.nil? || wanted == actual
+      return unless type_mismatch?(declared, actual_type)
 
       raise ArgumentError,
             "#{label}: '#{field}' is declared :#{declared} but the attribute is :#{actual_type} " \
             "(attribute :#{target} on #{model_expr(klass)}). Change the contract to match the attribute, " \
             "or declare the field virtual: true if it is not backed by it."
+    end
+
+    # Whether a contract type and a column/attribute type disagree: different
+    # groups, plus the one pair inside the temporal group that keeps nothing.
+    # A time column has no date part, so a :date value casts to NULL there
+    # (a :datetime value keeps its time of day, which is why it stays accepted).
+    def type_mismatch?(declared, actual)
+      wanted = TYPE_GROUPS[declared.to_sym]
+      found = TYPE_GROUPS[actual.to_sym]
+      return false if wanted.nil? || found.nil?
+
+      wanted != found || (declared.to_sym == :date && actual.to_sym == :time)
     end
 
     # Whether `name` is declared through the attribute API (`attribute :vip,

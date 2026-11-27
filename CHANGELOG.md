@@ -1,5 +1,10 @@
 <!-- CHANGELOG.md — format: docs/changelog-format.md -->
 
+## Unreleased
+
+### Fixed
+- **`check_column_types` refuses `:date` over a `time` column or `attribute :x, :time`.** Every value was cast to `NULL` and stored as nothing, so `optional :opens_at, :date` now raises `ArgumentError` at class load. Declare it `:datetime` (keeps the time of day) or migrate the column. (#PR)
+
 ## 0.17.0 (2026-11-22)
 <!-- title: rootless contracts refuse router keys, stricter strings and integer enums, and GET contracts exported as query parameters -->
 
