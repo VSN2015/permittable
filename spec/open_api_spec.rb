@@ -1683,6 +1683,18 @@ RSpec.describe Permittable::OpenAPI do
       )
     end
 
+    it "omits the default: of a transform: field from its query parameter schema" do
+      klass = controller_class do
+        permit_params(:index) do
+          optional :limit, :string, transform: ->(v) { v.to_i }, default: 25
+          optional :sort, :string, default: "id"
+        end
+      end
+      schemas = operation(klass)["parameters"].to_h { |p| [p["name"], p["schema"]] }
+      expect(schemas["limit"]).to eq("type" => "string", "x-permittable-transformed" => true)
+      expect(schemas["sort"]).to include("default" => "id")
+    end
+
     it "does not require a date query parameter, which a date_select's parts also meet" do
       klass = controller_class { permit_params(:index) { required :on, :date } }
       expect(operation(klass)["parameters"].first).to include("name" => "on", "required" => false)

@@ -614,6 +614,27 @@ RSpec.describe Permittable::JsonSchema do
       expect(props["tags"]["x-permittable-transformed"]).to be(true)
     end
 
+    # A default beside a transform: is in the action's shape (guide: author it
+    # "already in the shape the action should receive"), which the schema, a
+    # client's shape, would refuse. Left out, as x-permittable-transformed says.
+    it "omits default: from a field with transform:, or holding one, but keeps its example:" do
+      props = schema_for do
+        optional :limit, :string, transform: ->(v) { v.to_i }, default: 25, example: "25"
+        optional :at, :datetime, transform: ->(t) { t.to_date }, default: Date.new(2026, 1, 5)
+        array :ids, of: :string, transform: ->(a) { a.map(&:to_i) }, default: [1, 2]
+        array :rows, default: [{}] do
+          optional :n, :string, transform: ->(v) { v.to_i }, default: 5
+        end
+        optional :plain, :string, default: "x"
+      end["properties"]
+      expect(props["limit"]).to eq("type" => "string", "examples" => ["25"], "x-permittable-transformed" => true)
+      expect(props["at"]).not_to have_key("default")
+      expect(props["ids"]).not_to have_key("default")
+      expect(props["rows"]).not_to have_key("default")
+      expect(props["rows"]["items"]["properties"]["n"]).not_to have_key("default")
+      expect(props["plain"]["default"]).to eq("x")
+    end
+
     it "omits default:/example: from a sensitive: field, which is otherwise the one output channel meant for sharing" do
       prop = property("ssn") { optional :ssn, :string, sensitive: true, default: "000-00-0000", example: "078-05-1120" }
       expect(prop).to eq("type" => "string", "writeOnly" => true, "x-permittable-sensitive" => true)
