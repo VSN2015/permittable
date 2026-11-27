@@ -507,7 +507,7 @@ module Permittable
     def annotate(schema, field)
       decimal_mode = field[:kind] == JSON_TYPE ? :string : :number
       unless holds_sensitive?(field)
-        schema["default"] = json_value(field[:default], decimal: decimal_mode) if field.key?(:default)
+        schema["default"] = json_value(field[:default], decimal: decimal_mode) if field.key?(:default) && !holds_transform?(field)
         schema["examples"] = [json_value(field[:example], decimal: decimal_mode)] if field.key?(:example)
       end
       # dup: the stored desc is frozen; the export is editable and detached.
@@ -544,6 +544,18 @@ module Permittable
     # that has to find the sensitive key there is one more way to miss it.
     def holds_sensitive?(field)
       field[:sensitive] || Array(field[:fields]).any? { |child| holds_sensitive?(child) }
+    end
+
+    # Does this field have a `transform:`, or hold a field that does at any
+    # depth? A `default:` is stored in the shape the ACTION receives (as
+    # authored beside a `transform:`, a sub-field's own default filled into an
+    # array's), not the one a client sends, so beside a transform it is not a
+    # value this schema accepts: `transform: ->(v) { v.to_i }, default: 25` on
+    # a :string. It is omitted, as a sensitive field's is, and
+    # `x-permittable-transformed` is the signal. An `example:` is already
+    # published as a client sends it, so it stays.
+    def holds_transform?(field)
+      field[:transform] || Array(field[:fields]).any? { |child| holds_transform?(child) }
     end
 
     # The server checks the NORMALIZED string, so minLength/maxLength/pattern

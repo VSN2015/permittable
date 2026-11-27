@@ -1934,7 +1934,7 @@ module Permittable
       else
         assert_opts!(name, opts, SCALAR_OPTS)
         field = { name: name, kind: :scalar, required: required,
-                  type: scalar_type!(name, type || :string), **opts }
+                  type: scalar_type!(name, type || :string, [*SCALAR_TYPES, JSON_TYPE]), **opts }
         validate_scalar_opts!(field)
       end
       @fields << field
@@ -1956,12 +1956,14 @@ module Permittable
             "(allowed: #{allowed.map(&:inspect).join(', ')})"
     end
 
-    def scalar_type!(name, type)
+    # `listed` is what the message names: a field also takes :json, an array's
+    # `of:` does not. :json is handled before this is reached, so only the text differs.
+    def scalar_type!(name, type, listed = SCALAR_TYPES)
       type = type.to_sym
       return type if SCALAR_TYPES.include?(type)
 
       raise ArgumentError, "#{LABEL}: field :#{name} has unknown type :#{type} " \
-                           "(supported: #{SCALAR_TYPES.join(', ')})"
+                           "(supported: #{listed.join(', ')})"
     end
 
     def nested_fields!(name, &)

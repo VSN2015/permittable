@@ -85,6 +85,13 @@ RSpec.describe Permittable do
         .to raise_error(ArgumentError, /unknown type :money.*supported: string, integer/)
     end
 
+    it "names json among the supported types of an unknown field type, but not for an array's of:" do
+      expect { permittable_class { permit_params(:create) { optional :t, :time } } }
+        .to raise_error(ArgumentError, /unknown type :time.*supported: .*file, json\)/)
+      expect { permittable_class { permit_params(:create) { array :t, of: :time } } }
+        .to raise_error(ArgumentError) { |e| expect(e.message).not_to include("json") }
+    end
+
     it "rejects required + default (default implies optional)" do
       expect { permittable_class { permit_params(:create) { required :a, :string, default: "x" } } }
         .to raise_error(ArgumentError, /required and cannot have a :default/)
