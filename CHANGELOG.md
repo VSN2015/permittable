@@ -4,6 +4,7 @@
 
 ### Fixed
 - **An array of hashes reads an empty `{}` as `[]`.** Strong params permits that `fields_for` shape, but the field answered `invalid_type`; `length:` and `required` now treat it as an empty array. (#PR)
+- **The multipart OpenAPI export accepts a negative index (`items[-1][x]`).** The runtime reads it, as strong params does, but the pattern allowed only digits. (#PR)
 
 ## 0.17.0 (2026-11-22)
 <!-- title: rootless contracts refuse router keys, stricter strings and integer enums, and GET contracts exported as query parameters -->

@@ -341,7 +341,7 @@ module Permittable
 
     def form_pattern(path)
       body = path.each_with_index.map do |key, i|
-        text = key == :index ? '\\d+' : form_escape(key)
+        text = key == :index ? '-?\\d+' : form_escape(key)
         i.zero? ? text : "\\[#{text}\\]"
       end
       "^#{body.join}$"

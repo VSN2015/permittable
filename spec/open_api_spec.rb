@@ -452,9 +452,9 @@ RSpec.describe Permittable::OpenAPI do
         expect(patterns).to eq(
           # unknown: :error refuses unlisted names, so a part outside the root, which the runtime ignores, is let through
           '^(?!avatar(?:\[|$))' => {},
-          '^avatar\[items\]\[\d+\]\[photo\]$' => file,
-          '^avatar\[items\]\[\d+\]\[label\]$' => { "type" => "string" },
-          '^avatar\[items\]\[\d+\]\[marks\]\[\]$' => { "type" => "array", "items" => { "type" => "string" } }
+          '^avatar\[items\]\[-?\d+\]\[photo\]$' => file,
+          '^avatar\[items\]\[-?\d+\]\[label\]$' => { "type" => "string" },
+          '^avatar\[items\]\[-?\d+\]\[marks\]\[\]$' => { "type" => "array", "items" => { "type" => "string" } }
         )
       end
 
@@ -508,7 +508,7 @@ RSpec.describe Permittable::OpenAPI do
 
         it "escapes only ECMA-262 syntax characters in a pattern, so Unicode mode compiles it" do
           patterns = schema["patternProperties"].keys.grep(/line/)
-          expect(patterns).to eq(['^avatar\[line-items\]\[\d+\]\[scan-file\]$', '^avatar\[line-items\]\[\d+\]\[my note\]$'])
+          expect(patterns).to eq(['^avatar\[line-items\]\[-?\d+\]\[scan-file\]$', '^avatar\[line-items\]\[-?\d+\]\[my note\]$'])
           unless ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).any? { |d| File.executable?(File.join(d, "node")) }
             skip "node is not on PATH"
           end
@@ -628,7 +628,7 @@ RSpec.describe Permittable::OpenAPI do
           [0, 1].each do |i|
             next if file && i == 1
 
-            parts << [template.sub("d+", i.to_s), "v#{i}", (file ? "p.txt" : nil)]
+            parts << [template.sub("-?d+", i.to_s), "v#{i}", (file ? "p.txt" : nil)]
           end
         end
         result = IntegrationHarness.dispatch(uploads, :create, method: "POST", multipart: parts)
@@ -637,6 +637,15 @@ RSpec.describe Permittable::OpenAPI do
                                                  { "names" => "f0.txt",
                                                    "items" => [{ "photo" => "p.txt", "label" => "v0", "marks" => ["v0"] },
                                                                { "label" => "v1", "marks" => ["v1"] }] }])
+      end
+
+      it "documents the negative index the server reads, as strong params does" do
+        schema = multipart_schema(paths["/avatars"]["post"])
+        name = "avatar[items][-1][label]"
+        expect(schema["patternProperties"].keys.grep_v(/\A\^\(\?!/).any? { |pattern| name.match?(pattern) }).to be(true)
+        parts = [["avatar[name]", "n"], ["avatar[image]", "x", "p.txt"], [name, "v"]]
+        result = IntegrationHarness.dispatch(uploads, :create, method: "POST", multipart: parts)
+        expect([result.status, JSON.parse(result.body)["items"]]).to eq([200, [{ "label" => "v" }]])
       end
     end
 
