@@ -175,7 +175,9 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
       filter_attribute_names: ActiveRecord::Base.filter_attributes.grep(String),
       filter_attribute_procs: ActiveRecord::Base.filter_attributes.count { |f| f.is_a?(Proc) },
       filter_parameter_names: Rails.application.config.filter_parameters.grep(String),
-      insert: log.string.lines.grep(/INSERT/).join,
+      # Only the bind list: the Logger prefix (timestamp, pid) and the duration
+      # are digits too, and made a secret like 8888 match by chance.
+      insert: log.string.lines.grep(/INSERT/).join[/\\[\\[.*\\]\\]/].to_s,
       model_inspect: Person.first.inspect,
       rails_version: Rails.gem_version.to_s
     )
@@ -218,7 +220,9 @@ RSpec.describe "Permittable::Railtie in a booted Rails application", :integratio
       names_after_overwrite: names_after_overwrite,
       filter_attribute_names: ActiveRecord::Base.filter_attributes.grep(String),
       filter_attribute_symbols: ActiveRecord::Base.filter_attributes.grep(Symbol).map(&:to_s),
-      insert: log.string.lines.grep(/INSERT/).join,
+      # Only the bind list: the Logger prefix (timestamp, pid) and the duration
+      # are digits too, and made a secret like 8888 match by chance.
+      insert: log.string.lines.grep(/INSERT/).join[/\\[\\[.*\\]\\]/].to_s,
       model_inspect: Person.first.inspect,
       rails_version: Rails.gem_version.to_s
     )
