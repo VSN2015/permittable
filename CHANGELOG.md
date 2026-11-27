@@ -1,5 +1,10 @@
 <!-- CHANGELOG.md — format: docs/changelog-format.md -->
 
+## Unreleased
+
+### Fixed
+- **The unknown-type error for a field now names `json` among the supported types.** `optional :t, :time` listed only the scalar types, though `:json` is accepted.
+
 ## 0.17.0 (2026-11-22)
 <!-- title: rootless contracts refuse router keys, stricter strings and integer enums, and GET contracts exported as query parameters -->
 
