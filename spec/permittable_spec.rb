@@ -6128,7 +6128,8 @@ RSpec.describe Permittable do
     # InvalidParameters. They are now registered at the first `permit_params`.
     describe "on a bare ActionController::Metal controller, whatever the include order" do
       # `order` lists the modules to include; :permittable marks where.
-      # `rendering: :no_renderers` includes Rendering but not Renderers::All.
+      # `rendering: :no_renderers` includes Rendering but not Renderers::All;
+      # `:xml_only` adds Renderers with `use_renderers :xml` and no :json.
       def build_metal(order, rendering: true, &body)
         modules = { callbacks: AbstractController::Callbacks, rescue: ActionController::Rescue,
                     permittable: Permittable }
@@ -6136,10 +6137,12 @@ RSpec.describe Permittable do
           # One at a time, in Rails' own order: `include a, b` puts a in front.
           stack = [ActionController::Head, ActionController::StrongParameters]
           if rendering
-            renderers = rendering == :no_renderers ? [] : [ActionController::Renderers::All]
+            renderers = { no_renderers: [], xml_only: [ActionController::Renderers] }
+                        .fetch(rendering, [ActionController::Renderers::All])
             stack = [AbstractController::Rendering, ActionController::Rendering, *renderers] + stack
           end
           stack.each { |mod| klass.include mod }
+          klass.use_renderers :xml if rendering == :xml_only
           klass.define_singleton_method(:controller_path) { "metal_order" }
           order.each { |name| klass.include modules.fetch(name) }
           klass.class_eval(&body) if body
@@ -6388,17 +6391,39 @@ RSpec.describe Permittable do
           # Renderers::All it has no :json renderer: `render json:` answered
           # 200 text/plain " " and the rejected request looked like a success.
           { envelope: "application/json", problem: "application/problem+json" }.each do |format, media|
-            it "answers 422 under error_format :#{format} with Rendering but no Renderers::All" do
-              Permittable.error_format = format
-              controller = build_metal(order, rendering: :no_renderers) do
-                permit_params(:create, root: :user, enforce: true) { required :name, :string }
-                def create = head(:accepted)
+            %i[no_renderers xml_only].each do |rendering|
+              it "answers 422 under error_format :#{format} with Rendering and #{rendering} but no :json" do
+                Permittable.error_format = format
+                controller = build_metal(order, rendering: rendering) do
+                  permit_params(:create, root: :user, enforce: true) { required :name, :string }
+                  def create = head(:accepted)
+                end
+                status, type, body = dispatch_create(controller, json: { user: { nme: "x" } })
+                expect(status).to eq(422)
+                expect(type).to start_with(media)
+                expect(JSON.parse(body)).to include(format == :problem ? { "status" => 422 } : { "success" => false })
               end
-              status, type, body = dispatch_create(controller, json: { user: { nme: "x" } })
-              expect(status).to eq(422)
-              expect(type).to start_with(media)
-              expect(JSON.parse(body)).to include(format == :problem ? { "status" => 422 } : { "success" => false })
             end
+          end
+
+          # A `render` the host wrote answers for itself, whatever renderers
+          # the controller has: the gem must not bypass it.
+          it "keeps calling a host-written render when there is no :json renderer" do
+            controller = build_metal(order, rendering: :no_renderers) do
+              permit_params(:create, root: :user, enforce: true) { required :name, :string }
+              def create = head(:accepted)
+
+              def render(json:, status:, content_type: nil)
+                headers["X-Host-Render"] = "1"
+                self.status = status
+                self.content_type = content_type
+                self.response_body = [json.to_json]
+              end
+            end
+            result = IntegrationHarness.dispatch(controller, :create, method: "POST", json: { user: { nme: "x" } })
+            expect(result.status).to eq(422)
+            expect(result.header("X-Host-Render")).to eq("1")
+            expect(JSON.parse(result.body)).to include("success" => false)
           end
 
           it "delegates to a private render_error defined below permit_params" do

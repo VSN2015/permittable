@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Fixed
-- **A Metal controller with `ActionController::Rendering` but not `Renderers::All` answers a rejected request with 422.** It sent `200 text/plain " "` and skipped the action; the gem now writes the JSON or problem body itself there. (#TBD)
+- **A Metal controller with `ActionController::Rendering` but not `Renderers::All` answers a rejected request with 422.** It sent `200 text/plain " "` and skipped the action; the gem now writes the JSON or problem body itself there. (#PR)
 
 ## 0.17.0 (2026-11-22)
 <!-- title: rootless contracts refuse router keys, stricter strings and integer enums, and GET contracts exported as query parameters -->

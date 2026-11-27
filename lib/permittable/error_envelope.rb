@@ -67,11 +67,11 @@ module Permittable
     end
 
     # `render json:`, or — for a bare ActionController::Metal with no `render`,
-    # or whose `render` has no :json renderer (ActionController::Rendering
-    # without Renderers::All answers 200 " ") — the same response written
-    # through Metal's own status=, content_type= and response_body=.
-    # `render json:` calls `to_json` on a Hash, so the bytes are the same. A
-    # controller that can `render json:` always takes the first path.
+    # or only Rails' stock `render` and no :json renderer (Rendering without
+    # Renderers::All answers 200 " ") — the same response written through
+    # Metal's own status=, content_type= and response_body=. `render json:`
+    # calls `to_json` on a Hash, so the bytes are the same. A controller that
+    # can `render json:` always takes the first path.
     def render_json(controller, payload, status:, content_type: nil)
       # The number, not the symbol: Rack >= 3.1 deprecates :unprocessable_entity
       # (:unprocessable_content there) and Rails 7.1 passes it to Rack as is.
@@ -88,12 +88,22 @@ module Permittable
       controller.render(**options)
     end
 
-    # A `render` that can answer `json:`. A controller class without the
-    # Renderers module has no `_renderers` at all.
+    # Whether `render json:` will answer: the class has a :json renderer (a
+    # class without the Renderers module has no `_renderers` at all), or a
+    # `render` the host wrote, which is the host's to answer with. Only the
+    # stock render of Rails (Rendering, Instrumentation) with no :json renderer
+    # falls back to " ".
     def renders_json?(controller)
       return false unless controller.respond_to?(:render)
+      return true if controller.class.respond_to?(:_renderers) && controller.class._renderers.include?(:json)
 
-      controller.class.respond_to?(:_renderers) && controller.class._renderers.include?(:json)
+      method = controller.method(:render)
+      while method
+        return true unless method.owner.name.to_s.start_with?("ActionController::", "AbstractController::")
+
+        method = method.super_method
+      end
+      false
     end
 
     # The media type (no parameters) the response already carries, or nil when
