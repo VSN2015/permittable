@@ -211,6 +211,13 @@ module Permittable
     # `permit`, `require`, and `expect` can never spell out of it.
     MASK_CHAR = "\u0000".freeze
 
+    # What a scalar column with no contract type (`time`, `binary`, an
+    # adapter's own `inet`) is told: a client sends it as text, such as "07:30",
+    # so a nested block or an array would refuse what the legacy permit took.
+    AS_TEXT_ADVICE = "declare it by hand; a client sends it as text, so `:string` with a `format:` fits".freeze
+    TEXT_ARRAY_ADVICE = "declare it by hand; its elements are sent as text, so `array ..., of: :string` fits".freeze
+    DOCUMENT_ARRAY_ADVICE = "declare it as an `array ... do` block of documents".freeze
+
     module_function
 
     # `source` with its comments removed. A controller keeping a commented-out
@@ -1100,7 +1107,7 @@ module Permittable
       return array_column_line(column) if column.array
 
       type = column.enum ? :string : COLUMN_TYPES[column.type]
-      return "# TODO: #{column.name} (#{column.type}) has no contract type — declare it as a nested block or an array" unless type
+      return "# TODO: #{column.name} (#{column.type}) has no contract type — #{AS_TEXT_ADVICE}" unless type
       return json_array_todo(column) if type == :json && column.array_default
 
       required = column.rule != :update && required_column?(column)
@@ -1119,7 +1126,8 @@ module Permittable
     def array_column_line(column)
       type = COLUMN_TYPES[column.type]
       unless type && type != :json
-        return "# TODO: #{column.name} (#{column.type}[]) has no contract type — declare it as a nested block or an array"
+        advice = type ? DOCUMENT_ARRAY_ADVICE : TEXT_ARRAY_ADVICE
+        return "# TODO: #{column.name} (#{column.type}[]) has no contract type — #{advice}"
       end
 
       required = column.rule != :update && required_column?(column)

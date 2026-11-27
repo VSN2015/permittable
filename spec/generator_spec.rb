@@ -698,6 +698,23 @@ RSpec.describe Permittable::Generator do
       expect(draft).to match(/# TODO: thumbnail \(binary\) has no contract type/)
     end
 
+    # A client sends a time as text ("07:30"), so a nested block or an array
+    # would refuse every request the legacy permit accepted.
+    it "advises a text field, not a nested block or an array, for a scalar column with no contract type" do
+      ActiveRecord::Schema.define do
+        create_table(:gen_shifts) do |t|
+          t.string :name
+          t.time :wake_at
+        end
+      end
+      stub_const("GenShift", Class.new(TestModel) { self.table_name = "gen_shifts" })
+      draft = described_class.draft(model: GenShift, scan: described_class.scan("params.require(:gen_shift).permit(:name, :wake_at)"))
+      expect(draft).to match(/# TODO: wake_at \(time\) has no contract type — declare it by hand.*`:string` with a `format:`/)
+      expect(draft).not_to include("nested block")
+    ensure
+      ActiveRecord::Base.connection.drop_table(:gen_shifts, if_exists: true)
+    end
+
     it "drafts a TODO, with the columns, for permit!, which names no fields" do
       draft = described_class.draft(model: GenArticle, scan: described_class.scan("params.require(:gen_article).permit!"))
       expect(draft).to include("root: :gen_article").and include("# TODO: could not parse from the permit call: permit!")
@@ -800,7 +817,7 @@ RSpec.describe Permittable::Generator do
     end
 
     it "leaves a TODO for an array column whose element type has no scalar contract type" do
-      expect(draft).to match(/# TODO: labels \(jsonb\[\]\) has no contract type/)
+      expect(draft).to match(/# TODO: labels \(jsonb\[\]\) has no contract type — declare it as an `array ... do` block/)
     end
 
     it "produces a draft that accepts the array the column stores" do

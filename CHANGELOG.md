@@ -4,6 +4,7 @@
 
 ### Fixed
 - **`permittable:generate` reads `params[:user].permit(...)`, `params.fetch(:user, {}).permit(...)` and `&.permit(...)` like `require(:user).permit(...)`.** They were not scanned, so the draft fell back to every column, `admin` included. `permit!` now leaves a TODO instead of a silent fallback.
+- **`permittable:generate` no longer advises a nested block or an array for a `time` or `binary` column.** A client sends `"07:30"` as a string, so that advice refused every request the legacy permit accepted. The TODO now suggests a `:string` with a `format:`.
 
 ## 0.17.0 (2026-11-22)
 <!-- title: rootless contracts refuse router keys, stricter strings and integer enums, and GET contracts exported as query parameters -->
