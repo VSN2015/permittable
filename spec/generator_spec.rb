@@ -157,16 +157,44 @@ RSpec.describe Permittable::Generator do
       expect([scan.root, scan.scalars]).to eq([:user, %i[name age]])
     end
 
-    it "keeps a paren-less call whose arguments hold a method call as a TODO, rather than half-reading it" do
+    it "reads no field out of a paren-less call whose arguments hold a method call, and keeps it as a TODO" do
       scan = described_class.scan("params.require(:user).permit :name, *policy(record).extra")
-      expect([scan.calls, scan.root, scan.scalars, scan.unparsed]).to eq([1, :user, %i[name], ["*policy(record).extra"]])
+      expect([scan.calls, scan.root, scan.scalars, scan.unparsed]).to eq([0, nil, [], []])
+      expect(scan.unread).to eq(["params.require(:user).permit :name, *policy(record).extra"])
+      expect(scan).to be_found
+    end
+  end
+
+  describe ".scan of a permit call it cannot read" do
+    # Where such a call ends is a guess, so no field is read out of it: it is a
+    # TODO, never a half-read field list.
+    {
+      "a parenthesis inside a string" =>
+        "params.require(:user).permit(:name, f(\"(\"))\nhelper_method :a, :admin, :b\nlog \")\"",
+      "a parenthesis in a later string" => "params.require(:user).permit(:name, f(x), y: \")\", :email)",
+      "a paren-less call over two lines" => "params.require(:user).permit :name,\n  *policy(record).extra",
+      "a call wrapped in another call" => "respond_with(params.require(:user).permit :name, :email)",
+      "a call inside a list" => "x = [params.require(:user).permit :name, :admin]",
+      "a method call in the parentheses" => "params.permit(:name, *policy(a, b).keys)"
+    }.each do |label, source|
+      it "drafts no field from #{label}, only a TODO" do
+        scan = described_class.scan(source)
+        expect([scan.scalars, scan.unparsed, scan.calls]).to eq([[], [], 0])
+        expect(scan.unread.size).to eq(1)
+        expect(scan.unread.first).to include("params")
+      end
     end
 
-    it "keeps a parenthesised call whose arguments hold a method call, over several lines too" do
-      scan = described_class.scan("def p = params.require(:user).permit(:name, *policy(a, b).keys)")
-      expect([scan.scalars, scan.unparsed]).to eq([%i[name], ["*policy(a, b).keys"]])
-      scan = described_class.scan("params.permit(\n  :q,\n  *filters(x)\n)\nputs 1")
-      expect([scan.scalars, scan.unparsed]).to eq([%i[q], ["*filters(x)"]])
+    it "shortens a long call to its first line, and keeps it beside the readable ones" do
+      scan = described_class.scan("params.permit(:q)\nparams.require(:user).permit(*#{'x' * 200}(1))")
+      expect(scan.scalars).to eq(%i[q])
+      expect(scan.unread.first.length).to be <= 83
+      expect(scan.unread.first).to end_with("...")
+    end
+
+    it "keeps the call's own TODO beside a readable one" do
+      both = described_class.scan("params.permit(:name)\nparams.require(:user).permit(*policy(@u).keys)")
+      expect([both.scalars, both.unread.size]).to eq([%i[name], 1])
     end
   end
 
@@ -209,11 +237,6 @@ RSpec.describe Permittable::Generator do
         described_class.scan(piece * 3500)
         expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be < 3
       end
-    end
-
-    it "skips an unreadable call too long to quote, and one that never closes" do
-      expect(described_class.scan("params.permit(#{'a(1), ' * 300}b)").calls).to eq(0)
-      expect(described_class.scan("params.permit(a(1)\nx").calls).to eq(0)
     end
 
     it "notes that a fetch with a default answered a request without the root" do
@@ -754,6 +777,14 @@ RSpec.describe Permittable::Generator do
     it "drafts a TODO when the legacy fetch default accepted a request without the root" do
       draft = described_class.draft(model: GenArticle, scan: described_class.scan("params.fetch(:gen_article, {}).permit(:title)"))
       expect(draft).to include("# TODO: legacy accepted a request without `gen_article`")
+    end
+
+    it "drafts the columns with a TODO when the only permit call could not be read" do
+      scan = described_class.scan("params.require(:gen_article).permit(*policy(@a).keys)")
+      draft = described_class.draft(model: GenArticle, scan: scan)
+      expect(draft).to include("root: :gen_article").and include("optional :title")
+      expect(draft).to include("# TODO: could not read this permit call; declare its fields by hand: " \
+                               "params.require(:gen_article).permit(*policy(@a).keys)")
     end
 
     it "drafts a TODO, with the columns, for permit!, which names no fields" do

@@ -4,7 +4,7 @@
 
 ### Fixed
 - **`permittable:generate` reads `params[:user].permit(...)`, `params.fetch(:user, {}).permit(...)` and `&.permit(...)` like `require(:user).permit(...)`.** They were not scanned, so the draft fell back to every column, `admin` included. (#PR)
-- **`permittable:generate` leaves a TODO for `permit!`, a permit call whose arguments hold a method call, and a `fetch` default.** The draft keeps its column fallback beside the TODO instead of falling back silently. (#PR)
+- **`permittable:generate` leaves a TODO for `permit!`, a permit call whose arguments it cannot read, and a `fetch` default.** The draft quotes the call and declares no field from it, instead of ignoring it silently. (#PR)
 - **`permittable:generate` no longer advises a nested block or an array for a `time` or `binary` column.** A client sends `"07:30"` as a string, so that advice refused every request the legacy permit accepted. (#PR)
 
 ## 0.17.0 (2026-11-22)

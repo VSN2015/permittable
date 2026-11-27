@@ -80,10 +80,11 @@ module Permittable
     # losing root onto its calls, spelled as the source spells them. `calls`
     # counts the params calls found, and `default_roots` lists the chosen
     # root when a `params.fetch(root, default)` answered requests without it.
+    # `unread` quotes each permit call whose arguments could not be read.
     Scan = Struct.new(:root, :scalars, :arrays, :nested, :nested_arrays, :unparsed, :conflicts, :undecided,
-                      :route_params, :rootless, :other_envelopes, :calls, :default_roots, keyword_init: true) do
+                      :route_params, :rootless, :other_envelopes, :calls, :default_roots, :unread, keyword_init: true) do
       def found?
-        calls.positive?
+        calls.positive? || !Array(unread).empty?
       end
 
       # Whether the chosen root's calls parsed into any field. A draft checks
@@ -113,7 +114,7 @@ module Permittable
     # :email`, common in older controllers) it is empty and the arguments run
     # to the end of the statement: see call_args. `permit!` (group 11) has no
     # arguments to read, and an opening parenthesis (group 12) means a method
-    # call in the arguments: see permit_args.
+    # call in the arguments: see permit_call.
     ROOT = /\s*(?::(\w+)|"([^"\n]*)"|'([^'\n]*)')\s*/
     PERMIT_CALL = /#{PARAMS}\s*(?:\.\s*require\(#{ROOT}\)|\[#{ROOT}\]|\.\s*fetch\(#{ROOT}(?:,[^()]*)?\))?\s*&?\.\s*
                    permit(?:\(([^()]*)\)|[ \t]+(?=[^\s(])|(!)|(\())/mx
@@ -220,7 +221,8 @@ module Permittable
     TEXT_ARRAY_ADVICE = "declare it by hand; its elements are sent as text, so `array ..., of: :string` fits".freeze
     DOCUMENT_ARRAY_ADVICE = "declare it as an `array ... do` block of documents".freeze
 
-    MAX_UNREADABLE_ARGS = 1000
+    # How much of a permit call it could not read its TODO quotes.
+    UNREAD_SPELLING_LIMIT = 80
 
     module_function
 
@@ -325,12 +327,13 @@ module Permittable
     def scan(source, model: nil, exclude: [])
       result = Scan.new(root: nil, scalars: [], arrays: [], nested: {}, nested_arrays: {}, unparsed: [],
                         conflicts: [], undecided: [], route_params: [], rootless: [], other_envelopes: {}, calls: 0,
-                        default_roots: [])
+                        default_roots: [], unread: [])
       raw = source.to_s
       source = executable_source(raw)
       masked = masked_source(raw)
-      pairs = paren_pairs(masked)
-      permits = matches(masked, PERMIT_CALL).filter_map { |match| permit_call(source, masked, match, pairs) }
+      unread, permits = matches(masked, PERMIT_CALL).filter_map { |match| permit_call(source, masked, match) }
+                                                    .partition { |call| call.is_a?(String) }
+      result.unread = unread.uniq
       expects = matches(masked, EXPECT_CALL).filter_map do |match|
         args, = call_args(source, masked, match, 1)
         expect_calls(match.begin(0), split_args(args)) if args
@@ -757,8 +760,8 @@ module Permittable
       parts = [+""]
       depth = 0
       args.scan(/%[iIwW],[^,]*,|./m) do |token|
-        depth += 1 if token.size == 1 && "[{(".include?(token)
-        depth -= 1 if token.size == 1 && "]})".include?(token)
+        depth += 1 if token.size == 1 && "[{".include?(token)
+        depth -= 1 if token.size == 1 && "]}".include?(token)
         next parts << +"" if token == "," && depth.zero?
 
         parts.last << token
@@ -826,10 +829,17 @@ module Permittable
     # own text may hold placeholders rather than a real string argument's
     # characters (see masked_source), so every group is read back out of
     # `source` by position instead of off `match` directly.
-    # nil when the call cannot be read: a paren-less one whose arguments
-    # hold a method call, or a String root that is not a plain key.
-    def permit_call(source, masked, match, pairs)
-      args, finish = permit_args(source, masked, match, pairs)
+    # nil when there is nothing to read (a String root that is not a plain key,
+    # or `permit` with no arguments). A call whose arguments cannot be read — a
+    # method call among them, or a lookup wrapped in another call — is the
+    # String of its first line instead, which scan keeps as a TODO: no field is
+    # read out of it, since where it ends is a guess. `permit!` names no keys,
+    # and is the one argument kept as unparsed.
+    def permit_call(source, masked, match)
+      return unread_spelling(source, match) if match.begin(12)
+
+      args, finish = match.begin(11) ? ["permit!", match.end(0)] : call_args(source, masked, match, 10)
+      return unread_spelling(source, match) if finish == :unreadable
       return nil unless args
 
       root = (1..9).filter_map { |index| group(source, match, index) }.first
@@ -840,49 +850,11 @@ module Permittable
       Call.new(match.begin(0), root.to_sym, split_args(args), [], spelling, fetch_default?(masked, match))
     end
 
-    # The permit call's argument text and where the call ends. What cannot be
-    # read is kept as text rather than skipped, so the draft shows it in a
-    # TODO: `permit!` names no keys, and a method call in the arguments
-    # (`permit(*policy.keys)`) cannot be evaluated.
-    def permit_args(source, masked, match, pairs)
-      return ["permit!", match.end(0)] if match.begin(11)
-      return unreadable_args(source, masked, match.end(0), pairs[match.begin(12)]) if match.begin(12)
-
-      args = call_args(source, masked, match, 10)
-      return args if args || match.begin(10) || bare_args_end(masked, match.end(0))
-
-      unreadable_args(source, masked, match.end(0), nil)
-    end
-
-    # The arguments up to `close`, the offset of the closing parenthesis, or
-    # to the end of the line for a call with no parentheses, less a trailing
-    # modifier. Nil when nothing follows, for an opening parenthesis that never
-    # closes (a syntax error), and for more than MAX_UNREADABLE_ARGS characters.
-    # shortcut: such a call is skipped silently, as it always was; quoting
-    # nested or repeated ones whole is quadratic, so lift the cap only with a
-    # linear reader.
-    def unreadable_args(source, masked, start, close)
-      return if close.nil? && masked[start - 1] == "("
-
-      finish = close || masked.index("\n", start) || masked.length
-      return if finish - start > MAX_UNREADABLE_ARGS
-
-      args = source[start...finish].sub(BARE_MODIFIER, "").rstrip
-      [args, start + args.length] unless args.empty?
-    end
-
-    # Where each parenthesis of `masked` closes, by the offset of its opener,
-    # in one pass: an opener with no closer has no entry. Parentheses inside
-    # a string literal are kept by masked_source and count here.
-    def paren_pairs(masked)
-      open = []
-      masked.each_char.with_index.with_object({}) do |(char, index), pairs|
-        if char == "("
-          open << index
-        elsif char == ")" && !open.empty?
-          pairs[open.pop] = index
-        end
-      end
+    # The first line of the call, shortened.
+    def unread_spelling(source, match)
+      head = source[match.begin(0), UNREAD_SPELLING_LIMIT + 1]
+      line = head.lines.first.to_s.strip.gsub(/\s+/, " ")
+      head.length > UNREAD_SPELLING_LIMIT && !head.include?("\n") ? "#{line[0, UNREAD_SPELLING_LIMIT]}..." : line
     end
 
     # Whether a root lookup is a `fetch` with a default: one the legacy call
@@ -892,15 +864,16 @@ module Permittable
       index && masked[match.end(index)...match.end(0)].match?(/\A\s*,/)
     end
 
-    # A call's argument text and where the call ends, or nil when it cannot
-    # be read. Parenthesised, that is the paren group. Without parentheses
+    # A call's argument text and where the call ends, or nil when there is
+    # none; `[nil, :unreadable]` when a paren-less call's arguments cannot be
+    # read (see bare_args_end). Parenthesised, that is the paren group. Without parentheses
     # it runs from the match to the end of the statement (bare_args_end),
     # less any trailing modifier.
     def call_args(source, masked, match, paren_group)
       return [group(source, match, paren_group), match.end(0)] if match.begin(paren_group)
 
       finish = bare_args_end(masked, match.end(0))
-      return nil unless finish
+      return [nil, :unreadable] unless finish
 
       # The call ends where its arguments do, so a TODO quoting it never
       # quotes the modifier.
@@ -1323,6 +1296,7 @@ module Permittable
       Array(scan.conflicts).map { |conflict| "# TODO: #{conflict}" } +
         scan.unparsed.map { |arg| "# TODO: could not parse from the permit call: #{arg}" } +
         Array(scan.default_roots).map { |root| default_root_todo(root) } +
+        Array(scan.unread).map { |call| "# TODO: could not read this permit call; declare its fields by hand: #{call}" } +
         scan.other_envelopes.to_h.flat_map do |root, spellings|
           spellings.map { |spelling| "# TODO: belongs to another envelope (#{root}): #{spelling}" }
         end +
