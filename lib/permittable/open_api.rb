@@ -83,9 +83,9 @@ module Permittable
       "required" => %w[title status]
     }.freeze
 
-    # Instance methods the concern itself adds to every including controller;
-    # action_methods reports them as actions (they are public by design), but
-    # they are never routed and must not be documented as endpoints. Resolved
+    # Instance methods the concern itself adds to every including controller.
+    # Permittable::ActionMethods already keeps them out of action_methods; this
+    # is a defensive filter so they are never documented as endpoints. Resolved
     # lazily — at file-load time the concern's module body may not have run.
     def concern_methods
       @concern_methods ||= Permittable.public_instance_methods(false).map(&:to_s).freeze
