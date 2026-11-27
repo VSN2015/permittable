@@ -1402,7 +1402,7 @@ A `format:` regexp that does not translate to ECMA-262 is looser in the same way
 | `in:` list / numeric Range | `enum` of the cast members (a `:datetime` member written as a String is published as written; a `:date` member, however written, as `YYYY-MM-DD`) / `minimum` + `maximum` (exclusive ends honoured). An `in:` object that only answers `include?` is flagged `x-permittable-custom-validation` |
 | `length:` | `minLength`/`maxLength` on strings, `minItems`/`maxItems` on arrays |
 | `format:` | `pattern`, valid under the `u` flag Ajv compiles with: `\A`/`\z` become `^`/`$`, `\s` and `.` are spelled out as the classes they are in Ruby (ECMA-262's `\s` also matches NBSP and U+2028; its `.` also stops at `\r`), and redundant escapes like `\-` and `\#` are written bare |
-| `default:` / `desc:` / `example:` | `default` / `description` / `examples`. The `default` of a field with `transform:` (or of an array holding one at any depth) is omitted, since it is in the shape the action receives, not the one the schema accepts; `x-permittable-transformed` marks it. An `example:` is published as a client sends it, so it stays |
+| `default:` / `desc:` / `example:` | `default` / `description` / `examples`. The `default` of a field with `transform:` (or of an array holding one at any depth) is omitted, since it is in the shape the action receives, not the one the schema accepts; `x-permittable-transformed` marks the transformed field itself (not the array holding it). An `example:` is published as a client sends it, so it stays |
 | nested block / `array` | `object` + `properties` / `array` + `items` |
 | `unknown: :error` | `additionalProperties: false`, at every nesting level |
 | `root:` | the wrapping object, itself required |

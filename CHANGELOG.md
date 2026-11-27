@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Fixed
-- **The exported schema no longer publishes the `default:` of a field with `transform:`.** `transform: ->(v) { v.to_i }, default: 25` on a `:string` exported `"default": 25` under `"type": "string"`, a default the schema itself refuses. The default is now left out, also for an array holding such a field, and `x-permittable-transformed` still marks it.
+- **The exported schema no longer publishes the `default:` of a field with `transform:`.** `transform: ->(v) { v.to_i }, default: 25` on a `:string` exported `"default": 25` under `"type": "string"`, a default the schema itself refuses. The default is now left out, also for an array holding such a field, and `x-permittable-transformed` still marks the transformed field itself.
 - **The unknown-type error for a field now names `json` among the supported types.** `optional :t, :time` listed only the scalar types, though `:json` is accepted.
 
 ## 0.17.0 (2026-11-22)
